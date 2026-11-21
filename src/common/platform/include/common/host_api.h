@@ -15,9 +15,24 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "common/chip_swimlane_extension.h"
+#include "common/launch_entry_args.h"
 #include "host/scheduler_notifications.h"
+
+/**
+ * The arena bank selected for each pooled device region of one run.
+ *
+ * Each region is selected from its own declaration: a runtime may share its
+ * heap while still delivering a per-run image. A missing kind keeps zero,
+ * which is the only bank a context without that region can name.
+ */
+struct RegionBanks {
+    uint32_t heap;
+    uint32_t sm;
+    uint32_t image;
+};
 
 struct CoreAsyncCapability;
 
@@ -33,6 +48,11 @@ struct HostMetadataRegion {
     void *device_target;
     const void *host_source;
     size_t bytes;
+    // Onboard RTS delivers this snapshot to AICPU for Program and Kernel launches.
+    bool execution_image{false};
+    uint64_t mutable_prefix_bytes{UINT64_MAX};
+    const HbgImageReference *image_references{nullptr};
+    size_t reference_count{0};
 };
 
 /**
@@ -132,31 +152,10 @@ struct HostApiOps {
     // into it — the run's total is not known until every recording has ended, so
     // the capacity on offer is whatever the previous bind left behind.
     void (*get_graph_definition_staging)(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size);
-    // Runner-owned storage for one pipeline slot's device-side scheduler state,
-    // both sides of it: `device_out` receives the device block the scheduler
-    // reads and `host_out` the block the caller builds that state in before the
-    // single H2D that ships it. Both are aligned to `alignment` (a power of
-    // two) with at least `bytes` usable behind them, and the caller owns every
-    // offset inside them. Both are the aligned base rather than the allocation
-    // it sits in; nothing here hands out a pointer a free would take.
-    //
-    // Grow-only retention per slot: a request that fits the retained capacity
-    // reuses it, a larger one replaces it, and both sides are released at Worker
-    // finalization. Neither block is cleared here — the caller re-initializes
-    // and re-uploads the whole range it uses on every run, so a retained block
-    // carries nothing between runs.
-    //
-    // Reuse is the slot's, never a run's: the caller acquires during its bind,
-    // and a slot admits one run at a time, so the storage a bind receives was
-    // last used by a run of the same slot that has already released its
-    // bindings. A runner that cannot accept a run refuses this outright rather
-    // than handing back storage whose previous device writer was never proven
-    // stopped. Returns 0 on success.
-    //
-    // This table is internal to one build: it carries no version and callers
-    // index it by member, so the platform library and every runtime library
-    // that reads it are compiled and installed together. Adding an entry here
-    // therefore needs no compatibility handling and offers none.
+    // The bind builds scheduler state at host_out for publication to device_out.
+    // Both bases satisfy alignment and cover bytes. Onboard retains slot-local
+    // host staging and selects shared device scratch for serialized execution,
+    // or a distinct readback target when this run collects scheduler profiling.
     int (*acquire_scheduler_state_storage)(
         void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
     );
@@ -193,12 +192,13 @@ struct HostApiOps {
         void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out
     );
     // Commit the three pooled regions (GM heap, runtime shared memory, and
-    // prebuilt runtime arena) of the arena bank selected by this run, as three
-    // independent device allocations. `runtime_arena_size == 0` skips the
-    // third region. Idempotent on identical sizes; returns 0 on success, -1 on
-    // allocation failure.
+    // prebuilt runtime arena) into the bank each one selects, as independent
+    // device allocations. `runtime_arena_size == 0` skips the third region.
+    // Idempotent on identical sizes; returns 0 on success, -1 on allocation
+    // failure.
     int (*setup_static_arena)(
-        void *runner_ctx, uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+        void *runner_ctx, uint32_t pipeline_slot, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size,
+        size_t runtime_arena_size
     );
     // Return the per-Worker pooled pointer for the GM heap / runtime shared
     // memory / prebuilt runtime arena. setup_static_arena must have already
@@ -209,7 +209,7 @@ struct HostApiOps {
     // The runtime-arena region exists only when setup_static_arena was invoked
     // with runtime_arena_size > 0; otherwise acquire_pooled_runtime_arena
     // returns nullptr.
-    void *(*acquire_pooled_gm_heap)(void *runner_ctx, uint32_t arena_bank);
+    void *(*acquire_pooled_gm_heap)(void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank);
     void *(*acquire_pooled_gm_sm)(void *runner_ctx, uint32_t arena_bank);
     void *(*acquire_pooled_runtime_arena)(void *runner_ctx, uint32_t arena_bank);
     // Prebuilt runtime-arena image cache (trb): look up a previously built
@@ -308,6 +308,10 @@ struct HostApiOps {
     std::optional<HostCallableAsyncCapabilities> (*get_callable_async_capabilities)(
         void *runner_ctx, int32_t callable_id
     ) = nullptr;
+    bool launch_owns_execution_image{false};
+    int (*stage_owned_references)(
+        void *, uint32_t, const HostMetadataRegion *, size_t, std::vector<HbgImageReference> *
+    ) = nullptr;
 };
 
 /**
@@ -318,6 +322,8 @@ struct HostApiOps {
  */
 struct HostApi {
 public:
+    bool launch_owns_execution_image() const { return ops_->launch_owns_execution_image; }
+
     int stage_launch_metadata(const HostMetadataRegion *regions, size_t count) const {
         if (ops_->stage_launch_metadata != nullptr)
             return ops_->stage_launch_metadata(runner_ctx_, pipeline_slot_, regions, count);
@@ -330,6 +336,14 @@ public:
         return 0;
     }
 
+    int stage_metadata_with_references(
+        const HostMetadataRegion *regions, size_t count, std::vector<HbgImageReference> &owner
+    ) const {
+        if (!owner.empty() && ops_->stage_owned_references)
+            return ops_->stage_owned_references(runner_ctx_, pipeline_slot_, regions, count, &owner);
+        return stage_launch_metadata(regions, count);
+    }
+
     struct DiagnosticConfig {
         uint32_t chip_swimlane_level;
         bool pmu_enabled;
@@ -338,15 +352,24 @@ public:
     // Native runs supply their own selection before bind. Registration and
     // prewarm callers without a run retain the runner-query fallback.
     HostApi(
-        void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops,
+        void *runner_ctx, uint32_t pipeline_slot, RegionBanks banks, uint64_t run_epoch, const HostApiOps *ops,
         std::optional<DiagnosticConfig> diagnostics = std::nullopt
     ) noexcept :
         runner_ctx_(runner_ctx),
         pipeline_slot_(pipeline_slot),
-        arena_bank_(arena_bank),
+        banks_(banks),
         run_epoch_(run_epoch),
         ops_(ops),
         diagnostics_(diagnostics) {}
+
+    // Compatibility constructor for callers whose regions share one bank.
+    HostApi(
+        void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops,
+        std::optional<DiagnosticConfig> diagnostics = std::nullopt
+    ) noexcept :
+        HostApi(
+            runner_ctx, pipeline_slot, RegionBanks{arena_bank, arena_bank, arena_bank}, run_epoch, ops, diagnostics
+        ) {}
 
     // The epoch this run was given. Runtimes that build their own swimlane
     // record streams stamp it into each row: per-task tokens restart every run,
@@ -459,17 +482,21 @@ public:
         return ops_->acquire_run_image_staging(runner_ctx_, pipeline_slot_, bytes, alignment, addr_out);
     }
     int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) const {
-        return ops_->setup_static_arena(runner_ctx_, arena_bank_, gm_heap_size, gm_sm_size, runtime_arena_size);
+        return ops_->setup_static_arena(
+            runner_ctx_, pipeline_slot_, banks_, gm_heap_size, gm_sm_size, runtime_arena_size
+        );
     }
-    void *acquire_pooled_gm_heap() const { return ops_->acquire_pooled_gm_heap(runner_ctx_, arena_bank_); }
-    void *acquire_pooled_gm_sm() const { return ops_->acquire_pooled_gm_sm(runner_ctx_, arena_bank_); }
-    void *acquire_pooled_runtime_arena() const { return ops_->acquire_pooled_runtime_arena(runner_ctx_, arena_bank_); }
+    void *acquire_pooled_gm_heap() const {
+        return ops_->acquire_pooled_gm_heap(runner_ctx_, pipeline_slot_, banks_.heap);
+    }
+    void *acquire_pooled_gm_sm() const { return ops_->acquire_pooled_gm_sm(runner_ctx_, banks_.sm); }
+    void *acquire_pooled_runtime_arena() const { return ops_->acquire_pooled_runtime_arena(runner_ctx_, banks_.image); }
     bool lookup_prebuilt_runtime_arena_cache(
         uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
         void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
     ) const {
         return ops_->lookup_prebuilt_runtime_arena_cache(
-            runner_ctx_, arena_bank_, hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off,
+            runner_ctx_, banks_.image, hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off,
             image_data, image_size
         );
     }
@@ -478,7 +505,7 @@ public:
         void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
     ) const {
         ops_->mark_prebuilt_runtime_arena_cached(
-            runner_ctx_, arena_bank_, hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off,
+            runner_ctx_, banks_.image, hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off,
             image_data, image_size
         );
     }
@@ -613,7 +640,7 @@ private:
 
     void *runner_ctx_{nullptr};
     uint32_t pipeline_slot_{0};
-    uint32_t arena_bank_{0};
+    RegionBanks banks_{};
     uint64_t run_epoch_{0};
     const HostApiOps *ops_{nullptr};
     std::optional<DiagnosticConfig> diagnostics_;

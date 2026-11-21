@@ -26,35 +26,69 @@ public:
     RuntimeLaunchMetadata &operator=(const RuntimeLaunchMetadata &) = delete;
     RuntimeLaunchMetadata(RuntimeLaunchMetadata &&other) noexcept :
         regions_(std::move(other.regions_)),
+        execution_image_(std::move(other.execution_image_)),
         bytes_(std::exchange(other.bytes_, 0)) {
-        other.regions_.clear();
+        other.clear();
     }
     RuntimeLaunchMetadata &operator=(RuntimeLaunchMetadata &&other) noexcept {
         if (this != &other) {
             regions_ = std::move(other.regions_);
+            execution_image_ = std::move(other.execution_image_);
             bytes_ = std::exchange(other.bytes_, 0);
-            other.regions_.clear();
+            other.clear();
         }
         return *this;
     }
 
-    int prepare(const HostMetadataRegion *regions, size_t count) {
+    int prepare(const HostMetadataRegion *regions, size_t count, bool deliver_execution_image = false,
+                std::vector<HbgImageReference> *owner = nullptr) {
         if (count != 0 && regions == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         size_t total = 0;
+        bool image_seen = false;
         for (size_t i = 0; i < count; ++i) {
             const auto &region = regions[i];
-            if (region.device_target == nullptr || region.host_source == nullptr || region.bytes == 0 ||
-                region.bytes > std::numeric_limits<size_t>::max() - total)
+            if (region.device_target == nullptr || region.host_source == nullptr || region.bytes == 0)
                 return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+            if (deliver_execution_image && region.execution_image) {
+                if (image_seen || region.bytes > UINT32_MAX ||
+                    (region.mutable_prefix_bytes != UINT64_MAX && region.mutable_prefix_bytes > region.bytes) ||
+                    region.reference_count > (UINT32_MAX - region.bytes) / sizeof(HbgImageReference) ||
+                    (region.reference_count != 0 && region.image_references == nullptr))
+                    return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+                for (size_t j = 0; j < region.reference_count; ++j) {
+                    const auto &ref = region.image_references[j];
+                    if (ref.device_field_address == 0 || ref.device_field_address % alignof(uint64_t) != 0 ||
+                        ref.image_offset >= region.bytes)
+                        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+                }
+                if (owner && (owner->data() != region.image_references || owner->size() != region.reference_count))
+                    return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+                image_seen = true;
+                continue;
+            }
+            if (region.bytes > std::numeric_limits<size_t>::max() - total) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
             total += region.bytes;
         }
+        if (owner && !image_seen) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         std::vector<Region> captured;
         captured.reserve(count);
+        Region image{};
         for (size_t i = 0; i < count; ++i) {
             const auto *source = static_cast<const std::byte *>(regions[i].host_source);
-            captured.push_back({regions[i].device_target, {source, source + regions[i].bytes}});
+            Region region{regions[i].device_target, {source, source + regions[i].bytes}};
+            if (deliver_execution_image && regions[i].execution_image) {
+                region.mutable_prefix_bytes =
+                    regions[i].mutable_prefix_bytes == UINT64_MAX ? regions[i].bytes : regions[i].mutable_prefix_bytes;
+                if (regions[i].reference_count != 0 && !owner)
+                    region.references.assign(
+                        regions[i].image_references, regions[i].image_references + regions[i].reference_count
+                    );
+                image = std::move(region);
+            } else captured.push_back(std::move(region));
         }
+        if (owner) image.references = std::move(*owner);
         regions_ = std::move(captured);
+        execution_image_ = std::move(image);
         bytes_ = total;
         return 0;
     }
@@ -70,8 +104,21 @@ public:
     }
 
     size_t size() const { return bytes_; }
+    bool has_execution_image() const { return !execution_image_.bytes.empty(); }
+    HostMetadataRegion execution_image() const {
+        return {
+            execution_image_.target,
+            execution_image_.bytes.data(),
+            execution_image_.bytes.size(),
+            true,
+            execution_image_.mutable_prefix_bytes,
+            execution_image_.references.data(),
+            execution_image_.references.size()
+        };
+    }
     void clear() {
         regions_.clear();
+        execution_image_ = {};
         bytes_ = 0;
     }
 
@@ -99,7 +146,10 @@ private:
     struct Region {
         void *target;
         std::vector<std::byte> bytes;
+        uint64_t mutable_prefix_bytes{0};
+        std::vector<HbgImageReference> references{};
     };
     std::vector<Region> regions_;
+    Region execution_image_{};
     size_t bytes_{0};
 };

@@ -12,7 +12,7 @@
  * host_build_graph runtime maker (host orchestration).
  *
  * The HOST runs the orchestrator to completion, populates shared memory + the
- * prebuilt arena, and H2Ds the image; the device boots scheduler-only.
+ * prebuilt arena, and publishes the execution image. The device boots the scheduler.
  *
  * register_callable_impl:
  *   - dlopens the orchestration SO on the host and resolves its entry points,
@@ -106,25 +106,16 @@ static_assert(
 );
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
-    // Host orchestration materializes this run's own graph into the image it
-    // uploads, so every device-resident region carries per-run content.
-    //
-    // PTO_PIPELINE_GM_SM is absent because hbg has no separate shared-memory
-    // region: the image is the tail of the runtime-image region, so it shares that
-    // region's classification. The arena-topology check skips an absent kind.
-    // `pipeline_depth` is the maximum this runtime supports, not a configured
-    // count: every device-resident region it names carries per-run content and
-    // is selected by the caller's lease, so as many runs can hold one as a
-    // context cares to grant. What a context actually grants is the smaller of
-    // this and the request, and every per-run resource is built to that grant —
-    // so declaring no limit here commits nothing.
+    // Each launch supplies its initial image. Ordered executions share the
+    // device heap and the writable portion of the runtime arena.
+    // pipeline_depth bounds supported resource sets without preallocating them.
     static const PipelineContract contract = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
         4,
         UINT32_MAX,
         {
-            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0},
-            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_POOLED_SCRATCH, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_POOLED_SCRATCH, 0},
             {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
             {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
         },
@@ -135,16 +126,22 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out) {
     if (out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     if (config == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    // The graph and its heap are sized by each bind's host orchestration.
-    // Init declares their bank topology, without claiming a fixed capacity.
+    // Retained preparations keep the heap allocation alive, while caller
+    // ordering permits eager executions and recorded replays to reuse its contents.
     *out = *get_pipeline_contract();
     return 0;
 }
 
 extern "C" int concurrent_native_prepare_supported_impl(void) {
-    // HBG can materialize a complete graph into the lease-selected unpublished
-    // arena bank.
+    // Each prepare assembles its own host image.
     return 1;
+}
+
+extern "C" int
+prepared_run_config_compatible_impl(const HostApi *api, const uint64_t *, const uint64_t *, const uint64_t *) {
+    // Bind writes host staging. The device writes shared scratch only after
+    // launch ordering takes effect, and growth retains the previous backing.
+    return api != nullptr && api->launch_owns_execution_image();
 }
 
 extern "C" int teardown_report_supported_impl(void) {
@@ -155,11 +152,7 @@ extern "C" int teardown_report_supported_impl(void) {
 }
 
 extern "C" int joined_native_launch_supported_impl(void) {
-    // Every per-run device region this runtime names is selected by the run's
-    // own lease — the graph heap and the runtime image are both HOST_PER_RUN
-    // above — so a second launched run reads and writes nothing the first is
-    // still executing against. What orders the two on the device is a queued
-    // event wait, not this answer.
+    // A queued device event wait orders use of the shared heap and scheduler scratch.
     return 1;
 }
 
@@ -424,7 +417,7 @@ static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, S
     if (api == nullptr || host_header == nullptr) return 0;
     // The shared scheduler header can already belong to a successor.
     if (const auto observed = api->observed_run_status(); observed.has_value()) return *observed;
-    if (runtime == nullptr) return 0;
+    if (runtime == nullptr || api->launch_owns_execution_image()) return 0;
 
     void *device_sm = runtime->get_gm_sm_ptr();
     if (device_sm == nullptr) {
@@ -450,12 +443,6 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
 }
 
 namespace {
-
-// host_build_graph is host-orchestration-first: the HOST dlopens the
-// orchestration .so and runs it to completion. Every cross-task reference the
-// shared memory and arena carry is an offset or an index from its own block, so
-// the image the device schedules is the bytes the host wrote — there is nothing
-// to fix up after the H2D copy.
 
 bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
     size_t total = 0;
@@ -788,8 +775,8 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     always_assert(reinterpret_cast<uint64_t>(gm_heap) % DeviceArena::kDefaultBaseAlign == 0);
     const sm_layout::HeapRebase heap_rebase{reinterpret_cast<uint64_t>(gm_heap), heap_bytes};
 
-    // One host source for one copy: the copied zone and shared-memory image at
-    // exactly the offsets they occupy on the device.
+    // The publication contains the runtime header followed by the compact SM
+    // image. This layout keeps every argument delta relative to its own record.
     // Over-allocated and rounded up because every segment offset is
     // CHIP_ALIGN_SIZE-aligned and ChipTaskSlotState is alignas(64), which a byte
     // vector's data() is not.
@@ -831,9 +818,8 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
 }
 
 int32_t run_host_orchestration(
-    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt,
-    DeviceArena &host_arena, const RuntimeArenaLayout &layout, uint64_t sm_size, uint64_t task_capacity,
-    void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, HostPreparePlan &plan
+    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt, uint64_t sm_size,
+    uint64_t task_capacity, void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, HostPreparePlan &plan
 ) {
     // The dep_gen graph belongs to the orchestration that is about to run.
     dep_gen_host_graph_begin_capture();
@@ -1052,7 +1038,7 @@ int32_t run_host_orchestration(
         LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, SIMPLER_ERROR_READY_QUEUE_OVERFLOW, ready_queue_status);
         return ready_queue_status;
     }
-    rt->prebuilt_layout.sched.capacities = ready_queue_capacities;
+    plan.layout.sched.capacities = ready_queue_capacities;
     host_phase_trace_note_submitted(static_cast<uint64_t>(total_tasks));
 
     // The count travels inside the header the restack copies wholesale, which is
@@ -1085,12 +1071,8 @@ int32_t run_host_orchestration(
     const uint64_t image_bytes = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).end;
     runtime->dev.sm_image_bytes = image_bytes;
 
-    // Only now are both sizes known, so this is where the two device regions are
-    // committed: the arena up to its shared-memory tail, and the graph heap to the
-    // bytes orchestration actually handed out. setup_static_arena commits per
-    // region and short-circuits a request an existing one already covers, so a
-    // repeated workload pays for neither twice and the heap is grow-only across a
-    // Worker's binds.
+    // Orchestration determines the required span. Bind checks it against the
+    // configured fixed capacity before committing any device heap or image.
     // The compact shared-memory image is the only per-run tail in the device
     // arena. GraphExecution is initialized later in each outer Graph heap.
     // A graph whose every output is caller-owned allocates nothing, but its tasks
@@ -1364,14 +1346,11 @@ extern "C" int bind_callable_to_runtime_impl(
     if (!resolve_graph_task_capacity(ring_task_window, &task_capacity)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // The heap takes no configuration, so a set ring_heap reaches nothing in this
-    // runtime — most often it is a config written for the reclaiming one, whose knob
-    // it still is.
-    if (read_ring_override(ring_heap, 0) != 0) {
-        LOG_WARN(
-            "%s", "host_build_graph ignores ring_heap: its graph heap is committed after orchestration at the "
-                  "size the graph turned out to need"
-        );
+    const uint64_t heap_override = read_ring_override(ring_heap, 0);
+    const uint64_t heap_capacity = heap_override == 0 ? 256ULL * 1024 * 1024 : heap_override;
+    if (heap_capacity < 1024 || heap_capacity > MAX_HEAP_CAPACITY) {
+        LOG_ERROR("HBG heap capacity must be in [1024, %" PRIu64 "] bytes", uint64_t{MAX_HEAP_CAPACITY});
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     }
 
     // Build device args: copy from input, replace host tensor pointers with device pointers
@@ -1519,63 +1498,22 @@ extern "C" int bind_callable_to_runtime_impl(
     // Lay out the per-Worker static device arena. The GM heap and the prebuilt
     // runtime arena are two independent pooled device allocations, and neither is
     // committed here: the arena's size is known only once orchestration has
-    // submitted its tasks, and the heap's only once orchestration has allocated
-    // its intermediate buffers. Both are committed by the single
-    // setup_static_arena in run_host_orchestration. Owned by DeviceRunner across
-    // runs — do NOT record in tensor_leases(); the free is deferred to
-    // DeviceRunner::finalize(). The runtime-arena size is determined by replaying
-    // the reserve sequence on a host-side arena.
+    // submitted its tasks and reported the queue populations it can reach, and
+    // the heap's only once orchestration has allocated its intermediate buffers.
+    // Both are committed by the single setup_static_arena in commit_host_plan.
+    // Owned by DeviceRunner across runs — do NOT record in tensor_leases(); the
+    // free is deferred to DeviceRunner::finalize().
     uint64_t sm_size = SharedMemoryHandle::calculate_size(task_capacity);
 
-    const BindPhaseMark arena_build_phase = bind_phase_begin();
     auto plan = std::make_shared<HostPreparePlan>();
     plan->staging_bytes = required_temp_bytes == 0 ? 0 : required_temp_bytes + RetainedTempBump::kAlignment - 1;
     size_t staging_capacity = 0;
     api->get_retained_temp_buffer(&plan->staging_backing, &staging_capacity);
     DeviceArena &host_arena = plan->host_arena;
     RuntimeArenaLayout &layout = plan->layout;
-    layout = runtime_reserve_layout(host_arena, task_capacity);
-    if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-        LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    {
-        char attrs[kBindAttrsCapacity];
-        snprintf(attrs, sizeof(attrs), "bytes=%" PRIu64, static_cast<uint64_t>(layout.arena_size));
-        record_bind_phase(HostPhaseKind::BindArenaBuild, arena_build_phase, attrs);
-    }
 
     // Set up orchestration state (consumed by the host orchestrator below)
     runtime->set_orch_args(device_args);
-
-    // -------------------------------------------------------------------------
-    // Build the prebuilt runtime-arena image on host.
-    //
-    // We pre-compute every byte the AICPU's runtime arena would otherwise have
-    // to write at boot: layout offsets, sub-structure init data, and pointers
-    // back to the SM / GM heap. Then we rtMemcpy the image into the pooled
-    // runtime-arena region that DeviceRunner keeps alive across runs. AICPU
-    // boot becomes attach + wire (cheap pointer fixup) + sm_handle->init (SM
-    // reset) + a handful of device-only field fixups.
-    // -------------------------------------------------------------------------
-    const BindPhaseMark runtime_init_phase = bind_phase_begin();
-    // No SM base: the scheduler and sm_handle are device-written now, so nothing
-    // here stores one, and the region is not even committed yet.
-    RuntimeContext *rt =
-        runtime_init_data_from_layout(host_arena, layout, MODE_EXECUTE, /*sm_dev_base=*/nullptr, sm_size);
-    if (rt == nullptr) {
-        LOG_ERROR("runtime_init_data_from_layout failed");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    runtime_wire_arena_pointers(host_arena, layout, rt);
-    // Stash the layout inside the RuntimeContext image so the AICPU can recover every
-    // arena-internal offset after the copy. It is written before orchestration
-    // because orchestration assembles the image this header is part of, and the
-    // publication uploads what it assembled. The runtime arena's device base does
-    // NOT travel — it is on the host Runtime (set_prebuilt_arena below), since the
-    // AICPU needs that pointer before it can dereference the image.
-    rt->prebuilt_layout = layout;
-    record_bind_phase(HostPhaseKind::BindRuntimeInit, runtime_init_phase);
 
     // host_build_graph host-orch: run the orchestrator on the host now, against
     // a host SM mirror, and ship the populated SM to the device. The arena
@@ -1601,12 +1539,12 @@ extern "C" int bind_callable_to_runtime_impl(
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    RuntimeContext orch_rt{};
     {
         ChipTaskArgs orch_l2;
         orch_l2.create_from_entry_storage(runtime->get_orch_args());
         int32_t total_tasks = run_host_orchestration(
-            runtime, api, tensor_access, rt, host_arena, layout, sm_size, task_capacity, host_orch_func_ptr, orch_l2,
-            *plan
+            runtime, api, tensor_access, &orch_rt, sm_size, task_capacity, host_orch_func_ptr, orch_l2, *plan
         );
         const BindPhaseMark view_close_phase = bind_phase_begin();
         tensor_access.close();
@@ -1618,6 +1556,58 @@ extern "C" int bind_callable_to_runtime_impl(
         runtime->dev.host_total_tasks = total_tasks;
         LOG_INFO("host-orch: submitted %d tasks on host", total_tasks);
     }
+
+    // -------------------------------------------------------------------------
+    // Build the prebuilt runtime-arena image on host.
+    //
+    // Orchestration has now reported the queue populations its graph can reach
+    // and the shared-memory image size, so the arena is laid out against the run
+    // rather than the queue capacity limits. We pre-compute every byte the AICPU's
+    // runtime arena would otherwise have to write at boot: layout offsets,
+    // sub-structure init data, and pointers back to the SM / GM heap. Then we
+    // rtMemcpy the image into the pooled runtime-arena region that DeviceRunner
+    // keeps alive across runs. AICPU boot becomes attach + wire (cheap pointer
+    // fixup) + sm_handle->init (SM reset) + a handful of device-only field fixups.
+    // -------------------------------------------------------------------------
+    const BindPhaseMark arena_build_phase = bind_phase_begin();
+    const ReadyQueueCapacities ready_queue_capacities = layout.sched.capacities;
+    layout = runtime_reserve_layout(host_arena, task_capacity, ready_queue_capacities);
+    if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+        LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    {
+        char attrs[kBindAttrsCapacity];
+        snprintf(attrs, sizeof(attrs), "bytes=%" PRIu64, static_cast<uint64_t>(layout.arena_size));
+        record_bind_phase(HostPhaseKind::BindArenaBuild, arena_build_phase, attrs);
+    }
+
+    const BindPhaseMark runtime_init_phase = bind_phase_begin();
+    // No SM base: the scheduler and sm_handle are device-written now, so nothing
+    // here stores one.
+    RuntimeContext *rt =
+        runtime_init_data_from_layout(host_arena, layout, MODE_EXECUTE, /*sm_dev_base=*/nullptr, sm_size);
+    if (rt == nullptr) {
+        LOG_ERROR("runtime_init_data_from_layout failed");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    rt->inline_completed_tasks = orch_rt.inline_completed_tasks;
+    runtime_wire_arena_pointers(host_arena, layout, rt);
+    // Stash the layout inside the RuntimeContext image so the AICPU can recover
+    // every arena-internal offset after the copy. The runtime arena's device base
+    // does NOT travel — it is on the host Runtime (set_prebuilt_arena below),
+    // since the AICPU needs that pointer before it can dereference the image.
+    rt->prebuilt_layout = layout;
+    record_bind_phase(HostPhaseKind::BindRuntimeInit, runtime_init_phase);
+
+    if (plan->heap_bytes > heap_capacity) {
+        LOG_ERROR(
+            "HBG heap capacity exceeded: required=%" PRIu64 " configured=%" PRIu64 " bytes", plan->heap_bytes,
+            heap_capacity
+        );
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    plan->heap_bytes = heap_capacity;
 
     plan->diagnostic_outcome = dep_gen_host_graph_take(&plan->diagnostic_graph);
     plan->park(*runtime);
@@ -1648,14 +1638,17 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         LOG_ERROR("publish_run_image_impl: no prepared runtime image to publish");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // The slot snapshots prerequisites and image before this local record dies.
-    // Onboard launch publishes the same pinned sources in this order before the
-    // descriptor and entry fork. Synchronous backends use the HostApi fallback.
+    // The platform snapshots the sources before this record dies. Onboard
+    // launches carry the image in the RTS packet and queue prerequisites
+    // before AICPU entry. Synchronous backends copy all regions.
     std::vector<HostMetadataRegion> metadata;
     metadata.reserve(publication.prerequisites.size() + 1);
     for (const auto &region : publication.prerequisites)
         metadata.push_back({region.device_target, region.source, region.bytes});
-    metadata.push_back({publication.device_target, publication.source, publication.bytes});
+    metadata.push_back(
+        {publication.device_target, publication.source, publication.bytes, true, publication.mutable_prefix_bytes,
+         publication.image_references.data(), publication.image_references.size()}
+    );
     const BindPhaseMark staging_phase = bind_phase_begin();
     const int metadata_rc = api->stage_launch_metadata(metadata.data(), metadata.size());
     if (metadata_rc != 0) {
@@ -1668,9 +1661,7 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         // the pool counters had to travel.
         const uint64_t image_bytes = runtime->dev.sm_image_bytes;
         const uint64_t copied_bytes = publication.bytes - image_bytes;
-        // The widest attribute string a segment formats: eight uint64 fields plus
-        // their labels. With the counters ahead of it in the recorded string, this
-        // is the tail a truncation eats first.
+        // Keep the workspace address visible even when the attribute buffer fills.
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs),

@@ -517,9 +517,9 @@ TEST_F(CallerOrderTest, RecordingKeepsEventsUntilExternalUseEndsWithoutWaitingFo
     const auto recording_trace = trace;
     EXPECT_NE(order.retire(kRun), 0);
     EXPECT_NE(order.release(), 0);
-    EXPECT_NE(order.end_recording(kNext), 0);
+    EXPECT_NE(order.end_external_use(kNext), 0);
     EXPECT_EQ(destroyed, 0);
-    ASSERT_EQ(order.end_recording(kRun), 0);
+    ASSERT_EQ(order.end_external_use(kRun), 0);
     ASSERT_EQ(order.retire(kRun), 0);
     EXPECT_EQ(trace, recording_trace);
     EXPECT_EQ(order.release(), 0);
@@ -540,7 +540,7 @@ TEST_F(CallerOrderTest, ExternalRecordingEndDoesNotDischargeAnEagerCallerReferen
     );
     publish_whole_boundary();
     ASSERT_EQ(order.join(kRun, fence), 0);
-    EXPECT_NE(order.end_recording(kRun), 0);
+    EXPECT_NE(order.end_external_use(kRun), 0);
     EXPECT_NE(order.retire(kRun), 0);
     EXPECT_EQ(destroyed, 0);
 }

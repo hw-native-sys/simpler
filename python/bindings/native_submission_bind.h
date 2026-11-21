@@ -63,10 +63,10 @@ inline void bind_native_submission(nanobind::module_ &m) {
         )
         .def("_retire", &NativeSubmissionState::retire, nanobind::call_guard<nanobind::gil_scoped_release>())
         .def(
-            "_retain_model_resources",
+            "_register_model_destroy_notice",
             [](NativeSubmissionState &self, const NativeSubmissionState *anchor) {
                 int started = 0;
-                self.retain_model_resources(started, anchor);
+                self.register_model_destroy_notice(started, anchor);
             },
             nanobind::arg("anchor").none() = nullptr, nanobind::call_guard<nanobind::gil_scoped_release>()
         )
@@ -75,14 +75,7 @@ inline void bind_native_submission(nanobind::module_ &m) {
             nanobind::call_guard<nanobind::gil_scoped_release>()
         )
         .def(
-            "_release_model_resources",
-            [](NativeSubmissionState &self) {
-                NativeSubmissionCleanup outcome;
-                self.cancel_pending(outcome);
-                if (!outcome.carrier_retired) throw RunPreparationRefused("native capture carrier is still live");
-                self.release_resources();
-                return outcome.disposition == NativeSubmissionDisposition::Cancelled;
-            },
+            "_release_model_resources", &NativeSubmissionState::release_model_resources,
             nanobind::call_guard<nanobind::gil_scoped_release>()
         )
         .def(

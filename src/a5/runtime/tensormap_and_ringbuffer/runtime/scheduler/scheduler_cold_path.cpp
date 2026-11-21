@@ -859,7 +859,7 @@ int32_t SchedulerContext::retire_all_cores() {
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->get_workers());
     // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
     // native program launch, so only a report stamped with it is this run's;
     // zero on a kernel/persistent launch, which keeps the aicore_done predicate.
@@ -989,7 +989,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 // ci % active_threads. Same protocol as handshake_partition, but over the owned
 // set instead of a contiguous slice.
 void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads) {
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->get_workers());
     // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
     // native program launch, so only a report stamped with it is this run's;
     // zero on a kernel/persistent launch, which keeps the aicore_done predicate.

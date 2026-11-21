@@ -47,9 +47,8 @@
  * **A borrow belongs to a run identity, not to a count.** `borrow` is keyed on the run's own
  * identity, so a release names the run that took it and cannot discharge another run's reference.
  * Re-borrowing under one identity replaces that identity's set, which is what a re-prepared run
- * needs. For capture, the existing external reference snapshots these facts while the active
- * slot still aliases the same call. Checked Host-carrier retirement detaches that alias before
- * slot reuse; checked external last-use ends the retained facts.
+ * needs. A caller-owned submission keeps these facts under the original run handle before
+ * releasing the slot. Checked finalization ends that run's borrows.
  *
  * **A borrow is about lifetime, and says nothing about readability.** Holding an allocation is not
  * producing it: two runs may legitimately take the same immutable input, and neither makes the
@@ -64,8 +63,8 @@
  * declared by nobody and stays readable, which is what keeps every path that does not produce a
  * device tensor on the behaviour it already had.
  *
- * A declaration shares the borrow's identity and lifetime. A capture's external reference keeps
- * both facts after its Host carrier ends, until checked external last-use releases them. The two
+ * A declaration shares the borrow's identity and lifetime. A caller-owned run keeps
+ * both facts through its final stream use, even after its slot is reused. The two
  * facts are discharged independently, including when the call held no borrow. A span that resolves
  * to no recorded allocation is ignored: there is nothing to protect.
  *
@@ -214,7 +213,7 @@ public:
         release_locked(Identity(identity), keep);
     }
 
-    /** Snapshot this carrier's facts into its existing external reference. */
+    /** Keep the slot's current borrows and writes under the original run handle. */
     bool retain_reference(const void *reference, uint64_t active_identity) {
         if (reference == nullptr || active_identity == 0) return false;
         std::scoped_lock lk(mu_);
@@ -238,7 +237,7 @@ public:
         return true;
     }
 
-    /** The runner proves this exact reference's carrier retired before detaching its alias. */
+    /** The run now owns the borrows independently of its reusable slot. */
     void detach_reference(const void *reference) {
         std::scoped_lock lk(mu_);
         const auto key = Identity::retained(reference);
@@ -248,7 +247,7 @@ public:
         if (written != writes_.end()) written->second.active_alias = 0;
     }
 
-    /** End only this reference; the carrier's active records are independent. */
+    /** Release this run's borrows and writes without altering a later occupant of its slot. */
     void release_reference(const void *reference, bool keep) {
         std::scoped_lock lk(mu_);
         release_locked(Identity::retained(reference), keep);

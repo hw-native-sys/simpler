@@ -174,26 +174,6 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper) {
 // DeviceRunner Implementation
 // =============================================================================
 
-int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) {
-    if (args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-
-    int rc = init_aicore_register_addresses(&args->regs, device_id, mem_alloc_, AicoreRegKind::Ctrl);
-    if (rc != 0) {
-        LOG_ERROR("fill_persistent_arch_fields: init_aicore_register_addresses(Ctrl) failed: %d", rc);
-        return rc;
-    }
-
-    uint32_t ffts_len = 0;
-    rc = rtGetC2cCtrlAddr(&args->ffts_base_addr, &ffts_len);
-    if (rc != 0) {
-        LOG_ERROR("fill_persistent_arch_fields: rtGetC2cCtrlAddr failed: %d", rc);
-        if (mem_alloc_.free(reinterpret_cast<void *>(args->regs)) == 0) args->regs = 0;
-        args->ffts_base_addr = 0;
-        return rc;
-    }
-    return 0;
-}
-
 int DeviceRunner::ensure_aicpu_topology() {
     if (!aicpu_topology_.empty()) return 0;
     std::vector<simpler::a2a3::AicpuLogicalCpu> topology;
@@ -804,11 +784,8 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     if (!prepared.stream_lifetime) prepared.stream_lifetime = run_streams_.retain_aicore();
     if (prepared.caller_stream != nullptr) prepared.streams.aicpu = prepared.caller_stream;
     const auto &streams = prepared.streams;
-    if (prepared.caller_stream != nullptr) {
-        bool recording = false;
-        const int rc = validate_caller_stream(prepared.caller_stream, &recording);
-        if (rc == 0 && recording != prepared.recording)
-            return LaunchTransactionResult{PTO_RUNTIME_ERR_UNSUPPORTED, LaunchProgress::NotStarted, LaunchReceipt{}};
+    if (prepared.caller_stream != nullptr && !execution_mode_latch_.is_kernel()) {
+        const int rc = validate_caller_stream(prepared.caller_stream);
         if (rc != 0) {
             return LaunchTransactionResult{rc, LaunchProgress::NotStarted, LaunchReceipt{}};
         }
@@ -824,7 +801,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             try {
                 activate_launch_shape(runtime);
                 if (int fence_rc = arm_run_fence(prepared); fence_rc != 0) return fence_rc;
-                if (!prepared.recording) {
+                if (!prepared.caller_owns_submission) {
                     if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
                     // This run's own core types, resolved from its own prepared
                     // runtime and handed to admission. The resident copy the
@@ -903,11 +880,12 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
 
             // Publishing query/drain ownership is a state change, so it sits past
             // the arming block: everything the block covers is rollback-free.
-            int rc = prepared.recording ? 0 :
-                                          run_streams_.mark_submitted(
-                                              &prepared, prepared.streams.aicore,
-                                              execution_mode_latch().is_kernel() ? prepared.streams.aicpu : nullptr
-                                          );
+            int rc = prepared.caller_owns_submission ?
+                         0 :
+                         run_streams_.mark_submitted(
+                             &prepared, prepared.streams.aicore,
+                             execution_mode_latch().is_kernel() ? prepared.streams.aicpu : nullptr
+                         );
             if (rc != 0) {
                 LOG_ERROR("launch_run: failed to publish the run stream pair: %d", rc);
                 return rc;
@@ -923,14 +901,15 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             // released to begin this run's AICore work. A record is not a wait and no stream
             // waits on it, so a successor's marker cannot stand in for the production wait
             // above. A failed record does not fail the run; it makes the position unavailable.
-            if (!prepared.recording)
+            if (!prepared.caller_owns_submission)
                 (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared.identity, streams.aicore);
 
             LOG_INFO("=== launch_aicore_kernel ===");
-            int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.args);
+            int launch_rc =
+                launch_aicore_kernel(streams.aicore, prepared.kernel_args.args, prepared.kernel_args.aicore_view());
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
-                if (!prepared.recording) recover_device_or_mark_unusable(launch_rc);
+                if (!prepared.caller_owns_submission) recover_device_or_mark_unusable(launch_rc);
                 return launch_rc;
             }
             sink.mark_submitted();
@@ -975,13 +954,14 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 // AICore kernel had returned, which is what makes the time a *whole-operator*
                 // end rather than an AICPU-kernel end. Recorded only on this path, because only
                 // here does the stream position carry that meaning.
-                if (!prepared.recording)
+                if (!prepared.caller_owns_submission)
                     (void)mark_run_boundary(
                         RunBoundaryMarks::Position::WholeOperatorEnd, prepared.identity, streams.aicpu
                     );
             }
             int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
-            if (!prepared.recording && boundary_rc == 0 && whole_operator) note_whole_operator_boundary(prepared);
+            if (!prepared.caller_owns_submission && boundary_rc == 0 && whole_operator)
+                note_whole_operator_boundary(prepared);
             if (boundary_rc != 0) return boundary_rc;
             return queue_caller_exit(prepared);
         }
@@ -990,7 +970,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
 }
 
 int DeviceRunner::queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done) {
-    if (prepared.recording) return aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
+    if (prepared.caller_owns_submission) return aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
     const aclError wait_rc = aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
     // The API documents no guarantee that a failure means the wait was not
     // queued, so the reference is committed either way: a revoked reservation
@@ -1435,12 +1415,6 @@ int DeviceRunner::finalize_impl() {
         begin_fatal_close();
         stop_shared_collectors_for_device_failure();
         dep_gen_collector_.stop_for_device_failure();
-        if (prepared_resources_block_fatal_reset()) {
-            LOG_ERROR("Fatal teardown: prepared resources remain referenced; device reset deferred");
-            teardown_recorder_.note_stage(TEARDOWN_STAGE_REFUSED);
-            teardown_recorder_.finish(PTO_RUNTIME_ERR_INVALID_STATE);
-            return PTO_RUNTIME_ERR_INVALID_STATE;
-        }
         // A Worker that provisioned SDMA holds 48 CP-process streams, which is
         // what makes both the handoff delay and the single reset attempt below
         // necessary. Read before abandon_common_after_device_failure() clears
@@ -1653,7 +1627,7 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     if (rc != 0) return rc;
     // A per-run bank is acquired only after all enabled storage is ready.
     // Collector admission and thread startup remain in the launch transaction.
-    if (prepared.dfx.chip_swimlane_enabled() && !prepared.recording &&
+    if (prepared.dfx.chip_swimlane_enabled() && !prepared.caller_owns_submission &&
         !chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch)) {
         prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
             arm_chip_swimlane_run_terminal_bank(prepared.identity.run_epoch);

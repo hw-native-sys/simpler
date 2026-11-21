@@ -318,6 +318,7 @@ struct NativeViewFixture {
     scheduler_test::BasicGraphBuffer<8> original;
     NativeGraphHostPlan plan;
     NativeGraphReadonlyImage readonly_image;
+    std::unique_ptr<void, decltype(&std::free)> native_backing{nullptr, &std::free};
     std::unique_ptr<void, decltype(&std::free)> backing{nullptr, &std::free};
     SchedulerGraphView graph{};
     AicoreSchedulerLayout layout{};
@@ -375,39 +376,29 @@ struct NativeViewFixture {
                     }
                 }
             }
-            if (!scheduler_plan_layout(
-                    plan.bindings.size(), &layout, false, trace_count, requirements, false, false,
-                    readonly_image.bytes.size()
-                ))
+            if (!scheduler_plan_layout(plan.bindings.size(), &layout, false, trace_count, requirements))
                 throw std::runtime_error("scheduler layout");
             if (!scheduler_plan_task_catalog(task_metadata, workers / 3, layout.total_size, &catalog_plan))
                 throw std::runtime_error("task catalog plan");
             layout.total_size = catalog_plan.total_size;
-            header.image_bytes = layout.total_size;
         }
-        backing.reset(
-            std::aligned_alloc(
-                SCHEDULER_STATE_BASE_ALIGNMENT, (header.image_bytes + SCHEDULER_STATE_BASE_ALIGNMENT - 1) /
-                                                    SCHEDULER_STATE_BASE_ALIGNMENT * SCHEDULER_STATE_BASE_ALIGNMENT
-            )
-        );
-        if (!backing) throw std::bad_alloc();
-        std::memset(backing.get(), 0, header.image_bytes);
-        if (runtime_state &&
-            !scheduler_init_data_from_layout(backing.get(), layout, reinterpret_cast<uint64_t>(backing.get())))
-            throw std::runtime_error("scheduler init");
+        native_backing.reset(std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, readonly_image.bytes.size()));
+        if (!native_backing) throw std::bad_alloc();
+        std::memcpy(native_backing.get(), readonly_image.bytes.data(), readonly_image.bytes.size());
         std::memcpy(
-            static_cast<std::byte *>(backing.get()) + sizeof(SchedulerRunControl),
-            readonly_image.bytes.data() + sizeof(SchedulerRunControl),
-            readonly_image.bytes.size() - sizeof(SchedulerRunControl)
+            static_cast<std::byte *>(native_backing.get()) + readonly_image.header_offset, &header, sizeof(header)
         );
-        std::memcpy(static_cast<std::byte *>(backing.get()) + readonly_image.header_offset, &header, sizeof(header));
         graph = original.graph();
         graph.task_count = plan.bindings.size();
-        graph.scheduler_state_address = reinterpret_cast<uint64_t>(backing.get());
-        graph.scheduler_state_bytes = header.image_bytes;
+        graph.native_graph_address = reinterpret_cast<uint64_t>(native_backing.get());
+        graph.native_graph_bytes = header.image_bytes;
         graph.native_header_offset = readonly_image.header_offset;
         if (runtime_state) {
+            const auto bytes = CHIP_ALIGN_UP(layout.total_size, SCHEDULER_STATE_BASE_ALIGNMENT);
+            backing.reset(std::aligned_alloc(SCHEDULER_STATE_BASE_ALIGNMENT, bytes));
+            if (!backing) throw std::bad_alloc();
+            if (!scheduler_init_data_from_layout(backing.get(), layout, reinterpret_cast<uint64_t>(backing.get())))
+                throw std::runtime_error("scheduler init");
             std::copy(
                 task_metadata.begin(), task_metadata.end(),
                 scheduler_state_at<SchedulerTaskMetadata>(backing.get(), layout.task_metadata_offset)
@@ -420,12 +411,12 @@ struct NativeViewFixture {
     }
     SchedulerNativeGraphHeader &header() {
         return *reinterpret_cast<SchedulerNativeGraphHeader *>(
-            static_cast<std::byte *>(backing.get()) + readonly_image.header_offset
+            static_cast<std::byte *>(native_backing.get()) + readonly_image.header_offset
         );
     }
     SchedulerGraphTemplate &definition() {
         return *reinterpret_cast<SchedulerGraphTemplate *>(
-            static_cast<std::byte *>(backing.get()) + header().templates_offset
+            static_cast<std::byte *>(native_backing.get()) + header().templates_offset
         );
     }
 };
@@ -495,14 +486,14 @@ TEST(HbgNativeGraphPlan, CanonicalFaninConnectsGraphControlsAcrossInstances) {
 
 TEST(HbgNativeGraphPlan, AccessConstructionDoesNotObserveNativeBacking) {
     SchedulerGraphView wire = scheduler_ordinary_graph_view(4096, 1, 0);
-    wire.scheduler_state_address = SCHEDULER_STATE_ALIGNMENT;
-    wire.scheduler_state_bytes = 1024 * 1024;
-    wire.native_header_offset = sizeof(SchedulerRunControl);
+    wire.native_graph_address = SCHEDULER_STATE_ALIGNMENT;
+    wire.native_graph_bytes = 1024 * 1024;
+    wire.native_header_offset = SCHEDULER_STATE_ALIGNMENT;
     ASSERT_TRUE(scheduler_native_header_extent_valid(
-        wire.scheduler_state_address, wire.scheduler_state_bytes, wire.native_header_offset
+        wire.native_graph_address, wire.native_graph_bytes, wire.native_header_offset
     ));
     const SchedulerGraphAccess access(wire);
-    EXPECT_EQ(access.scheduler_state_address, wire.scheduler_state_address);
+    EXPECT_EQ(access.native_graph_address, wire.native_graph_address);
     EXPECT_EQ(access.native_header_offset, wire.native_header_offset);
 }
 
@@ -564,19 +555,19 @@ TEST(HbgNativeGraphPlan, AccessAlternatesDefinitionsWithoutSkippingNodeBounds) {
     EXPECT_FALSE(scheduler_native_node_checked(access, -1, &node));
     EXPECT_FALSE(scheduler_native_node_checked(access, view.graph.task_count, &node));
     auto *bindings = reinterpret_cast<SchedulerNodeBinding *>(
-        static_cast<std::byte *>(view.backing.get()) + view.header().bindings_offset
+        static_cast<std::byte *>(view.native_backing.get()) + view.header().bindings_offset
     );
     bindings[1].instance_index = view.header().instance_count;
     EXPECT_FALSE(scheduler_native_node_checked(access, 1, &node));
     bindings[1].instance_index = 0;
     auto *instances = reinterpret_cast<SchedulerGraphInstance *>(
-        static_cast<std::byte *>(view.backing.get()) + view.header().instances_offset
+        static_cast<std::byte *>(view.native_backing.get()) + view.header().instances_offset
     );
     instances[0].exit_ref = view.header().node_count;
     EXPECT_FALSE(scheduler_native_node_checked(access, 1, &node));
     instances[0].exit_ref = instances[0].child_begin + instances[0].child_count;
     auto *child = reinterpret_cast<SchedulerGraphChildPlan *>(
-        static_cast<std::byte *>(view.backing.get()) + view.definition().child_plans_offset
+        static_cast<std::byte *>(view.native_backing.get()) + view.definition().child_plans_offset
     );
     child->tensor_count = MAX_TENSOR_ARGS + 1;
     SchedulerTaskPayloadArguments arguments{};
@@ -651,7 +642,7 @@ TEST(HbgNativeGraphPlan, ReadersRejectForgedHeaderRegionsAndInstanceBindings) {
     NativeViewFixture view(body, {0});
     ASSERT_TRUE(scheduler_graph_view_valid(view.graph));
     auto graph = view.graph;
-    graph.scheduler_state_bytes = view.readonly_image.header_offset;
+    graph.native_graph_bytes = view.readonly_image.header_offset;
     EXPECT_FALSE(scheduler_graph_view_valid(graph));
     graph = view.graph;
     graph.native_header_offset = UINT64_MAX - 127;
@@ -670,8 +661,9 @@ TEST(HbgNativeGraphPlan, ReadersRejectForgedHeaderRegionsAndInstanceBindings) {
     SchedulerFaninView fanin{};
     EXPECT_NE(scheduler_node_fanin_view(view.graph, 1, &fanin), SchedulerGraphResult::OK);
     definition.fanin_offsets_offset = rows_offset;
-    auto *bindings =
-        reinterpret_cast<SchedulerNodeBinding *>(static_cast<std::byte *>(view.backing.get()) + header.bindings_offset);
+    auto *bindings = reinterpret_cast<SchedulerNodeBinding *>(
+        static_cast<std::byte *>(view.native_backing.get()) + header.bindings_offset
+    );
     bindings[1].instance_index = 99;
     EXPECT_NE(scheduler_node_fanin_view(view.graph, 1, &fanin), SchedulerGraphResult::OK);
 }
@@ -1133,7 +1125,7 @@ struct BoundArgumentsFixture {
     NativeGraphArguments arguments{};
     explicit BoundArgumentsFixture(NativeViewFixture &view, uint32_t index) {
         instance = reinterpret_cast<SchedulerGraphInstance *>(
-                       static_cast<std::byte *>(view.backing.get()) + view.header().instances_offset
+                       static_cast<std::byte *>(view.native_backing.get()) + view.header().instances_offset
                    ) +
                    index;
         boundary.buffer.addr = 0x100000 + index * 0x10000;

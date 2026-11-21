@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "host/aligned_image_storage.h"
+#include "host/scratch_pool.h"
 #include "utils/device_arena.h"
 #include "utils/retained_scheduler_storage.h"
 #include "workspace_manager.h"
@@ -50,6 +52,10 @@ public:
         void *base{nullptr};
         size_t capacity{0};
         WorkspaceManager::BackingLease backing;
+        // Prepared runs that may still reach this block. The slot holds the
+        // storage object itself, not a lease; growth and retirement key on this
+        // explicit count rather than a shared_ptr count.
+        std::atomic<size_t> run_leases{0};
 
         template <typename Free>
         int release(WorkspaceManager &workspace, Free free) {
@@ -74,78 +80,89 @@ public:
 
     using ImageStorage = AlignedImageStorage;
 
-    struct ArenaBank {
-        ArenaBank(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
-            gm_heap(alloc, free_fn, ctx),
-            gm_sm(alloc, free_fn, ctx),
-            runtime_pool(alloc, free_fn, ctx) {}
-        DeviceArena gm_heap;
-        DeviceArena gm_sm;
-        DeviceArena runtime_pool;
-        size_t cached_gm_heap_size{0};
-        size_t cached_gm_sm_size{0};
-        size_t cached_runtime_arena_size{0};
+    struct ArenaRegion {
+        ArenaRegion(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
+            arena(alloc, free_fn, ctx) {}
+        DeviceArena arena;
+        size_t cached_size{0};
     };
 
-    // A retired bank still names its raw allocations after its last execution
-    // ends. These leases outlive that execution and remain until the bank has
-    // detached every address. Only then may the ledger reuse those addresses.
-    class RetiredArena {
+    struct ArenaBank {
+        ArenaBank(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
+            gm_heap(std::make_shared<ArenaRegion>(alloc, free_fn, ctx)),
+            gm_sm(std::make_shared<ArenaRegion>(alloc, free_fn, ctx)),
+            runtime_pool(std::make_shared<ArenaRegion>(alloc, free_fn, ctx)) {}
+        std::shared_ptr<ArenaRegion> gm_heap;
+        std::shared_ptr<ArenaRegion> gm_sm;
+        std::shared_ptr<ArenaRegion> runtime_pool;
+
+        std::shared_ptr<ArenaRegion> &region(size_t index) {
+            if (index == 0) return gm_heap;
+            if (index == 1) return gm_sm;
+            return runtime_pool;
+        }
+    };
+
+    // Retired regions keep their backing leased until their arena detaches it,
+    // independently of other regions in the same bank.
+    class RetiredRegion {
     public:
-        int retain(const std::shared_ptr<ArenaBank> &bank, WorkspaceManager &workspace) {
-            if (!bank || bank_) return PTO_RUNTIME_ERR_INVALID_STATE;
-            std::vector<WorkspaceManager::BackingLease> backing;
-            backing.reserve(3);
-            for (void *raw :
-                 {bank->gm_heap.raw_backing(), bank->gm_sm.raw_backing(), bank->runtime_pool.raw_backing()}) {
-                if (raw == nullptr || !workspace.owns(raw)) continue;
-                auto lease = workspace.retain_backing(raw);
-                if (!lease) return PTO_RUNTIME_ERR_INVALID_STATE;
-                backing.push_back(std::move(lease));
+        int retain(const std::shared_ptr<ArenaRegion> &region, WorkspaceManager &workspace) {
+            if (!region || region_) return PTO_RUNTIME_ERR_INVALID_STATE;
+            WorkspaceManager::BackingLease backing;
+            void *raw = region->arena.raw_backing();
+            if (raw != nullptr && workspace.owns(raw)) {
+                backing = workspace.retain_backing(raw);
+                if (!backing) return PTO_RUNTIME_ERR_INVALID_STATE;
             }
-            bank_ = bank;
+            region_ = region;
             backing_ = std::move(backing);
             return 0;
         }
 
-        bool in_use() const { return bank_.use_count() > 1; }
-        bool holds(const std::shared_ptr<ArenaBank> &bank) const { return bank_ == bank; }
+        bool in_use() const { return region_.use_count() > 1; }
+        bool holds(const std::shared_ptr<ArenaRegion> &region) const { return region_ == region; }
 
         int reclaim(WorkspaceManager &workspace) {
-            if (!bank_) return 0;
+            if (!region_) return 0;
             if (in_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
-            for (DeviceArena *arena : {&bank_->gm_heap, &bank_->gm_sm, &bank_->runtime_pool}) {
-                workspace.note_unpublished(arena->raw_backing());
-                arena->release();
-            }
-            bank_.reset();
-            backing_.clear();
+            workspace.note_unpublished(region_->arena.raw_backing());
+            region_->arena.release();
+            region_.reset();
+            backing_.reset();
             return 0;
         }
 
         void abandon_after_device_failure() {
-            if (bank_) {
-                bank_->gm_heap.abandon_after_device_failure();
-                bank_->gm_sm.abandon_after_device_failure();
-                bank_->runtime_pool.abandon_after_device_failure();
-            }
-            bank_.reset();
-            backing_.clear();
+            if (region_) region_->arena.abandon_after_device_failure();
+            region_.reset();
+            backing_.reset();
         }
 
     private:
-        std::shared_ptr<ArenaBank> bank_;
-        std::vector<WorkspaceManager::BackingLease> backing_;
+        std::shared_ptr<ArenaRegion> region_;
+        WorkspaceManager::BackingLease backing_;
     };
 
     PreparedRunResources(
         std::shared_ptr<ImageStorage> image, std::shared_ptr<RetainedSchedulerStorage> scheduler,
-        std::shared_ptr<ArenaBank> arena, std::vector<WorkspaceManager::BackingLease> backing
+        std::vector<std::shared_ptr<ArenaRegion>> regions, std::vector<WorkspaceManager::BackingLease> backing
     ) :
         image_(std::move(image)),
         scheduler_(std::move(scheduler)),
-        arena_(std::move(arena)),
+        regions_(std::move(regions)),
         backing_(std::move(backing)) {}
+
+    PreparedRunResources(
+        std::shared_ptr<ImageStorage> image, std::shared_ptr<RetainedSchedulerStorage> scheduler,
+        std::shared_ptr<ArenaRegion> region, std::vector<WorkspaceManager::BackingLease> backing
+    ) :
+        PreparedRunResources(
+            std::move(image), std::move(scheduler),
+            region ? std::vector<std::shared_ptr<ArenaRegion>>{std::move(region)} :
+                     std::vector<std::shared_ptr<ArenaRegion>>{},
+            std::move(backing)
+        ) {}
 
     // A candidate is published only after allocation succeeds; same-capacity
     // acquires also detach when an older prepared execution holds the bytes.
@@ -163,14 +180,14 @@ public:
     static RetainedSchedulerStorage::Status acquire_scheduler(
         std::shared_ptr<RetainedSchedulerStorage> &cache,
         std::vector<std::shared_ptr<RetainedSchedulerStorage>> &retired, size_t bytes, size_t alignment,
-        Allocate allocate, Free free, void **device_out, void **host_out
+        Allocate allocate, Free free, void **device_out
     ) {
-        if (cache && cache.use_count() == 1)
-            return cache->acquire(bytes, alignment, allocate, free, device_out, host_out);
-        // Reserve bookkeeping before taking device ownership.
+        if (cache && (cache.use_count() == 1 || cache->covers_device(bytes, alignment)))
+            return cache->acquire_device(bytes, alignment, allocate, free, device_out);
+        // A launch can keep naming a smaller generation after a successor grows.
         if (cache) retired.reserve(retired.size() + 1);
         auto next = std::make_shared<RetainedSchedulerStorage>();
-        const auto status = next->acquire(bytes, alignment, allocate, free, device_out, host_out);
+        const auto status = next->acquire_device(bytes, alignment, allocate, free, device_out);
         if (status == RetainedSchedulerStorage::Status::Ok) {
             if (cache) retired.push_back(cache);
             cache = std::move(next);
@@ -178,21 +195,60 @@ public:
         return status;
     }
 
-    // Runtime-specific immutable publication description; its concrete type
-    // belongs to the runtime, while its backing is held by the members below.
-    void retain_initial_publication(std::shared_ptr<const void> publication) {
-        initial_publication_ = std::move(publication);
+    // Device resources referenced by the initial execution state, including
+    // scheduler notifications and counters.
+    void retain_shared_resources(std::vector<std::shared_ptr<const void>> resources) {
+        shared_resources_ = std::move(resources);
+    }
+
+    // The prepared-resources object's lease on the retained staging block. It
+    // is held for as long as any owner (the run use, a published owner, or an
+    // caller-owned run) can reach this preparation; the block's owner uses
+    // this explicit count, not a shared_ptr count, to decide growth and
+    // retirement.
+    void hold_temporary(std::shared_ptr<TemporaryStorage> storage) {
+        temporary_ = std::move(storage);
+        if (temporary_) {
+            temporary_->run_leases.fetch_add(1, std::memory_order_relaxed);
+            temporary_lease_held_ = true;
+        }
+    }
+    void release_temporary_lease() const {
+        if (!temporary_lease_held_ || !temporary_) return;
+        temporary_->run_leases.fetch_sub(1, std::memory_order_relaxed);
+        temporary_lease_held_ = false;
+    }
+    // Transfer ownership of a pooled heap lease to these prepared resources.
+    void take_heap_lease(std::shared_ptr<ScratchPool> pool, ScratchPool::Lease lease) {
+        heap_pool_ = std::move(pool);
+        heap_lease_ = lease;
+    }
+
+    PreparedRunResources(const PreparedRunResources &) = delete;
+    PreparedRunResources &operator=(const PreparedRunResources &) = delete;
+
+    ~PreparedRunResources() {
+        // The object is the lease holder; its destruction ends the last host
+        // reference to this preparation. The device blocks themselves are
+        // retired or freed by the runner's explicit reclaim paths.
+        release_temporary_lease();
+        if (heap_pool_ != nullptr && heap_lease_.valid()) heap_pool_->release(heap_lease_);
     }
 
 private:
     std::shared_ptr<const void> streams_;
     std::shared_ptr<TemporaryStorage> temporary_;
+    mutable bool temporary_lease_held_{false};
     std::shared_ptr<const CallableUse> callable_;
     std::shared_ptr<PreparedSubmissionStorage> submission_;
-    std::shared_ptr<const void> initial_publication_;
+    std::vector<std::shared_ptr<const void>> shared_resources_;
     std::shared_ptr<ImageStorage> image_;
     std::shared_ptr<RetainedSchedulerStorage> scheduler_;
-    std::shared_ptr<ArenaBank> arena_;
+    // The regions this preparation uses, independently of their bank numbers.
+    std::vector<std::shared_ptr<ArenaRegion>> regions_;
+    // The fixed context heap, when the contract selected one.
+    std::shared_ptr<ScratchPool> heap_pool_;
+    ScratchPool::Lease heap_lease_{};
     std::vector<WorkspaceManager::BackingLease> backing_;
 };
 
@@ -233,20 +289,10 @@ public:
         }
     }
     void note_waits_consumed() { waits_ended_ = true; }
-    bool can_retain_external_use() const { return !external_registered_ && !host_ended_; }
-    bool retain_external_use() {
-        if (!can_retain_external_use()) return false;
-        external_registered_ = true;
-        external_ended_ = false;
-        return true;
-    }
-    // Caller reports no future use and completion of all external in-flight use.
-    void note_external_use_ended() { external_ended_ = true; }
-    bool internal_obligations_ended() const {
+    bool obligations_ended() const {
         const bool unused = not_submitted_ && !launched_;
         return host_ended_ && copyback_ended_ && bindings_ended_ && (unused || (device_ended_ && waits_ended_));
     }
-    bool obligations_ended() const { return internal_obligations_ended() && external_ended_; }
     bool host_ended() const { return host_ended_; }
 
 private:
@@ -258,6 +304,4 @@ private:
     bool copyback_ended_{false};
     bool bindings_ended_{false};
     bool host_ended_{false};
-    bool external_registered_{false};
-    bool external_ended_{true};
 };

@@ -43,9 +43,11 @@ inline std::vector<uint8_t> read(const char *path) {
 }
 struct Model {
     aclmdlRI model = nullptr;
-    RuntimeHandle reference = nullptr;
+    std::vector<uint8_t> storage;
+    RuntimeHandle run = nullptr;
     void *output = nullptr;
     size_t offset = 0;
+    uint64_t image_address = 0;
 };
 class CaptureFixture {
 public:
@@ -53,13 +55,11 @@ public:
     aclrtStream caller = nullptr;
     CallConfig config{};
     std::vector<Model> models;
-    RuntimeHandle run = nullptr;
     volatile int32_t accepted = 0;
     uint64_t epoch = 0;
     bool tmr;
     void *input = nullptr;
     aclrtContext owner = nullptr;
-    std::vector<uint8_t> storage;
 
     CaptureFixture(int argc, char **argv, size_t model_count = 3) :
         models(model_count),
@@ -74,6 +74,9 @@ public:
                 config.runtime_env.ring_heap[ring] = 1ULL << 20;
                 config.runtime_env.ring_dep_pool[ring] = 256;
             }
+        } else {
+            // The finite-budget fixture reserves one fixed heap below its total budget.
+            config.runtime_env.ring_heap[0] = 64ULL << 20;
         }
         const int device = std::atoi(argv[1]);
         check(aclInit(nullptr), "acl-init");
@@ -93,10 +96,6 @@ public:
             "kernel-init"
         );
         check(simpler_kernel_mode_prepare_callable(context, 0, callable.data(), callable.size()), "register");
-        storage.resize(get_runtime_size() + get_runtime_alignment());
-        run = reinterpret_cast<void *>(
-            (reinterpret_cast<uintptr_t>(storage.data()) + get_runtime_alignment() - 1) & ~(get_runtime_alignment() - 1)
-        );
         for (size_t i = 0; i < models.size(); ++i) {
             models[i].offset = i % 2 == 1 ? 32 : 0;
             check(aclrtMalloc(&models[i].output, bytes, ACL_MEM_MALLOC_HUGE_FIRST), "output");
@@ -140,7 +139,13 @@ public:
         require(correct, "full-values-and-view-guards");
     }
     int prepare(Model &model, uint64_t workspace_bytes = 0) {
-        std::memset(run, 0, get_runtime_size());
+        require(model.model == nullptr && model.run == nullptr, "prepare-unused-run");
+        const auto alignment = get_runtime_alignment();
+        model.storage.resize(get_runtime_size() + alignment);
+        model.run = reinterpret_cast<void *>(
+            (reinterpret_cast<uintptr_t>(model.storage.data()) + alignment - 1) & ~(alignment - 1)
+        );
+        std::memset(model.run, 0, get_runtime_size());
         uint32_t shape[]{elements};
         ChipTensor in{}, out{};
         in.init_external(input, bytes, shape, 1, DataType::INT32, AddressSpace::DEVICE, TensorTransfer::NONE);
@@ -157,19 +162,24 @@ public:
         }
         NativeRunDescriptor descriptor{};
         descriptor.generation = descriptor.run_epoch = descriptor.dispatch_id = ++epoch;
-        descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
         descriptor.accepted_state = &accepted;
         descriptor.accepted_value = 1;
         accepted = 0;
-        return simpler_prepare_run(context, run, 0, &args, &current, &descriptor);
+        const int rc = simpler_prepare_caller_run(context, model.run, 0, &args, &current, &descriptor);
+        if (rc != 0) model.run = nullptr;
+        return rc;
     }
     void record(Model &model) {
-        check(simpler_retain_run_resources(context, run, caller, &model.reference), "retain");
         check(aclmdlRICaptureBegin(caller, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL), "capture-begin");
-        check(simpler_launch_run_on_stream(context, run, caller, nullptr), "capture-submit");
+        check(simpler_submit_run_on_stream(context, model.run, caller), "capture-submit");
+        require(last_launch_has_inline_runtime(), "inline-runtime-without-host-input");
+        model.image_address = last_runtime_image_address();
+        require(
+            tmr ? last_rts_execution_image_bytes() == 0 : last_rts_execution_image_bytes() != 0,
+            "inline-execution-image"
+        );
         check(aclmdlRICaptureEnd(caller, &model.model), "capture-end");
         require(model.model != nullptr, "model");
-        check(simpler_finalize_run(context, run), "retire-host-carrier");
         unchanged(model);
     }
     void replay(Model &model, int round) {
@@ -182,8 +192,8 @@ public:
     void release(Model &model) {
         check(aclmdlRIDestroy(model.model), "destroy-model");
         model.model = nullptr;
-        check(simpler_release_run_resources(context, model.reference), "release-reference");
-        model.reference = nullptr;
+        check(simpler_finalize_run(context, model.run), "finalize-original-run");
+        model.run = nullptr;
     }
     SimplerWorkspaceReport report(const char *phase) {
         SimplerWorkspaceReport report{};
@@ -204,7 +214,7 @@ public:
     }
     void close() {
         for (const auto &model : models)
-            require(model.model == nullptr && model.reference == nullptr, "no-live-model");
+            require(model.model == nullptr && model.run == nullptr, "no-live-model");
         check(simpler_unregister_callable(context, 0), "unregister");
         check(finalize_device(context), "context-finalize");
         require(report("finalized").reserved_bytes == 0, "workspace-reclaimed");

@@ -946,32 +946,31 @@ host drain/replenish path has more buffer headroom.
 
 PMU alone is supported by native Kernel cold capture on A3 TMR and HBG.
 Both use their AICPU task-completion PMU producer and the common native
-prepare/launch/resource-reference path. Program remains eager-only. A5,
+caller-owned run path. Program remains eager-only. A5,
 framework graph capture and combinations with other diagnostic families are
 not supported by this contract.
 
-Prepare with `SIMPLER_PREPARE_CAPTURE`, `CallConfig.enable_pmu > 0` and an
-`output_prefix`; retain the existing resource reference **before** RTS
-CaptureBegin. Prepare snapshots the resolved event group, including a valid
+Before RTS CaptureBegin, call `simpler_prepare_caller_run` with
+`CallConfig.enable_pmu > 0` and an `output_prefix`. Prepare snapshots the resolved event group, including a valid
 `SIMPLER_PMU_EVENT_TYPE` override, and the output path. Later configuration or
 environment changes cannot alter the captured descriptor or its CSV columns.
 Capture records work without executing the computation; each replay performs
 the ordinary device PMU init, task collection and buffer flush. Replay requires
 no Host PMU callback, new epoch or diagnostic-success query.
 
-The external reference retains the collection window and the existing best-effort
-PMU driver protection after the original Host run finalizes. A held driver channel
+The original run owns its collection window and PMU driver protection through
+its finalization after the last use. A held driver channel
 can deny another profiler for the model's lifetime. `occupied`, `refused` and
 `absent` protection observations do not reject business execution or promise
 accurate counters; inspect actual samples and the protection observation.
 
 All PMU-enabled models and eager producers sharing one context's pool must run
-in one caller-ordered domain. Multiple references/windows may coexist. Before
-releasing any reference, stop **all** producers sharing that pool, including
-raw replays on other streams, and start none until release returns. Closing one
+in one caller-ordered domain. Multiple run windows may coexist. Before
+finalizing any run, stop **all** producers sharing that pool, including
+raw replays on other streams, and start none until finalization returns. Closing one
 window does not close another. The caller's promise plus the retained stream's
 synchronization establishes the device boundary; reader quiescence transfers its
-ready samples into Host shards. A failed stream proof keeps the same reference,
+ready samples into Host shards. A failed stream proof keeps the same run,
 window and lease for cleanup retry. Successful resource release is independent
 of later CSV publication or diagnostic flush failure.
 
@@ -998,7 +997,7 @@ results keep strict accounting and CSV-only output. Ordinary eager collection
 with retention disabled keeps its existing warning-only reconciliation for
 device drops and count mismatches.
 
-End/cancel the model, release its resource reference, and successfully call the
+End/cancel the model, finalize its original run, and successfully call the
 existing `simpler_flush_diagnostics_ctx` before consuming the recorded pair.
 Neither file's existence alone proves success. Metadata is invalidated before
 an accepted destination is reused, including ordinary CSV reuse, and published

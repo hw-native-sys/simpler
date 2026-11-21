@@ -66,6 +66,7 @@
 #include "utils/device_arena.h"
 #include "utils/retained_scheduler_storage.h"
 #include "host/prepared_run_resources.h"
+#include "host/scratch_pool.h"
 #include "aicore_pmu_lease.h"
 #include "device_phase_capture.h"
 #include "device_runner_helpers.h"
@@ -86,7 +87,9 @@
 #include "host/kernel_entry_validation.h"
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
+#include "host/reported_pool.h"
 #include "host/auto_admission.h"
+#include "host/run_resource_cost.h"
 #include "host/run_resource_growth.h"
 #include "host/workspace_manager.h"
 #include "host/pmu_collector.h"
@@ -108,7 +111,6 @@
 #include "prepare_callable_common.h"
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
-#include "kernel_persistent_args.h"
 #include "common/native_invocation_evidence.h"
 
 // Actual submission backing, independent of a slot's next execution. The runner
@@ -119,14 +121,6 @@ struct PreparedSubmissionStorage {
     std::unique_ptr<RunCompletionFence> fence;
     std::unique_ptr<RunCallerOrder> caller_order;
     void *device_wall{nullptr};
-    void *device_result{nullptr};
-    // A failed allocation's nonnull output is owned, but cannot be initialized
-    // until checked release succeeds. Copy failures keep a valid allocation.
-    int result_allocation_rc{0};
-    bool result_initialized{false};
-    bool retain_replay_evidence{false};
-    bool evidence_observed{false};
-    NativeInvocationEvidence::Snapshot observed_evidence{};
 };
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
@@ -279,7 +273,7 @@ public:
      */
     bool try_reserve_native_run(
         const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor,
-        bool capture_preparation = false, const NativeRunIdentity &identity = {}
+        bool independent_preparation = false, const NativeRunIdentity &identity = {}
     );
     /** Publish preparation only after its backing owner and resource plan are complete. */
     void mark_native_run_prepared(const void *owner);
@@ -288,13 +282,12 @@ public:
     bool owns_native_run_observation(const void *owner) const;
     bool
     retire_run_workspace(uint32_t slot, uint64_t run_epoch, bool retain_host_outputs, void **retired_unmanaged_staging);
-    bool native_runs_outstanding() const;
+    bool native_runs_outstanding(bool include_caller_owners = true) const;
     struct RunStreams;
     // Only fresh callable additions may ignore already-retired observer debt.
     bool fresh_callable_addition_allowed() const;
     void retain_framework_observation(const RunStreams &streams);
     int observe_framework_submissions(int *all_observed);
-    bool has_external_run_reference(const NativeRunIdentity &identity) const;
 
     /**
      * Whether a live reservation other than `owner`'s holds `arena_bank`.
@@ -302,7 +295,7 @@ public:
      * Two runs collide over the pooled device regions only when the slot lease
      * hands them the same bank, and that is a property of the contract rather
      * than of the depth: `pipeline_resource_slot` gives every slot its own bank
-     * for a `HOST_PER_RUN` arena and bank 0 to all of them for a shared one. So
+     * for a `DELIVERED` arena and bank 0 to all of them for a shared one. So
      * a successor whose bank differs cannot reach its predecessor's regions —
      * `setup_static_arena` only ever touches the bank it is given — while one
      * that shares a bank can grow or release regions the predecessor is
@@ -373,12 +366,10 @@ public:
 
     /**
      * Whether any kernel-context owner still holds a device resource: the
-     * streams and events in `KernelExecutionState`, the argument blocks in
-     * `PersistentKernelArgs`, the loaded AICPU binary in `LoadAicpuOp`, or a
-     * retained callable image in `chip_callable_buffers_`. An adopted device
-     * also retains the context until shared native-run resources have closed.
-     * The destruction guard reads this aggregate: a close that succeeded for
-     * some owners and failed for another is not a close.
+     * streams and events in `KernelExecutionState`, the per-run shared states, the loaded AICPU binary in
+     * `LoadAicpuOp`, or a retained callable image in `chip_callable_buffers_`. An adopted device also retains the
+     * context until shared native-run resources have closed. The destruction guard reads this aggregate: a close that
+     * succeeded for some owners and failed for another is not a close.
      *
      * False on a program context: `chip_callable_buffers_` and the loader are
      * shared with program registration, and a program context resets its
@@ -390,8 +381,8 @@ public:
         // Only successful resource teardown clears the adopted device. This
         // also covers a failed release of native-run events or streams after
         // the cold-path owners below have already closed successfully.
-        return device_id_ >= 0 || kernel_exec_state_.has_live_resources() || persistent_args_.has_live_resources() ||
-               load_aicpu_op_.has_live_resources() || !chip_callable_buffers_.empty();
+        return device_id_ >= 0 || kernel_exec_state_.has_live_resources() || load_aicpu_op_.has_live_resources() ||
+               !chip_callable_buffers_.empty();
     }
 
     /**
@@ -412,7 +403,7 @@ public:
     // device and RTS context without changing them. Also used for abandoning
     // an unlaunched run.
     int enter_run_thread();
-    int validate_caller_stream(rtStream_t caller, bool *recording = nullptr);
+    int validate_caller_stream(rtStream_t caller);
     // A borrowed environment must be current before resource mutation. An
     // owned environment has no caller binding to validate; enter_run_thread
     // performs its thread attachment before device work.
@@ -494,7 +485,8 @@ public:
 
     int free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
-    int stage_launch_metadata(uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count);
+    int stage_launch_metadata(uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count,
+                              std::vector<HbgImageReference> *owner = nullptr);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
 
     /**
@@ -585,24 +577,9 @@ public:
         uint32_t pipeline_slot, const void *bytes, std::size_t length, uint32_t *source_out, uint64_t *base_out
     );
     /**
-     * Hand one pipeline slot its retained scheduler-state storage, both sides.
-     *
-     * `bytes` is what this run uses; the retained capacity may exceed it, and
-     * only the caller's own length is ever initialized, uploaded or read back.
-     * Both outputs are the aligned base, never the allocation it sits in.
-     * Neither block is cleared: the caller writes the whole range it uses
-     * before shipping it.
-     *
-     * Growth prepares the host side first — the side that can fail without
-     * touching the device — and keeps the previously handed-out device block
-     * when the device allocation fails, so a failed growth leaves the slot the
-     * storage its last successful bind published into. A device block whose
-     * release fails is retained in the slot's single failed-release record,
-     * which then refuses any further growth for that slot.
-     *
-     * Refused while the runner cannot accept a run: a quarantined device is one
-     * whose previous writer was never proven stopped, so its slot's storage is
-     * not handed back for overwriting.
+     * Prepare slot-local initialization bytes and select a device destination.
+     * Serialized launches share a capacity-fitting destination. Profiling reads
+     * its device image after execution and therefore uses a run-owned target.
      */
     int acquire_scheduler_state_storage(
         uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **host_out
@@ -738,6 +715,19 @@ public:
     }
 
     /**
+     * What the last preparation retained on `pipeline_slot` committed.
+     *
+     * Zero until a preparation has retained its resources on the slot since the
+     * grant was installed, and after an explicit proof withdrawal. This is the
+     * figure `note_run_resources_proven` hands to admission, not a live
+     * footprint.
+     */
+    RunResourceCost run_resource_cost(uint32_t pipeline_slot) const {
+        const RunResourceCost *cost = run_resource_costs_.find(pipeline_slot);
+        return cost != nullptr ? *cost : RunResourceCost{};
+    }
+
+    /**
      * Give up every resource a saved plan still holds, at whatever stage it
      * reached, and forget it.
      *
@@ -771,7 +761,10 @@ public:
     void release_plan_epoch_refs(uint32_t pipeline_slot, std::uint64_t run_epoch);
 
     /** Withdraw a slot's resource proof. */
-    void clear_run_resource_proof(uint32_t pipeline_slot) { auto_admission_.clear_proven(pipeline_slot); }
+    void clear_run_resource_proof(uint32_t pipeline_slot) {
+        auto_admission_.clear_proven(pipeline_slot);
+        if (RunResourceCost *cost = run_resource_costs_.find(pipeline_slot); cost != nullptr) *cost = RunResourceCost{};
+    }
 
     /**
      * Return the storage of every run-resource set nothing can reach, so a
@@ -970,7 +963,18 @@ public:
      *
      * @return 0 on success, -1 on failure.
      */
-    int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    int setup_static_arena(
+        uint32_t pipeline_slot, RegionBanks banks, bool pooled_heap, size_t gm_heap_size, size_t gm_sm_size,
+        size_t runtime_arena_size, bool shared_runtime_arena = false
+    );
+    int setup_static_arena(RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
+        return setup_static_arena(0, banks, false, gm_heap_size, gm_sm_size, runtime_arena_size);
+    }
+    int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
+        return setup_static_arena(
+            0, RegionBanks{arena_bank, arena_bank, arena_bank}, false, gm_heap_size, gm_sm_size, runtime_arena_size
+        );
+    }
 
     /**
      * Return the pooled GM heap / shared memory / runtime arena base pointer of the
@@ -984,9 +988,18 @@ public:
      * memory stays uncommitted and `acquire_pooled_gm_sm` returns nullptr for
      * it, while its runtime arena is committed and is a region it acquires.
      */
-    void *acquire_pooled_gm_heap(uint32_t arena_bank);
+    void *acquire_pooled_gm_heap(uint32_t pipeline_slot, uint32_t arena_bank);
+    void *acquire_pooled_gm_heap(uint32_t arena_bank) { return acquire_pooled_gm_heap(0, arena_bank); }
     void *acquire_pooled_gm_sm(uint32_t arena_bank);
     void *acquire_pooled_runtime_arena(uint32_t arena_bank);
+    /** The fixed pooled heap base, or nullptr when unpooled. */
+    void *pooled_heap_base() const { return heap_pool_ ? heap_pool_->current_base() : nullptr; }
+    /** The pooled heap pinned by this prepared run, or nullptr before publication. */
+    void *prepared_heap_base(uint32_t pipeline_slot, uint64_t run_epoch) const;
+    /** Release a pooled heap lease that no prepared resource took ownership of. */
+    void release_heap_lease(uint32_t pipeline_slot);
+    /** Hand the context heap block back to the workspace ledger. */
+    void on_heap_released(void *raw);
     bool lookup_prebuilt_runtime_arena_cache(
         uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
         void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
@@ -1232,7 +1245,7 @@ public:
      * transfer happened.
      */
     int read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
-    void release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved);
+    int release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved);
 
     /**
      * What this slot's cached region says about the run whose epoch is
@@ -1431,7 +1444,7 @@ public:
     void activate_launch_shape(const Runtime &runtime);
 
     // Pure preflight: capture cannot replay Host orchestration writes.
-    int validate_capture_prepare_args(int32_t callable_id, const void *args) const;
+    int validate_caller_submission_args(int32_t callable_id, const void *args) const;
 
     /**
      * Point a fresh Runtime at a previously-registered callable and complete
@@ -1630,7 +1643,10 @@ public:
             stream_lifetime(std::move(other.stream_lifetime)),
             artifact_identity(other.artifact_identity),
             caller_stream(std::exchange(other.caller_stream, nullptr)),
-            recording(other.recording),
+            caller_owns_submission(other.caller_owns_submission),
+            diagnostic_window_open(std::exchange(other.diagnostic_window_open, false)),
+            closing_backing(std::move(other.closing_backing)),
+            closing_callable(std::move(other.closing_callable)),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
@@ -1677,7 +1693,10 @@ public:
          */
         NativeRunArtifactIdentity artifact_identity{};
         rtStream_t caller_stream{nullptr};
-        bool recording{false};
+        bool caller_owns_submission{false};
+        bool diagnostic_window_open{false};
+        std::vector<WorkspaceManager::BackingIdentity> closing_backing;
+        std::shared_ptr<const PreparedRunResources::CallableUse> closing_callable;
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
         /**
@@ -1861,20 +1880,24 @@ public:
         return prepared.streams.ready() ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
     }
     virtual int reclaim_execution_streams() { return 0; }
-    int prepare_run_storage(uint32_t pipeline_slot, bool capture_preparation = false);
-    int retain_prepared_run_resources(PreparedExecution &prepared, uint32_t arena_bank, int32_t callable_id = -1);
-    int retain_external_run_resources(
-        PreparedExecution &prepared, void *caller_stream, void **out_reference, NativeRunPreparePurpose purpose
-    );
-    int release_external_run_resources(void *reference);
-    int admit_recording(PreparedExecution &prepared);
-    bool capture_diagnostics_supported(const PreparedExecution &prepared) const;
-    virtual bool supports_scope_stats_capture() const { return false; }
-    virtual bool supports_pmu_capture() const { return false; }
-    virtual bool supports_swimlane_capture() const { return false; }
-    virtual bool supports_args_dump_capture() const { return false; }
+    int prepare_run_storage(uint32_t pipeline_slot);
+    int retain_prepared_run_resources(PreparedExecution &prepared, RegionBanks banks, int32_t callable_id = -1);
+    int retain_prepared_run_resources(PreparedExecution &prepared, uint32_t arena_bank, int32_t callable_id = -1) {
+        return retain_prepared_run_resources(prepared, RegionBanks{arena_bank, arena_bank, arena_bank}, callable_id);
+    }
+    int prepare_caller_diagnostics(PreparedExecution &prepared);
+    int reclaim_caller_backing(PreparedExecution &prepared);
+    int close_caller_diagnostics(PreparedExecution &prepared);
+    int prepare_caller_submission(void *owner, PreparedExecution &prepared);
+    void yield_caller_submission(void *owner, const NativeRunIdentity &identity);
+    int finish_caller_submission(ActiveExecution &active);
+    void release_caller_submission(void *owner) { caller_device_buffers_.release_reference(owner, false); }
+    bool caller_diagnostics_supported(const PreparedExecution &prepared) const;
+    virtual bool supports_caller_scope_stats() const { return false; }
+    virtual bool supports_caller_pmu() const { return false; }
+    virtual bool supports_caller_swimlane() const { return false; }
+    virtual bool supports_caller_args_dump() const { return false; }
     bool prepared_storage_in_use() const;
-    bool prepared_resources_block_fatal_reset() const;
     bool prepared_resources_can_abandon() const;
 
     /**
@@ -1922,8 +1945,6 @@ public:
         return terminal_close_generation_.has_value() && device_health_.generation() != *terminal_close_generation_;
     }
     void abandon_native_run_owners_after_reset();
-
-    virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
 
     /**
      * Fill the `InitArgs` fields only one architecture defines, before the init
@@ -2018,7 +2039,7 @@ public:
      * device-resident copy. The projection carries this run's final values, so
      * the call must follow collector arming.
      */
-    int launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args);
+    int launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args, const AicoreRuntimeView &runtime);
     int ensure_aicore_binary_registered();
 
     /**
@@ -2217,7 +2238,7 @@ protected:
     /** The runner and bank one arena setup announces its regions against. */
     struct ArenaRegionAnnounce {
         DeviceRunnerBase *runner;
-        uint32_t bank;
+        RegionBanks banks;
     };
 
     /**
@@ -2254,7 +2275,7 @@ protected:
      * @return 0, or PTO_RUNTIME_ERR_INTERNAL when a reference could not be
      *         recorded — refused rather than silently unprotected
      */
-    int reference_bank_arenas(uint32_t arena_bank, const ArenaRegionRequest *requests, std::size_t count);
+    int reference_bank_arenas(RegionBanks banks, const ArenaRegionRequest *requests, std::size_t count);
 
     /** Record one acquisition the transaction in flight on this thread caused. */
     void record_workspace_claim(void *base, bool was_region_backing);
@@ -2285,7 +2306,6 @@ protected:
      */
     int configure_aicore_op_timeout();
 
-    PersistentArgsOps persistent_args_ops();
     int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
 
     /**
@@ -2821,22 +2841,11 @@ protected:
 
     void release_graph_definition_staging();
 
-    /**
-     * Release every slot's retained scheduler-state storage.
-     *
-     * Returns the first failing free's code, having attempted every block —
-     * the live one and any failed-release record — so one failure cannot
-     * strand the rest. Each outcome is recorded before the slot's entry is
-     * cleared, and an address the allocator could not free stays in its
-     * tracking map with its bytes still committed, which is what hands that
-     * block to the allocator's own terminal sweep rather than dropping it.
-     * Clearing the entry afterwards is what makes a second close a no-op; it
-     * is not a claim that the bytes went back.
-     */
+    // After retired generations have drained, release the current shared block.
     int release_scheduler_state_storage();
 
     /**
-     * Drop every slot's retained scheduler-state storage without a device call.
+     * Forget active and retired scheduler backing after a confirmed reset.
      *
      * The fatal counterpart of release_scheduler_state_storage(): a force reset
      * has already invalidated the device generation these addresses belong to,
@@ -2969,7 +2978,7 @@ protected:
         uint32_t pipeline_slot{0};
         uint32_t arena_bank{0};
         bool permits_prepared_successor{false};
-        bool capture_preparation{false};
+        bool independent_preparation{false};
         NativeRunPreparationState preparation_state{NativeRunPreparationState::Preparing};
         NativeRunIdentity identity{};
     };
@@ -2980,6 +2989,7 @@ protected:
         Kind kind{Kind::RunOwner};
         const void *owner{nullptr};
         RunStreams streams{};
+        bool caller_owned{false};  // Payload, not part of the observation identity.
         bool operator==(const NativeRunObservation &other) const {
             return kind == other.kind && owner == other.owner && streams.aicpu == other.streams.aicpu &&
                    streams.aicore == other.streams.aicore;
@@ -3042,7 +3052,6 @@ protected:
     ExecutionModeLatch execution_mode_latch_;
     bool program_initialized_{false};
     KernelExecutionState kernel_exec_state_;
-    PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
@@ -3099,6 +3108,9 @@ protected:
     host::LoadAicpuOp load_aicpu_op_;
 
     MemoryAllocator mem_alloc_;
+    // Run-result regions keyed by run epoch, so a successor reusing the slot
+    // cannot inherit or overwrite an unobserved predecessor result.
+    ReportedPool reported_pool_{mem_alloc_};
 
     // The device allocations a caller minted through this context, and which
     // runs still hold them — see host/caller_device_buffers.h. Only the
@@ -3138,11 +3150,13 @@ protected:
         std::vector<std::byte> bytes;
     };
     RunResourceSlots<RetainedGraphStaging> graph_definition_staging_;
-    // Scheduler-state storage, one retained pair per pipeline slot — see
-    // HostApi acquire_scheduler_state_storage and utils/retained_scheduler_storage.h,
-    // which holds the grow, alignment and failure rules. One pair per slot
-    // because a slot's runs are serialized while different slots' runs are not.
-    RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>> scheduler_state_storage_;
+    struct SchedulerBindStorage {
+        AlignedImageStorage host;
+        // Holds the chosen generation across bind until the prepared run takes it.
+        std::shared_ptr<RetainedSchedulerStorage> device;
+    };
+    RunResourceSlots<SchedulerBindStorage> scheduler_state_storage_;
+    std::shared_ptr<RetainedSchedulerStorage> shared_scheduler_state_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -3177,16 +3191,25 @@ protected:
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so
     // preparing one bank never mutates a region the active run is executing
-    // out of. `cached_*` back `setup_static_arena`'s "fits" check: a later
+    // out of. Each region's cached size backs `setup_static_arena`'s "fits" check: a later
     // init asking for an equal-or-smaller layout on an already-committed
     // arena reuses it instead of re-allocating when no prepared owner holds it.
     using ArenaBank = PreparedRunResources::ArenaBank;
+    using ArenaRegion = PreparedRunResources::ArenaRegion;
     // Held by pointer because DeviceArena is non-copyable and non-movable, so a
     // bank is constructed in place with its allocator rather than default-built
     // with the rest of its set.
     RunResourceSlots<std::shared_ptr<ArenaBank>> arena_banks_;
+    // Fixed shared scratch for a contract whose GM heap is pooled. It is
+    // declared after the allocator and ledger it allocates through, so it is
+    // destroyed before either of them.
+    std::mutex heap_backing_mutex_;
+    WorkspaceManager::BackingLease heap_backing_;
+    std::shared_ptr<ScratchPool> heap_pool_;
+    std::mutex heap_lease_mutex_;
+    std::vector<ScratchPool::Lease> heap_leases_;
     mutable std::mutex prepared_storage_mutex_;
-    std::vector<PreparedRunResources::RetiredArena> retired_prepared_arenas_;
+    std::vector<PreparedRunResources::RetiredRegion> retired_prepared_regions_;
     std::vector<std::shared_ptr<RetainedSchedulerStorage>> retired_prepared_schedulers_;
     struct PreparedUseRecord {
         NativeRunIdentity identity;
@@ -3195,26 +3218,7 @@ protected:
     std::vector<PreparedUseRecord> prepared_uses_;
     // Registered published owners; internal use records never own this lifetime.
     std::vector<std::weak_ptr<const PreparedRunResources>> prepared_resource_owners_;
-    struct ExternalRunReference {
-        NativeRunIdentity identity;
-        std::shared_ptr<const PreparedRunResources> resources;
-        // Kept through a failed close even after backing moved to retirement.
-        std::shared_ptr<const PreparedRunResources::CallableUse> callable;
-        std::vector<WorkspaceManager::BackingIdentity> managed_backing;
-        void *caller_stream{nullptr};
-        bool recording{false};
-        bool scope_stats_window{false};
-        bool pmu_window{false};
-        bool swimlane_window{false};
-        bool args_dump_window{false};
-        bool release_requested{false};
-        bool closing{false};
-    };
-    std::unordered_map<void *, std::unique_ptr<ExternalRunReference>> external_run_references_;
-    // Serializes external close across RTS calls without holding the storage lock.
-    std::mutex external_reference_mutex_;
-
-    bool prepared_storage_has_external_references_locked() const;
+    bool has_live_prepared_owners_locked() const;
     void note_prepared_waits_consumed(const NativeRunIdentity &identity);
     int reclaim_prepared_storage();
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
@@ -3224,6 +3228,9 @@ protected:
     // rewrites their contents instead of reallocating them.
     RunResourceSlots<std::shared_ptr<PreparedSubmissionStorage>> submission_storage_;
     std::vector<std::shared_ptr<PreparedSubmissionStorage>> retired_submission_storage_;
+    // Unused generations have no model owner and may be consumed by any slot.
+    std::vector<std::shared_ptr<PreparedSubmissionStorage>> spare_submission_storage_;
+    int prepare_spare_submission_storage(void *control_stream);
     static std::shared_ptr<PreparedSubmissionStorage> make_submission_storage();
     int release_submission_storage(PreparedSubmissionStorage &storage, bool abandon);
 
@@ -3244,7 +3251,7 @@ protected:
         RunResourceSlots<NativeRunClaim>::Storage active_native_runs;
         RunResourceSlots<std::shared_ptr<PreparedRunResources::TemporaryStorage>>::Storage temporary_storage;
         RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
-        RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>>::Storage scheduler_state_storage;
+        RunResourceSlots<SchedulerBindStorage>::Storage scheduler_state_storage;
         RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
         RunResourceSlots<std::shared_ptr<void>>::Storage prepare_plans;
         RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
@@ -3255,6 +3262,7 @@ protected:
         RunResourceSlots<DeviceRunTiming>::Storage device_run_timing;
         RunResourceSlots<bool>::Storage device_timing_armed;
         RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
+        RunResourceSlots<RunResourceCost>::Storage run_resource_costs;
         RunBoundaryLedger::Storage run_boundaries_observed;
         QueuedStreamWaits::Storage queued_waits;
         RunBoundaryMarks::Storage boundary_marks;
@@ -3383,8 +3391,8 @@ protected:
     // `KernelArgs::pmu_reg_addrs` and stays unset on a5, which has no separate
     // PMU register page and reads the Ctrl table instead.
     //
-    // Kernel mode owns the same table through `PersistentKernelArgs`
-    // (`kernel_persistent_args.h`) instead; a context latches one mode for its
+    // Both execution modes retain this table for the context lifetime.
+    // A context latches one mode for its
     // whole lifetime, so exactly one of the two owners is ever live.
     uint64_t aicore_ctrl_reg_table_dev_{0};
     uint64_t aicore_pmu_reg_table_dev_{0};
@@ -3405,16 +3413,20 @@ protected:
     // Preparation cannot overwrite an armed slot. Failed publication leaves it
     // unarmed, so readback cannot misattribute a predecessor's timing.
     RunResourceSlots<bool> device_timing_armed_;
-    // Each live call owns its original result address and optional host read.
-    // An idle current-slot allocation is retained for sequential reuse.
+    // Each live call owns its epoch's result lease and optional host read. The
+    // pool keeps one idle region for a sequential successor.
     struct RunResultStorage {
         uint32_t pipeline_slot{UINT32_MAX};
-        void *device_ptr{nullptr};
-        std::shared_ptr<PreparedSubmissionStorage> backing;
+        ReportedPool::Lease lease;
         DeviceRunResultRegion region{};
         RunRecordRead read{RunRecordRead::NotAttempted};
         int transfer_rc{0};
         bool initialized{false};
+        bool retain_evidence{false};
+        bool evidence_observed{false};
+        // The run's own lease ends at finalize; each external retain adds one.
+        // The pool region stays owned until both are gone.
+        NativeInvocationEvidence::Snapshot observed_evidence{};
     };
     // Owned by the live call, independently of its reusable execution slot.
     std::unordered_map<uint64_t, RunResultStorage> run_result_storage_;
@@ -3459,6 +3471,10 @@ protected:
     // bind is preparation and a prepared successor prepares while its
     // predecessor still owns the collectors — see host_phase_run_state.h.
     RunResourceSlots<HostPhaseRunState> host_phase_runs_;
+    // What each set committed when its run proved the slot, measured at the
+    // one point the preparation's resources are all committed and before the
+    // heap lease moves into the published resources.
+    RunResourceSlots<RunResourceCost> run_resource_costs_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     // Reference-counted for the whole of PMU collection, which spans every
@@ -3474,8 +3490,34 @@ protected:
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
     bool pmu_enabled_{false};                                             // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                         // diagnostic artifact root directory
+protected:
+    // Test-visible snapshot of one epoch's result region. Production callers
+    // reach the same state through the run-result API.
+    struct ResultRegionSnapshot {
+        bool found{false};
+        void *device_ptr{nullptr};
+        bool initialized{false};
+        bool retain_evidence{false};
+        bool evidence_observed{false};
+        NativeInvocationEvidence::Snapshot observed_evidence{};
+    };
+    ResultRegionSnapshot result_region_snapshot(uint64_t run_epoch, uint32_t pipeline_slot) const;
+    // The most recent evidence read, kept after its epoch is released so the
+    // observation remains inspectable. Test-visible; production reads the log.
+    const ResultRegionSnapshot &last_observed_result_region() const { return last_observed_result_region_; }
+    void *idle_result_device_ptr() const { return reported_pool_.idle_device_ptr(); }
+    bool idle_result_initialized() const { return reported_pool_.idle_region_initialized(); }
+    void *pending_failed_result_device_ptr() const { return reported_pool_.pending_failed_device_ptr(); }
+    // Called under run_result_mu_; records that this epoch's evidence tail is
+    // worth reading even when the run is not a diagnostic recording.
+    void set_result_retain_evidence(uint64_t run_epoch, uint32_t pipeline_slot);
+
 private:
     int prepare_submission_slot_resources(uint32_t pipeline_slot);
-    // Called under run_result_mu_; initialization creates no epoch observation.
-    int initialize_result_storage(PreparedSubmissionStorage &backing);
+    // Called under run_result_mu_; no-op when the epoch has no unread evidence.
+    int read_result_evidence(RunResultStorage &storage);
+    // Called under run_result_mu_; releases the pool region once every lease
+    // has ended and the evidence has been read.
+    int finish_result_release(RunResultStorage &storage);
+    ResultRegionSnapshot last_observed_result_region_;
 };

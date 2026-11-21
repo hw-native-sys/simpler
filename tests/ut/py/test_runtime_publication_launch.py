@@ -133,8 +133,7 @@ def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_pat
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS:" in result.stdout
     if probe == "run_caller_launch":
-        assert "external resources: public retain/finalize/reuse/release and retries passed" in result.stderr
-        assert "capture release: timeout/error retain, completion retry and duplicate rejection passed" in result.stderr
+        assert "caller-owned run: last-use finalization and retry passed" in result.stderr
         _check_close_failure_cases(binary)
     if probe == "runtime_timeout_configuration":
         output = result.stdout + result.stderr
@@ -164,10 +163,7 @@ def _check_close_failure_cases(binary: Path):
         "probe-failure",
         "acl-finalize-retry",
         "borrowed",
-        "held-program",
         "held-borrowed",
-        "external-program",
-        "external-borrowed",
         "unused",
         "unused-release-retry",
         "unused-sticky-close",
@@ -177,8 +173,8 @@ def _check_close_failure_cases(binary: Path):
         if scenario.startswith("unused"):
             assert "standalone collector unused: preparation retired without submission" in failed_reset.stderr
             continue
-        if scenario.startswith(("held-", "external-")):
-            assert f"standalone collector {scenario}: external close deferred; readers_" in failed_reset.stderr
+        if scenario == "held-borrowed":
+            assert "standalone collector held-borrowed: readers retained" in failed_reset.stderr
             continue
         expected = (
             "standalone collector acl-finalize-retry: confirmed reset reused; original error="

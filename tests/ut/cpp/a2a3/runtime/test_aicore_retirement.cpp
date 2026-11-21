@@ -25,7 +25,7 @@
 #include "../../support/aicore_exit_responder.h"
 #include "runtime.h"
 
-void aicore_execute(Runtime *runtime, int block_idx, CoreType core_type);
+void aicore_execute(AicoreRuntimeView runtime, int block_idx, CoreType core_type);
 
 namespace {
 
@@ -65,7 +65,7 @@ void check_no_return_before_close(CoreType core_type) {
     store_register(RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
     store_register(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     std::thread worker([&] {
-        aicore_execute(&runtime, 0, core_type);
+        aicore_execute(runtime_aicore_view(&runtime.dev), 0, core_type);
         returned.store(true, std::memory_order_release);
     });
     if (!wait_until(
@@ -104,7 +104,7 @@ void check_repeated_retirement(CoreType core_type) {
         store_register(RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
         store_register(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
         std::thread worker([&] {
-            aicore_execute(&runtime, 0, core_type);
+            aicore_execute(runtime_aicore_view(&runtime.dev), 0, core_type);
             returned.store(true, std::memory_order_release);
         });
         if (!wait_until(
@@ -273,7 +273,7 @@ Handshake publish_one_report(uint64_t epoch, CoreType core_type) {
 
     std::atomic<bool> returned{false};
     std::thread worker([&] {
-        aicore_execute(&runtime, 0, core_type);
+        aicore_execute(runtime_aicore_view(&runtime.dev), 0, core_type);
         returned.store(true, std::memory_order_release);
     });
     EXPECT_TRUE(wait_until(
@@ -332,7 +332,7 @@ void check_retirement_before_idle(uint64_t epoch, CoreType core_type, uint32_t r
     g_pause_first_register.store(true, std::memory_order_release);
     std::atomic<bool> returned{false};
     std::thread worker([&] {
-        aicore_execute(&runtime, 0, core_type);
+        aicore_execute(runtime_aicore_view(&runtime.dev), 0, core_type);
         returned.store(true, std::memory_order_release);
     });
     if (!wait_until(
@@ -402,7 +402,9 @@ TEST(AicoreFreshnessDeathTest, UnstampedAivRetiresAfterFailureBeforeIdle) {
 
 // Only handshake storage is used by these idle-worker tests. Keep host-side
 // orchestration and the profiling service out of this executor-level fixture.
-Runtime::Runtime() {
+Runtime::Runtime() :
+    dev{} {
+    dev.shared_state_addr = reinterpret_cast<uint64_t>(&host_shared_state_);
     std::memset(get_workers(), 0, sizeof(Handshake) * RUNTIME_MAX_WORKER);
     std::memset(get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * RUNTIME_MAX_WORKER);
 }

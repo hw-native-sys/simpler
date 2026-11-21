@@ -29,6 +29,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 enum class EntryCacheMaintenance : uint32_t { Full = 0, FullFreshen = 1, Live = 2 };
 
@@ -74,6 +75,47 @@ enum class GraphSectionSource : uint32_t {
  * agree whenever the launch base does.
  */
 inline constexpr size_t LAUNCH_ENVELOPE_HEADER_BYTES = 192;
+
+// Byte ranges in the RTS-owned launch packet. Offsets are relative to KernelArgs.
+struct LaunchImageSection {
+    uint32_t offset;
+    uint32_t bytes;
+};
+static_assert(sizeof(LaunchImageSection) == 8);
+
+struct alignas(8) RuntimeDescriptorSection {
+    uint32_t descriptor_offset;
+    uint32_t packet_bytes;
+};
+static_assert(sizeof(RuntimeDescriptorSection) == 8);
+
+// Prepared by the runtime for a pointer field in mutable device storage.
+// image_offset is relative to the first image byte after HbgExecutionImage.
+struct HbgImageReference {
+    uint64_t device_field_address;
+    uint64_t image_offset;
+};
+
+// The snapshot and then reference_count HbgImageReference records follow this header.
+struct HbgExecutionImage {
+    uint64_t working_address;
+    uint64_t bytes;
+    uint64_t mutable_prefix_bytes;
+    uint64_t reference_count;
+};
+static_assert(std::is_trivially_copyable_v<HbgExecutionImage> && std::is_standard_layout_v<HbgExecutionImage>);
+static_assert(sizeof(HbgExecutionImage) == 32 && sizeof(HbgImageReference) == 16);
+
+inline constexpr uint64_t HBG_IMAGE_ALIGNMENT = 64;
+// Direct references require cache-line-aligned data. On ARM RTS pools copies up to
+// 4 KiB at 8-byte alignment; larger packets use a cache-line-aligned allocation.
+inline constexpr uint64_t HBG_DIRECT_IMAGE_MIN_PACKET_BYTES = 4096 + HBG_IMAGE_ALIGNMENT;
+
+// Keep the first image byte cache-line aligned relative to the RTS packet.
+inline constexpr uint64_t hbg_execution_image_offset(uint64_t descriptor_end) {
+    return ((descriptor_end + sizeof(HbgExecutionImage) + HBG_IMAGE_ALIGNMENT - 1) & ~(HBG_IMAGE_ALIGNMENT - 1)) -
+           sizeof(HbgExecutionImage);
+}
 
 /**
  * Host bytes a persistent argument block keeps of the descriptor prefix its

@@ -34,10 +34,70 @@ static std::vector<uint8_t> read(const char *path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+static void check_program_packet(
+    int device, const std::vector<uint8_t> &callable, const std::vector<uint8_t> &cpu, const std::vector<uint8_t> &core,
+    const std::vector<uint8_t> &dispatcher
+) {
+    auto ctx = create_device_context();
+    require(ctx != nullptr, "program-context");
+    CallConfig config{};
+    config.aicpu_thread_num = 2;
+    check(
+        simpler_init(
+            ctx, device, cpu.data(), cpu.size(), core.data(), core.size(), dispatcher.data(), dispatcher.size(),
+            &config, 0, nullptr, 0
+        ),
+        "program-init"
+    );
+    check(simpler_register_callable(ctx, 0, callable.data()), "program-register");
+    std::vector<uint8_t> storage(get_runtime_size() + get_runtime_alignment());
+    const auto aligned =
+        (reinterpret_cast<uintptr_t>(storage.data()) + get_runtime_alignment() - 1) & ~(get_runtime_alignment() - 1);
+    int32_t input[16], output[16]{}, control = 3;
+    const uint32_t shape[]{16}, one[]{1};
+    for (int i = 0; i < 16; ++i)
+        input[i] = i;
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor_external(input, shape, 1, DataType::INT32, AddressSpace::HOST, TensorTransfer::H2D));
+    args.add_tensor(make_tensor_external(output, shape, 1, DataType::INT32, AddressSpace::HOST, TensorTransfer::H2D));
+    args.add_tensor(make_tensor_external(&control, one, 1, DataType::INT32, AddressSpace::HOST, TensorTransfer::H2D));
+    args.add_scalar(0);
+    NativeRunDescriptor descriptor{};
+    descriptor.run_epoch = descriptor.generation = 1;
+    auto run = reinterpret_cast<void *>(aligned);
+    check(simpler_prepare_run(ctx, run, 0, &args, &config, &descriptor), "program-prepare");
+    capture_test::begin_capture_publication_probe();
+    check(simpler_launch_run(ctx, run), "program-launch");
+    const auto record = capture_test::finish_capture_publication_probe();
+    check(simpler_wait_run(ctx, run), "program-wait");
+    check(simpler_finalize_run(ctx, run), "program-finalize-run");
+    std::printf("program-cpu-launches=%zu\n", record.cpu_launches.size());
+    for (const auto &launch : record.cpu_launches)
+        std::printf(
+            "program-cpu-packet inline=%d image_bytes=%llu refs=%llu\n", launch.inline_runtime,
+            static_cast<unsigned long long>(launch.image_bytes), static_cast<unsigned long long>(launch.references)
+        );
+    require(
+        record.cpu_launches.size() == 1 && record.cpu_launches.front().inline_runtime &&
+            record.cpu_launches.front().image_bytes > 0 &&
+            record.cpu_launches.front().references == 0,
+        "program-inline-packet-with-zero-references"
+    );
+    for (int i = 0; i < 16; ++i)
+        require(output[i] == i + 10, "program-output");
+    check(simpler_unregister_callable(ctx, 0), "program-unregister");
+    check(finalize_device(ctx), "program-finalize");
+    destroy_device_context(ctx);
+}
+
 int main(int argc, char **argv) {
     require(argc == 7, "usage: device scenario callable cpu core dispatcher");
     const int device = std::atoi(argv[1]), scenario = std::atoi(argv[2]);
     const auto callable = read(argv[3]), cpu = read(argv[4]), core = read(argv[5]), dispatcher = read(argv[6]);
+    if (scenario == 16) {
+        check_program_packet(device, callable, cpu, core, dispatcher);
+        return 0;
+    }
     check(aclInit(nullptr), "aclInit");
     check(aclrtSetDevice(device), "set-device");
     aclrtStream caller = nullptr;
@@ -97,13 +157,10 @@ int main(int argc, char **argv) {
         NativeRunDescriptor descriptor{};
         descriptor.generation = cycle + 1;
         descriptor.run_epoch = cycle + 1;
-        descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
         const size_t publishes_before = capture_test::prepare_snapshot(ctx, scenario);
-        check(simpler_prepare_run(ctx, run, 0, &args, &config, &descriptor), "prepare-once");
+        check(simpler_prepare_caller_run(ctx, run, 0, &args, &config, &descriptor), "prepare-once");
         capture_test::check_prepare(ctx, scenario, publishes_before);
         host_control = 93;  // Changing the source must not change the prepared task arguments.
-        RuntimeHandle reference = nullptr;
-        check(simpler_retain_run_resources(ctx, run, caller, &reference), "retain-once");
         aclmdlRI model = nullptr;
         check(aclmdlRICaptureBegin(caller, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL), "capture-begin");
         check(aclrtMemcpyAsync(input, bytes, host_input, bytes, ACL_MEMCPY_HOST_TO_DEVICE, caller), "capture-input");
@@ -117,9 +174,9 @@ int main(int argc, char **argv) {
             check(aclrtRecordEvent(dependency_event, other_stream), "conflict-other-record");
             arm_capture_submit_fault(caller, dependency_event);
         }
-        const bool probe_publications = capture_test::needs_publications(scenario);
+        const bool probe_publications = capture_test::needs_publications(scenario) || scenario == 14 || scenario == 0;
         if (probe_publications) capture_test::begin_capture_publication_probe();
-        const int launch_rc = simpler_launch_run_on_stream(ctx, run, caller, nullptr);
+        const int launch_rc = simpler_submit_run_on_stream(ctx, run, caller);
         const auto submission =
             probe_publications ? capture_test::finish_capture_publication_probe() : capture_test::CapturedSubmission{};
         if (partial_submission) {
@@ -138,9 +195,15 @@ int main(int argc, char **argv) {
         } else {
             check(launch_rc, "capture-launch-once");
         }
+        if (probe_publications && !partial_submission)
+            require(
+                submission.cpu_launches.size() == 1 && submission.cpu_launches.front().inline_runtime &&
+                    submission.cpu_launches.front().image_bytes > 0 && submission.cpu_launches.front().references == 0,
+                "kernel-inline-packet-with-zero-references"
+            );
         capture_test::check_publications(scenario, submission);
         if (scenario == 4) {
-            const int rc = simpler_launch_run_on_stream(ctx, run, caller, nullptr);
+            const int rc = simpler_submit_run_on_stream(ctx, run, caller);
             std::printf("capture-duplicate-rejected rc=%d expected=%d\n", rc, PTO_RUNTIME_ERR_INVALID_STATE);
             require(rc == PTO_RUNTIME_ERR_INVALID_STATE, "reject-duplicate-capture-launch");
         }
@@ -178,21 +241,8 @@ int main(int argc, char **argv) {
             aclmdlRI recording_model = nullptr;
             check(aclmdlRICaptureGetInfo(caller, &status, &recording_model), "capture-info-before-cancel");
             require(status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE && recording_model != nullptr, "capture-still-active");
-            const int finalize_rc = simpler_finalize_run(ctx, run);
-            std::printf("finalize-capture rc=%d expected=%d\n", finalize_rc, launch_rc);
-            require(finalize_rc == launch_rc, "finalize-during-capture");
             require(
-                simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE,
-                "external-reference-retains-callable"
-            );
-            const int release_rc = simpler_release_run_resources(ctx, reference);
-            std::printf("release-during-capture rc=%d expected=%d\n", release_rc, PTO_RUNTIME_ERR_UNSUPPORTED);
-            require(release_rc == PTO_RUNTIME_ERR_UNSUPPORTED, "release-live-capture-rejected");
-            aclmdlRI still_recording = nullptr;
-            check(aclmdlRICaptureGetInfo(caller, &status, &still_recording), "capture-info-after-release-refusal");
-            require(
-                status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE && still_recording == recording_model,
-                "release-refusal-keeps-capture"
+                simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE, "original-run-retains-callable"
             );
         }
         const int end_rc = aclmdlRICaptureEnd(caller, &model);
@@ -221,7 +271,6 @@ int main(int argc, char **argv) {
         aclmdlRI ended_model = nullptr;
         check(aclmdlRICaptureGetInfo(caller, &ended_status, &ended_model), "capture-info-after-end");
         require(ended_status == ACL_MODEL_RI_CAPTURE_STATUS_NONE && ended_model == nullptr, "capture-ended");
-        if (!cancel_recording) check(simpler_finalize_run(ctx, run), "finalize-host-run");
         int32_t observed[16];
         check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-before-replay");
         require(std::memcmp(poison, observed, bytes) == 0, "capture-did-not-execute");
@@ -267,7 +316,7 @@ int main(int argc, char **argv) {
                 std::printf("fault-replay=%d executed=16\n", fault_round + 1);
             }
         }
-        const int replays = (scenario == 3 || cancel_recording) ? 0 : 3;
+        const int replays = (scenario == 3 || scenario == 15 || cancel_recording) ? 0 : 3;
         total_replays += replays;
         for (int round = 0; round < replays; ++round) {
             host_control = 1000 + round;
@@ -285,11 +334,58 @@ int main(int argc, char **argv) {
                     "fresh-output"
                 );
             std::printf("replay=%d verified=16\n", round + 1);
+            if (scenario == 14 && round < 2) {
+                // Keep the captured run and model alive. First reuse its workspace for
+                // a different scalar, then submit a larger graph before the last replay.
+                const bool same_size = round == 0;
+                std::vector<uint8_t> eager_storage(get_runtime_size() + get_runtime_alignment());
+                const auto aligned = (reinterpret_cast<uintptr_t>(eager_storage.data()) + get_runtime_alignment() - 1) &
+                                     ~(get_runtime_alignment() - 1);
+                auto eager_run = reinterpret_cast<void *>(aligned);
+                ChipStorageTaskArgs eager_args;
+                for (int i = 0; i < args.tensor_count(); ++i)
+                    eager_args.add_tensor(args.tensor(i));
+                host_control = 13;
+                eager_args.add_scalar(same_size ? 6 : 16);
+                NativeRunDescriptor eager_descriptor{};
+                eager_descriptor.generation = eager_descriptor.run_epoch = round + 2;
+                check(simpler_prepare_run(ctx, eager_run, 0, &eager_args, &config, &eager_descriptor), "prepare-eager");
+                capture_test::begin_capture_publication_probe();
+                check(simpler_launch_run_on_stream(ctx, eager_run, caller, nullptr), "launch-eager");
+                const auto eager_submission = capture_test::finish_capture_publication_probe();
+                require(submission.cpu_launches.size() == 1 && eager_submission.cpu_launches.size() == 1, "cpu-launch");
+                const auto &original = submission.cpu_launches.front();
+                const auto &eager = eager_submission.cpu_launches.front();
+                require(original.image_bytes > 0 && eager.inline_runtime && eager.references == 0, "original-image");
+                if (same_size) {
+                    require(eager.image_bytes == original.image_bytes, "same-size-image");
+                    require(
+                        original.working_address && eager.working_address == original.working_address,
+                        "shared-runtime-workspace"
+                    );
+                    // Resident A5 workers have a second writable region for their scheduler.
+                    const auto worker_base = submission.launches.at(0).worker_context_base;
+                    if (worker_base)
+                        require(
+                            eager_submission.launches.at(0).worker_context_base == worker_base,
+                            "shared-scheduler-workspace"
+                        );
+                } else {
+                    require(eager.image_bytes > original.image_bytes, "larger-image");
+                }
+                check(simpler_finalize_run(ctx, eager_run), "finalize-eager");
+                check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-eager-output");
+                for (int i = 0; i < 16; ++i)
+                    require(observed[i] == 100 * round + i + (same_size ? 20 : 14), "eager-output");
+            }
         }
         if (model != nullptr) check(aclmdlRIDestroy(model), "destroy-model");
-        check(simpler_release_run_resources(ctx, reference), "release-after-destroy");
+        const int finalize_rc = simpler_finalize_run(ctx, run);
+        std::printf("finalize-after-last-use rc=%d expected=%d\n", finalize_rc, launch_rc);
+        require(finalize_rc == launch_rc, "finalize-after-destroy");
         if (cancel_recording) std::printf("cancelled-capture-cleaned cycle=%d\n", cycle);
     }
+    capture_test::release_boot_fault_source();
     if (dependency_event != nullptr) check(aclrtDestroyEvent(dependency_event), "destroy-failure-event");
     if (other_stream != nullptr) check(aclrtDestroyStream(other_stream), "destroy-failure-other-stream");
     check(finalize_device(ctx), "finalize-context");

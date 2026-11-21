@@ -110,7 +110,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(test_three_run_capacity PRIVATE
         "LINKER:--wrap=_ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE")
     target_link_options(test_chip_run_lane PRIVATE
-        "LINKER:--wrap=pthread_mutex_lock"
         "LINKER:--wrap=pthread_cond_wait"
         "LINKER:--wrap=pthread_cond_timedwait"
         "LINKER:--wrap=pthread_cond_clockwait"

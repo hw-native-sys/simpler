@@ -34,10 +34,12 @@
 #include <stdio.h>   // for fprintf, printf
 #include <string.h>  // for memset
 
+#include <cstring>
 #include <type_traits>
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/runtime_shared_state.h"
 #include "common/host_api.h"
 #include "host/scope_stats_capacity.h"
 #include "common/chip_swimlane_profiling.h"
@@ -109,7 +111,7 @@ struct Handshake {
 // dcci(..., CACHELINE_OUT) on its report and again on exit. A word the AICPU
 // must publish independently cannot live here — a stale line writeback would
 // overwrite it. The post-close return gates live in
-// DeviceRuntimeLaunchDesc::teardown_gates, one AICPU-owned request/release line per worker.
+// RuntimeSharedState::teardown_gates, one AICPU-owned request/release line per worker.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
 // The payload offsets are the device-side wire contract: AICore writes them and
@@ -153,30 +155,14 @@ inline void aicore_invalidate_retired_report(Handshake *handshake) {
 // =============================================================================
 
 /**
- * DeviceRuntimeLaunchDesc - the device-copied half of Runtime.
- *
- * This is the ONLY part of Runtime that reaches device memory: the host fills it,
- * `device_runner_helpers.cpp` allocates `sizeof(DeviceRuntimeLaunchDesc)` bytes
- * for it and rtMemcpy's a prefix from offset 0 of the Runtime image, and the
- * AICPU/AICore read these fields back. It is the first member of Runtime
- * (offsetof == 0), so the narrowed copy needs no offset arithmetic.
- *
- * Three lengths, in order. `runtime_device_copy_size` is what a steady-state run
- * re-publishes: it stops inside `orch_args_storage_`, after the tensor slots that
- * run filled, and so is the only one of the three that varies per run rather than
- * per runtime — at capacity it reaches exactly `workers`.
- * `runtime_device_initialized_prefix_size` is the full range through `workers`,
- * stopping before `teardown_gates`, and is what the first publication onto an
- * allocation sends so the handshake region and every args slot start defined;
- * `runtime_device_extent_size` is the whole allocation. Both remain per-runtime
- * constants. The gate tail is in no copy: its host storage is never initialized.
- *
- * Adding a field here grows the device image; adding a field to Runtime's
- * host-only tail does not. Keep it standard-layout (static_assert below) so the
- * rtMemcpy is well-defined. alignas(64) makes sizeof a multiple of the cache
- * line so the per-run cache_invalidate_range(runtime, sizeof(dev)) never rounds
- * into a neighbouring line.
+ * Host-published runtime fields. Shared worker state is addressed separately.
+ * Kernel invocations carry this descriptor in RTS-owned launch storage.
  */
+using RuntimeSharedState = RuntimeSharedStateStorage<Handshake, AicoreTeardownControl, RUNTIME_MAX_WORKER>;
+static_assert(std::is_trivially_copyable_v<RuntimeSharedState> && std::is_standard_layout_v<RuntimeSharedState>);
+static_assert(offsetof(RuntimeSharedState, workers) % 64 == 0);
+static_assert(offsetof(RuntimeSharedState, teardown_gates) % 64 == 0);
+
 struct alignas(64) DeviceRuntimeLaunchDesc {
     int worker_count;  // Number of active workers
 
@@ -244,6 +230,8 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     uint32_t pmu_event_type;   // PmuEventType; zero while PMU is disabled.
     uint32_t dump_args_level;  // DumpArgsLevel; zero while argument dumping is disabled.
 
+    uint64_t shared_state_addr;  // Borrowed address of RuntimeSharedState.
+
     // Entry args, adopted on the host. Last of the uploaded fields, because it
     // is the only one whose useful length is a property of the run: a
     // steady-state publication stops after `tensor_count_` of its
@@ -252,34 +240,24 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Slots past the count keep whatever an earlier run of this allocation
     // wrote; the consumers are count-bounded and must stay so.
     simpler::tmr::EntryArgsStorage orch_args_storage_;
-
-    // Handshake buffers for AICPU-AICore communication, one 64-byte line per
-    // worker.
-    //
-    // Outside the per-run uploaded prefix: every field the device reads here is
-    // written on the device — the AICore publishes its report and the AICPU the
-    // task pointer it answers with — and no host value is consumed. A
-    // steady-state run re-uploads none of it; the first publication onto a given
-    // allocation carries it once, which is what gives a fresh block a defined
-    // starting value.
-    Handshake workers[RUNTIME_MAX_WORKER];
-
-    // Post-close return gates, one isolated cache line per worker. The AICPU
-    // stores here only after that worker's register window is closed; the
-    // AICore bypass-loads its own entry and returns once it reads RELEASE.
-    // Separate from workers[] because the AICore flushes its whole Handshake
-    // line, which would overwrite a gate sharing it.
-    //
-    // Last, and outside the uploaded prefix: the AICPU resets each active request/release line
-    // in `pre_handshake_init` and executes `wmb()` before it publishes
-    // `hs_setup_done_`, and no register window opens before that publication. So
-    // the meaningful initial value is produced on the device ahead of every read
-    // of it, and no host-supplied gate value is consumed. The allocation still
-    // covers this array.
-    // Each 64-byte control is written only by AICPU and cleared before READY
-    // or EXIT. AICore bypass-loads the request and returns its nonce in COND.
-    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
 };
+
+inline constexpr size_t RUNTIME_LAUNCH_DESCRIPTOR_BYTES = offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_);
+
+inline AicoreRuntimeView runtime_aicore_view(const void *descriptor) {
+    AicoreRuntimeView view{};
+    const auto *bytes = static_cast<const unsigned char *>(descriptor);
+    std::memcpy(
+        &view.shared_state_addr, bytes + offsetof(DeviceRuntimeLaunchDesc, shared_state_addr),
+        sizeof(view.shared_state_addr)
+    );
+    std::memcpy(&view.worker_count, bytes + offsetof(DeviceRuntimeLaunchDesc, worker_count), sizeof(view.worker_count));
+    std::memcpy(
+        &view.chip_swimlane_level, bytes + offsetof(DeviceRuntimeLaunchDesc, chip_swimlane_level),
+        sizeof(view.chip_swimlane_level)
+    );
+    return view;
+}
 
 // =============================================================================
 // Runtime Class
@@ -302,11 +280,16 @@ public:
     // The device-copied half. MUST stay the first member: device_runner_helpers
     // copies sizeof(DeviceRuntimeLaunchDesc) bytes from offset 0.
     DeviceRuntimeLaunchDesc dev;
+    RuntimeSharedState host_shared_state_;
 
     /**
      * Constructor - zero-initialize all arrays
      */
     Runtime();
+    Runtime(const Runtime &) = delete;
+    Runtime &operator=(const Runtime &) = delete;
+    Runtime(Runtime &&) = delete;
+    Runtime &operator=(Runtime &&) = delete;
 
     // =========================================================================
     // Accessors for the device-copied fields in `dev`
@@ -320,9 +303,13 @@ public:
     void set_worker_count(int n) { dev.worker_count = n; }
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
-    Handshake *get_workers() { return dev.workers; }
-    const Handshake *get_workers() const { return dev.workers; }
-    AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
+    Handshake *get_workers() { return reinterpret_cast<RuntimeSharedState *>(dev.shared_state_addr)->workers; }
+    const Handshake *get_workers() const {
+        return reinterpret_cast<const RuntimeSharedState *>(dev.shared_state_addr)->workers;
+    }
+    AicoreTeardownControl *get_teardown_gates() {
+        return reinterpret_cast<RuntimeSharedState *>(dev.shared_state_addr)->teardown_gates;
+    }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
     int32_t get_aicpu_launch_count() const { return dev.aicpu_launch_count; }
@@ -448,7 +435,7 @@ public:
     // The launch shape's AIC/AIV rule, one entry per active worker. Host state
     // with host readers only: the DFX swimlane collector and the sim's per-core
     // thread start need the rule before any core has reported, and
-    // `dev.workers[i].core_type` cannot serve them — it is outside the per-run
+    // `get_workers()[i].core_type` cannot serve them — it is outside the per-run
     // uploaded prefix and the device overwrites it with each core's own report.
     std::vector<CoreType> core_type_rule_;
 
@@ -457,7 +444,7 @@ public:
      * `worker_count` workers are AIC and the rest AIV.
      *
      * Set wherever `worker_count` is, and read by every host consumer of the
-     * rule. Callers must not read `dev.workers[i].core_type` for it — that word
+     * rule. Callers must not read `get_workers()[i].core_type` for it — that word
      * belongs to the core's own report.
      */
     void set_core_type_rule(int worker_count, int aic_count) {
@@ -502,12 +489,6 @@ static_assert(
     "stays cache-line aligned"
 );
 static_assert(
-    offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_) + sizeof(simpler::tmr::EntryArgsStorage) ==
-        offsetof(DeviceRuntimeLaunchDesc, workers),
-    "orch_args_storage_ must be the last uploaded member: runtime_device_copy_size() stops inside it, so a "
-    "field placed between it and workers would fall outside every steady-state publication"
-);
-static_assert(
     offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_) <= LAUNCH_ROUTE_PREFIX_CACHE_BYTES,
     "the launch route's published prefix must fit the fixed per-allocation host copy a slot keeps of it"
 );
@@ -516,42 +497,21 @@ static_assert(
     "orch_args_storage_ must start on a cache line: the steady-state length is its offset plus a whole "
     "number of 64-byte-aligned Tensor slots, and both halves have to stay line-aligned"
 );
-static_assert(
-    offsetof(DeviceRuntimeLaunchDesc, workers) % 64 == 0,
-    "workers must start on a cache line: each Handshake is one line the AICore writes back whole"
-);
-static_assert(
-    offsetof(DeviceRuntimeLaunchDesc, workers) + sizeof(DeviceRuntimeLaunchDesc::workers) ==
-        offsetof(DeviceRuntimeLaunchDesc, teardown_gates),
-    "workers must be the last host-initialized member: the initialized prefix ends where it ends, and a "
-    "field placed between it and the gates would be uploaded once instead of every run"
-);
-static_assert(
-    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) % 64 == 0,
-    "teardown_gates must start on a cache line: the AICore flushes a whole Handshake line and a gate "
-    "sharing one would be overwritten"
-);
-static_assert(
-    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) + sizeof(DeviceRuntimeLaunchDesc::teardown_gates) ==
-        sizeof(DeviceRuntimeLaunchDesc),
-    "teardown_gates must end the descriptor: a field appended behind it would sit outside the uploaded "
-    "prefix and never receive its host value"
-);
 
-// Bytes a steady-state run uploads: the descriptor before the handshake region.
-// Defined per-runtime so the shared device_runner_helpers.cpp /
-// kernel_persistent_args.cpp paths stay runtime-agnostic.
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_) + sizeof(simpler::tmr::EntryArgsStorage) ==
+        sizeof(DeviceRuntimeLaunchDesc),
+    "entry storage must end the descriptor"
+);
+// Descriptor upload length; TMR bounds entry storage by the current tensor count.
 size_t runtime_device_copy_size(const Runtime &rt);
 
-// Bytes the first publication onto a device allocation uploads: through the end
-// of the handshake region, stopping before the host-uninitialized gate tail.
+// Fully initialized descriptor bytes. Shared worker state has a separate publication.
 size_t runtime_device_initialized_prefix_size(const Runtime &rt);
-
-// Bytes of device memory a Runtime image occupies. Never smaller than
-// `runtime_device_initialized_prefix_size`, and the size every allocation
-// backing a device `Runtime` must use: the device addresses gates inside the
-// tail this exceeds the published prefixes by.
 size_t runtime_device_extent_size(const Runtime &rt);
+
+// Bytes carried in a Kernel invocation launch package.
+size_t runtime_device_launch_size(const Runtime &rt);
 
 // This run's entry-argument routing facts, captured from `rt` while it is still
 // this run's. Defined per-runtime, and `supported` is false on a runtime with no

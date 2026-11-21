@@ -463,14 +463,14 @@ paths, including Mix waves and ranked empty views (§3.1.1).
 
 ArgsDump alone can accompany native Kernel capture on A3 TMR and HBG. It uses
 the [common capture and resource lifetime](../design/native-capture-common-contract.md)
-path: prepare and retain before `CaptureBegin`, record the normal launch, then
-retire the original Host carrier. No eager computation is required. The retained
-reference keeps the dump pool and output window alive for model replay. Caller
+path. Prepare the caller-owned run before `CaptureBegin` and record its stream
+submission. The original run holds the dump pool and output window for replay
+through finalization after model destruction. Caller
 IO remains caller-owned and stream-ordered. Program remains eager-only.
 
 Diagnostic producers sharing a context's collector pool execute serially in one
-caller-ordered domain. Before releasing any retained model reference, finish
-all producers sharing that pool and start none until release returns. Multiple
+caller-ordered domain. Before finalizing any model run, finish
+all producers sharing that pool and start none until finalization returns. Multiple
 model windows may remain retained; closing one does not close the others.
 
 The task hooks sample inputs before dispatch and outputs after completion,

@@ -28,7 +28,7 @@
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler_error.h"
 
-void aicore_execute(Runtime *runtime, int block_idx, CoreType core_type);
+void aicore_execute(AicoreRuntimeView runtime, int block_idx, CoreType core_type);
 
 namespace {
 alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
@@ -62,7 +62,7 @@ void check_exit(uint32_t mode, BootstrapBase base, uint64_t epoch, CoreType type
     first_read.store(false);
     pause_first_read.store(true);
     resume_read.store(false);
-    auto &gate = runtime->dev.teardown_gates[0];
+    auto &gate = runtime->get_teardown_gates()[0];
     gate.exit_request = AICORE_EXIT_NONCE_0;
     gate.post_close_release = AICORE_POST_CLOSE_RELEASE;
     context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&run_control);
@@ -76,7 +76,7 @@ void check_exit(uint32_t mode, BootstrapBase base, uint64_t epoch, CoreType type
     runtime->publish_scheduler_bootstrap(mode, bootstrap_address);
     std::atomic<bool> returned{false};
     std::thread worker([&] {
-        aicore_execute(runtime.get(), 0, type);
+        aicore_execute(runtime_aicore_view(&runtime->dev), 0, type);
         returned.store(true, std::memory_order_release);
     });
     if (!wait_until(
@@ -86,7 +86,7 @@ void check_exit(uint32_t mode, BootstrapBase base, uint64_t epoch, CoreType type
             std::chrono::seconds(2)
         ))
         std::_Exit(10);
-    if (!aicore_report_accepted(&runtime->dev.workers[0], epoch)) std::_Exit(11);
+    if (!aicore_report_accepted(&runtime->get_workers()[0], epoch)) std::_Exit(11);
     if (wait_until(
             [&] {
                 return returned.load(std::memory_order_acquire);
@@ -147,7 +147,7 @@ void check_ready_error_publication(bool publish_ready, bool stale_error) {
     resume_read.store(false);
     const uint64_t address = reinterpret_cast<uint64_t>(registers.data());
     std::thread core([&] {
-        aicore_execute(runtime.get(), 0, CoreType::AIV);
+        aicore_execute(runtime_aicore_view(&runtime->dev), 0, CoreType::AIV);
     });
     if (!wait_until(
             [] {
@@ -159,8 +159,8 @@ void check_ready_error_publication(bool publish_ready, bool stale_error) {
     if (control.scheduler_error != (stale_error ? 7u : 0u) || control.error_claimed != 0) std::_Exit(31);
     if (publish_ready) {
         scheduler_publish_error(&control, 0);
-        runtime->dev.workers[0].task = reinterpret_cast<uint64_t>(&context);
-        runtime->dev.workers[0].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
+        runtime->get_workers()[0].task = reinterpret_cast<uint64_t>(&context);
+        runtime->get_workers()[0].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
     }
     resume_read.store(true, std::memory_order_release);
     if (publish_ready && !wait_until(
@@ -170,7 +170,7 @@ void check_ready_error_publication(bool publish_ready, bool stale_error) {
                              std::chrono::seconds(2)
                          ))
         std::_Exit(32);
-    const AicoreExitTarget target{address, &runtime->dev.teardown_gates[0]};
+    const AicoreExitTarget target{address, &runtime->get_teardown_gates()[0]};
     if (platform_retire_aicore_group(&target, 1, platform_aicore_exit_deadline()) != 0) std::_Exit(33);
     core.join();
     if (publish_ready) {
@@ -182,7 +182,9 @@ void check_ready_error_publication(bool publish_ready, bool stale_error) {
 }
 }  // namespace
 
-Runtime::Runtime() {
+Runtime::Runtime() :
+    dev{} {
+    dev.shared_state_addr = reinterpret_cast<uint64_t>(&host_shared_state_);
     std::memset(get_workers(), 0, sizeof(Handshake) * RUNTIME_MAX_WORKER);
     std::memset(get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * RUNTIME_MAX_WORKER);
     dev.scheduler_bootstrap = {};

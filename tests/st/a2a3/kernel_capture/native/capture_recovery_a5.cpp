@@ -20,7 +20,7 @@
 namespace simpler::capture_test {
 namespace {
 
-// These views borrow the original reference's retained publication source.
+// The original run owns this scheduler publication through the final replay.
 struct CapturedResidentState {
     const void *run_control = nullptr;
     char *metadata_source = nullptr;
@@ -40,28 +40,8 @@ bool contains(const CapturedPublication &publication, uint64_t address, size_t b
 CapturedResidentState
 capture_resident_state(const CapturedLaunch &launch, const std::vector<CapturedPublication> &publications) {
     if (launch.publication_count > publications.size()) return {};
-    const uint64_t descriptor_address = launch.runtime_args;
-    constexpr size_t bootstrap_offset = offsetof(DeviceRuntimeLaunchDesc, scheduler_bootstrap);
-    constexpr size_t workers_offset = offsetof(DeviceRuntimeLaunchDesc, worker_count);
-    const CapturedPublication *descriptor = nullptr;
-    for (size_t index = 0; index < launch.publication_count; ++index) {
-        const auto &publication = publications[index];
-        if (reinterpret_cast<uintptr_t>(publication.destination) == descriptor_address) {
-            if (descriptor != nullptr) return {};
-            descriptor = &publication;
-        }
-    }
-    if (descriptor == nullptr || descriptor->source == nullptr ||
-        descriptor->bytes < bootstrap_offset + sizeof(SchedulerBootstrapInputs) ||
-        descriptor->bytes < workers_offset + sizeof(int32_t)) {
-        return {};
-    }
-    auto *descriptor_source = static_cast<const char *>(descriptor->source);
-    SchedulerBootstrapInputs bootstrap{};
-    int32_t worker_count = 0;
-    std::memcpy(&bootstrap, descriptor_source + bootstrap_offset, sizeof(bootstrap));
-    std::memcpy(&worker_count, descriptor_source + workers_offset, sizeof(worker_count));
-    if (bootstrap.runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING || bootstrap.worker_context_base == 0 ||
+    const int32_t worker_count = launch.worker_count;
+    if (launch.runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING || launch.worker_context_base == 0 ||
         worker_count <= 0 || worker_count > PLATFORM_MAX_CORES) {
         return {};
     }
@@ -70,14 +50,14 @@ capture_resident_state(const CapturedLaunch &launch, const std::vector<CapturedP
     const CapturedPublication *metadata = nullptr;
     for (size_t index = 0; index < launch.publication_count; ++index) {
         const auto &publication = publications[index];
-        if (&publication != descriptor && contains(publication, bootstrap.worker_context_base, context_bytes)) {
+        if (contains(publication, launch.worker_context_base, context_bytes)) {
             if (metadata != nullptr) return {};
             metadata = &publication;
         }
     }
     if (metadata == nullptr) return {};
     const auto metadata_base = reinterpret_cast<uintptr_t>(metadata->destination);
-    const size_t contexts_offset = bootstrap.worker_context_base - metadata_base;
+    const size_t contexts_offset = launch.worker_context_base - metadata_base;
     auto *metadata_source = static_cast<char *>(const_cast<void *>(metadata->source));
     uint64_t run_control_offset = 0;
     uint64_t original_task_count = 0;
@@ -172,6 +152,9 @@ void check_publications(int scenario, const CapturedSubmission &submission) {
     resident_state = capture_resident_state(submission.launches[0], submission.publications);
     require(resident_state.run_control != nullptr, "observed-resident-publication");
 }
+
+void release_boot_fault_source() {}
+bool record_boot_fault_prefix(const unsigned char *, void *) { return false; }
 
 void inject_boot_failure() { set_captured_original_task_count(resident_state, 0); }
 

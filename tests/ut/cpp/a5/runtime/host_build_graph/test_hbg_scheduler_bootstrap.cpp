@@ -138,7 +138,7 @@ TEST_F(SchedulerBootstrapFields, TheBootstrapLineIsDisjointFromEveryHandshakeLin
     ASSERT_EQ(reinterpret_cast<uintptr_t>(&runtime.dev.scheduler_bootstrap) % 64, 0u);
 
     for (int32_t worker = 0; worker < RUNTIME_MAX_WORKER; ++worker) {
-        ASSERT_NE(base_of(&runtime.dev.workers[worker]), bootstrap_line) << "worker " << worker;
+        ASSERT_NE(base_of(&runtime.get_workers()[worker]), bootstrap_line) << "worker " << worker;
     }
 }
 

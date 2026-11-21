@@ -39,6 +39,7 @@
 #include <cstdint>
 
 #include "common/dma_workspace.h"
+#include "common/runtime_shared_state.h"
 #include "common/launch_entry_args.h"
 
 inline constexpr bool PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE = true;
@@ -95,8 +96,13 @@ extern "C" {
 struct KernelArgs {
     // Offset-locked front: the front-less launch protocol and the device
     // entries require runtime_args @ 0 and regs @ 8 (see static_asserts below).
-    __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
-    uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
+    union {
+        // External descriptor when runtime_descriptor_bytes is zero.
+        __may_used_by_aicore__ Runtime *runtime_args{nullptr};
+        // Inline packet's optional HBG image. Both fields are zero for TMR.
+        LaunchImageSection image_section;
+    };
+    uint64_t regs{0};  // Per-core register base address array (platform-specific)
     // Remaining 64-bit fields. Grouped before the 32-bit tail so the struct
     // needs no interior alignment padding — every uint64_t lands on its natural
     // 8-byte boundary. The nine 32-bit tail members require four trailing
@@ -185,17 +191,15 @@ struct KernelArgs {
     uint32_t graph_section_bytes{0};
     uint32_t graph_section_source{static_cast<uint32_t>(GraphSectionSource::None)};
     uint32_t entry_cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
+    uint32_t runtime_descriptor_bytes{0};
+    RuntimeDescriptorSection runtime_section{};
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 
-// The swimlane bases are not offset-locked by any device contract — AICPU reads
-// them by field name from a CANN-private copy of the whole struct. These pin the
-// measured a2a3 layout so that appending, reordering, or widening a field is a
-// build failure rather than a silently different launch payload: `sizeof` is
-// what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
-// what `PersistentKernelArgs::prepare_once` allocates and copies H2D.
+// These assertions pin the launch header ABI. Optional sections and the Kernel
+// runtime descriptor follow this header within the RTS-owned argument package.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 32, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 40,
@@ -212,7 +216,8 @@ static_assert(
 // eighteen 8-byte fields end at 144; the Graph triple starts at 164.
 static_assert(offsetof(KernelArgs, graph_section_offset) == 164, "KernelArgs::graph_section_offset offset drift");
 static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 176, "entry cache policy offset drift");
-static_assert(sizeof(KernelArgs) == 184, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, runtime_section) == 184, "runtime descriptor section offset drift");
+static_assert(sizeof(KernelArgs) == 192, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
@@ -239,7 +244,7 @@ static_assert(
  * collector arming and these are this run's final values.
  */
 struct AicoreLaunchArgs {
-    uint64_t runtime_args;
+    uint64_t shared_state_addr;
     uint32_t enable_profiling_flag;
     uint64_t ffts_base_addr;
     uint64_t chip_swimlane_aicore_rotation_table;
@@ -248,9 +253,13 @@ struct AicoreLaunchArgs {
     // this run's report. Zero on a kernel/persistent launch, which keeps the
     // `aicore_done != 0` predicate.
     uint64_t report_epoch;
+    uint64_t worker_context_base;
+    uint32_t runtime_mode;
+    int32_t worker_count;
+    uint32_t chip_swimlane_level;
 };
 
-static_assert(sizeof(AicoreLaunchArgs) == 40, "AicoreLaunchArgs size drift");
+static_assert(sizeof(AicoreLaunchArgs) == 64, "AicoreLaunchArgs size drift");
 
 /**
  * Fill the `AicoreLaunchArgs` fields every architecture shares, from the
@@ -262,8 +271,13 @@ static_assert(sizeof(AicoreLaunchArgs) == 40, "AicoreLaunchArgs size drift");
  * launch supplies a non-zero epoch; a kernel/persistent launch leaves it 0,
  * which selects the protocol that predates the stamp.
  */
-inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
-    args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
+inline void
+fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args, const AicoreRuntimeView &runtime) {
+    args.shared_state_addr = runtime.shared_state_addr;
+    args.worker_context_base = runtime.worker_context_base;
+    args.runtime_mode = runtime.runtime_mode;
+    args.worker_count = runtime.worker_count;
+    args.chip_swimlane_level = runtime.chip_swimlane_level;
     args.enable_profiling_flag = k_args.enable_profiling_flag;
     args.report_epoch = k_args.run_result_epoch;
 }

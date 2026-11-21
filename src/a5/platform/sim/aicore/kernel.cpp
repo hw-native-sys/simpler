@@ -163,7 +163,7 @@ extern "C" void sim_install_core_identity_setters(SimIdentitySetFn set_subblock_
 }
 
 // Declare the original function (defined in aicore_executor.cpp with weak linkage)
-void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
+void aicore_execute(AicoreRuntimeView runtime, int block_idx, CoreType core_type);
 
 // Wrapper with extern "C" for dlsym lookup. Mirrors the onboard kernel.cpp
 // KERNEL_ENTRY: receives launch arguments straight from the host, populates
@@ -242,7 +242,7 @@ extern "C" int aicore_execute_wrapper_checked(
     }
 
     const bool admitted = ready(startup, error);
-    if (error == 0 && admitted) aicore_execute(runtime, block_idx, core_type);
+    if (error == 0 && admitted) aicore_execute(runtime_aicore_view(&runtime->dev), block_idx, core_type);
     const int clear_error = state.clear();
     return error != 0 ? error : clear_error;
 }

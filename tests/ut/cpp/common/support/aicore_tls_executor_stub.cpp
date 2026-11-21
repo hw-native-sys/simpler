@@ -13,4 +13,4 @@
 #include "runtime.h"
 
 // Key lifetime tests link the production wrapper without starting an executor.
-void aicore_execute(Runtime *, int, CoreType) {}
+void aicore_execute(AicoreRuntimeView, int, CoreType) {}

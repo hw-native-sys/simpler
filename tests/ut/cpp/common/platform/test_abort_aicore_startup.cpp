@@ -28,8 +28,12 @@
 #include "scheduler/scheduler_types.h"
 #endif
 
-void aicore_execute(Runtime *, int, CoreType);
-Runtime::Runtime() { dev = {}; }
+void aicore_execute(AicoreRuntimeView, int, CoreType);
+Runtime::Runtime() :
+    dev{},
+    host_shared_state_{} {
+    dev.shared_state_addr = reinterpret_cast<uint64_t>(&host_shared_state_);
+}
 namespace {
 alignas(64) std::array<uint8_t, 0x10000> registers{};
 std::atomic<bool> reject_binding{false};
@@ -65,7 +69,7 @@ void rejected_launch(uint32_t mode, bool valid_base = true) {
         reject_binding = true;
         std::atomic<bool> core_returned{false};
         std::thread core([&] {
-            aicore_execute(runtime.get(), 0, CoreType::AIC);
+            aicore_execute(runtime_aicore_view(&runtime->dev), 0, CoreType::AIC);
             core_returned = true;
         });
         const int32_t allowed[] = {sched_getcpu()};
@@ -97,7 +101,7 @@ void rejected_launch(uint32_t mode, bool valid_base = true) {
         core.join();
         const auto terminal = device_run_result_terminal(result.result, report_epoch);
         if (terminal.state != DeviceRunTerminalState::Failed || terminal.code != -1) std::_Exit(27);
-        if (!core_returned || finishes != 3 || runtime->dev.workers[0].aicore_done != 0) std::_Exit(24);
+        if (!core_returned || finishes != 3 || runtime->get_workers()[0].aicore_done != 0) std::_Exit(24);
     }
     std::_Exit(0);
 }
@@ -142,7 +146,7 @@ TEST(AbortAicoreStartup, MissingReportOrAckDoesNotReleaseOrInvalidateCore) {
     registers.fill(0);
     std::array<uint64_t, PLATFORM_MAX_CORES> regs{};
     regs[0] = reinterpret_cast<uint64_t>(registers.data());
-    auto &report = runtime->dev.workers[0];
+    auto &report = runtime->get_workers()[0];
     report.physical_core_id = 0;
     report.aicore_done = 1;
     report.report_epoch = report_epoch - 1;
@@ -165,9 +169,9 @@ TEST(AbortAicoreStartup, DuplicatePhysicalReportNeverCreatesTwoRetirementOwners)
     std::array<uint64_t, PLATFORM_MAX_CORES> regs{};
     regs[0] = reinterpret_cast<uint64_t>(registers.data());
     for (int32_t i = 0; i < 2; ++i) {
-        runtime->dev.workers[i].physical_core_id = 0;
-        runtime->dev.workers[i].aicore_done = 1;
-        runtime->dev.workers[i].report_epoch = report_epoch;
+        runtime->get_workers()[i].physical_core_id = 0;
+        runtime->get_workers()[i].aicore_done = 1;
+        runtime->get_workers()[i].report_epoch = report_epoch;
     }
     expire_immediately = true;
     EXPECT_EQ(abort_aicore_startup(runtime.get(), reinterpret_cast<uint64_t>(regs.data()), report_epoch), -1);
@@ -175,7 +179,7 @@ TEST(AbortAicoreStartup, DuplicatePhysicalReportNeverCreatesTwoRetirementOwners)
     // the duplicate never became a second owner and no ACK released a report.
     EXPECT_EQ(read_reg(regs[0], RegId::DATA_MAIN_BASE), AICORE_EXIT_SIGNAL);
     EXPECT_EQ(runtime->get_teardown_gates()[0].post_close_release, 0u);
-    EXPECT_EQ(runtime->dev.workers[0].aicore_done, 1);
-    EXPECT_EQ(runtime->dev.workers[1].aicore_done, 1);
+    EXPECT_EQ(runtime->get_workers()[0].aicore_done, 1);
+    EXPECT_EQ(runtime->get_workers()[1].aicore_done, 1);
     expire_immediately = false;
 }

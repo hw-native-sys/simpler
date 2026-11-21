@@ -21,16 +21,16 @@ struct ProfileCompilation<> {
 #include "lane_loop.h"
 
 template <CoreType Architecture>
-__aicore__ void percounter_execute_profiled(__gm__ Runtime *runtime, int block_idx) {
+__aicore__ void percounter_execute_profiled(AicoreRuntimeView runtime, int block_idx) {
     simpler::percounter::percounter_scalar_bind(nullptr);
     simpler::percounter::percounter_aicore_execute(runtime, block_idx, Architecture);
 }
 
 #if defined(__DAV_CUBE__)
-template __aicore__ void percounter_execute_profiled<CoreType::AIC>(__gm__ Runtime *, int);
+template __aicore__ void percounter_execute_profiled<CoreType::AIC>(AicoreRuntimeView, int);
 #elif defined(__DAV_VEC__)
-template __aicore__ void percounter_execute_profiled<CoreType::AIV>(__gm__ Runtime *, int);
+template __aicore__ void percounter_execute_profiled<CoreType::AIV>(AicoreRuntimeView, int);
 #else
-template __aicore__ void percounter_execute_profiled<CoreType::AIC>(__gm__ Runtime *, int);
-template __aicore__ void percounter_execute_profiled<CoreType::AIV>(__gm__ Runtime *, int);
+template __aicore__ void percounter_execute_profiled<CoreType::AIC>(AicoreRuntimeView, int);
+template __aicore__ void percounter_execute_profiled<CoreType::AIV>(AicoreRuntimeView, int);
 #endif

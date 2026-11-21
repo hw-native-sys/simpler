@@ -77,18 +77,19 @@ int main(int argc, char **argv) {
     );
     NativeRunDescriptor descriptor{};
     descriptor.generation = descriptor.run_epoch = 1;
-    descriptor.prepare_purpose = capture ? SIMPLER_PREPARE_CAPTURE : SIMPLER_PREPARE_EAGER;
-    check(simpler_prepare_run(ctx, run, 0, &args, &config, &descriptor), "prepare");
-    RuntimeHandle reference = nullptr;
+    const auto prepare_run = capture ? simpler_prepare_caller_run : simpler_prepare_run;
+    check(prepare_run(ctx, run, 0, &args, &config, &descriptor), "prepare");
     aclmdlRI model = nullptr;
     if (capture) {
-        check(simpler_retain_run_resources(ctx, run, caller, &reference), "retain");
         check(aclmdlRICaptureBegin(caller, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL), "capture-begin");
     }
-    check(simpler_launch_run_on_stream(ctx, run, caller, nullptr), "launch");
+    check(
+        capture ? simpler_submit_run_on_stream(ctx, run, caller) :
+                  simpler_launch_run_on_stream(ctx, run, caller, nullptr),
+        "launch"
+    );
     if (capture) {
         check(aclmdlRICaptureEnd(caller, &model), "capture-end");
-        check(simpler_finalize_run(ctx, run), "finalize-recording");
         int32_t observed = 0;
         check(
             aclrtMemcpy(&observed, sizeof(observed), output, sizeof(observed), ACL_MEMCPY_DEVICE_TO_HOST),
@@ -118,7 +119,7 @@ int main(int argc, char **argv) {
     require(observed == 1, "success-consumer-output");
     if (capture) {
         check(aclmdlRIDestroy(model), "destroy-model");
-        check(simpler_release_run_resources(ctx, reference), "release-model-resources");
+        check(simpler_finalize_run(ctx, run), "finalize-original-run");
     } else {
         check(simpler_wait_run(ctx, run), "wait");
         check(simpler_finalize_run(ctx, run), "finalize");

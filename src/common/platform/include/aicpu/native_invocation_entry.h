@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <cstddef>
+
 #include "aicpu/platform_aicpu_affinity.h"
 
 // Shared invocation protocol; platform gates still decide which callbacks work.
@@ -21,12 +23,19 @@ struct NativeInvocationEntry {
     int32_t (*begin)(int32_t, uint64_t, uint64_t);
     void (*reset)();
     int32_t (*finish)(int32_t, int32_t);
+    const void *execution_image{nullptr};
+    int32_t (*restore_execution_image)(const void *, size_t){nullptr};
+    size_t execution_image_bytes{0};
 
     static int32_t initialize(void *opaque) {
         auto &entry = *static_cast<NativeInvocationEntry *>(opaque);
         if (entry.begin == nullptr || entry.reset == nullptr || entry.finish == nullptr) return -1;
         const int32_t rc = entry.begin(entry.callbacks, entry.result_base, entry.result_epoch);
         entry.reset();
+        if (rc == 0 && entry.execution_image != nullptr) {
+            if (entry.restore_execution_image == nullptr) return -1;
+            return entry.restore_execution_image(entry.execution_image, entry.execution_image_bytes);
+        }
         return rc;
     }
     AicpuEntryGateInitializer initializer() { return {initialize, this}; }

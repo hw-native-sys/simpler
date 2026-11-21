@@ -69,7 +69,7 @@ __attribute__((weak)) __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlan
     return s_chip_swimlane_aicore_head;
 }
 
-extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
+extern __aicore__ void aicore_execute(AicoreRuntimeView runtime, int block_idx, CoreType core_type);
 
 /**
  * Kernel entry point with control loop
@@ -88,7 +88,7 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  * GM read. The host builds that block after collector arming, which is what
  * makes these addresses this run's final ones.
  *
- * @param runtime_args Device address of this run's Runtime image
+ * @param shared_state_addr Device address of this run's shared worker state
  * @param enable_profiling_flag Profiling umbrella bitmask for this run
  * @param ffts_base_addr FFTS base for cross-core sync inside user kernels
  * @param chip_swimlane_aicore_rotation_table Device address of the
@@ -97,8 +97,9 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  *        pre-existing kernel/persistent report protocol
  */
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
-    uint64_t runtime_args, uint32_t enable_profiling_flag, uint64_t ffts_base_addr,
-    uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch
+    uint64_t shared_state_addr, uint32_t enable_profiling_flag, uint64_t ffts_base_addr,
+    uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch, uint64_t worker_context_base,
+    uint32_t runtime_mode, int32_t worker_count, uint32_t chip_swimlane_level
 ) {
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
@@ -146,5 +147,8 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
         set_chip_swimlane_aicore_head_slot(nullptr);
     }
 
-    aicore_execute(reinterpret_cast<__gm__ Runtime *>(runtime_args), block_idx, core_type);
+    aicore_execute(
+        AicoreRuntimeView{shared_state_addr, worker_context_base, runtime_mode, worker_count, chip_swimlane_level, 0},
+        block_idx, core_type
+    );
 }

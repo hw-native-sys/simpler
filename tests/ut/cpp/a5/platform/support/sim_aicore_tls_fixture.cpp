@@ -27,11 +27,14 @@ uint64_t expected_epoch;
 uint64_t register_addresses[kWorkers];
 }  // namespace
 
-// The wrapper reads only worker_count; this fixture uses the real Runtime type
-// without bringing an orchestrator or scheduler into the loadable module.
-Runtime::Runtime() = default;
+// The wrapper projects launch configuration without entering a runtime executor.
+Runtime::Runtime() :
+    dev{},
+    host_shared_state_{} {
+    dev.shared_state_addr = reinterpret_cast<uint64_t>(&host_shared_state_);
+}
 
-void aicore_execute(Runtime *, int block_idx, CoreType) {
+void aicore_execute(AicoreRuntimeView, int block_idx, CoreType) {
     if (get_aicore_report_epoch() != expected_epoch || sim_get_physical_core_id() != static_cast<uint32_t>(block_idx) ||
         reinterpret_cast<uintptr_t>(sim_get_reg_base()) != register_addresses[block_idx] ||
         get_aicore_pmu_reg_base() != register_addresses[block_idx] || get_aicore_profiling_flag() != 0 ||

@@ -17,8 +17,8 @@
  * the arch's own `device_runner.h` rather than being declared here.
  *
  * Current contents:
- *   - `KernelArgsHelper`: host-side `KernelArgs` wrapper with device-memory
- *     management for the H2D `Runtime` and `KernelArgs` copies.
+ *   - `KernelArgsHelper`: per-run launch snapshots, packet section offsets and
+ *     borrowed views of slot-owned shared device state.
  *
  * Future migrations:
  *   - `DeviceRunnerBase` (lifecycle + registration + profiling init).
@@ -91,8 +91,8 @@ int query_stream_pair_error(rtStream_t aicpu_stream, rtStream_t aicore_stream);
  * Pass the same stream handle the launch will submit on, resolved and about to
  * be used, so the answer describes the stream that actually carries the launch.
  *
- * The common eager launch passes its actual AICPU stream, for either device
- * ownership policy. Captured launches remain outside this contract.
+ * Program eager passes its actual AICPU stream. Kernel delivers its launch
+ * inputs through RTS in both eager and recording.
  */
 bool launch_entry_args_permitted(rtStream_t aicpu_stream);
 
@@ -170,21 +170,13 @@ struct SlotPersistentArgs {
     // Bind hands owned metadata values to prepare; launch consumes them once.
     RuntimeLaunchMetadata staged_launch_metadata;
 
-    Runtime *runtime_args{nullptr};  // device block holding the Runtime descriptor
+    RuntimeSharedState *shared_state{nullptr};
+    Runtime *runtime_args{nullptr};  // Program descriptor; Kernel descriptors belong to RTS
     uint64_t runtime_bytes{0};       // committed length: the full device extent, not a published prefix
 
-    // Whether THIS block's handshake initialization has been established.
-    //
-    // It states a fact about the allocation named above, not about the slot:
-    // the field lives here so it is adopted, released and abandoned with the
-    // pointer it describes, and the two teardown paths reset the whole struct
-    // rather than named fields, so a later block cannot inherit a predecessor's
-    // verdict. Replayable preparation commits it after synchronous initialization.
-    // Program publication commits it after the initializing copy is accepted
-    // into the stream, with both readers ordered after it by the entry fork.
-    // A failed initializing copy leaves it false. Slot reuse requires retirement
-    // of the previous run, never just an accepted publication.
+    // Initialization precedes use and never overwrites a live core report.
     bool workers_initialized{false};
+    bool worker_initialization_pending{false};
     EntryCacheQualification entry_cache_qualification;
     // Survives failed submissions and failed frees of this allocation.
     bool entry_cmo_may_have_trimmed{false};
@@ -272,11 +264,15 @@ struct KernelArgsHelper {
         runtime_image_(std::move(other.runtime_image_)),
         launch_metadata_(std::move(other.launch_metadata_)),
         runtime_args_state_(std::exchange(other.runtime_args_state_, RuntimeArgsState::Empty)),
-        initializing_slot_(std::exchange(other.initializing_slot_, nullptr)),
         slot_(std::exchange(other.slot_, nullptr)),
         plan_(other.plan_),
         kernel_invocation_(std::move(other.kernel_invocation_)),
         graph_section_bytes_(std::exchange(other.graph_section_bytes_, 0)),
+        launch_owned_runtime_(std::exchange(other.launch_owned_runtime_, false)),
+        runtime_launch_bytes_(std::exchange(other.runtime_launch_bytes_, 0)),
+        runtime_launch_image_(std::move(other.runtime_launch_image_)),
+        execution_image_package_(std::move(other.execution_image_package_)),
+        aicore_view_(other.aicore_view_),
         launch_payload_(nullptr),
         launch_payload_bytes_(std::exchange(other.launch_payload_bytes_, 0)) {
         // The payload points either into the slot's staging or at this object's
@@ -294,14 +290,10 @@ struct KernelArgsHelper {
     KernelArgs args;
     MemoryAllocator *allocator_{nullptr};
 
-    // Reserve the slot's destination and snapshot this invocation's device-read
-    // descriptor. An unpublished snapshot rejects another prepare without
-    // changing its source, destination, or allocator. After publication or
-    // release, a fresh prepare withdraws the previous publication status.
-    // Replayable allocations initialize their handshake region synchronously
-    // before capture; their recorded publications exclude device-owned words.
+    // Program reserves a device descriptor and pinned publication source.
+    // Kernel carries the descriptor through RTS; both retain shared-state backing.
     int prepare_runtime_args(
-        const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, bool replayable = false
+        const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, bool kernel_mode = false
     );
 
     int prepare_kernel_invocation(const simpler::tmr::KernelCallableIdentity &identity);
@@ -310,12 +302,8 @@ struct KernelArgsHelper {
      * Consume the snapshot by enqueueing metadata H2D on `stream`, having recorded
      * which route this run's entry values take.
      *
-     * `launch_route_permitted` says the caller has established that this
-     * launch may carry the values as launch arguments — on the streams this
-     * repo owns, that this run's own AICPU stream is not capturing. It is a
-     * permission, not a request: a runtime with no launch route, and the first
-     * publication onto a block (which sends the whole initialized prefix
-     * anyway), stay on the descriptor route regardless.
+     * `launch_route_permitted` admits an entry-argument package on the target
+     * stream. Kernel invocations require it; retained recording owns its payload.
      *
      * Everything published comes from the snapshot taken at prepare. The route
      * decision and this run's counts are patched into it; nothing is re-read
@@ -337,20 +325,21 @@ struct KernelArgsHelper {
     // This verdict covers the Runtime descriptor and staged launch metadata,
     // not late DFX publication.
     bool runtime_args_published() const {
-        return runtime_args_state_ == RuntimeArgsState::Published && args.runtime_args != nullptr;
+        return runtime_args_state_ == RuntimeArgsState::Published && slot_ != nullptr && slot_->shared_state != nullptr;
     }
 
     // Whether this run holds a snapshot that has yet to be published. A launch
     // entry admits this as well as Published, because publication is what the
     // launch does first; only a kernel submission requires Published.
     bool runtime_args_prepared() const {
-        return runtime_args_state_ == RuntimeArgsState::Prepared && args.runtime_args != nullptr;
+        return runtime_args_state_ == RuntimeArgsState::Prepared && slot_ != nullptr && slot_->shared_state != nullptr;
     }
 
     // What a launch entry admits: a run that has published, or one that still
     // can. Both arches gate on this, so the two cannot disagree about which
     // states reach a launch.
     bool launchable() const { return runtime_args_prepared() || runtime_args_published(); }
+    bool uses_rts_runtime_args() const { return launch_owned_runtime_; }
 
     /**
      * The AICPU launch payload and its length for this run.
@@ -369,6 +358,11 @@ struct KernelArgsHelper {
      */
     void *launch_payload();
     size_t launch_payload_bytes() const { return launch_payload_bytes_; }
+    bool has_execution_image() const { return launch_metadata_.has_execution_image(); }
+    const AicoreRuntimeView &aicore_view() const { return aicore_view_; }
+    const void *runtime_launch_data() const { return runtime_launch_image_.data(); }
+    size_t runtime_launch_bytes() const { return runtime_launch_image_.size(); }
+    RuntimeSharedState *shared_state() const { return slot_ != nullptr ? slot_->shared_state : nullptr; }
 
     void set_entry_cache_epoch(uint64_t epoch) { entry_cache_epoch_ = epoch; }
 
@@ -381,13 +375,18 @@ struct KernelArgsHelper {
     void release_run_view() {
         runtime_image_.clear();
         launch_metadata_.clear();
+        std::vector<std::byte>().swap(execution_image_package_);
         runtime_args_state_ = RuntimeArgsState::Empty;
         args.runtime_args = nullptr;
+        args.runtime_descriptor_bytes = 0;
+        args.runtime_section = {};
         args.entry_cache_maintenance = static_cast<uint32_t>(EntryCacheMaintenance::Full);
-        initializing_slot_ = nullptr;
         slot_ = nullptr;
         plan_ = LaunchEntryArgsPlan{};
         kernel_invocation_.clear();
+        launch_owned_runtime_ = false;
+        runtime_launch_bytes_ = 0;
+        runtime_launch_image_.clear();
         launch_payload_ = nullptr;
         launch_payload_bytes_ = 0;
     }
@@ -420,12 +419,6 @@ private:
     RuntimeLaunchMetadata launch_metadata_;
     RuntimeArgsState runtime_args_state_{RuntimeArgsState::Empty};
 
-    // The slot awaiting asynchronous handshake initialization through Program
-    // publication. Successful publication commits workers_initialized through it.
-    // Null for an already initialized block, including one initialized
-    // synchronously by replayable preparation.
-    SlotPersistentArgs *initializing_slot_{nullptr};
-
     // The slot this run prepared against, which owns both the destination and
     // the host staging a launch package is built in. Held for the whole run
     // because publication happens at launch, by which time the caller's
@@ -441,6 +434,13 @@ private:
     // staged length agrees with it, so a length a failed prepare left staged
     // cannot be adopted by the next run on this slot.
     uint32_t graph_section_bytes_{0};
+    bool launch_owned_runtime_{false};
+    size_t runtime_launch_bytes_{0};
+    std::vector<std::byte> runtime_launch_image_;
+    // The combined package is temporary Host storage of the original run.
+    // The retained submission slot is also used by models after that run ends.
+    std::vector<std::byte> execution_image_package_;
+    AicoreRuntimeView aicore_view_{};
 
     void *launch_payload_{nullptr};
     size_t launch_payload_bytes_{0};
@@ -464,21 +464,20 @@ private:
  * An already-published run is an idempotent no-op.
  */
 int publish_for_launch(
-    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording = false
+    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording = false,
+    bool kernel_mode = false
 );
 
-enum class RuntimeWorkerInit { OnPublication, BeforeRecording, DuringRecording };
-
 /**
- * Reserve the slot's fixed Runtime device extent and pinned publication span.
- * Metadata bytes extend the pinned span only. Replayable backing needs a
- * one-time initialization of its private worker reports before publication.
+ * Reserve shared worker state and initialize its reports once. Program also
+ * reserves a device descriptor; Kernel descriptors live in RTS launch arguments.
+ * Pinned sources cover only the descriptor/metadata actually published by DMA.
  * Failed frees retain ownership. Failed allocations preserve committed device
  * storage and leave missing pinned backing retryable.
  */
 int reserve_slot_runtime_args(
     const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, uint64_t metadata_bytes,
-    RuntimeWorkerInit worker_init = RuntimeWorkerInit::OnPublication, int *capture_mode_restore_error = nullptr
+    bool launch_owned = false
 );
 
 /**

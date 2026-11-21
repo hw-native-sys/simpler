@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""TMR replay through native launch and common prepared-resource retention."""
+"""TMR replay with caller-owned native runs."""
 
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ _ROOT = Path(__file__).resolve().parents[3]
 _COUNT = 128 * 128
 _BYTES = _COUNT * ctypes.sizeof(ctypes.c_float)
 _POISON = -123.0
-_PREPARE_CAPTURE = 1
 pytestmark = pytest.mark.runtime("tensormap_and_ringbuffer")
 
 
@@ -55,10 +54,7 @@ def _fatal_callable(arch):
 
 
 def _bind(lib):
-    lib.simpler_set_run_resource_grant_ctx.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    lib.simpler_retain_run_resources.argtypes = [ctypes.c_void_p] * 3 + [ctypes.POINTER(ctypes.c_void_p)]
-    lib.simpler_release_run_resources.argtypes = [ctypes.c_void_p] * 2
-    lib.simpler_launch_run_on_stream.argtypes = [ctypes.c_void_p] * 4
+    lib.simpler_submit_run_on_stream.argtypes = [ctypes.c_void_p] * 3
     lib.aclrtCreateStream.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
     lib.aclrtDestroyStream.argtypes = [ctypes.c_void_p]
     lib.aclrtSynchronizeStreamWithTimeout.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -81,14 +77,13 @@ def _bind(lib):
 
 
 class _Recording:
-    def __init__(self, lib, ctx, caller, config, epoch, slot, *, capture=True):
+    def __init__(self, lib, ctx, caller, epoch):
         from simpler.task_interface import AddressSpace, ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
         self.lib, self.ctx, self.caller = lib, ctx, caller
         self.device = [ctypes.c_void_p() for _ in range(3)]
         self.host = [ctypes.c_void_p() for _ in range(3)]
         self.views = []
-        self.reference = ctypes.c_void_p()
         for device, host in zip(self.device, self.host):
             assert lib.aclrtMalloc(ctypes.byref(device), _BYTES, 0) == 0
             assert lib.aclrtMallocHost(ctypes.byref(host), _BYTES) == 0
@@ -96,38 +91,28 @@ class _Recording:
             self.views.append((ctypes.c_float * _COUNT).from_address(host.value))
         self.views[2][:] = [_POISON] * _COUNT
         assert lib.aclrtMemcpy(self.device[2], _BYTES, self.host[2], _BYTES, 1) == 0
-        args = ChipStorageTaskArgs()
+        self.args = ChipStorageTaskArgs()
         for ptr in self.device:
-            args.add_tensor(ChipTensor.make(ptr.value, (_COUNT,), DataType.FLOAT32, address_space=AddressSpace.DEVICE))
+            self.args.add_tensor(
+                ChipTensor.make(ptr.value, (_COUNT,), DataType.FLOAT32, address_space=AddressSpace.DEVICE)
+            )
         self.storage, self.run = _native_run_storage(lib)
-        descriptor = NativeRunDescriptor(
-            pipeline_slot=slot,
-            generation=1,
-            dispatch_id=epoch,
-            run_epoch=epoch,
-            prepare_purpose=_PREPARE_CAPTURE if capture else 0,
-        )
+        self.descriptor = NativeRunDescriptor(generation=epoch, dispatch_id=epoch, run_epoch=epoch)
+
+    def record(self, config):
         assert (
-            lib.simpler_prepare_run(ctx, self.run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
+            self.lib.simpler_prepare_caller_run(
+                self.ctx, self.run, 0, self.args.__ptr__(), ctypes.byref(config), ctypes.byref(self.descriptor)
+            )
             == 0
         )
-        if capture:
-            retain_rc = lib.simpler_retain_run_resources(ctx, self.run, caller, ctypes.byref(self.reference))
-            assert retain_rc == 0, f"simpler_retain_run_resources failed: {retain_rc}"
-            assert self.reference.value is not None
-        # The launch consumes its prepared snapshot, not this mutable source object.
-        args.clear()
-        args.add_scalar(111)
-
-    def record(self):
+        # Mutate the argument source after prepare, before recording the node.
+        self.args.clear()
+        self.args.add_scalar(111)
         for index in range(2):
             assert self.lib.aclrtMemcpyAsync(self.device[index], _BYTES, self.host[index], _BYTES, 1, self.caller) == 0
-        assert self.lib.simpler_launch_run_on_stream(self.ctx, self.run, self.caller, None) == 0
+        assert self.lib.simpler_submit_run_on_stream(self.ctx, self.run, self.caller) == 0
         assert self.lib.aclrtMemcpyAsync(self.host[2], _BYTES, self.device[2], _BYTES, 2, self.caller) == 0
-
-    def retire_original_run(self):
-        assert self.lib.simpler_finalize_run(self.ctx, self.run) == 0
-        ctypes.memset(ctypes.addressof(self.storage), 0xA5, ctypes.sizeof(self.storage))
 
     def check_not_executed(self):
         assert self.lib.aclrtMemcpy(self.host[2], _BYTES, self.device[2], _BYTES, 2) == 0
@@ -145,8 +130,7 @@ class _Recording:
         assert all(result == expected for result in self.views[2]), (value, list(self.views[2][:8]), expected)
 
     def close(self):
-        if self.reference.value:
-            assert self.lib.simpler_release_run_resources(self.ctx, self.reference) == 0
+        assert self.lib.simpler_finalize_run(self.ctx, self.run) == 0
         for ptr in self.device:
             assert self.lib.aclrtFree(ptr) == 0
         for ptr in self.host:
@@ -156,14 +140,11 @@ class _Recording:
 class _Model:
     def __init__(self, lib, ctx, caller, config, epochs):
         self.lib, self.caller = lib, caller
-        self.nodes = [_Recording(lib, ctx, caller, config, epoch, slot) for slot, epoch in enumerate(epochs)]
+        self.nodes = [_Recording(lib, ctx, caller, epoch) for epoch in epochs]
         self.model = ctypes.c_void_p()
         assert lib.aclmdlRICaptureBegin(caller, 0) == 0
         for node in self.nodes:
-            node.record()
-            # Retained resources outlive the recording handle; no device wait
-            # or private-result observation is needed to record the next node.
-            node.retire_original_run()
+            node.record(config)
         assert lib.aclmdlRICaptureEnd(caller, ctypes.byref(self.model)) == 0
         assert self.model.value is not None
         for node in self.nodes:
@@ -193,8 +174,6 @@ def _run(arch, device, scenario):
     contexts = _CallerContexts(lib, device)
     ctx, caller = lib.create_device_context(), ctypes.c_void_p()
     assert ctx
-    if scenario == "two-nodes":
-        assert lib.simpler_set_run_resource_grant_ctx(ctx, 2) == 0
     assert lib.aclrtCreateStream(ctypes.byref(caller)) == 0
     aicpu, aicore, dispatcher = _binaries(arch, "tensormap_and_ringbuffer")
     config = CallConfig(aicpu_thread_num=2)

@@ -118,6 +118,44 @@ TEST(AutoAdmissionCapacity, TheExploratorySetIsWithheldWhileAGrowerHoldsTheToken
     EXPECT_EQ(state->affordable_sets(kDirectory), 2u);
 }
 
+// The recorded cost is what the set's commit reported, and withdrawing the
+// proof withdraws the figure with it: a slot that cannot carry a run has no
+// footprint to estimate the next one from.
+TEST(AutoAdmissionCost, AProvenSetKeepsTheCostItsCommitReported) {
+    AutoAdmissionState state;
+    state.configure(kDirectory);
+    RunResourceCost cost;
+    cost.heap_bytes = 100;
+    cost.image_bytes = 40;
+    cost.shared_memory_bytes = 10;
+    cost.scheduler_bytes = 5;
+    cost.reported_bytes = 7;
+    state.note_proven(0, cost);
+    const RunResourceCost recorded = state.proven_cost(0);
+    EXPECT_EQ(recorded.heap_bytes, 100u);
+    EXPECT_EQ(recorded.image_bytes, 40u);
+    EXPECT_EQ(recorded.shared_memory_bytes, 10u);
+    EXPECT_EQ(recorded.scheduler_bytes, 5u);
+    EXPECT_EQ(recorded.reported_bytes, 7u);
+    EXPECT_EQ(recorded.budgeted_bytes(), 150u);
+    EXPECT_EQ(recorded.total_bytes(), 162u);
+    state.clear_proven(0);
+    EXPECT_FALSE(state.proven_cost(0).any());
+}
+
+// Footprints include shared regions and cannot predict incremental allocations.
+TEST(AutoAdmissionCost, LargeSharedFootprintsDoNotWithholdTheExploratorySet) {
+    AutoAdmissionState state;
+    state.configure(kDirectory);
+    RunResourceCost cost;
+    cost.heap_bytes = 1ull << 40;
+    state.note_proven(0, cost);
+    EXPECT_EQ(state.affordable_sets(kDirectory), 2u);
+    state.note_proven(1, cost);
+    EXPECT_EQ(state.max_proven_cost().heap_bytes, cost.heap_bytes);
+    EXPECT_EQ(state.affordable_sets(kDirectory), 3u);
+}
+
 // One grower per context, and the holder keeps it across its own stages: a plan
 // that grows its inputs and then its regions is one growth attempt.
 TEST(AutoAdmissionToken, OneGrowerAtATimeAndTheHolderIsIdempotent) {

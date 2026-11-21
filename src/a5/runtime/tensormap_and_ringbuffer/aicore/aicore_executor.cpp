@@ -64,8 +64,10 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Dispat
  * @param block_idx Block index (core ID)
  * @param core_type Core type (AIC or AIV)
  */
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
-    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
+__aicore__ __attribute__((weak)) void aicore_execute(AicoreRuntimeView runtime, int block_idx, CoreType core_type) {
+    __gm__ Handshake *my_hank =
+        (__gm__ Handshake *)(&reinterpret_cast<__gm__ RuntimeSharedState *>(runtime.shared_state_addr)
+                                  ->workers[block_idx]);
 
     // Phase 1: report physical core ID + core type and signal done in one write,
     // with no wait for the AICPU — both fields are self-known. The AICPU opens
@@ -107,7 +109,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Entry rejection can cancel before tasks or profiling state are published.
     // Acknowledge without accessing those buffers or writing an initial IDLE.
     if (read_reg(RegId::DATA_MAIN_BASE) == AICORE_EXIT_SIGNAL) {
-        acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+        acknowledge_aicore_cond_nonce_and_wait(
+            &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime.shared_state_addr)->teardown_gates[block_idx]
+        );
         return;
     }
     // Report initial idle status via register (the window is now open).
@@ -269,5 +273,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     // Flush all dirty cache lines to HBM before kernel exit.
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+    acknowledge_aicore_cond_nonce_and_wait(
+        &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime.shared_state_addr)->teardown_gates[block_idx]
+    );
 }

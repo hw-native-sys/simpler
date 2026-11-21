@@ -40,7 +40,7 @@ inline int32_t abort_aicore_startup(Runtime *runtime, uint64_t regs_base, uint64
     const uint64_t discovery_deadline = platform_aicore_exit_deadline();
     do {
         for (int32_t i = 0; i < total; ++i) {
-            auto *report = &runtime->dev.workers[i];
+            auto *report = &runtime->get_workers()[i];
             if (observed[i] || !aicore_report_accepted(report, epoch)) continue;
             rmb();
             observed[i] = true;
@@ -53,7 +53,7 @@ inline int32_t abort_aicore_startup(Runtime *runtime, uint64_t regs_base, uint64
             for (size_t j = 0; j < count; ++j)
                 duplicate |= targets[j].reg_addr == regs[physical];
             if (duplicate) continue;
-            // `i` indexes both runtime->dev.workers and teardown_gates. The
+            // `i` indexes both runtime->get_workers() and teardown_gates. The
             // core-side exit path acknowledges through teardown_gates[block_idx],
             // so this path relies on the launch block index and the worker report
             // index being the same, as the normal retirement path does.
@@ -70,7 +70,7 @@ inline int32_t abort_aicore_startup(Runtime *runtime, uint64_t regs_base, uint64
     const int32_t retire_rc = platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline(), released);
     for (size_t i = 0; i < count; ++i) {
         if (!released[i]) continue;
-        auto *report = &runtime->dev.workers[ids[i]];
+        auto *report = &runtime->get_workers()[ids[i]];
         report->aicore_done = 0;
         report->aicpu_ready = 0;
         cache_flush_range(report, sizeof(*report));

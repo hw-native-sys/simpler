@@ -637,22 +637,12 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
-def test_simulated_capture_retention_is_unsupported(arch: str, runtime: str):
+def test_simulated_caller_owned_runs_are_unsupported(arch: str, runtime: str):
     lib = _load(arch, "sim", runtime)
-    lib.simpler_retain_run_resources.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    lib.simpler_retain_run_resources.restype = ctypes.c_int
-    lib.simpler_release_run_resources.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    lib.simpler_release_run_resources.restype = ctypes.c_int
-    reference = ctypes.c_void_p(1)
-    assert lib.simpler_retain_run_resources(None, None, None, ctypes.byref(reference)) == PTO_RUNTIME_ERR_UNSUPPORTED
-    assert reference.value is None
-    assert lib.simpler_retain_run_resources(None, None, None, None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    assert lib.simpler_release_run_resources(None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
+    _native_run_storage(lib)
+    lib.simpler_submit_run_on_stream.argtypes = [ctypes.c_void_p] * 3
+    assert lib.simpler_prepare_caller_run(None, None, 0, None, None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
+    assert lib.simpler_submit_run_on_stream(None, None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
@@ -1435,7 +1425,6 @@ class NativeRunDescriptor(ctypes.Structure):
         ("accepted_value", ctypes.c_int32),
         ("joinable_boundary", ctypes.c_uint32),
         ("provenance", NativeRunProvenance),
-        ("prepare_purpose", ctypes.c_uint32),
         ("ccu_workspace_addr", ctypes.c_uint64),
     ]
 
@@ -1513,6 +1502,7 @@ def _native_run_storage(lib):
         ctypes.POINTER(CallConfig),
         ctypes.POINTER(NativeRunDescriptor),
     ]
+    lib.simpler_prepare_caller_run.argtypes = lib.simpler_prepare_run.argtypes
     for name in ("simpler_finalize_run", "simpler_launch_run"):
         getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     return storage, run

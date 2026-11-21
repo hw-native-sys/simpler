@@ -62,6 +62,7 @@ void RunResourceGrowth::rollback_claims() {
 }
 
 std::size_t RunResourceGrowth::trim_idle_sets(uint32_t requesting_slot) {
+    endpoint_.trim_idle_scratch();
     const std::size_t granted = endpoint_.run_resource_sets();
     if (granted == 0) return 0;
 

@@ -26,9 +26,14 @@ int main(int argc, char **argv) {
     const auto before_budget = fixture.report("before-refusal");
     const auto before = launch_counts();
     require(before.core > 0 && before.cpu > 0, "launch-observer-reached");
-    const int rc = fixture.prepare(fixture.models[0], workspace_budget * 2);
+    Model refused;
+    refused.output = fixture.models[0].output;
+    const int rc = fixture.prepare(refused, workspace_budget * 2);
     std::printf("workspace-refusal rc=%d accepted=%d\n", rc, fixture.accepted);
-    require(rc == SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE, "typed-workspace-refusal");
+    require(
+        rc == (fixture.tmr ? SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE : PTO_RUNTIME_ERR_INVALID_ARGUMENT),
+        "typed-workspace-refusal"
+    );
     require(fixture.accepted == 0 && launch_counts() == before, "refusal-before-kernel-submission");
     check(simpler_abort_run_plan_ctx(fixture.context, 0, fixture.epoch), "abort-only-refused-plan");
     const auto after_budget = fixture.report("after-refusal-abort");

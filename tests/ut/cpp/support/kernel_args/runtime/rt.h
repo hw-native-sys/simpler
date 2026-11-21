@@ -13,6 +13,10 @@
 
 #include <cstdint>
 
+struct rtHostInputInfo_t {
+    uint32_t addrOffset;
+    uint32_t dataOffset;
+};
 using rtStream_t = void *;
 using rtError_t = int32_t;
 constexpr rtError_t RT_ERROR_NONE = 0;

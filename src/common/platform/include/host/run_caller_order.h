@@ -187,9 +187,9 @@ public:
         return 0;
     }
 
-    // The external owner has ended the graph and every in-flight execution.
-    // Recording uses the caller as its CPU stream, so it owns no cross-run ref.
-    int end_recording(const NativeRunIdentity &id) {
+    // The external owner has ended all uses and drained execution.
+    // External submission uses the caller as its CPU stream without a cross-run reference.
+    int end_external_use(const NativeRunIdentity &id) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!active_) return 0;
         if (!owns(id) || reference_.valid() || streams_[Caller] != streams_[Aicpu])

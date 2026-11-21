@@ -51,7 +51,7 @@ def test_failed_replay_preserves_native_and_device_logs(capture_module, tmp_path
     request = SimpleNamespace(config=SimpleNamespace(getoption=lambda _: "0"))
     for _ in range(2):
         with pytest.raises(AssertionError):
-            capture_module.test_hbg_model_replays_after_host_finalize((tmp_path, [str(driver)]), request, 12)
+            capture_module.test_hbg_model_replays_with_original_run((tmp_path, [str(driver)]), request, 12)
     runs = list((tmp_path / "outputs/hbg-capture").glob("scenario-12-*"))
     assert len(runs) == 2
     assert (runs[0] / "stdout.log").read_bytes() == (runs[1] / "stdout.log").read_bytes()
@@ -73,7 +73,7 @@ def test_timed_out_replay_keeps_partial_streams(capture_module, tmp_path, monkey
     monkeypatch.setattr(capture_module.subprocess, "run", timeout)
     request = SimpleNamespace(config=SimpleNamespace(getoption=lambda _: "0"))
     with pytest.raises(subprocess.TimeoutExpired) as failure:
-        capture_module.test_hbg_model_replays_after_host_finalize((tmp_path, ["driver"]), request, 12)
+        capture_module.test_hbg_model_replays_with_original_run((tmp_path, ["driver"]), request, 12)
     assert failure.value.timeout == 180
     runs = list((tmp_path / "outputs/hbg-capture").glob("scenario-12-*"))
     assert len(runs) == 1

@@ -267,9 +267,11 @@ concurrent device execution by itself:
 
 | Resource class | Copies | Selection |
 | -------------- | -----: | --------- |
-| `HOST_PER_RUN` | `pipeline_depth` | lease `slot_id` |
-| `DEVICE_SCRATCH` | 1 | slot 0 |
-| `EXEC_HANDLE` | `pipeline_depth` | lease `slot_id`, plus any hardware-generation key |
+| `DELIVERED` | `pipeline_depth` | lease `slot_id` |
+| `SCRATCH` | 1 | slot 0 |
+| `POOLED_SCRATCH` | 1 per context | shared GM heap lease; ordered device execution |
+| `EXEC_HANDLE` | 1 per execution role | runner-owned; not slot-indexed |
+| `REPORTED` | 1 per `run_epoch` | `run_epoch` (declared in ABI v2; no runtime declares it yet) |
 
 A run-owned lease is `{slot_id, generation}`. `RunResourceArena` mints it and
 is the authority on ownership: releasing the current lease is idempotent, while

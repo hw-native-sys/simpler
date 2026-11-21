@@ -82,9 +82,9 @@ class DeviceRunner : public DeviceRunnerBase {
     friend class RunRetentionProbePeer;
 
 public:
-    bool supports_pmu_capture() const override { return SIMPLER_DFX != 0; }
-    bool supports_swimlane_capture() const override { return SIMPLER_DFX != 0; }
-    bool supports_args_dump_capture() const override { return SIMPLER_DFX != 0; }
+    bool supports_caller_pmu() const override { return SIMPLER_DFX != 0; }
+    bool supports_caller_swimlane() const override { return SIMPLER_DFX != 0; }
+    bool supports_caller_args_dump() const override { return SIMPLER_DFX != 0; }
 
     DeviceRunner() = default;
     int acquire_scheduler_notifications(
@@ -154,7 +154,6 @@ public:
      * a5 fills the per-core register table only: it has no ffts_base_addr
      * field. The table is allocated on `mem_alloc_`.
      */
-    int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
 
     // `upload_chip_callable_buffer`, `register_callable`,
     // `record_host_orch_callable`, `unregister_callable`, `has_callable`,

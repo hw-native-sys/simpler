@@ -26,7 +26,11 @@
 extern "C" int initialize_aicore_sim_tls();
 // The production wrapper is linked against a stub executor.
 // Only the wrapper and its inline worker-count accessor run in this fixture.
-Runtime::Runtime() {}
+Runtime::Runtime() :
+    dev{},
+    host_shared_state_{} {
+    dev.shared_state_addr = reinterpret_cast<uint64_t>(&host_shared_state_);
+}
 static std::atomic<int> reject_binding_after{-1};
 static std::atomic<int> executor_calls{0};
 static std::atomic<int> pthread_writes{0};
@@ -53,7 +57,7 @@ extern "C" int __wrap_pthread_setspecific(pthread_key_t key, const void *value) 
     if (value != nullptr && reject_binding_after.fetch_sub(1) == 0) return ENOMEM;
     return __real_pthread_setspecific(key, value);
 }
-void aicore_execute(Runtime *, int, CoreType) {
+void aicore_execute(AicoreRuntimeView, int, CoreType) {
     ++executor_calls;
     const int before = pthread_writes.load();
     set_aicore_profiling_flag(17);
