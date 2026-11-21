@@ -507,6 +507,7 @@ void SchedulerContext::check_running_cores_for_completion(
         // 3. Update tracker bitmap
         bool is_idle = (core.running_reg_task_id == AICPU_TASK_INVALID);
         if (is_idle) {
+            local_lanes_[thread_idx].needs_idle_scan = true;
             tracker.change_core_state(bit_pos);       // Mark idle
             tracker.clear_pending_occupied(bit_pos);  // Idle safeguard: no payload to protect
         } else if (t.pending_freed && core.pending_reg_task_id == AICPU_TASK_INVALID) {
@@ -534,11 +535,16 @@ void SchedulerContext::check_running_cores_for_completion(
 // Two-phase protocol: CAS 0 -> -1 (sentinel) to claim ownership, store task and
 // reset staging state, then release-store block_num. Other threads acquire-load
 // sync_start_pending; seeing block_num > 0 ensures all relaxed stores are visible.
-bool SchedulerContext::enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num) {
+bool SchedulerContext::enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num, bool admission_owned) {
+    uint64_t admission = 0;
+    if (!admission_owned && !begin_ss_admission(admission)) return false;
+    admission = ready_sync_.state.load(std::memory_order_relaxed);
+    ready_sync_.state.store(admission_with_mode(admission, AdmissionMode::LEGACY), std::memory_order_release);
     int32_t expected = 0;
     if (!drain_state_.sync_start_pending.compare_exchange_strong(
             expected, -1, std::memory_order_acquire, std::memory_order_relaxed
         )) {
+        finish_ss_admission();
         return false;  // Another thread already holds the drain slot.
     }
     // Advance the attempt before publishing the new task so delayed participants
@@ -598,6 +604,9 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
     // (idle -> running, busy -> pending when to_pending); a MIX cluster's idle cores are the
     // running-slot cores, counted BEFORE staging mutates the tracker (rendezvous seed).
     auto stage = [&](CoreTracker::BitStates valid, bool to_pending) {
+        int expected = valid.count();
+        valid = acquire_local_lanes(thread_idx, valid, shape, lanes, expected);
+        always_assert(valid.count() == expected);
         while (valid.has_value()) {
             int32_t avail = valid.count();
             int32_t start = 0;
@@ -692,6 +701,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
             stage(tracker.get_pending_core_offset_states(shape), /*to_pending=*/true);
         }
     }
+    release_idle_lanes(thread_idx);
     return result;
 }
 
@@ -853,4 +863,5 @@ void SchedulerContext::handle_drain_mode(
         sched_->propagate_dispatch_fanin(*slot_state);
     }
     SchedulerState::finish_early_sync_drain(*slot_state->payload);
+    finish_ss_admission();
 }

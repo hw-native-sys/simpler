@@ -42,6 +42,9 @@ public:
         context.func_id_to_addr_count_ = 1;
         auto &tracker = context.core_trackers_[0];
         tracker.init(clusters);
+#if __has_include("scheduler/cluster_admission.h")
+        context.lane_pool_.initialize(0, clusters);
+#endif
         for (int cluster = 0; cluster < clusters; ++cluster)
             tracker.set_cluster(cluster, cluster * 3, cluster * 3 + 1, cluster * 3 + 2);
         for (int core = 0; core < 6; ++core) {
@@ -70,7 +73,13 @@ public:
         bool progress = false, pushed = false;
         auto &tracker = context.core_trackers_[0];
         context.dispatch_ready_tasks(0, tracker, false, progress, pushed);
+#if __has_include("scheduler/cluster_admission.h")
+        context.release_idle_lanes(0);
+#endif
         (void)context.try_early_dispatch(0, tracker, false, progress, pushed);
+#if __has_include("scheduler/cluster_admission.h")
+        context.release_idle_lanes(0);
+#endif
     }
 
     static int poll(SchedulerContext &context) {
@@ -80,6 +89,9 @@ public:
         context.check_running_cores_for_completion(
             0, nullptr, completed, thread_completed, progress, releases, release_count
         );
+#if __has_include("scheduler/cluster_admission.h")
+        context.release_idle_lanes(0);
+#endif
         release(context, releases, release_count);
         return completed;
     }
