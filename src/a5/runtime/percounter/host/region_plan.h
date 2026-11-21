@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <cstring>
 #include <numeric>
 #include <string>
@@ -33,6 +34,7 @@
 #include "host_build_graph/host/control_folding.h"
 #include "host_build_graph/runtime_types.h"
 #include "resource_order.h"
+#include "terminal_pipeline.h"
 #include "scheduler/wire_types.h"
 #include "scheduler/profiling_types.h"
 #include "scheduler/scheduler_layout.h"
@@ -526,7 +528,7 @@ inline T *region_at(void *base, uint64_t offset) {
 inline bool build_tables(
     const TaskInput *tasks, uint64_t task_count, const PercounterLayout &layout, void *base, uint64_t device_base,
     uint32_t clusters, const ExternalAddresses &external = {}, BuildResult *result = nullptr,
-    const GraphPlanInput &graph = {}
+    const GraphPlanInput &graph = {}, bool enable_terminal = false, const std::function<bool(uint32_t)> &may_defer = {}
 ) {
     const auto fail = [&](BuildStatus status, int64_t task_id, int32_t fanin_index) {
         if (result != nullptr) *result = BuildResult{status, task_id, fanin_index};
@@ -567,7 +569,7 @@ inline bool build_tables(
         region_at<uint64_t>(base, layout.orders_offset[0]),
         region_at<uint64_t>(base, layout.orders_offset[1]),
     };
-    const uint64_t list_count[PERCOUNTER_LIST_COUNT] = {layout.order_count[0], layout.order_count[1]};
+    uint64_t list_count[PERCOUNTER_LIST_COUNT] = {layout.order_count[0], layout.order_count[1]};
     // The tasks each list will hold, collected in id order and ordered by
     // the shared resource schedule. A GRAPH task stands for its
     // whole body in every list the body uses.
@@ -714,6 +716,30 @@ inline bool build_tables(
         sinks[sink_count++] = id;
     }
 
+    if (enable_terminal && may_defer && graph.invocation_count == 0 && task_count > 0) {
+        const auto plan = plan_proven_terminal_pipeline(tasks, task_count, clusters, may_defer);
+        if (plan && plan->steps.size() <= std::size(control->terminal.steps) &&
+            plan->prerequisites.size() <= std::size(control->terminal.prerequisites)) {
+            auto &list = eligible[1];
+            const auto kept = std::remove_if(list.begin(), list.end(), [&](int64_t id) {
+                return std::find(plan->steps.begin(), plan->steps.end(), id) != plan->steps.end();
+            });
+            if (static_cast<size_t>(list.end() - kept) != plan->steps.size())
+                return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
+            list.erase(kept, list.end());
+            list_count[1] -= plan->steps.size();
+            entries[1] -= plan->steps.size();
+            for (const auto id : plan->steps) {
+                boundary_tasks -= tasks[id].is_mix || tasks[id].block_num > 1;
+                mix_tasks -= tasks[id].is_mix;
+            }
+            control->terminal.step_count = static_cast<uint32_t>(plan->steps.size());
+            std::copy(plan->steps.begin(), plan->steps.end(), control->terminal.steps);
+            control->terminal.prerequisite_count = static_cast<uint32_t>(plan->prerequisites.size());
+            std::copy(plan->prerequisites.begin(), plan->prerequisites.end(), control->terminal.prerequisites);
+        }
+    }
+
     std::vector<ResourceOrderTask> order_tasks(task_count);
     for (uint64_t id = 0; id < task_count; ++id) {
         const auto &task = tasks[id];
@@ -839,8 +865,7 @@ inline bool build_tables(
         if (begin < list_count[l]) ++ticket_interval;
         control->segment_count[l] = segment_cursor - control->segment_begin[l];
     }
-    if (segment_cursor != layout.boundary_task_count + PERCOUNTER_LIST_COUNT ||
-        ticket_interval > layout.ticket_interval_count)
+    if (segment_cursor != boundary_tasks + PERCOUNTER_LIST_COUNT || ticket_interval > layout.ticket_interval_count)
         return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
 
     // Templates, back to back, then one record per invocation pointing at its own.
@@ -922,8 +947,8 @@ inline bool build_tables(
     control->sinks_offset = layout.sinks_offset;
     control->edge_count = layout.edge_count;
     control->tickets_offset = layout.tickets_offset;
-    control->mix_task_count = layout.mix_task_count;
-    control->boundary_task_count = layout.boundary_task_count;
+    control->mix_task_count = mix_tasks;
+    control->boundary_task_count = boundary_tasks;
     control->task_claims_offset = layout.task_claims_offset;
     control->claim_summary_offset = layout.claim_summary_offset;
     control->sync_cohort_count = layout.sync_cohort_count;
@@ -959,7 +984,7 @@ inline bool build_tables(
     control->async_run_epoch = next_async_run_epoch();
     auto *claims = region_at<PercounterTaskClaim>(base, layout.task_claims_offset);
     const uint64_t aic_boundaries = control->segment_count[0] - 1;
-    for (uint64_t index = 0; index < layout.boundary_task_count; ++index) {
+    for (uint64_t index = 0; index < boundary_tasks; ++index) {
         const uint64_t segment = index + (index >= aic_boundaries ? 1 : 0);
         const uint32_t blocks = static_cast<uint32_t>(segments[segment].task_shape >> 48);
         // The upload prefix was zeroed above, including every claim sector. An
@@ -977,7 +1002,7 @@ inline bool build_tables(
     control->callable_addresses_address = external.callable_table;
     control->callable_addresses_count = external.callable_count;
     for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t) {
-        control->order_count[t] = layout.order_count[t];
+        control->order_count[t] = list_count[t];
         control->orders_offset[t] = layout.orders_offset[t];
     }
     return true;

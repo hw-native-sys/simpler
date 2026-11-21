@@ -15,12 +15,14 @@
 uint64_t get_aicore_report_epoch();
 #include "lane_loop.h"
 #include "graph_template.h"
+#include "terminal_pipeline.h"
 #include "scheduler/argument_metadata.h"
 
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -39,6 +41,14 @@ int bind_context(void *context) {
 void *read_context() { return current_context; }
 alignas(64) std::array<uint8_t, PLATFORM_SSBUF_SIZE> startup_ssbuf{};
 void kernel(int64_t *args) { execute(args); }
+
+bool synchronous_task(uint32_t) { return false; }
+
+std::function<void(uint32_t, int64_t *)> execute_terminal_role;
+template <uint32_t Role>
+void terminal_role_kernel(int64_t *args) {
+    execute_terminal_role(Role, args);
+}
 
 TaskInput task(uint32_t mask, int blocks = 1, bool sync = false) {
     TaskInput result{};
@@ -73,7 +83,8 @@ struct Fixture {
 
     explicit Fixture(
         std::vector<TaskInput> in = {task(1), task(1), task(1)}, uint32_t clusters = 2,
-        const ExternalAddresses &external = {}, bool fold_dependencies = false
+        const ExternalAddresses &external = {}, bool fold_dependencies = false, bool enable_terminal = false,
+        const std::function<bool(uint32_t)> &may_defer = {}
     ) :
         inputs(std::move(in)),
         storage(inputs.size()),
@@ -109,7 +120,8 @@ struct Fixture {
         region.resize(layout.total_size + 128);
         auto *base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(region.data()) + 127) & ~uintptr_t{127});
         EXPECT_TRUE(build_tables(
-            inputs.data(), inputs.size(), layout, base, reinterpret_cast<uint64_t>(base), clusters, external
+            inputs.data(), inputs.size(), layout, base, reinterpret_cast<uint64_t>(base), clusters, external, nullptr,
+            {}, enable_terminal, may_defer
         ));
         control = reinterpret_cast<PercounterControl *>(base);
         counters = region_at<PercounterCounter>(base, layout.counters_offset);
@@ -2265,6 +2277,281 @@ TEST(PercounterAcquire, FoldedJoinStillWaitsForOffLaneCompletion) {
     f.drain();
     f.expect_completed(3);
     EXPECT_EQ(f.calls.size(), 2U);
+}
+
+TEST(PercounterAcquire, TerminalPipelineRequiresClosedSuffixAndKeepsIndependentInput) {
+    const int32_t before_vector[] = {0};
+    const int32_t before_mix[] = {2};
+    const int32_t before_sink[] = {1, 3};
+    auto vector = task(2, 4);
+    vector.fanin_ids = before_vector;
+    vector.fanin_count = 1;
+    auto mix = task(7, 2);
+    mix.fanin_ids = before_mix;
+    mix.fanin_count = 1;
+    auto sink = task(7, 2);
+    sink.fanin_ids = before_sink;
+    sink.fanin_count = 2;
+    std::vector<TaskInput> inputs{task(7, 2, true), task(2, 3), vector, mix, sink};
+    auto plan = plan_terminal_pipeline(inputs.data(), inputs.size(), 2);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->steps, (std::vector<uint32_t>{0, 2, 3, 4}));
+    EXPECT_EQ(plan->prerequisites, (std::vector<uint32_t>{1}));
+    {
+        Fixture f(inputs, 2, {}, false, true, synchronous_task);
+        EXPECT_EQ(f.control->terminal.step_count, 4U);
+        EXPECT_EQ(f.control->terminal.steps[0], 0U);
+        EXPECT_EQ(f.control->terminal.steps[1], 2U);
+        EXPECT_EQ(f.control->terminal.steps[2], 3U);
+        EXPECT_EQ(f.control->terminal.steps[3], 4U);
+        EXPECT_EQ(f.control->terminal.prerequisite_count, 1U);
+        EXPECT_EQ(f.control->order_count[1], 1U);
+        EXPECT_EQ(f.control->mix_task_count, 0U);
+        EXPECT_FALSE(f.sinks_complete());
+        f.drain_until(
+            [&] {
+                return f.completed(1);
+            },
+            "normal scheduling before the tail"
+        );
+        EXPECT_EQ(f.calls.size(), 3U);
+        EXPECT_FALSE(f.completed(0));
+        EXPECT_FALSE(f.completed(2));
+        EXPECT_FALSE(f.sinks_complete());
+    }
+    {
+        Fixture unknown(inputs, 2, {}, false, true);
+        EXPECT_EQ(unknown.control->terminal.step_count, 0U);
+        EXPECT_EQ(unknown.control->order_count[1], 5U);
+        EXPECT_EQ(unknown.control->mix_task_count, 3U);
+    }
+    inputs[3].sync_start = true;
+    EXPECT_FALSE(plan_terminal_pipeline(inputs.data(), inputs.size(), 2));
+    inputs[3].sync_start = false;
+    inputs[1].published_off_lane = true;
+    EXPECT_FALSE(plan_terminal_pipeline(inputs.data(), inputs.size(), 2));
+    inputs[1].published_off_lane = false;
+    inputs.push_back(vector);
+    EXPECT_FALSE(plan_terminal_pipeline(inputs.data(), inputs.size(), 2));
+}
+
+TEST(PercounterAcquire, TerminalPipelinePreservesDeferredPrefixProgress) {
+    const int32_t required = 0;
+    const int32_t vector_id = 2;
+    const std::array<int32_t, 2> sink_fanins{1, 3};
+    auto vector = task(2, 4);
+    auto projection = task(7, 2);
+    auto sink = task(7, 2);
+    vector.fanin_ids = &required;
+    vector.fanin_count = 1;
+    projection.fanin_ids = &vector_id;
+    projection.fanin_count = 1;
+    sink.fanin_ids = sink_fanins.data();
+    sink.fanin_count = sink_fanins.size();
+    const std::vector<TaskInput> tasks{task(2), task(2), vector, projection, sink};
+    {
+        Fixture required(tasks, 2, {}, false, true, [](uint32_t id) {
+            return id == 0;
+        });
+        EXPECT_EQ(required.control->terminal.step_count, 3U);
+        EXPECT_EQ(required.control->order_count[1], 2U);
+    }
+    {
+        Fixture independent(tasks, 2, {}, false, true, [](uint32_t id) {
+            return id == 1;
+        });
+        EXPECT_EQ(independent.control->terminal.step_count, 0U);
+        EXPECT_EQ(independent.control->order_count[1], 5U);
+    }
+}
+
+TEST(PercounterAcquire, TerminalPipelineRetainsSuffixWithProvenEntryAncestry) {
+    const int32_t gather_id = 0;
+    const int32_t vector_id = 2;
+    const int32_t projection_id = 3;
+    const std::array<int32_t, 2> vector_fanins{gather_id, 1};
+    auto gather = task(7, 2, true);
+    auto vector = task(2, 4);
+    auto projection = task(7, 2);
+    auto sink = task(7, 2);
+    vector.fanin_ids = vector_fanins.data();
+    vector.fanin_count = vector_fanins.size();
+    projection.fanin_ids = &vector_id;
+    projection.fanin_count = 1;
+    sink.fanin_ids = &projection_id;
+    sink.fanin_count = 1;
+    const std::vector<TaskInput> tasks{gather, task(2), vector, projection, sink};
+    const auto plan = plan_proven_terminal_pipeline(tasks.data(), tasks.size(), 2, [](uint32_t id) {
+        return id == 1;
+    });
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->steps, (std::vector<uint32_t>{2, 3, 4}));
+    EXPECT_EQ(plan->prerequisites, (std::vector<uint32_t>{0, 1}));
+}
+
+TEST(PercounterAcquire, TerminalPipelineLeavesNarrowMixInPrefix) {
+    const int32_t gather_id = 0;
+    const int32_t vector_id = 1;
+    const int32_t mix_id = 2;
+    auto gather = task(7, 2);
+    auto vector = task(2, 6);
+    auto mix = task(7, 3);
+    auto sink = task(7, 3);
+    vector.fanin_ids = &gather_id;
+    vector.fanin_count = 1;
+    mix.fanin_ids = &vector_id;
+    mix.fanin_count = 1;
+    sink.fanin_ids = &mix_id;
+    sink.fanin_count = 1;
+    const std::vector<TaskInput> tasks{gather, vector, mix, sink};
+    const auto plan = plan_terminal_pipeline(tasks.data(), tasks.size(), 3);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->steps, (std::vector<uint32_t>{1, 2, 3}));
+    EXPECT_EQ(plan->prerequisites, (std::vector<uint32_t>{0}));
+}
+
+TEST(PercounterAcquire, TerminalPipelineLeavesIndependentBridgeInPrefix) {
+    const int32_t external = 0;
+    const int32_t reset_id = 1;
+    const int32_t topk_id = 2;
+    const int32_t gather_id = 3;
+    const int32_t vector_id = 4;
+    const int32_t projection_id = 5;
+    const std::array<int32_t, 2> gather_fanins{reset_id, topk_id};
+    auto topk = task(7, 2, true);
+    auto gather = task(7, 2, true);
+    auto vector = task(2, 4);
+    auto projection = task(7, 2);
+    auto sink = task(7, 2);
+    topk.fanin_ids = &external;
+    topk.fanin_count = 1;
+    gather.fanin_ids = gather_fanins.data();
+    gather.fanin_count = gather_fanins.size();
+    vector.fanin_ids = &gather_id;
+    vector.fanin_count = 1;
+    projection.fanin_ids = &vector_id;
+    projection.fanin_count = 1;
+    sink.fanin_ids = &projection_id;
+    sink.fanin_count = 1;
+    Fixture f({task(2), task(2), topk, gather, vector, projection, sink}, 2, {}, false, true, synchronous_task);
+    ASSERT_EQ(f.control->terminal.step_count, 5U);
+    ASSERT_EQ(f.control->terminal.steps[0], static_cast<uint32_t>(topk_id));
+    ASSERT_EQ(f.control->terminal.steps[1], static_cast<uint32_t>(gather_id));
+    ASSERT_EQ(f.control->terminal.prerequisite_count, 2U);
+    EXPECT_EQ(f.control->terminal.prerequisites[0], static_cast<uint32_t>(external));
+    EXPECT_EQ(f.control->terminal.prerequisites[1], static_cast<uint32_t>(reset_id));
+}
+
+TEST(PercounterAcquire, ExtendedTerminalPipelineExecutesEveryBlockAndRoleOnce) {
+    const int32_t external = 0;
+    const int32_t topk_id = 1;
+    const int32_t reset_id = 2;
+    const int32_t gather_id = 3;
+    const int32_t vector_id = 4;
+    const int32_t projection_id = 5;
+    auto topk = task(7, 2, true);
+    auto reset = task(2);
+    auto gather = task(7, 2, true);
+    auto vector = task(2, 4);
+    auto projection = task(7, 2);
+    auto sink = task(7, 2);
+    const std::array<std::pair<TaskInput *, const int32_t *>, 6> links{
+        {{&topk, &external},
+         {&reset, &topk_id},
+         {&gather, &reset_id},
+         {&vector, &gather_id},
+         {&projection, &vector_id},
+         {&sink, &projection_id}}
+    };
+    for (const auto &[next, predecessor] : links) {
+        next->fanin_ids = predecessor;
+        next->fanin_count = 1;
+    }
+    Fixture f({task(2), topk, reset, gather, vector, projection, sink}, 2, {}, false, true, synchronous_task);
+    ASSERT_EQ(f.control->terminal.step_count, 6U);
+    ASSERT_EQ(f.control->terminal.prerequisite_count, 1U);
+    ASSERT_EQ(f.control->terminal.prerequisites[0], 0U);
+
+    const std::array<uint64_t, 3> addresses{
+        reinterpret_cast<uint64_t>(&terminal_role_kernel<0>), reinterpret_cast<uint64_t>(&terminal_role_kernel<1>),
+        reinterpret_cast<uint64_t>(&terminal_role_kernel<2>)
+    };
+    for (size_t id = 1; id < f.inputs.size(); ++id) {
+        for (uint32_t role = 0; role < addresses.size(); ++role) {
+            if ((f.inputs[id].active_mask & (1U << role)) != 0)
+                f.counters[id].function_addresses[role] = addresses[role];
+        }
+    }
+    std::array<std::array<std::array<std::atomic<uint32_t>, 3>, 4>, 7> counts{};
+    std::array<std::atomic<bool>, 6> status{};
+    std::atomic<size_t> finished{0};
+    execute_terminal_role = [&](uint32_t role, int64_t *args) {
+        const uint32_t id = args[0];
+        const auto *context = percounter_current_context();
+        const uint32_t block = context->local.block_idx;
+        ASSERT_LT(id, counts.size());
+        ASSERT_LT(block, counts[id].size());
+        if (f.inputs[id].is_mix) EXPECT_EQ(context, &f.signals[block].contexts[role].value);
+        if (id == topk_id) EXPECT_TRUE(percounter_counter_published(percounter_gm_read(f.counters[external].value)));
+        counts[id][block][role].fetch_add(1, std::memory_order_relaxed);
+    };
+    const auto sync = percounter_metadata(f.cfg[1], topk_id).sync_index;
+    const PercounterSyncNotify no_notify{0, 0};
+    std::atomic<uint32_t> prerequisite_polls{0};
+    on_poll = [&] {
+        if (current_context != &f.signals[0].contexts[1].value ||
+            percounter_ssbuf_load_field(&f.signals[0].terminal_grant[0]) != 0 ||
+            !percounter_start_ready(f.cfg[1], no_notify, sync, 2, 0))
+            return;
+
+        // START can miss the last arrival once. A second poll before grant,
+        // with all arrivals visible, comes from the prerequisite wait.
+        prerequisite_polls.fetch_add(1, std::memory_order_release);
+    };
+    std::vector<std::thread> lanes;
+    for (size_t lane = 0; lane < f.cfg.size(); ++lane) {
+        lanes.emplace_back([&, lane] {
+            percounter_bind_sim_context(&f.signals[lane / 3].contexts[lane % 3].value);
+            status[lane].store(percounter_run_terminal(f.cfg[lane], &f.state[lane]), std::memory_order_relaxed);
+            finished.fetch_add(1, std::memory_order_release);
+        });
+    }
+    const auto wait_limit = std::chrono::seconds(2);
+    const auto prerequisite_deadline = std::chrono::steady_clock::now() + wait_limit;
+    while (prerequisite_polls.load(std::memory_order_acquire) < 2 &&
+           std::chrono::steady_clock::now() < prerequisite_deadline)
+        std::this_thread::yield();
+    EXPECT_GE(prerequisite_polls.load(std::memory_order_acquire), 2U);
+    for (auto &cluster : f.signals)
+        EXPECT_EQ(percounter_ssbuf_load_field(&cluster.terminal_grant[0]), 0U);
+
+    percounter_gm_store(f.counters[external].value, PERCOUNTER_COUNTER_PUBLISHED);
+    const auto finish_deadline = std::chrono::steady_clock::now() + wait_limit;
+    while (finished.load(std::memory_order_acquire) != lanes.size() &&
+           std::chrono::steady_clock::now() < finish_deadline)
+        std::this_thread::yield();
+    const bool all_finished = finished.load(std::memory_order_acquire) == lanes.size();
+    if (!all_finished)
+        percounter_gm_store(f.control->lane_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
+    for (auto &lane : lanes)
+        lane.join();
+    on_poll = {};
+    execute_terminal_role = {};
+    ASSERT_TRUE(all_finished) << "terminal lanes did not exit after releasing the prerequisite";
+
+    for (const auto &ok : status)
+        EXPECT_TRUE(ok.load(std::memory_order_relaxed));
+    for (uint32_t i = 1; i < links.size() + 1; ++i) {
+        const auto &task = f.inputs[i];
+        for (int block = 0; block < task.block_num; ++block) {
+            for (uint32_t role = 0; role < addresses.size(); ++role) {
+                const uint32_t expected = (task.active_mask >> role) & 1U;
+                EXPECT_EQ(counts[i][block][role].load(std::memory_order_relaxed), expected)
+                    << "task " << i << " block " << block << " role " << role;
+            }
+        }
+        f.expect_completed(i);
+    }
 }
 
 TEST(PercounterAcquire, FoldedTerminalJoinRetainsUnsettledPredecessor) {

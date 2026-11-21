@@ -339,10 +339,23 @@ inline StateSelection select_percounter_state(
     const GraphPlanInput graph_plan{
         graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
     };
+    const auto may_defer = [&](uint32_t id) {
+        const auto &input = inputs[id];
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            if ((input.active_mask & (1U << lane)) == 0) continue;
+            try {
+                const auto capability = runtime->get_function_async_capability(task_metadata[id].kernel_ids[lane]);
+                if (capability.mode != CoreAsyncMode::SYNCHRONOUS) return true;
+            } catch (const std::exception &) {
+                return true;
+            }
+        }
+        return false;
+    };
     if (!build_tables(
             inputs.data(), task_count, layout, host_base, device_base,
             static_cast<uint32_t>(runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM), external, &build,
-            graph_plan
+            graph_plan, true, may_defer
         )) {
         LOG_ERROR(
             "A5 percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status), build.task_id,
@@ -351,6 +364,14 @@ inline StateSelection select_percounter_state(
         return StateSelection::FAILED;
     }
 
+    const auto *terminal_control = region_at<PercounterControl>(host_base, layout.control_offset);
+    if (terminal_control->terminal.step_count != 0)
+        LOG_TIMING(
+            "A5 percounter: terminal pipeline %u steps, first=%u, last=%u, prerequisites=%u",
+            terminal_control->terminal.step_count, terminal_control->terminal.steps[0],
+            terminal_control->terminal.steps[terminal_control->terminal.step_count - 1],
+            terminal_control->terminal.prerequisite_count
+        );
     if (task_count != 0 && uploaded_sm == nullptr) return StateSelection::FAILED;
     const auto address_space = std::strcmp(get_platform(), "a5sim") == 0 ? SchedulerCallableAddressSpace::HOST :
                                                                            SchedulerCallableAddressSpace::DEVICE;
@@ -418,9 +439,9 @@ inline StateSelection select_percounter_state(
         "A5 percounter: selected for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
         " MIX list entries, %" PRIu64 " sync cohorts, %zu edges, %zu Graph invocations of %zu Definitions with %" PRIu64
         " body tasks; %" PRIu64 " of %" PRIu64 " region bytes uploaded)",
-        total_tasks, order_count[0], order_count[1], mix_task_count, sync_cohort_count, edges.size(),
-        graph.invocations.size(), graph.templates.size(), graph.layout.body_task_count, layout.upload_size,
-        layout.total_size
+        total_tasks, terminal_control->order_count[0], terminal_control->order_count[1],
+        terminal_control->mix_task_count, sync_cohort_count, edges.size(), graph.invocations.size(),
+        graph.templates.size(), graph.layout.body_task_count, layout.upload_size, layout.total_size
     );
     return StateSelection::PERCOUNTER;
 }
