@@ -9,6 +9,8 @@
 
 """Join device-captured HBG execution identities; never infer them from row order."""
 
+from .schedule_timing import attach_checkpoints
+
 FIELDS = frozenset(
     (
         "run_epoch",
@@ -37,8 +39,11 @@ def valid_source_index(index, group_kind):
     return group_kind == 2 and index in (4, 5)
 
 
-def _validate_record(record, *, legacy=False):
-    if not isinstance(record, dict) or set(record) != FIELDS:
+def _validate_record(record, *, legacy=False, checkpoints=False):
+    expected = FIELDS | {"schedule_cycles"} if checkpoints else FIELDS
+    if checkpoints and isinstance(record, dict) and "pending_fanin" in record:
+        expected = expected | {"pending_fanin"}
+    if not isinstance(record, dict) or set(record) != expected:
         raise ValueError("execution identity has missing or unknown fields")
     for field in FIELDS - {"order_key", "group_seq", "executed"}:
         if type(record[field]) is not int or not 0 <= record[field] < 1 << 64:
@@ -70,17 +75,20 @@ def _validate_record(record, *, legacy=False):
         raise ValueError("invalid execution identity shape")
 
 
-def attach_execution_identities(section, tasks, runtime):
+def attach_execution_identities(section, tasks, runtime, *, schedule_clock=None):
     if (
         runtime != "host_build_graph"
         or not isinstance(section, dict)
         or set(section) not in ({"schema", "producer", "records"}, {"schema", "version", "producer", "records"})
-        or ("version" in section and (type(section["version"]) is not int or section["version"] != 2))
+        or ("version" in section and (type(section["version"]) is not int or section["version"] not in (2, 3)))
         or section["schema"] != "hbg-execution-identity"
         or section["producer"] != "aicore"
         or not isinstance(section["records"], list)
     ):
         raise ValueError("invalid execution identity envelope")
+    checkpoints = section.get("version") == 3
+    if checkpoints and schedule_clock is None:
+        raise ValueError("HBG schedule checkpoints require an AICore L2 capture")
     # Before the ranked exporter gained a version tag, both layouts used this
     # envelope. A null rank or an ordered-group source identifies the old layout.
     legacy = "version" not in section and any(
@@ -93,11 +101,13 @@ def attach_execution_identities(section, tasks, runtime):
     observed, executions = set(), set()
     positions, orders, groups, block_counts = {}, {}, {}, {}
     for record in section["records"]:
-        _validate_record(record, legacy=legacy)
+        _validate_record(record, legacy=legacy, checkpoints=checkpoints)
         key = tuple(record[field] for field in JOIN)
         task = rows.get(key)
         if key in observed or task is None or task["task_id"] != record["task_id"]:
             raise ValueError("missing, duplicate or mismatched execution identity join")
+        if checkpoints:
+            attach_checkpoints(task, record, record["schedule_cycles"], schedule_clock)
         is_cube = task["core_type"] == "aic"
         if (record["subtask_slot"] == 0) != is_cube or (record["cluster_lane"] == 0) != is_cube:
             raise ValueError("execution identity lane/type mismatch")

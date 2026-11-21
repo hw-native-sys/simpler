@@ -20,6 +20,7 @@ from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
 from simpler_setup.scene_test import compile_chip_callable_spec
+from simpler_setup.tools.percounter import display
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
 
 pytestmark = [
@@ -106,6 +107,32 @@ def test_l1_rotates_and_reuses_buffers(st_platform, st_device_ids, tmp_path):
         worker.close()
 
 
+def _check_task_milestones(milestones, blocks, level):
+    assert milestones["dropped"] == milestones["unmatched_deferred_updates"] == 0
+    per_block = defaultdict(list)
+    for event in milestones["records"]:
+        per_block[(event["task_id"], event["block_index"])].append(event)
+    assert len(per_block) == blocks * TASKS
+    for events in per_block.values():
+        by_kind = {e["kind"]: e for e in events}
+        expected = {"claim", "ready", "kernel_end", "completion_issue"}
+        if level == 2:
+            expected.add("inputs_ready")
+            if "inputs_pending" in by_kind:
+                expected.add("inputs_pending")
+                assert by_kind["inputs_pending"]["cycles"] <= by_kind["inputs_ready"]["cycles"]
+            assert by_kind["claim"]["mix"] is False
+            assert by_kind["claim"]["cycles"] <= by_kind["inputs_ready"]["cycles"] <= by_kind["ready"]["cycles"]
+        assert len(events) == len(expected) and by_kind.keys() == expected
+        claim, ready, kernel, completion = (by_kind[k] for k in ("claim", "ready", "kernel_end", "completion_issue"))
+        assert 0 < claim["claim_start_cycles"] <= claim["cycles"]
+        assert claim["cycles"] <= ready["cycles"] <= kernel["kernel_start_cycles"]
+        assert kernel["kernel_start_cycles"] <= kernel["cycles"] <= completion["cycles"]
+        assert completion["contribution"] == 1
+        assert all(e["block_count"] == blocks for e in events)
+        assert len({(e["worker_id"], e["run_epoch"]) for e in events}) == 1
+
+
 @pytest.mark.parametrize(
     "levels",
     [
@@ -155,24 +182,7 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                     timing = raw["scheduler_tasks"]
                     assert timing["producer"] == "aicore"
                     assert {(r[0], r[1], r[4]) for r in timing["records"]} == {(r[0], r[2], r[6]) for r in rows}
-                    milestones = raw["percounter_task_events"]
-                    assert milestones["dropped"] == milestones["unmatched_deferred_updates"] == 0
-                    per_block = defaultdict(list)
-                    for event in milestones["records"]:
-                        per_block[(event["task_id"], event["block_index"])].append(event)
-                    assert len(per_block) == blocks * TASKS
-                    for events in per_block.values():
-                        assert len(events) == 4
-                        by_kind = {e["kind"]: e for e in events}
-                        claim, ready, kernel, completion = (
-                            by_kind[k] for k in ("claim", "ready", "kernel_end", "completion_issue")
-                        )
-                        assert 0 < claim["claim_start_cycles"] <= claim["cycles"]
-                        assert claim["cycles"] <= ready["cycles"] <= kernel["kernel_start_cycles"]
-                        assert kernel["kernel_start_cycles"] <= kernel["cycles"] <= completion["cycles"]
-                        assert completion["contribution"] == 1
-                        assert all(e["block_count"] == blocks for e in events)
-                        assert len({(e["worker_id"], e["run_epoch"]) for e in events}) == 1
+                    _check_task_milestones(raw["percounter_task_events"], blocks, level)
                 else:
                     assert not raw.get("scheduler_tasks", {}).get("records")
                     assert "percounter_task_events" not in raw
@@ -217,8 +227,20 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                     )
                     events = json.loads(trace.read_text())["traceEvents"]
                     assert any(e.get("pid") == 2 and e.get("name") == "trace_finish" for e in events) == (level >= 3)
-                    milestones = Counter(e["args"]["kind"] for e in events if e.get("pid") == 3 and e.get("ph") == "i")
-                    assert milestones["claim_start"] == milestones["claim"] == blocks * TASKS
+                    if level == 2:
+                        starts = [e for e in events if e["ph"] == "b" and e["cat"] == "Percounter L2"]
+                        assert starts and not any(e["name"].startswith(("EXECUTE", "Kernel execution")) for e in starts)
+                        workers = [
+                            e for e in events if e["pid"] == 4 and e["ph"] == "X" and "kernel-duration-us" in e["args"]
+                        ]
+                        assert len(workers) == blocks * TASKS
+                        assert all(e["name"].startswith(display(e["args"]["taskId"]) + "-") for e in workers)
+                        assert not any(e.get("pid") == 3 for e in events)
+                    else:
+                        milestones = Counter(
+                            e["args"]["kind"] for e in events if e.get("pid") == 3 and e.get("ph") == "i"
+                        )
+                        assert milestones["claim_start"] == milestones["claim"] == blocks * TASKS
                 assert bool(raw.get("host_orchestrator_phases")) == (level == 4)
         finally:
             worker.free(buffer)

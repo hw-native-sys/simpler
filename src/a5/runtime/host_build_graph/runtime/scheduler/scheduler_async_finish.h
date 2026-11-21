@@ -70,8 +70,13 @@ static inline __aicore__ bool scheduler_service_async_slice(
     made_progress = false;
     if (local->async == nullptr) return true;
     auto &async = *local->async;
-    async.business_returns = 0;
-    if (async.error_code == 0 && !scheduler_async_work_activated(&async)) return true;
+    if (!scheduler_async_service_due(async)) return true;
+    SchedulerScalarScope scalar_step(local, SchedPhaseKind::ScalarAsyncCheck);
+    const bool retry = async.retry_counter_address != 0 && async.error_code == 0;
+    // The resident loop also checks for errors periodically. Check again before
+    // consuming any condition or publishing credit after a successful retry.
+    if (retry && !scheduler_async_counter_reached(async.retry_counter_address, async.retry_counter_threshold))
+        return true;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     if (async.error_code != 0) {
         scheduler_record_error(
@@ -80,18 +85,10 @@ static inline __aicore__ bool scheduler_service_async_slice(
         );
         return false;
     }
-    // CHECK has one opportunity per two active slices, starting with the first.
-    // Completing an owned task consumes no additional directory polling budget.
-    if (async.check_service_countdown != 0) {
-        --async.check_service_countdown;
-        return true;
-    }
-    async.check_service_countdown = 1;
-    SchedulerScalarScope scalar_step(local, SchedPhaseKind::ScalarAsyncCheck);
     SchedulerAsyncCompletion completion{};
     bool ok = scheduler_async_check_step(
         async, UINT32_C(1) << local->config.self_core_type, 8, SchedulerAsyncCompletionObserver{}, made_progress,
-        completion
+        completion, retry
     );
     scalar_step.close();
     if (ok && completion.result == SchedulerAsyncCompletionResult::FINISH_OWNER)

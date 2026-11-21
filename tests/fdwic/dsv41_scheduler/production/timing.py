@@ -106,10 +106,15 @@ def summarize(per_rank, devices, warmup, rounds):
     }
 
 
-def replay_rank_samples(directory, result):
+def replay_rank_samples(directory, result, *, analytical_golden=False):
     native = result.get("execution") == "native_moe_host_control"
     require(result["passed"], "Execution failed")
-    if native:
+    if analytical_golden or result.get("execution") == "analytical_snapshot":
+        require(
+            result.get("numerical_validation") is True and result["snapshot_inputs"] and result["isolated_case"],
+            "Full-wave numerical validation against analytical outputs failed",
+        )
+    elif native:
         require(result.get("numerical_validation") is False, "Native MoE is a performance-only run")
     else:
         require(result["validated_against_fused_prefix"], "Replay numerical validation failed")
@@ -144,7 +149,7 @@ def replay_rank_samples(directory, result):
     ]
 
 
-def summarize_replay(directory):
+def summarize_replay(directory, *, analytical_golden=False):
     reports = [json.loads(path.read_text()) for path in directory.glob("rank*/result.json")]
     reports.sort(key=lambda result: result["rank"])
     require(
@@ -158,7 +163,10 @@ def summarize_replay(directory):
             "Ranks disagree on the replay contract",
         )
     return summarize(
-        [replay_rank_samples(directory / f"rank{result['rank']}", result) for result in reports],
+        [
+            replay_rank_samples(directory / f"rank{result['rank']}", result, analytical_golden=analytical_golden)
+            for result in reports
+        ],
         [result["device"] for result in reports],
         first["warmup"],
         first["rounds"],

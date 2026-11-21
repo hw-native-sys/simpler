@@ -17,6 +17,13 @@
 #include "scheduler_types.h"
 #include "scheduler_scalar_record.h"
 
+// Onboard Host validates the counter and notification mappings before publishing the image.
+#if defined(__CCE_AICORE__)
+inline constexpr bool SCHEDULER_REQUIRES_CNT_NOTIFY = true;
+#else
+inline constexpr bool SCHEDULER_REQUIRES_CNT_NOTIFY = false;
+#endif
+
 // Capture ordinary operands and address values by value at observer calls.
 // GM words retain reference captures so their accesses stay inside the timed
 // primitive, while caller temporaries do not escape through the callback.
@@ -121,7 +128,7 @@ static inline __aicore__ void scheduler_observe_input_cache(__gm__ SchedulerPrep
 // build, whose implementation is a C++ atomic. An AICore reaches ordering
 // through explicit barriers instead, so the parameter is inert there.
 static inline __aicore__ int64_t scheduler_gm_query(__gm__ volatile int64_t &value, int order = __ATOMIC_ACQUIRE) {
-    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [&value, order]() __aicore__ {
+    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarGmLoad, [&value, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
         (void)order;
         __gm__ int64_t *signed_address = const_cast<__gm__ int64_t *>(&value);
@@ -134,7 +141,7 @@ static inline __aicore__ int64_t scheduler_gm_query(__gm__ volatile int64_t &val
 }
 
 static inline __aicore__ uint64_t scheduler_gm_query(__gm__ volatile uint64_t &value, int order = __ATOMIC_ACQUIRE) {
-    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [&value, order]() __aicore__ {
+    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarGmLoad, [&value, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
         (void)order;
         return static_cast<uint64_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint64_t *>(&value), 0));
@@ -147,7 +154,7 @@ static inline __aicore__ uint64_t scheduler_gm_query(__gm__ volatile uint64_t &v
 // CntNotify exposes one 32-bit SET/read register. Never widen this access
 // into its neighbouring register, or run a cache maintenance instruction on it.
 static inline __aicore__ uint32_t scheduler_notify_query(__gm__ volatile uint32_t &value) {
-    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [&value]() __aicore__ {
+    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarCntNotifyLoad, [&value]() __aicore__ {
 #if defined(__CCE_AICORE__)
         return static_cast<uint32_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint32_t *>(&value), 0));
 #else
@@ -212,7 +219,7 @@ static inline __aicore__ void scheduler_notify_add(__gm__ volatile uint32_t &val
 
 static inline __aicore__ uint64_t
 scheduler_gm_query_u32_pair(__gm__ volatile uint32_t *values, int order = __ATOMIC_ACQUIRE) {
-    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [values, order]() __aicore__ {
+    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarGmLoad, [values, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
         (void)order;
         __gm__ uint32_t *first = const_cast<__gm__ uint32_t *>(values);

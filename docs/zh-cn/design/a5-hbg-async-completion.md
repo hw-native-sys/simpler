@@ -7,12 +7,14 @@
 
 本文档组规定待实现的目标行为和接口，不表示功能已经交付。适用环境为具有 native Graph、SPMD、GM MIX 和 ordered admission 的 A5 HBG；既有同步调度、通信域和 run 退休机制作为集成基础。
 
+当前 HBG 使用登记核负责 CHECK 的策略。子文档中跨核领取 CHECK 的 lease 和目录描述属于原设计。当前队列布局和检查时机见[调度器的 defer_wait 协议](a5-hbg-graph-task/build-execute-separation.md#defer_wait物理返回与逻辑完成分离)。
+
 ## 1. 功能范围
 
 | 范围 | 开发目标 |
 | ---- | -------- |
 | 条件类型 | 通知 COUNTER、SDMA post-done；同一 group 可包含多类型、多资源条件 |
-| 普通任务 | AIC/AIV 单 lane 任务；完成条件检查可由其他参与核执行 |
+| 普通任务 | AIC/AIV 单 lane 任务；完成条件由登记该组的物理核检查 |
 | 并行任务 | SPMD、MIX masks 3/5/6/7、`sync_start` |
 | Graph | 当前单层 native Graph、多实例、内部与外部依赖、普通任务混排 |
 | predicate | 保留单 lane、单 block 的原生支持边界；skip 不执行 kernel、不发起 DMA |
@@ -40,7 +42,7 @@ flowchart LR
     H[Host 绑定与预分配] --> K[执行 kernel 并登记条件]
     K --> S[封口 group]
     S --> R[释放 slot 与 block 执行义务]
-    S -->|非零登记| C[任意参与核执行 CHECK]
+    S -->|非零登记| C[登记核执行 CHECK]
     C -->|PENDING| C
     C -->|全部满足| G[结算 group]
     R --> J[实际 pending 与计算释放汇合]
@@ -58,7 +60,7 @@ flowchart LR
 
 每个可能调用登记接口的物理执行预留一个稳定 group，每个含此类执行的逻辑 task 预留独立 FINISH 状态。CHECK 和 FINISH 是控制工作，不创建业务 TaskId，不占 dispatch slot，也不取得 cooperative admission。
 
-基础实现只计入实际非零 group，复用计算释放汇合，采用常驻完成记录、平坦活动位图、有界 strong-CAS 目录更新和有界 FINISH 路径。完成记录在 run 内不移动、不回收。基础实现为可执行任务提供登记空间，所有成员均零登记的任务沿用同步完成路径，不创建 CHECK/FINISH 工作。空间、bind 和同步运行成本单独验证，优化不能引入强制的额外用户声明。
+基础实现只计入实际非零 group，复用计算释放汇合，采用常驻条件记录、本核等待队列和有界 CHECK。完成记录在 run 内不移动、不回收。基础实现为可执行任务提供登记空间，所有成员均零登记的任务沿用同步完成路径，不创建 CHECK/FINISH 工作。空间、bind 和同步运行成本单独验证，优化不能引入强制的额外用户声明。
 
 ## 3. 完成语义与不变量
 
@@ -72,7 +74,7 @@ flowchart LR
 
 消费者在读取 payload 前还必须完成其自身核需要的缓存获取操作；观察核的缓存维护不能代替消费者核。该要求同样适用于同步消费者。优先复用现有 backend 和读取路径；确需额外获取时从现有参数/Graph 绑定生成旁表，MIX/sync-start 在实际成员准备完成后执行。
 
-1. 一个物理执行只有一个登记写者，一个可服务记录同时只有一个 lease owner。
+1. 一个物理执行只有一个登记写者，该写者也负责之后的条件检查。
 2. group 身份由 run、内部 task ref、block 和 subtask 确定，不依赖可复用 slot 或 DFX 数据。
 3. 每个非零 group 恰好登记、结算一次；零登记与合法 skip 仍须封口并释放执行资源，每个逻辑 block 恰好贡献一次计算释放。
 4. 只有关闭计算或递减最后 pending 的原子操作返回值能授予 FINISH 激活责任；必须同时满足计算已释放且 pending 为零，普通观察者不能激活。

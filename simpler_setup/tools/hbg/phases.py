@@ -169,6 +169,8 @@ SCALAR_PHASES = frozenset(
         "scalar_dsb_all",
         "scalar_dsb_ddr",
         "scalar_bypass_load",
+        "scalar_gm_load",
+        "scalar_cnt_notify_load",
         "scalar_bypass_store",
     }
 )

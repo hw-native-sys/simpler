@@ -618,7 +618,7 @@ def test_real_converter_preserves_native_audit_in_perfetto_metadata(tmp_path):
     assert trace["metadata"]["hbg_protocol_audit"] == parsed["protocol_audit"]
 
 
-@pytest.mark.parametrize("version", (None, 1, 3))
+@pytest.mark.parametrize("version", (None, 2, 4))
 def test_converter_rejects_unknown_or_unversioned_mix_protocol(tmp_path, version):
     raw = wire_capture()
     protocol = raw["aicore_protocol"]

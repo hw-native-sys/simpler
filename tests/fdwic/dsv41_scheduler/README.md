@@ -13,12 +13,13 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The seven cases are selected by `workloads/pypto_lib_latest/source.json`.
-The build, export and run commands use this model by default.
+The active matrix contains seven model cases from `workloads/pypto_lib_latest/source.json`
+and the single-device `synthetic/full_wave_mix_chain`. Use `production/list_cases.py`
+for the eight paths in measurement order.
 Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
 Refresh both HBG and percounter for every case.
 
-Retain scheduler optimizations only when the sum of all seven case means improves,
+Retain scheduler optimizations only when the sum of all eight case means improves,
 using AICore L0 wall with one warmup and ten measured rounds per case. Include
 both communicating cases; each two-device round starts after a Device
 rendezvous and contributes the maximum of the ranks' local durations. L1/L3
@@ -58,9 +59,17 @@ correctness or update its performance results; run and record those explicitly.
 | moe | 2 | Standalone native MoE with Host token-count control |
 | engram | 1 | Layer 1 Engram quantization, projection and gating |
 | layers_19_21 | 2 | Layers 19 through 21, including the encoder-to-decoder transition |
+| full_wave_mix_chain | 1 | Six dependent synthetic stages alternating pure and mixed engine use |
 
 Layer indices are zero-based. The six slices use the original full-forward
 prefix to produce their boundary inputs.
+
+The synthetic chain uses 32 AIC blocks, 32 1C2V groups, 64 AIV blocks,
+32 1C2V groups, one 1C1V group, and 32 1C2V groups, in that order.
+The five full waves request `sync_start`. Each stage consumes the previous
+stage's output. The runner checks all six buffers against integer golden
+values, including untouched padding. One timed round covers 6 tasks and
+386 block/lane executions.
 
 An execution is one `(task, block, subtask)` invocation. Original scalar values,
 tensor shapes, strides, offsets, aliasing, argument directions, explicit
@@ -134,7 +143,7 @@ Host controls execute during graph construction, outside Device wall time.
 The other replay cases preserve device execution for their captured controls;
 they do not test dynamic Host `get_tensor_data` reads.
 
-All seven prepared cases run with the C++ `native-runner`, standard Python and
+All eight prepared cases run with the C++ `native-runner`, standard Python and
 Simpler/CANN libraries. No PyPTO, PyPTO-lib checkout, Torch or Simpler Python
 bindings are needed during execution. Only initial native MoE input preparation
 requires CPU Torch; the numerical helpers and generated Host/kernel sources
@@ -376,7 +385,18 @@ launcher never compiles while holding devices. Native MoE `--compile-only`
 remains available with an unwrapped runtime. Single-device Attention replay
 needs no gate.
 
-To run exactly the seven native scenarios, including when an older prepared directory contains extra cases:
+The default preparation creates all eight bundles. To prepare only the synthetic
+case for an existing runtime and native runner, use the same `--runtime` for
+preparation and execution:
+
+```bash
+python3 "$DSV41/production/prepare.py" "$DSV41_RUNTIME" "$DSV41/build/chain-prepared" \
+  --flavor synthetic --runtime host_build_graph
+bash "$DSV41/run.sh" "$DSV41/build/chain-prepared/cases/synthetic/full_wave_mix_chain" \
+  "$DSV41_RUNTIME" "$DSV41/outputs/chain" 0 1 10 --runtime=host_build_graph
+```
+
+To run all eight active cases from the default prepared directory:
 
 ```bash
 while IFS= read -r selected; do

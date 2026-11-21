@@ -232,20 +232,6 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         }
         wmb();
     }
-    const auto *notification_summary =
-        scheduler_state_at<SchedulerGraphSummary>(scheduler_state_base, bootstrap_context->graph_summary_offset);
-    if (notification_summary->async_layout_offset != 0) {
-        const auto *async =
-            scheduler_state_at<SchedulerAsyncLayout>(scheduler_state_base, notification_summary->async_layout_offset);
-        const auto *directory =
-            scheduler_state_at<SchedulerAsyncDirectoryWord>(scheduler_state_base, async->check_directory_offset);
-        const uint64_t halves = (static_cast<uint64_t>(async->group_count) + 31) / 32;
-        for (uint64_t half = 0; half < halves; ++half) {
-            const uint64_t address = directory[half / 2].notification_addresses[half % 2];
-            if (address != 0) *reinterpret_cast<volatile uint32_t *>(address) = 0;
-        }
-        wmb();
-    }
     if (!initialize_resident_args_dump_outputs(
             reinterpret_cast<void *>(bootstrap_context->args_dump_address), runtime->dev.callable_table_addr_,
             runtime->dev.callable_table_len_
@@ -562,8 +548,7 @@ void AicoreLifecycle::collect_run_swimlane_records(Runtime *runtime) {
     const auto level = get_chip_swimlane_level();
     const uint64_t epoch = get_platform_run_result_epoch();
     auto phase = [&](uint64_t worker, SchedPhaseKind kind, uint64_t start, uint64_t end, uint64_t loop, TaskId task) {
-        if (level < ChipSwimlaneLevel::SCHED_PHASES || worker >= static_cast<uint64_t>(core_count_) || start == 0 ||
-            end < start)
+        if (worker >= static_cast<uint64_t>(core_count_) || start == 0 || end < start)
             return;
         ChipSwimlaneAicpuSchedPhaseRecord record{};
         record.start_time = start;
@@ -580,54 +565,55 @@ void AicoreLifecycle::collect_run_swimlane_records(Runtime *runtime) {
         record.participant_physical_core_id = runtime->dev.workers[worker].physical_core_id;
         chip_swimlane_aicpu_record_staged_phase(kDiagnosticDumpLane, record);
     };
+    const uint64_t bytes = context->scheduler_state_bytes;
+    const uint64_t trace_limit =
+        context->trace_cells_offset <= bytes ?
+            std::min<uint64_t>(
+                (bytes - context->trace_cells_offset) / sizeof(SchedulerTaskTrace), uint64_t{UINT32_MAX} + 1
+            ) :
+            0;
     for (uint64_t task = 0; task < context->graph_task_count; ++task) {
         if (!scheduler_task_is_executable(metadata[task].flags)) continue;
         const auto identity = aicore_scheduler_public_identity(graph, task);
         if (!identity.is_valid()) continue;
-        for (uint32_t block = 0; block < metadata[task].logical_block_num; ++block) {
-            for (uint8_t subtask = 0; subtask < SUBTASK_SLOT_COUNT; ++subtask) {
-                if (!metadata[task].active_mask.has(static_cast<SubtaskSlot>(subtask))) continue;
-                const uint64_t index = scheduler_task_trace_index(
-                    metadata[task].trace_index_base, metadata[task].active_mask, static_cast<SubtaskSlot>(subtask),
-                    block
-                );
-                const uint64_t bytes = context->scheduler_state_bytes;
-                if (index > UINT32_MAX || context->trace_cells_offset > bytes ||
-                    index >= (bytes - context->trace_cells_offset) / sizeof(SchedulerTaskTrace))
-                    continue;
-                const auto &trace = traces[index];
-                if (trace.valid == 0 || trace.task_ref != task ||
-                    trace.worker_id >= static_cast<uint64_t>(core_count_) || trace.execution_run_epoch != epoch ||
-                    trace.kernel_start_cycles == 0 || trace.kernel_end_cycles < trace.kernel_start_cycles)
-                    continue;
-                if (level >= ChipSwimlaneLevel::SCHEDULE_TIMING &&
-                    (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles))
-                    continue;
-                const uint64_t receive =
-                    trace.ready_observe_cycles != 0 && trace.kernel_start_cycles >= trace.ready_observe_cycles ?
-                        trace.kernel_start_cycles - trace.ready_observe_cycles :
-                        0;
-                ChipSwimlaneAicoreTaskRecord record{
-                    trace.kernel_start_cycles, trace.kernel_end_cycles, identity, static_cast<uint32_t>(index),
-                    static_cast<uint32_t>(std::min(receive, uint64_t{UINT32_MAX}))
-                };
-                chip_swimlane_aicpu_record_staged_task(
-                    static_cast<int>(trace.worker_id), kDiagnosticDumpLane, record, trace.dispatch_end_cycles,
-                    trace.complete_start_cycles
-                );
-                phase(
-                    trace.worker_id, SchedPhaseKind::StateProbe, trace.state_probe_start_cycles,
-                    trace.state_probe_end_cycles, trace.dispatch_loop_iter, identity
-                );
-                phase(
-                    trace.worker_id, SchedPhaseKind::Dispatch, trace.dispatch_start_cycles, trace.dispatch_end_cycles,
-                    trace.dispatch_loop_iter, identity
-                );
-                phase(
-                    trace.worker_id, SchedPhaseKind::Complete, trace.complete_start_cycles, trace.complete_end_cycles,
-                    trace.complete_loop_iter, identity
-                );
-            }
+        const uint64_t first = metadata[task].trace_index_base;
+        const uint64_t cells =
+            static_cast<uint64_t>(metadata[task].logical_block_num) * metadata[task].active_mask.count();
+        const uint64_t end = std::min(first + cells, trace_limit);
+        for (uint64_t index = first; index < end; ++index) {
+            const auto &trace = traces[index];
+            if (trace.valid == 0 || trace.task_ref != task || trace.worker_id >= static_cast<uint64_t>(core_count_) ||
+                trace.execution_run_epoch != epoch || trace.kernel_start_cycles == 0 ||
+                trace.kernel_end_cycles < trace.kernel_start_cycles)
+                continue;
+            if (level >= ChipSwimlaneLevel::SCHEDULE_TIMING &&
+                (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles))
+                continue;
+            const uint64_t receive =
+                trace.ready_observe_cycles != 0 && trace.kernel_start_cycles >= trace.ready_observe_cycles ?
+                    trace.kernel_start_cycles - trace.ready_observe_cycles :
+                    0;
+            ChipSwimlaneAicoreTaskRecord record{
+                trace.kernel_start_cycles, trace.kernel_end_cycles, identity, static_cast<uint32_t>(index),
+                static_cast<uint32_t>(std::min(receive, uint64_t{UINT32_MAX}))
+            };
+            chip_swimlane_aicpu_record_staged_task(
+                static_cast<int>(trace.worker_id), kDiagnosticDumpLane, record, trace.dispatch_end_cycles,
+                trace.complete_start_cycles
+            );
+            if (level < ChipSwimlaneLevel::SCHED_PHASES) continue;
+            phase(
+                trace.worker_id, SchedPhaseKind::StateProbe, trace.state_probe_start_cycles,
+                trace.state_probe_end_cycles, trace.dispatch_loop_iter, identity
+            );
+            phase(
+                trace.worker_id, SchedPhaseKind::Dispatch, trace.dispatch_start_cycles, trace.dispatch_end_cycles,
+                trace.dispatch_loop_iter, identity
+            );
+            phase(
+                trace.worker_id, SchedPhaseKind::Complete, trace.complete_start_cycles, trace.complete_end_cycles,
+                trace.complete_loop_iter, identity
+            );
         }
     }
     int32_t core_ids[kMaxWorkers];

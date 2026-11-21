@@ -41,11 +41,11 @@ static inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const L
     if (base == nullptr || local == nullptr || local->config.graph == nullptr ||
         local->config.graph_summary_offset == 0)
         return false;
-    if (local->profiling != nullptr) local->profiling->protocol_layout_offset = 0;
+    if (__builtin_expect(local->profiling != nullptr, false)) local->profiling->protocol_layout_offset = 0;
     auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, local->config.graph_summary_offset);
     scheduler_observe_cache_line(&summary->protocol_layout_offset);
     const uint64_t offset = summary->protocol_layout_offset;
-    if (offset == 0) return true;
+    if (__builtin_expect(offset == 0, true)) return true;
     if (local->profiling == nullptr || (offset & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
         offset > UINT64_MAX - reinterpret_cast<uintptr_t>(base) - sizeof(SchedulerProtocolLayout))
         return false;
@@ -108,7 +108,8 @@ static inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const L
 
 template <typename Local>
 inline __aicore__ __gm__ SchedulerProtocolLayout *scheduler_protocol_layout_at(__gm__ void *base, const Local *local) {
-    if (local == nullptr || local->profiling == nullptr || local->profiling->protocol_layout_offset == 0)
+    if (local == nullptr || __builtin_expect(local->profiling == nullptr, true) ||
+        local->profiling->protocol_layout_offset == 0)
         return nullptr;
     return scheduler_state_at<SchedulerProtocolLayout>(base, local->profiling->protocol_layout_offset);
 }
@@ -163,7 +164,8 @@ static inline __aicore__ bool scheduler_protocol_stamp(
 
 template <typename Local>
 inline __aicore__ bool scheduler_protocol_enabled(const Local *local) {
-    return local != nullptr && local->profiling != nullptr && local->profiling->protocol_layout_offset != 0;
+    return local != nullptr && __builtin_expect(local->profiling != nullptr, false) &&
+           local->profiling->protocol_layout_offset != 0;
 }
 
 template <typename Local>

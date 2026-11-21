@@ -297,7 +297,7 @@ inline StateSelection select_percounter_state(
     if (notify_count != 0) {
         SchedulerDoneNotifications notifications{};
         if (api->acquire_scheduler_notifications(
-                SchedulerNotificationPurpose::COMPLETION_COUNTER, static_cast<size_t>(notify_count), &notifications
+                SchedulerNotificationPurpose::PERCOUNTER_SYNC_COHORT, static_cast<size_t>(notify_count), &notifications
             ) == 0) {
             notify_addresses = std::move(notifications.addresses);
             if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));

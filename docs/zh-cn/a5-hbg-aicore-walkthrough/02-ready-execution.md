@@ -18,7 +18,7 @@ Host 按现有数据和 Graph 控制依赖，以 `(level, -b_level, node_ref)` �
 
 每个真实 block/lane 都有已发布 Call 和 Binding。普通任务通过有效 block ticket
 取得一个具体执行 token，验证函数、任务、epoch、block/lane 和 generation。
-每核可持有两份普通自取记录和两份按 bank 索引的 MIX 成员记录；取得 Call 责任不等于取得 kernel 执行许可。
+每核有一个普通自取位置和一个 MIX 成员位置。取得 Call 责任后仍需通过 kernel 执行门禁。
 
 ```text
 查询本核目录游标并确认前驱供给
@@ -34,7 +34,7 @@ completion_state 的 total/remaining_compute/debt 必须合法。
 Graph 外部 fanin 经过 completion_refs，child-local index 加实例 child_begin；root 依赖 ENTER。
 不存在每条边 remaining decrement、wake-list 或 per-successor 通知。
 
-自取窗口被等待依赖的项占满时，保留两份自取责任及准备状态；原核在依赖满足后继续执行。
+自取位置被等待依赖的项占用时，原核保留这份自取责任及准备状态，依赖满足后继续执行。
 执行责任从首次有效领取到退休不转移，不再发布 PARKING/PARKED 或让其他核重领。
 等待期间继续服务独立 async/control 和已有协作责任，MIX 成员使用各自的 bank 记录。
 

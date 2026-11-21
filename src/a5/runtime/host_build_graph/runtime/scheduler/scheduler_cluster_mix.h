@@ -136,8 +136,7 @@ scheduler_protocol_cluster_all(__gm__ void *base, const SchedulerLocalState *loc
     auto *values = releases ? record->owner.released_seq : lane->arrived_seq;
     const auto resources = group.active_mask;
     for (uint32_t peer = 0; peer < 3; ++peer) {
-        const bool observed =
-            releases || group.requires_peer_order || local->async != nullptr || peer == local->config.self_lane;
+        const bool observed = releases || group.requires_peer_order || peer == local->config.self_lane;
         values[peer] = observed && resources.has(static_cast<SubtaskSlot>(peer)) ? group.generation : 0;
     }
     scheduler_protocol_stamp(base, local, layout, stamp);
@@ -147,6 +146,34 @@ scheduler_protocol_cluster_all(__gm__ void *base, const SchedulerLocalState *loc
     } else {
         scheduler_protocol_publish_record(lane);
     }
+}
+
+// Only the proxy reuses a bank. Every named lane published its execution credit
+// before FIN, so the matching FINs suffice when no accountant receipt is owed.
+inline __aicore__ bool scheduler_cluster_mix_recycle(
+    const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run, uint32_t bank,
+    uint32_t generation, bool *recycled
+) {
+    SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarClusterMixRecycle);
+    auto *signal = &local->cluster_signal->groups[bank];
+    if (scheduler_mix_needs_receipt(local, signal)) {
+        if (scheduler_cluster_load_field(&signal->accounted_generation) != generation) return true;
+    } else {
+        const auto fin =
+            scheduler_mix_fin_status(signal, scheduler_cluster_load_field(&signal->active_mask), generation);
+        if (fin == SchedulerMixFin::PENDING) return true;
+        if (fin == SchedulerMixFin::FAILED)
+            return scheduler_admission_fail(
+                graph, local, run, scheduler_cluster_load_field(&signal->task_ref),
+                SchedulerErrorSite::GROUP_ACK_INVALID
+            );
+    }
+    scheduler_cluster_store_release(&signal->armed_generation, generation + 1);
+    // An unnamed observer may still be sampling the old odd generation.
+    // Publish invalidation before any new payload field can be overwritten.
+    scheduler_cluster_barrier();
+    *recycled = true;
+    return true;
 }
 
 static inline __aicore__ bool scheduler_claim_for_build(
@@ -173,9 +200,13 @@ static inline __aicore__ bool scheduler_claim_for_build(
     auto *signal = local->cluster_signal;
     for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank) {
         const auto *descriptor = &signal->groups[bank];
-        if (scheduler_cluster_mix_armed(scheduler_cluster_load_field(&descriptor->armed_generation)) &&
-            scheduler_cluster_load_field(&descriptor->task_ref) == task_ref)
-            return true;
+        const uint32_t generation = scheduler_cluster_load_field(&descriptor->armed_generation);
+        if (scheduler_cluster_mix_armed(generation) &&
+            scheduler_cluster_load_field(&descriptor->task_ref) == task_ref) {
+            bool recycled = false;
+            if (!scheduler_cluster_mix_recycle(graph, local, run, bank, generation, &recycled)) return false;
+            if (!recycled) return true;
+        }
     }
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
@@ -185,12 +216,14 @@ static inline __aicore__ bool scheduler_claim_for_build(
     SchedulerScalarScope scope(local, SchedPhaseKind::ScalarClusterMixDiscoverTask, task_ref);
     auto &pending = local->cluster_pending;
     const bool trace = scheduler_protocol_enabled(local);
-    const uint64_t before = trace ? scheduler_protocol_cycles(local) : 0;
+    const uint64_t before = __builtin_expect(trace, false) ? scheduler_protocol_cycles(local) : 0;
     uint32_t block = blocks;
     bool closes = false;
     if (scheduler_task_has_fixed_owners(metadata.flags)) {
         block = local->config.cluster_index;
-    } else if (!scheduler_claim_ticket(graph, base, local, run, task_ref, blocks, &block, &closes)) {
+    } else if (!scheduler_claim_ticket(
+                   graph, base, local, run, task_ref, blocks, &block, &closes, /*execution_claim=*/false
+               )) {
         return false;
     }
     scheduler_invalidate_issue_snapshot(snapshot);
@@ -198,7 +231,7 @@ static inline __aicore__ bool scheduler_claim_for_build(
         if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
         return true;
     }
-    if (trace)
+    if (__builtin_expect(trace, false))
         scheduler_protocol_block_claim(
             base, local, task_ref, block, before, scheduler_protocol_cycles(local), closes ? blocks : 0
         );
@@ -235,22 +268,6 @@ static inline __aicore__ bool scheduler_cluster_mix_discover_next(
     return true;
 }
 
-// The accountant has received FIN for every active lane, completed its credit
-// and stopped touching the descriptor when its receipt reaches the proxy.
-inline __aicore__ bool scheduler_cluster_mix_recycle(SchedulerLocalState *local, uint32_t bank) {
-    SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarClusterMixRecycle);
-    auto *signal = &local->cluster_signal->groups[bank];
-    const uint32_t generation = scheduler_cluster_load_field(&signal->armed_generation);
-    if (!scheduler_cluster_mix_armed(generation) ||
-        scheduler_cluster_load_field(&signal->accounted_generation) != generation)
-        return false;
-    scheduler_cluster_store_release(&signal->armed_generation, generation + 1);
-    // An unnamed observer may still be sampling the old odd generation.
-    // Publish invalidation before any new payload field can be overwritten.
-    scheduler_cluster_barrier();
-    return true;
-}
-
 // Only the AIV0 holding the group ticket writes this descriptor. Members acquire it through armed_generation.
 static inline __aicore__ void scheduler_build_payload(SchedulerLocalState *local, LaneMask active, uint32_t bank) {
     const auto &pending = local->cluster_pending;
@@ -275,16 +292,22 @@ static inline __aicore__ bool scheduler_progress_mix_publication(
     *progress = false;
     if (!local->is_mix_coordinator() || local->cluster_signal == nullptr) return true;
     auto &pending = local->cluster_pending;
+    const bool pending_work = !scheduler_task_ref_is_null(pending.task_ref);
+    if (!pending_work && (SCHEDULER_REQUIRES_CNT_NOTIFY || local->config.completion_counters_offset != 0) &&
+        !scheduler_protocol_enabled(local))
+        return true;
     uint32_t bank = SCHEDULER_MIX_MEMBER_COUNT;
     for (uint32_t i = 0; i < SCHEDULER_MIX_MEMBER_COUNT; ++i) {
-        if (scheduler_cluster_mix_recycle(local, i)) *progress = true;
-        if (!scheduler_task_ref_is_null(pending.task_ref) && bank == SCHEDULER_MIX_MEMBER_COUNT &&
-            !scheduler_cluster_mix_armed(
-                scheduler_cluster_load_field(&local->cluster_signal->groups[i].armed_generation)
-            ))
-            bank = i;
+        const uint32_t generation = scheduler_cluster_load_field(&local->cluster_signal->groups[i].armed_generation);
+        if (scheduler_cluster_mix_armed(generation)) {
+            bool recycled = false;
+            if (!scheduler_cluster_mix_recycle(graph, local, run, i, generation, &recycled)) return false;
+            if (!recycled) continue;
+            *progress = true;
+        }
+        if (bank == SCHEDULER_MIX_MEMBER_COUNT) bank = i;
     }
-    if (scheduler_task_ref_is_null(pending.task_ref) || bank == SCHEDULER_MIX_MEMBER_COUNT) return true;
+    if (!pending_work || bank == SCHEDULER_MIX_MEMBER_COUNT) return true;
     auto *signal = local->cluster_signal;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     if (local->last_mix_generation >= UINT32_MAX - 2 ||
@@ -296,8 +319,13 @@ static inline __aicore__ bool scheduler_progress_mix_publication(
     local->last_mix_generation = generation;
     const auto active = scheduler_task_lanes(*scheduler_task_metadata_at(base, local, pending.task_ref));
     const bool trace = scheduler_protocol_enabled(local);
-    const uint64_t before = trace ? scheduler_protocol_cycles(local) : 0;
+    const uint64_t before = __builtin_expect(trace, false) ? scheduler_protocol_cycles(local) : 0;
+    const bool l2 = local->profiling != nullptr && local->profiling->capture_l2;
+    if (__builtin_expect(l2, false))
+        scheduler_cluster_store_field(&signal->l2_proxy[bank].prepare_cycles, scheduler_cycles());
     scheduler_build_payload(local, active, bank);
+    if (__builtin_expect(l2, false))
+        scheduler_cluster_store_field(&signal->l2_proxy[bank].arm_cycles, scheduler_cycles());
     scheduler_publish_built(local, generation, bank);
     scheduler_store_signal(
         scheduler_worker_context_at(base, local, local->worker_id())->mix_proxy_published[bank],
@@ -305,7 +333,7 @@ static inline __aicore__ bool scheduler_progress_mix_publication(
             SchedulerMixProxyPhase::PUBLISHED, static_cast<uint32_t>(pending.task_ref), pending.block_idx
         )
     );
-    if (trace) {
+    if (__builtin_expect(trace, false)) {
         scheduler_protocol_cluster_arm(
             base, local, pending.task_ref, pending.block_idx, generation, pending.rank, before,
             scheduler_protocol_cycles(local)
@@ -317,6 +345,28 @@ static inline __aicore__ bool scheduler_progress_mix_publication(
     pending = {};
     *progress = true;
     return true;
+}
+
+// A returning coordinator can publish its existing reservation or the fixed MIX at its
+// directory head before the next general selection pass. The bank still requires all FINs.
+static inline __aicore__ bool scheduler_continue_mix_publication(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+) {
+    bool progress = false;
+    if (scheduler_task_ref_is_null(local->cluster_pending.task_ref)) {
+        const auto &catalog = local->config.engine_catalog;
+        if (local->issue_cursor >= catalog.count || scheduler_has_execution_tokens(local)) return true;
+        const int64_t ref = catalog.refs[local->issue_cursor];
+        if (!scheduler_task_ref_valid(graph, ref)) return scheduler_issue_fail(graph, local, run, ref);
+        const auto flags = scheduler_task_metadata_at(base, local, ref)->flags;
+        if (!scheduler_task_is_mix(flags) || !scheduler_task_has_fixed_owners(flags)) return true;
+        bool ready = false;
+        if (!scheduler_check_predecessor_supply(graph, base, local, run, ref, &ready)) return false;
+        if (!ready) return true;
+        if (!scheduler_claim_for_build(graph, base, local, run, ref, &progress)) return false;
+        if (!progress) return true;
+    }
+    return scheduler_progress_mix_publication(graph, base, local, run, &progress);
 }
 
 static inline __aicore__ bool scheduler_cluster_mix_observe(
@@ -339,7 +389,8 @@ static inline __aicore__ bool scheduler_cluster_mix_observe(
         group.generation = generation;
         return true;
     }
-    if (scheduler_protocol_enabled(local) && scheduler_cluster_load_acquire(&signal->trace_generation) != generation)
+    if (__builtin_expect(scheduler_protocol_enabled(local), false) &&
+        scheduler_cluster_load_acquire(&signal->trace_generation) != generation)
         return true;
     const auto task = scheduler_cluster_load_field(&signal->task_ref);
     const uint32_t rank = scheduler_cluster_load_field(&signal->rank);
@@ -349,28 +400,43 @@ static inline __aicore__ bool scheduler_cluster_mix_observe(
         !scheduler_task_ref_valid(graph, task) || group.phase != SchedulerGmMixPhase::IDLE)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::GROUP_INVALID_DESCRIPTOR);
     const auto &metadata = *scheduler_task_metadata_at(base, local, task);
+    const auto flags = metadata.flags;
     const auto active = scheduler_task_lanes(metadata);
     const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
     const auto &order = scheduler_task_catalog_order(base, pool, static_cast<uint32_t>(task));
-    if (!scheduler_task_is_mix(metadata.flags) || scheduler_task_has_predicate(metadata.flags) || !active.is_mix() ||
+    if (!scheduler_task_is_mix(flags) || scheduler_task_has_predicate(flags) || !active.is_mix() ||
         active.raw() != bits || block >= metadata.logical_block_num || order.rank != rank)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::GROUP_INVALID_DESCRIPTOR);
     if (group.state != SchedulerDispatchSlotState::FREE)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::GROUP_INVALID_STATE);
     group = {};
+    if (__builtin_expect(local->profiling != nullptr, false) && local->profiling->capture_l2)
+        group.prepare_start_cycles = scheduler_cycles();
     group.task_ref = task;
     group.rank = rank;
     group.block_idx = block;
     group.generation = generation;
     group.active_mask = active;
+    group.sync_start = scheduler_task_requires_sync_start(flags);
+    group.may_observe_async_inputs = (flags & SCHEDULER_TASK_ASYNC_INPUT) != 0;
+    group.required_floor = order.required_floor[lane];
     for (uint32_t peer = 0; peer < PLATFORM_CORES_PER_BLOCKDIM; ++peer)
         if (active.has(static_cast<SubtaskSlot>(peer)) && order.required_floor[peer] != 0)
             group.requires_peer_order = true;
     group.subtask_slot = lane;
     group.phase = SchedulerGmMixPhase::PUBLISHED;
-    if (scheduler_profiled_node_fanin_view(graph, task, &group.fanin) != SchedulerGraphResult::OK)
+    if (!scheduler_task_is_executable(flags) ||
+        scheduler_metadata_core_type_index(lane) != local->config.self_core_type)
+        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::DISPATCH_INVALID_SHAPE);
+    SchedulerNativeNode node{};
+    if (scheduler_profiled_node_fanin_view(graph, task, &group.fanin, &node) != SchedulerGraphResult::OK)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::GROUP_INVALID_STATE);
     scheduler_protocol_cluster_observe(base, local, bank);
+    if (graph.native_header_offset != 0) {
+        const auto binding_error = scheduler_observe_graph_arguments(graph, node);
+        if (binding_error != SchedulerGraphBindingError::NONE)
+            return scheduler_admission_fail(graph, local, run, task, scheduler_graph_binding_error_site(binding_error));
+    }
     *progress = true;
     return true;
 }
@@ -382,14 +448,13 @@ static inline __aicore__ bool scheduler_poll_mix_fanin(
     auto &group = local->mix_groups[bank];
     if (group.next_fanin == group.fanin.count) return true;
     SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarClusterMixDependencies, group.task_ref);
-    bool ready = false;
     const auto previous = group.next_fanin;
     if (!scheduler_observe_fanin_prefix(
-            graph, base, local, run, group.task_ref, group.fanin, group.next_fanin, &ready, &group.wait
+            graph, base, local, run, group.task_ref, group.fanin, group.next_fanin, &group.wait
         ))
         return false;
     *progress = *progress || previous != group.next_fanin;
-    if (ready) scheduler_cluster_barrier();
+    if (group.next_fanin == group.fanin.count) scheduler_cluster_barrier();
     return true;
 }
 
@@ -403,13 +468,10 @@ static inline __aicore__ bool scheduler_account_mix_returns(
         return true;
     SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarClusterMixAccount, group.task_ref);
     auto *signal = &local->cluster_signal->groups[bank];
-    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        if (!group.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-        const uint32_t finished = scheduler_cluster_load_field(&signal->finished[lane]);
-        if (finished < group.generation) return true;
-        if (finished != group.generation)
-            return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_ACK_INVALID);
-    }
+    const auto fin = scheduler_mix_fin_status(signal, group.active_mask.raw(), group.generation);
+    if (fin == SchedulerMixFin::PENDING) return true;
+    if (fin == SchedulerMixFin::FAILED)
+        return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_ACK_INVALID);
     scheduler_cluster_barrier();
     if (group.completion_submitted || scheduler_cluster_load_field(&signal->armed_generation) != group.generation)
         return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_ACK_INVALID);
@@ -430,25 +492,16 @@ static inline __aicore__ bool scheduler_prepare_mix_lane(
     auto &group = local->mix_groups[bank];
     SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarClusterMixPrepareMember, group.task_ref);
     const uint32_t lane = group.subtask_slot;
-    const auto binding_error = scheduler_observe_graph_arguments(graph, group.task_ref);
-    if (binding_error != SchedulerGraphBindingError::NONE)
-        return scheduler_admission_fail(
-            graph, local, run, group.task_ref, scheduler_graph_binding_error_site(binding_error)
-        );
     group.cluster_mix = true;
     group.state = SchedulerDispatchSlotState::FILLING;
-    group.prepare_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+    if (scheduler_phase_timing_enabled(profiling_level)) group.prepare_start_cycles = scheduler_cycles();
     if (!scheduler_acquire_group_lane(
             base, local->config.prepared, local->worker_id(), group.task_ref, group.block_idx,
             static_cast<uint8_t>(lane), group.active_mask.raw(), &group.prepared
         ))
         return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-    const auto metadata = scheduler_load_dispatch_metadata(base, local, group.task_ref, profiling_level);
-    group.sync_start = scheduler_task_requires_sync_start(metadata.flags);
-    if (!scheduler_task_is_executable(metadata.flags) || !scheduler_task_is_mix(metadata.flags) ||
-        !scheduler_task_lanes(metadata).has(static_cast<SubtaskSlot>(lane)) ||
-        scheduler_metadata_core_type_index(lane) != local->config.self_core_type)
-        return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::DISPATCH_INVALID_SHAPE);
+    if (profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL)
+        local->profiling->l2_mix[bank] = {scheduler_cycles(), 0};
     *progress = true;
     return true;
 }
@@ -478,11 +531,14 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
     if (group.phase == SchedulerGmMixPhase::PUBLISHED) {
         if (!scheduler_poll_mix_fanin(graph, base, local, run, progress, bank)) return false;
         if (group.next_fanin != group.fanin.count) return true;
+        if (profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL &&
+            local->profiling->l2_mix[bank].fanin_seen_cycles == 0)
+            local->profiling->l2_mix[bank].fanin_seen_cycles = scheduler_cycles();
         // A claimed member may prepare while its core still owes work to an earlier MIX group.
         // MIX groups share at least one member. Committing too early can occupy a core the earlier group needs.
         if (scheduler_cluster_owes_before(local, group.rank, bank)) return true;
         bool permit = false;
-        if (!scheduler_mix_lane_order_ready(graph, base, local, run, group.task_ref, &permit)) return false;
+        if (!scheduler_mix_lane_order_ready(graph, base, local, run, group, &permit)) return false;
         if (!permit) return true;
         if (group.requires_peer_order) {
             // This core passed its order check and can run ordinary work while it waits for the other members.
@@ -497,24 +553,30 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
             // This lane may have claimed an earlier block while waiting for its peers.
             if (scheduler_owned_token_blocks_mix_arrival(local, group.rank)) return true;
         }
-        if (scheduler_task_requires_sync_start(scheduler_task_metadata_at(base, local, group.task_ref)->flags))
-            scheduler_protocol_member(base, local, group.task_ref, false);
+        if (group.sync_start) scheduler_protocol_member(base, local, group.task_ref, false);
         scheduler_protocol_cluster_ack(base, local, false, true, bank);
-        scheduler_cluster_store_release(&signal->arrived[group.subtask_slot], group.generation);
+        if (group.requires_peer_order) {
+            scheduler_cluster_store_release(&signal->arrived[group.subtask_slot], group.generation);
+            group.phase = SchedulerGmMixPhase::ARRIVED;
+        }
         scheduler_protocol_cluster_ack(base, local, false, false, bank);
-        group.phase = SchedulerGmMixPhase::ARRIVED;
         *progress = true;
     }
-    // External waits and earlier sync cohorts can require a peer to run older work.
-    if ((group.requires_peer_order || local->async != nullptr) &&
-        !scheduler_cluster_mix_all(signal->arrived, group.active_mask, group.generation))
+    // An earlier conflicting cohort can still require a peer to run older work.
+    if (group.requires_peer_order && !scheduler_cluster_mix_all(signal->arrived, group.active_mask, group.generation))
         return true;
     scheduler_protocol_cluster_all(base, local, false, bank);
     group.predicate = SchedulerPredicateState::PASS;
-    const auto metadata = scheduler_load_dispatch_metadata(base, local, group.task_ref, profiling_level);
-    scheduler_publish_dispatch_slot(
-        base, local, SCHEDULER_CLUSTER_MIX_EXECUTION + bank, metadata, profiling_level, group.prepare_start_cycles
-    );
+    if (__builtin_expect(local->profiling == nullptr, true)) {
+        // Only the async-input flag is needed at entry, and this bank already owns it.
+        group.state = SchedulerDispatchSlotState::READY;
+    } else {
+        // Sampled L0 also needs the timing slot carried by dispatch metadata.
+        const auto metadata = scheduler_load_dispatch_metadata(base, local, group.task_ref, profiling_level);
+        scheduler_publish_dispatch_slot(
+            base, local, SCHEDULER_CLUSTER_MIX_EXECUTION + bank, metadata, profiling_level, group.prepare_start_cycles
+        );
+    }
     group.phase = SchedulerGmMixPhase::RUNNING;
     *progress = true;
     return true;
@@ -545,7 +607,7 @@ static inline __aicore__ bool scheduler_cluster_mix_service(
 
 static inline __aicore__ bool scheduler_cluster_mix_can_enter(
     const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run, uint32_t slot_index,
-    bool *permit
+    bool *permit, bool ready_checked
 ) {
     SchedulerScalarScope scope(local, SchedPhaseKind::ScalarClusterMixEnter);
     *permit = false;
@@ -558,9 +620,9 @@ static inline __aicore__ bool scheduler_cluster_mix_can_enter(
     const auto &group = local->mix_groups[bank];
     const auto *signal = &local->cluster_signal->groups[bank];
     if (group.phase != SchedulerGmMixPhase::RUNNING || !group.cluster_mix ||
-        group.state != SchedulerDispatchSlotState::READY ||
+        (!ready_checked && group.state != SchedulerDispatchSlotState::READY) ||
         scheduler_cluster_load_acquire(&signal->armed_generation) != group.generation ||
-        scheduler_cluster_load_field(&local->cluster_signal->run_epoch) != local->config.prepared->run_epoch)
+        scheduler_cluster_load_field(&local->cluster_signal->run_epoch) != local->run_epoch)
         return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     *permit = true;
     return true;
@@ -580,12 +642,13 @@ static inline __aicore__ bool scheduler_release_mix_lane(
     if (group.phase != SchedulerGmMixPhase::RUNNING || &completed != &group || !group.cluster_mix ||
         group.state != SchedulerDispatchSlotState::EXECUTING || group.prepared.claimed_state != 0)
         return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
+    const bool accountant = group.subtask_slot == scheduler_mix_accountant_lane(group.active_mask) &&
+                            scheduler_mix_needs_receipt(local, signal);
     scheduler_protocol_cluster_ack(base, local, true, true, bank);
     scheduler_cluster_store_release(&signal->finished[group.subtask_slot], group.generation + (successful ? 0 : 1));
     scheduler_protocol_cluster_ack(base, local, true, false, bank);
-    if (scheduler_task_requires_sync_start(scheduler_task_metadata_at(base, local, group.task_ref)->flags))
-        scheduler_protocol_member(base, local, group.task_ref, true);
-    if (group.subtask_slot != scheduler_mix_accountant_lane(group.active_mask)) {
+    if (group.sync_start) scheduler_protocol_member(base, local, group.task_ref, true);
+    if (!accountant) {
         group.phase = SchedulerGmMixPhase::IDLE;
         return true;
     }
@@ -620,11 +683,13 @@ static inline __aicore__ bool scheduler_cluster_mix_drain(
                 graph, local, run, group.task_ref, SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT
             );
         if (local->is_mix_coordinator()) {
-            scheduler_cluster_mix_recycle(local, bank);
-            if (scheduler_cluster_mix_armed(
-                    scheduler_cluster_load_field(&local->cluster_signal->groups[bank].armed_generation)
-                ))
-                retired = false;
+            const uint32_t generation =
+                scheduler_cluster_load_field(&local->cluster_signal->groups[bank].armed_generation);
+            if (scheduler_cluster_mix_armed(generation)) {
+                bool recycled = false;
+                if (!scheduler_cluster_mix_recycle(graph, local, run, bank, generation, &recycled)) return false;
+                retired = retired && recycled;
+            }
         }
     }
     *done = retired && (local->is_mix_coordinator() || !scheduler_cluster_owes_before(local, UINT32_MAX));

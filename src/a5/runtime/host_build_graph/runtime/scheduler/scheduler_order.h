@@ -20,6 +20,34 @@ scheduler_order_for(__gm__ void *base, const SchedulerLocalState *local, int64_t
     return scheduler_task_catalog_order(base, catalog, static_cast<uint32_t>(task));
 }
 
+// Normal A5 groups publish one counter credit per returning lane. The simulator's
+// GM group credit and the optional protocol trace require an accountant receipt.
+inline __aicore__ bool scheduler_mix_needs_receipt(
+    const SchedulerLocalState *local, const SCHEDULER_CLUSTER_SSBUF SchedulerClusterDescriptor *descriptor
+) {
+    if constexpr (!SCHEDULER_REQUIRES_CNT_NOTIFY) {
+        const uint64_t offset = local->config.completion_counters_offset;
+        if (offset == 0) return true;
+        auto *base = reinterpret_cast<__gm__ void *>(local->config.shared_context->scheduler_state_base_address);
+        if (scheduler_completion_counter_at(base, offset, scheduler_cluster_load_field(&descriptor->task_ref)) == nullptr)
+            return true;
+    }
+    return scheduler_protocol_enabled(local);
+}
+
+enum class SchedulerMixFin { PENDING, COMPLETE, FAILED };
+
+inline __aicore__ SchedulerMixFin scheduler_mix_fin_status(
+    const SCHEDULER_CLUSTER_SSBUF SchedulerClusterDescriptor *descriptor, uint32_t mask, uint32_t generation
+) {
+    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        if ((mask & (1U << lane)) == 0) continue;
+        const uint32_t fin = scheduler_cluster_load_field(&descriptor->finished[lane]);
+        if (fin != generation) return fin < generation ? SchedulerMixFin::PENDING : SchedulerMixFin::FAILED;
+    }
+    return SchedulerMixFin::COMPLETE;
+}
+
 inline __aicore__ bool scheduler_cluster_owes_before(
     const SchedulerLocalState *local, uint32_t rank, uint32_t current_bank = SCHEDULER_MIX_MEMBER_COUNT
 ) {
@@ -33,16 +61,26 @@ inline __aicore__ bool scheduler_cluster_owes_before(
         if ((generation & 1U) == 0) continue;
         const uint32_t previous = scheduler_cluster_load_field(&descriptor->rank);
         bool owes = previous < rank;
+        const bool receipt = scheduler_mix_needs_receipt(local, descriptor);
         const auto *ack = &descriptor->accounted_generation;
         if (current_bank == SCHEDULER_MIX_MEMBER_COUNT) {
             const uint32_t bits = scheduler_cluster_load_field(&descriptor->active_mask);
             const LaneMask mask{(bits & 1U) != 0, (bits & 2U) != 0, (bits & 4U) != 0};
             const auto lane = local->config.self_lane;
             owes = owes && mask.has(static_cast<SubtaskSlot>(lane));
-            if (lane != scheduler_mix_accountant_lane(mask)) ack = &descriptor->finished[lane];
+            if (!receipt || lane != scheduler_mix_accountant_lane(mask)) ack = &descriptor->finished[lane];
         }
         if (scheduler_cluster_load_acquire(&descriptor->armed_generation) != generation) return true;
-        if (owes && scheduler_cluster_load_acquire(ack) != generation) return true;
+        if (!owes) continue;
+        if (current_bank != SCHEDULER_MIX_MEMBER_COUNT && !receipt) {
+            if (scheduler_mix_fin_status(
+                    descriptor, scheduler_cluster_load_field(&descriptor->active_mask), generation
+                ) != SchedulerMixFin::COMPLETE)
+                return true;
+            scheduler_cluster_barrier();
+        } else if (scheduler_cluster_load_acquire(ack) != generation) {
+            return true;
+        }
     }
     return false;
 }
@@ -91,22 +129,21 @@ inline __aicore__ bool scheduler_owned_token_blocks_mix_arrival(const SchedulerL
 // Graph control predecessor. Already assigned pure cohorts remain in W.
 static inline __aicore__ bool scheduler_mix_lane_order_ready(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, bool *ready
+    const SchedulerClusterMixLocalState &group, bool *ready
 ) {
-    SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarMixLaneOrderReady, ref);
+    SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarMixLaneOrderReady, group.task_ref);
     *ready = false;
-    const auto &row = scheduler_order_for(base, local, ref);
-    if (scheduler_owned_token_blocks_mix_arrival(local, row.rank)) return true;
-    const auto required = row.required_floor[local->config.self_lane];
+    if (scheduler_owned_token_blocks_mix_arrival(local, group.rank)) return true;
+    const auto required = group.required_floor;
     local->observed_self_floor = 0;
     if (required != 0) {
         const auto &catalog = local->config.engine_catalog;
-        if (local->issue_cursor > catalog.count || required > row.rank)
-            return scheduler_issue_fail(graph, local, run, ref);
+        if (local->issue_cursor > catalog.count || required > group.rank)
+            return scheduler_issue_fail(graph, local, run, group.task_ref);
         uint32_t floor = static_cast<uint32_t>(graph.task_count);
         if (local->issue_cursor != catalog.count) {
             const auto head = catalog.refs[local->issue_cursor];
-            if (!scheduler_task_ref_valid(graph, head)) return scheduler_issue_fail(graph, local, run, ref);
+            if (!scheduler_task_ref_valid(graph, head)) return scheduler_issue_fail(graph, local, run, group.task_ref);
             floor = scheduler_order_for(base, local, head).rank;
         }
         if (floor < required) return true;
@@ -156,9 +193,9 @@ static inline __aicore__ bool scheduler_advance_mix_floor(
     if (prior != UINT32_MAX) local->next_mix_ref = row.next_mix_ref;
     const auto cluster = local->config.shared_context->cluster_index;
     const bool trace = scheduler_protocol_enabled(local);
-    if (trace) scheduler_protocol_mix_floor(base, local, cluster, prior, floor, true);
+    if (__builtin_expect(trace, false)) scheduler_protocol_mix_floor(base, local, cluster, prior, floor, true);
     scheduler_cluster_store_release(&local->cluster_signal->mix_floor, floor);
-    if (trace) scheduler_protocol_mix_floor(base, local, cluster, prior, floor, false);
+    if (__builtin_expect(trace, false)) scheduler_protocol_mix_floor(base, local, cluster, prior, floor, false);
     local->published_mix_floor = floor;
     *progress = true;
     return true;

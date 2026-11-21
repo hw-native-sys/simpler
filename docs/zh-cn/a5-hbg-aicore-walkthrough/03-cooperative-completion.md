@@ -12,10 +12,10 @@ MIX 的 resource mask 与 active mask 相同，只有掩码内的 lane 执行函
 ## MIX 和 sync_start 的所有权
 
 每簇的 AIV0 领取一个 MIX block，将 task、block、rank 和参与掩码发布到本簇的 SSBUF。
-两个 bank 都被占用时，代理在本核保留一份已分发的待发布组。
+唯一的 bank 被占用时，代理在本核保留一份已分发的待发布组。
 成员两次读到相同的有效代后，按掩码接收自己的 Call，并保留本代直到完成。
 成员通过依赖、顺序及启动许可后进入 kernel。记账者收齐本代所有参与成员的 FIN，代理才可复用这个 bank。
-代理分别保留已领取组、两个 bank 最近发布的组及发布前的取消记录。各执行核分别记录已接收、进入 kernel 和物理返回，支持定位发布前取消及 kernel 挂起。
+代理分别保留已领取组、bank 最近发布的组及发布前的取消记录。各执行核分别记录已接收、进入 kernel 和物理返回，支持定位发布前取消及 kernel 挂起。
 
 sync_start 为一个任务的 blocks 建立同驻 cohort，使用全 run 的 ordered cooperative admission。
 metadata 不决定运行时 order key；Graph 内外共享同一顺序域。

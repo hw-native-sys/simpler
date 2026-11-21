@@ -11,6 +11,7 @@
 #include "host/scheduler_notification_cache.h"
 #include "host/scheduler_notification_address.h"
 #include <gtest/gtest.h>
+#include <stdexcept>
 
 namespace {
 struct Counters {
@@ -26,16 +27,20 @@ public:
     FakePool(void *context, SchedulerNotificationPurpose purpose, Counters &counts) :
         SchedulerNotificationStorage(context),
         counts_(counts),
-        counter_(purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER) {
+        purpose_(purpose) {
         ++counts_.created;
     }
     size_t capacity() const override { return capacity_; }
     SchedulerDoneNotifications prepare(size_t count) override {
         ++counts_.prepared;
+        if (count > counts_.capacity_limit && purpose_ != SchedulerNotificationPurpose::PERCOUNTER_SYNC_COHORT)
+            throw std::runtime_error("CntNotify exhausted");
         capacity_ = std::min(std::max(capacity_, count), counts_.capacity_limit);
         SchedulerDoneNotifications result{std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
         std::fill_n(result.addresses.begin(), std::min(capacity_, count), 32);
-        if (counter_) std::fill_n(result.add_addresses.begin(), std::min(capacity_, count), 40);
+        if (purpose_ == SchedulerNotificationPurpose::COMPLETION_COUNTER ||
+            purpose_ == SchedulerNotificationPurpose::PERCOUNTER_SYNC_COHORT)
+            std::fill_n(result.add_addresses.begin(), std::min(capacity_, count), 40);
         return result;
     }
     int release() override {
@@ -46,7 +51,7 @@ public:
 
 private:
     Counters &counts_;
-    const bool counter_;
+    const SchedulerNotificationPurpose purpose_;
     size_t capacity_{0};
 };
 struct Fixture {
@@ -158,11 +163,27 @@ TEST(SchedulerNotificationCache, CounterAliasesArePurposeSpecific) {
     EXPECT_EQ(f.cache.release(), 0);
 }
 
-TEST(SchedulerNotificationCache, CapacityFallbackKeepsWholeCounterPairsAndLease) {
+TEST(SchedulerNotificationCache, FailedHbgAllocationRetiresThePartialPoolAndCanBeRetried) {
+    Fixture f;
+    f.counts.capacity_limit = 2;
+    SchedulerDoneNotifications lease;
+    EXPECT_THROW(f.acquire(lease, 4, SchedulerNotificationPurpose::COMPLETION_COUNTER), std::runtime_error);
+    EXPECT_EQ(lease.owner, nullptr);
+    EXPECT_TRUE(lease.addresses.empty());
+    f.counts.capacity_limit = 4;
+    ASSERT_EQ(f.acquire(lease, 4, SchedulerNotificationPurpose::COMPLETION_COUNTER), 0);
+    EXPECT_EQ(f.counts.released, 1);
+    EXPECT_EQ(f.counts.created, 2);
+    EXPECT_EQ(lease.add_addresses.back(), 40u);
+    lease = {};
+    EXPECT_EQ(f.cache.release(), 0);
+}
+
+TEST(SchedulerNotificationCache, PercounterCapacityFallbackKeepsWholeCounterPairsAndLease) {
     Fixture f;
     f.counts.capacity_limit = 2;
     SchedulerDoneNotifications counter;
-    ASSERT_EQ(f.acquire(counter, 4, SchedulerNotificationPurpose::COMPLETION_COUNTER), 0);
+    ASSERT_EQ(f.acquire(counter, 4, SchedulerNotificationPurpose::PERCOUNTER_SYNC_COHORT), 0);
     ASSERT_EQ(counter.addresses.size(), 4u);
     ASSERT_EQ(counter.add_addresses.size(), 4u);
     EXPECT_EQ(counter.addresses[0], 32u);

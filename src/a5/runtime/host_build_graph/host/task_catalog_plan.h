@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -20,8 +21,10 @@
 #include "scheduler/scheduler_task_catalog.h"
 #include "dependency_plan.h"
 #include "host/control_folding.h"
+#include "task_catalog_deferral.h"
 
 struct SchedulerTaskCatalogPlan {
+    uint32_t cluster_count{0};
     uint64_t header_offset{0};
     uint64_t total_size{0};
     SchedulerTaskCatalogHeader header{};
@@ -43,14 +46,17 @@ struct SchedulerTaskOrder {
 
 // Sorting owns these scratch successor rows. Deduplicate in place and reuse them for the rank check.
 inline bool scheduler_topological_task_order(
-    std::vector<std::vector<int64_t>> &successors, SchedulerTaskOrder *order, std::string *error = nullptr
+    std::vector<std::vector<int64_t>> &successors, const std::vector<SchedulerTaskMetadata> &metadata,
+    uint32_t clusters, bool defer_side_tasks, SchedulerTaskOrder *order, std::string *error = nullptr
 ) {
     const auto fail = [&](const std::string &message) {
         if (error != nullptr) *error = message;
         return false;
     };
     const size_t count = successors.size();
-    if (order == nullptr || count > INT32_MAX) return fail("invalid topological task count");
+    if (order == nullptr || count > INT32_MAX || metadata.size() != count || clusters == 0 ||
+        clusters > SCHEDULER_CLUSTER_CAPACITY)
+        return fail("invalid task ordering inputs");
     for (const auto &row : successors)
         for (const auto successor : row)
             if (successor < 0 || static_cast<uint64_t>(successor) >= count)
@@ -92,6 +98,8 @@ inline bool scheduler_topological_task_order(
     std::vector<uint32_t> ranks(count, 0);
     for (size_t rank = 0; rank < count; ++rank)
         ranks[topological[rank]] = static_cast<uint32_t>(rank);
+    if (defer_side_tasks)
+        scheduler_defer_side_tasks(successors, metadata, clusters, levels, bottom_levels, topological, ranks);
     *order = {std::move(topological), std::move(levels), std::move(bottom_levels), std::move(ranks)};
     if (error != nullptr) error->clear();
     return true;
@@ -177,9 +185,19 @@ inline bool scheduler_apply_task_order(
     return true;
 }
 
+inline bool scheduler_can_defer_side_tasks(
+    bool native_graph, bool has_deferred_work, uint64_t control_count,
+    const std::vector<SchedulerTaskMetadata> &metadata
+) {
+    if (native_graph || has_deferred_work || control_count != 0) return false;
+    return std::none_of(metadata.begin(), metadata.end(), [](const SchedulerTaskMetadata &task) {
+        return scheduler_task_has_predicate(task.flags);
+    });
+}
+
 inline bool scheduler_order_task_catalog(
     const SchedulerDependencyPlan &decoded, const std::vector<SchedulerTaskMetadata> &metadata,
-    SchedulerTaskCatalogPlan *plan, std::string *error = nullptr
+    SchedulerTaskCatalogPlan *plan, std::string *error = nullptr, bool defer_side_tasks = false
 ) {
     const size_t count = metadata.size();
     if (plan == nullptr || plan->header.task_count != count || decoded.fanin.size() != count ||
@@ -190,7 +208,8 @@ inline bool scheduler_order_task_catalog(
         for (const auto producer : decoded.fanin[consumer])
             successors[producer].push_back(static_cast<int64_t>(consumer));
     SchedulerTaskOrder ordered;
-    if (!scheduler_topological_task_order(successors, &ordered, error)) return false;
+    if (!scheduler_topological_task_order(successors, metadata, plan->cluster_count, defer_side_tasks, &ordered, error))
+        return false;
     for (size_t producer = 0; producer < count; ++producer)
         for (const auto consumer : successors[producer])
             if (ordered.task_ranks[producer] >= ordered.task_ranks[consumer]) {
@@ -198,6 +217,46 @@ inline bool scheduler_order_task_catalog(
                 return false;
             }
     return scheduler_apply_task_order(std::move(ordered), metadata, plan, error);
+}
+
+// A member observes every data predecessor's logical completion before it applies its MIX floor.
+// Track only contiguous prefixes of ordinary work. A larger rank on an independent branch cannot
+// certify an earlier task. An uncertain edge or task contributes no completion proof.
+inline void scheduler_elide_proven_mix_floors(
+    const SchedulerDependencyPlan &deps, const std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<LaneMask> &possible_async_lanes, SchedulerTaskCatalogPlan &catalog
+) {
+    using LaneFloors = std::array<uint32_t, PLATFORM_CORES_PER_BLOCKDIM>;
+    std::vector<LaneFloors> completed_prefix(metadata.size());
+    LaneFloors last_ordinary{};
+    for (const int64_t ref : catalog.task_order) {
+        const auto &task = metadata[ref];
+        if (deps.host_done[ref] || !scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags))
+            continue;
+        auto &proof = completed_prefix[ref];
+        const bool known = !scheduler_task_has_predicate(task.flags) && possible_async_lanes[ref].is_empty();
+        if (known)
+            for (const int64_t pred : deps.fanin[ref])
+                for (size_t lane = 0; lane < proof.size(); ++lane)
+                    proof[lane] = std::max(proof[lane], completed_prefix[pred][lane]);
+
+        auto &row = catalog.order_rows[ref];
+        const auto lanes = scheduler_task_claim_lanes(task.flags, task.active_mask).merged_with(task.active_mask);
+        if (scheduler_task_is_mix(task.flags)) {
+            // Keep the full peer protocol if even one participating lane can owe earlier work.
+            bool all_clear = known;
+            for (size_t lane = 0; lane < proof.size(); ++lane)
+                if (lanes.has(static_cast<SubtaskSlot>(lane)) && proof[lane] < last_ordinary[lane])
+                    all_clear = false;
+            if (all_clear) std::fill_n(row.required_floor, proof.size(), 0u);
+        } else {
+            for (size_t lane = 0; lane < proof.size(); ++lane) {
+                if (!lanes.has(static_cast<SubtaskSlot>(lane))) continue;
+                if (known && proof[lane] >= last_ordinary[lane]) proof[lane] = row.rank + 1;
+                last_ordinary[lane] = row.rank + 1;
+            }
+        }
+    }
 }
 
 // The original topology fixes issue order. Fold pure controls with at most one consumer within the fan-in limit.
@@ -312,6 +371,7 @@ inline bool scheduler_size_task_catalog(
         start_offset == 0)
         return false;
     SchedulerTaskCatalogPlan next{};
+    next.cluster_count = clusters;
     auto &header = next.header;
     header.task_count = metadata.size();
     next.descriptors.resize(SCHEDULER_EXECUTION_ENGINE_COUNT);
