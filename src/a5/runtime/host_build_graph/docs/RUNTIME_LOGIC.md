@@ -462,6 +462,36 @@ applicable epoch and cooperative entry conditions before invoking the Call.
 When a kernel returns with an outstanding deferred condition, CHECK follows
 the condition in the shared async directory.
 
+Early dispatch is the resident path's claim of a consumer before its
+predecessors complete. Five states are distinguished: metadata available (the
+task sits in the engine catalog with its prepared Call), pre-dispatched (a
+worker holds the ticket and has claimed and received the Call while fanin is
+incomplete), dependencies ready (the confirmed fanin prefix covers every
+predecessor), kernel started (the slot passes its order checks and enters),
+and TaskDone (the completion accounting publishes DONE). A block's ticket is
+issued only after every cross-engine predecessor has closed its supply and
+every same-engine predecessor has passed the worker's issue cursor, so owners
+exist for all earlier work before a consumer takes space.
+
+The retention contracts are: a ticket is irrevocable and each block executes
+at most once; a pre-dispatched slot never consumes unread inputs, never
+evaluates a predicate, and never publishes completion before its fanin
+settles; occupancy is bounded by the per-core token capacity and by
+irrevocable supply seals, so a fanned-out wave of waiting consumers cannot
+deny producers their owners; a candidate that cannot claim keeps its normal
+issuance through the same catalog, with no legacy fallback; and a run-level
+failure cancels only provably owned unstarted handles to FAILED without
+manufacturing a return, after which a re-initialized epoch rejects the drained
+run's stale handles and signals.
+
+The support matrix for pre-dispatch covers ordinary single-block and SPMD
+AIC/AIV tasks, including sync-start cohorts, predicates evaluated only after
+dependencies complete, and consumers of deferred asynchronous completions,
+whose gate is the shared completion accounting and never the producer's
+physical kernel return. MIX and inline work never occupy an execution token:
+MIX members prepare through the cluster SSBUF banks instead, and inline tasks
+have no Call to prepare.
+
 ### 7.2 Business Execution and Cooperative Work
 
 The executor calls the prepared function with `Call.args`. The kernel receives
