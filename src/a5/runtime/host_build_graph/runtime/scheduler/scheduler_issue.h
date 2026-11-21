@@ -112,9 +112,10 @@ static inline __aicore__ bool scheduler_task_supply_closed(
 // contribute. A total of N therefore proves all N blocks have fixed owners.
 static inline __aicore__ bool scheduler_claim_ticket(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, uint32_t blocks, uint32_t *block, bool *closes_supply
+    int64_t ref, uint32_t blocks, uint32_t *block, bool *closes_supply, bool execution_claim = true
 ) {
     SchedulerScalarScope scope(local, SchedPhaseKind::ScalarOrdinaryBlockClaim, ref);
+    SchedulerExecutionClaimLoads claim_loads(execution_claim);
     *block = blocks;
     *closes_supply = false;
     auto *control = scheduler_task_control_at(base, local, ref);

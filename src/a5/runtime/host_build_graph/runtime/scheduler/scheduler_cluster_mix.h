@@ -190,7 +190,9 @@ static inline __aicore__ bool scheduler_claim_for_build(
     bool closes = false;
     if (scheduler_task_has_fixed_owners(metadata.flags)) {
         block = local->config.cluster_index;
-    } else if (!scheduler_claim_ticket(graph, base, local, run, task_ref, blocks, &block, &closes)) {
+    } else if (!scheduler_claim_ticket(
+                   graph, base, local, run, task_ref, blocks, &block, &closes, /*execution_claim=*/false
+               )) {
         return false;
     }
     scheduler_invalidate_issue_snapshot(snapshot);
@@ -297,7 +299,10 @@ static inline __aicore__ bool scheduler_progress_mix_publication(
     const auto active = scheduler_task_lanes(*scheduler_task_metadata_at(base, local, pending.task_ref));
     const bool trace = scheduler_protocol_enabled(local);
     const uint64_t before = trace ? scheduler_protocol_cycles(local) : 0;
+    const bool l2 = local->profiling != nullptr && local->profiling->capture_l2;
+    if (l2) scheduler_cluster_store_field(&signal->l2_proxy[bank].prepare_cycles, scheduler_cycles());
     scheduler_build_payload(local, active, bank);
+    if (l2) scheduler_cluster_store_field(&signal->l2_proxy[bank].arm_cycles, scheduler_cycles());
     scheduler_publish_built(local, generation, bank);
     scheduler_store_signal(
         scheduler_worker_context_at(base, local, local->worker_id())->mix_proxy_published[bank],
@@ -349,25 +354,33 @@ static inline __aicore__ bool scheduler_cluster_mix_observe(
         !scheduler_task_ref_valid(graph, task) || group.phase != SchedulerGmMixPhase::IDLE)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::GROUP_INVALID_DESCRIPTOR);
     const auto &metadata = *scheduler_task_metadata_at(base, local, task);
+    const auto flags = metadata.flags;
     const auto active = scheduler_task_lanes(metadata);
     const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
     const auto &order = scheduler_task_catalog_order(base, pool, static_cast<uint32_t>(task));
-    if (!scheduler_task_is_mix(metadata.flags) || scheduler_task_has_predicate(metadata.flags) || !active.is_mix() ||
+    if (!scheduler_task_is_mix(flags) || scheduler_task_has_predicate(flags) || !active.is_mix() ||
         active.raw() != bits || block >= metadata.logical_block_num || order.rank != rank)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::GROUP_INVALID_DESCRIPTOR);
     if (group.state != SchedulerDispatchSlotState::FREE)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::GROUP_INVALID_STATE);
     group = {};
+    if (local->profiling != nullptr && local->profiling->capture_l2) group.prepare_start_cycles = scheduler_cycles();
     group.task_ref = task;
     group.rank = rank;
     group.block_idx = block;
     group.generation = generation;
     group.active_mask = active;
+    group.sync_start = scheduler_task_requires_sync_start(flags);
+    group.may_observe_async_inputs = (flags & SCHEDULER_TASK_ASYNC_INPUT) != 0;
+    group.required_floor = order.required_floor[lane];
     for (uint32_t peer = 0; peer < PLATFORM_CORES_PER_BLOCKDIM; ++peer)
         if (active.has(static_cast<SubtaskSlot>(peer)) && order.required_floor[peer] != 0)
             group.requires_peer_order = true;
     group.subtask_slot = lane;
     group.phase = SchedulerGmMixPhase::PUBLISHED;
+    if (!scheduler_task_is_executable(flags) ||
+        scheduler_metadata_core_type_index(lane) != local->config.self_core_type)
+        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::DISPATCH_INVALID_SHAPE);
     if (scheduler_profiled_node_fanin_view(graph, task, &group.fanin) != SchedulerGraphResult::OK)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::GROUP_INVALID_STATE);
     scheduler_protocol_cluster_observe(base, local, bank);
@@ -437,18 +450,14 @@ static inline __aicore__ bool scheduler_prepare_mix_lane(
         );
     group.cluster_mix = true;
     group.state = SchedulerDispatchSlotState::FILLING;
-    group.prepare_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+    if (scheduler_phase_timing_enabled(profiling_level)) group.prepare_start_cycles = scheduler_cycles();
     if (!scheduler_acquire_group_lane(
             base, local->config.prepared, local->worker_id(), group.task_ref, group.block_idx,
             static_cast<uint8_t>(lane), group.active_mask.raw(), &group.prepared
         ))
         return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-    const auto metadata = scheduler_load_dispatch_metadata(base, local, group.task_ref, profiling_level);
-    group.sync_start = scheduler_task_requires_sync_start(metadata.flags);
-    if (!scheduler_task_is_executable(metadata.flags) || !scheduler_task_is_mix(metadata.flags) ||
-        !scheduler_task_lanes(metadata).has(static_cast<SubtaskSlot>(lane)) ||
-        scheduler_metadata_core_type_index(lane) != local->config.self_core_type)
-        return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::DISPATCH_INVALID_SHAPE);
+    if (profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL)
+        local->profiling->l2_mix[bank] = {scheduler_cycles(), 0};
     *progress = true;
     return true;
 }
@@ -478,11 +487,14 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
     if (group.phase == SchedulerGmMixPhase::PUBLISHED) {
         if (!scheduler_poll_mix_fanin(graph, base, local, run, progress, bank)) return false;
         if (group.next_fanin != group.fanin.count) return true;
+        if (profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL &&
+            local->profiling->l2_mix[bank].fanin_seen_cycles == 0)
+            local->profiling->l2_mix[bank].fanin_seen_cycles = scheduler_cycles();
         // A claimed member may prepare while its core still owes work to an earlier MIX group.
         // MIX groups share at least one member. Committing too early can occupy a core the earlier group needs.
         if (scheduler_cluster_owes_before(local, group.rank, bank)) return true;
         bool permit = false;
-        if (!scheduler_mix_lane_order_ready(graph, base, local, run, group.task_ref, &permit)) return false;
+        if (!scheduler_mix_lane_order_ready(graph, base, local, run, group, &permit)) return false;
         if (!permit) return true;
         if (group.requires_peer_order) {
             // This core passed its order check and can run ordinary work while it waits for the other members.
@@ -497,8 +509,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
             // This lane may have claimed an earlier block while waiting for its peers.
             if (scheduler_owned_token_blocks_mix_arrival(local, group.rank)) return true;
         }
-        if (scheduler_task_requires_sync_start(scheduler_task_metadata_at(base, local, group.task_ref)->flags))
-            scheduler_protocol_member(base, local, group.task_ref, false);
+        if (group.sync_start) scheduler_protocol_member(base, local, group.task_ref, false);
         scheduler_protocol_cluster_ack(base, local, false, true, bank);
         scheduler_cluster_store_release(&signal->arrived[group.subtask_slot], group.generation);
         scheduler_protocol_cluster_ack(base, local, false, false, bank);
@@ -511,10 +522,16 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
         return true;
     scheduler_protocol_cluster_all(base, local, false, bank);
     group.predicate = SchedulerPredicateState::PASS;
-    const auto metadata = scheduler_load_dispatch_metadata(base, local, group.task_ref, profiling_level);
-    scheduler_publish_dispatch_slot(
-        base, local, SCHEDULER_CLUSTER_MIX_EXECUTION + bank, metadata, profiling_level, group.prepare_start_cycles
-    );
+    if (local->profiling == nullptr) {
+        // Only the async-input flag is needed at entry, and this bank already owns it.
+        group.state = SchedulerDispatchSlotState::READY;
+    } else {
+        // Sampled L0 also needs the timing slot carried by dispatch metadata.
+        const auto metadata = scheduler_load_dispatch_metadata(base, local, group.task_ref, profiling_level);
+        scheduler_publish_dispatch_slot(
+            base, local, SCHEDULER_CLUSTER_MIX_EXECUTION + bank, metadata, profiling_level, group.prepare_start_cycles
+        );
+    }
     group.phase = SchedulerGmMixPhase::RUNNING;
     *progress = true;
     return true;
@@ -583,8 +600,7 @@ static inline __aicore__ bool scheduler_release_mix_lane(
     scheduler_protocol_cluster_ack(base, local, true, true, bank);
     scheduler_cluster_store_release(&signal->finished[group.subtask_slot], group.generation + (successful ? 0 : 1));
     scheduler_protocol_cluster_ack(base, local, true, false, bank);
-    if (scheduler_task_requires_sync_start(scheduler_task_metadata_at(base, local, group.task_ref)->flags))
-        scheduler_protocol_member(base, local, group.task_ref, true);
+    if (group.sync_start) scheduler_protocol_member(base, local, group.task_ref, true);
     if (group.subtask_slot != scheduler_mix_accountant_lane(group.active_mask)) {
         group.phase = SchedulerGmMixPhase::IDLE;
         return true;

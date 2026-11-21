@@ -91,22 +91,21 @@ inline __aicore__ bool scheduler_owned_token_blocks_mix_arrival(const SchedulerL
 // Graph control predecessor. Already assigned pure cohorts remain in W.
 static inline __aicore__ bool scheduler_mix_lane_order_ready(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, bool *ready
+    const SchedulerClusterMixLocalState &group, bool *ready
 ) {
-    SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarMixLaneOrderReady, ref);
+    SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarMixLaneOrderReady, group.task_ref);
     *ready = false;
-    const auto &row = scheduler_order_for(base, local, ref);
-    if (scheduler_owned_token_blocks_mix_arrival(local, row.rank)) return true;
-    const auto required = row.required_floor[local->config.self_lane];
+    if (scheduler_owned_token_blocks_mix_arrival(local, group.rank)) return true;
+    const auto required = group.required_floor;
     local->observed_self_floor = 0;
     if (required != 0) {
         const auto &catalog = local->config.engine_catalog;
-        if (local->issue_cursor > catalog.count || required > row.rank)
-            return scheduler_issue_fail(graph, local, run, ref);
+        if (local->issue_cursor > catalog.count || required > group.rank)
+            return scheduler_issue_fail(graph, local, run, group.task_ref);
         uint32_t floor = static_cast<uint32_t>(graph.task_count);
         if (local->issue_cursor != catalog.count) {
             const auto head = catalog.refs[local->issue_cursor];
-            if (!scheduler_task_ref_valid(graph, head)) return scheduler_issue_fail(graph, local, run, ref);
+            if (!scheduler_task_ref_valid(graph, head)) return scheduler_issue_fail(graph, local, run, group.task_ref);
             floor = scheduler_order_for(base, local, head).rank;
         }
         if (floor < required) return true;

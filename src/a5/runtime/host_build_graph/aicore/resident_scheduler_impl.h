@@ -821,7 +821,10 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     constexpr size_t resident_state_bytes = sizeof(graph) + sizeof(stats) + sizeof(profile) +
                                             sizeof(scheduler_local_state) + sizeof(scalar_binding) + sizeof(async);
     static_assert(resident_state_bytes < 0x8000, "resident scheduler state exhausts the A5 AICore stack");
-    if constexpr (WithProfiling) scheduler_local_state.profiling = &profile;
+    if constexpr (WithProfiling) {
+        profile.capture_l2 = profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL;
+        scheduler_local_state.profiling = &profile;
+    }
     // READY publishes a new image even when its GM address was used by an older
     // run. Observe it before local-config validation reads the native header.
     const bool native_extent_valid =
@@ -840,6 +843,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
                     scheduler_state_base, scheduler_gm_query(profile.scalar.buffer->scalar_records_offset)
                 );
                 profile.scalar.window_start = aicore_entry_cycles;
+                profile.scalar.capture_trace_control = profiling_level >= 4;
                 profile.scalar.function_min_cycles =
                     profiling_level >= 4 ? 0 : PLATFORM_PROF_SYS_CNT_FREQ / UINT64_C(1000000);
                 scalar_binding.attach(&profile.scalar);

@@ -24,6 +24,7 @@ struct SchedulerScalarCompilation<void> {
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <tuple>
@@ -442,7 +443,7 @@ TEST(HbgScalarObserverLifetime, BootstrapPreservesTheResidentBinding) {
         EXPECT_EQ(storage.run_control->bootstrap_complete, 1u);
         EXPECT_EQ(scheduler_scalar_current(), &trace);
         EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarAtomicFetchAdd), 0u);
-        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarBypassLoad), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarGmLoad), 0u);
     }
     EXPECT_EQ(scheduler_scalar_current(), nullptr);
 }
@@ -482,7 +483,7 @@ TEST(HbgScalarObserverLifetime, DispatchLoopRecordsMemoryPrimitives) {
         EXPECT_EQ(scalar_record_count(trace, SchedPhaseKind::ScalarExecutorScan), 0u);
         EXPECT_EQ(scheduler_scalar_current(), &trace);
         EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarAtomicFetchAdd), 0u);
-        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarBypassLoad), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarGmLoad), 0u);
         EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarDcciOut), 0u);
         EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarDsbAll), 0u);
     }
@@ -493,41 +494,163 @@ class HbgExecutionIdentityEntry : public ::testing::TestWithParam<std::tuple<uin
 
 TEST(HbgExecutionIdentityEntryL0, MixKernelSeesItsEnteredStateBeforeASeparateMemberReturns) {
     using namespace scheduler_test::gm_mix;
-    GmMixFixture f({{1, kAicAiv1}}, false, 1);
-    f.storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&capture_mix_entry);
-    ASSERT_TRUE(f.prepare_calls());
-    auto *member = f.locals[0];
-    uint64_t index = UINT64_MAX;
-    ASSERT_TRUE(scheduler_prepared_execution_index(f.base(), member->config.prepared, 0, 0, 0, &index));
-    auto *cell = scheduler_prepared_control_at(f.base(), member->config.prepared, index);
-    auto *call = scheduler_prepared_call_at(f.base(), member->config.prepared, index);
-    uint64_t seen_in_kernel = 0;
-    call->num_args = 2;
-    call->args[0] = reinterpret_cast<uint64_t>(cell);
-    call->args[1] = reinterpret_cast<uint64_t>(&seen_in_kernel);
+    for (const bool sampled : {false, true}) {
+        for (const bool async_input : {false, true}) {
+            SCOPED_TRACE(sampled);
+            SCOPED_TRACE(async_input);
+            GmMixFixture f({{1, kAicAiv1}}, false, 1);
+            if (async_input) f.storage.metadata[0].flags |= SCHEDULER_TASK_ASYNC_INPUT;
+            f.storage.metadata[0].timing_slot = sampled ? 0 : -1;
+            if (!sampled)
+                for (auto *local : f.locals)
+                    local->profiling = nullptr;
+            f.storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&capture_mix_entry);
+            ASSERT_TRUE(f.prepare_calls());
+            auto *member = f.locals[0];
+            struct {
+                SchedulerAsyncLayout layout{};
+                SchedulerAsyncActivity activity{};
+            } image;
+            image.layout.activity_offset =
+                reinterpret_cast<uintptr_t>(&image.activity) - reinterpret_cast<uintptr_t>(&image);
+            image.activity.activated = 1;
+            SchedulerAsyncLocalState async{};
+            async.layout = &image.layout;
+            async.base = reinterpret_cast<uint8_t *>(&image);
+            member->async = &async;
+            uint64_t index = UINT64_MAX;
+            ASSERT_TRUE(scheduler_prepared_execution_index(f.base(), member->config.prepared, 0, 0, 0, &index));
+            auto *cell = scheduler_prepared_control_at(f.base(), member->config.prepared, index);
+            auto *call = scheduler_prepared_call_at(f.base(), member->config.prepared, index);
+            alignas(64) uint64_t seen_in_kernel = 0;
+            call->input_cache_spans = 1;
+            call->input_cache_lines[0] = {
+                reinterpret_cast<uint64_t>(&seen_in_kernel), reinterpret_cast<uint64_t>(&seen_in_kernel)
+            };
+            call->num_args = 2;
+            call->args[0] = reinterpret_cast<uint64_t>(cell);
+            call->args[1] = reinterpret_cast<uint64_t>(&seen_in_kernel);
 
+            bool published = false;
+            ASSERT_TRUE(f.ordinary_arm(0, 0, &published));
+            ASSERT_TRUE(published);
+            for (uint32_t pass = 0; pass < 3; ++pass)
+                for (uint32_t lane : {0u, 2u})
+                    ASSERT_TRUE(f.service_cooperative(lane));
+            ASSERT_EQ(member->execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION).state, SchedulerDispatchSlotState::READY);
+            EXPECT_EQ(member->execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION).may_observe_async_inputs, async_input);
+            EXPECT_EQ(member->timing_slot(SCHEDULER_CLUSTER_MIX_EXECUTION), sampled ? 0 : -1);
+            ASSERT_FALSE(async.work_activated);
+            alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
+            ScopedStartupRegisterObserver observer([] {});
+            startup_reg_base = registers.data();
+            write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+            SchedulerWorkerStats stats{};
+            if (sampled) {
+                ASSERT_TRUE(
+                    (run_ready_dispatch_loop<false, true>(f.graph.graph(), f.base(), member, f.run(), &stats, 0))
+                );
+            } else {
+                ASSERT_EQ(member->profiling, nullptr);
+                ASSERT_TRUE(
+                    (run_ready_dispatch_loop<false, false>(f.graph.graph(), f.base(), member, f.run(), &stats, 0))
+                );
+            }
+            EXPECT_EQ(async.work_activated, async_input);
+            const auto *trace = scheduler_state_at<SchedulerTaskTrace>(f.base(), f.storage.layout.trace_cells_offset);
+            EXPECT_EQ(trace->valid, 0u);
+            EXPECT_EQ(trace->execution_identity_flags, 0u);
+            if (sampled) {
+                EXPECT_GT(trace->kernel_start_cycles, 0u);
+                EXPECT_GE(trace->kernel_end_cycles, trace->kernel_start_cycles);
+            } else {
+                EXPECT_EQ(trace->kernel_start_cycles, 0u);
+                EXPECT_EQ(trace->kernel_end_cycles, 0u);
+            }
+            EXPECT_EQ(
+                seen_in_kernel,
+                scheduler_prepared_state(SchedulerPreparedPhase::ENTERED, 0) | SCHEDULER_PREPARED_MIX_OWNED
+            );
+            EXPECT_EQ(
+                cell->state,
+                scheduler_prepared_state(SchedulerPreparedPhase::RETURNED, 0) | SCHEDULER_PREPARED_MIX_OWNED
+            );
+            EXPECT_EQ(f.signal(0)->groups[0].finished[2], 0u);
+            EXPECT_FALSE(f.task_done(0));
+            EXPECT_EQ(scheduler_read_error(f.run()), 0u);
+        }
+    }
+}
+
+void capture_mix_identity_then_change_binding(__gm__ int64_t *args) {
+    const auto *trace = reinterpret_cast<const SchedulerTaskTrace *>(args[0]);
+    auto *at_entry = reinterpret_cast<SchedulerTaskTrace *>(args[1]);
+    std::memcpy(at_entry, trace, sizeof(*at_entry));
+    auto *context = reinterpret_cast<LocalContext *>(args[SPMD_LOCAL_CONTEXT_INDEX]);
+    context->block_idx = 77;
+    context->block_num = 99;
+    write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+}
+
+TEST(HbgExecutionIdentityEntryL3, OrderedMixMemberSeesItsFullIdentityBeforeChangingTheBinding) {
+    using namespace scheduler_test::gm_mix;
+    GmMixFixture fixture({{1, LaneMask::aic()}, {2, kAicAiv1, true}}, false, 2);
+    fixture.storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&capture_mix_identity_then_change_binding);
+    ASSERT_TRUE(fixture.prepare_calls());
+    auto *member = fixture.locals[5];
     bool published = false;
-    ASSERT_TRUE(f.ordinary_arm(0, 0, &published));
+    ASSERT_TRUE(fixture.ordinary_arm(1, 1, &published));
     ASSERT_TRUE(published);
+    auto &descriptor = fixture.signal(1)->groups[0];
+    const auto block = static_cast<uint32_t>(descriptor.block_idx);
+    uint64_t index = UINT64_MAX;
+    ASSERT_TRUE(scheduler_prepared_execution_index(fixture.base(), member->config.prepared, 1, block, 2, &index));
+    auto *trace = scheduler_state_at<SchedulerTaskTrace>(fixture.base(), fixture.storage.layout.trace_cells_offset) +
+                  scheduler_trace_index_at(fixture.base(), member, 1, SubtaskSlot::AIV1, block);
+    SchedulerTaskTrace at_entry{};
+    std::memset(
+        &trace->execution_run_epoch, 0xff,
+        sizeof(SchedulerTaskTrace) - offsetof(SchedulerTaskTrace, execution_run_epoch)
+    );
+    auto *call = scheduler_prepared_call_at(fixture.base(), member->config.prepared, index);
+    call->num_args = 2;
+    call->args[0] = reinterpret_cast<uint64_t>(trace);
+    call->args[1] = reinterpret_cast<uint64_t>(&at_entry);
+    bool progress = false;
     for (uint32_t pass = 0; pass < 3; ++pass)
-        for (uint32_t lane : {0u, 2u})
-            ASSERT_TRUE(f.service_cooperative(lane));
+        for (uint32_t worker : {3u, 5u})
+            ASSERT_TRUE(fixture.ordinary_service(worker, &progress, 3));
     ASSERT_EQ(member->execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION).state, SchedulerDispatchSlotState::READY);
     alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
     ScopedStartupRegisterObserver observer([] {});
     startup_reg_base = registers.data();
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     SchedulerWorkerStats stats{};
-    ASSERT_TRUE((run_ready_dispatch_loop<false, false>(f.graph.graph(), f.base(), member, f.run(), &stats, 0)));
-    EXPECT_EQ(
-        seen_in_kernel, scheduler_prepared_state(SchedulerPreparedPhase::ENTERED, 0) | SCHEDULER_PREPARED_MIX_OWNED
+    ASSERT_TRUE(
+        (run_ready_dispatch_loop<false, true>(fixture.graph.graph(), fixture.base(), member, fixture.run(), &stats, 3))
     );
+    EXPECT_EQ(at_entry.valid, 0u);
+    EXPECT_EQ(trace->valid, 1u);
+    EXPECT_EQ(at_entry.execution_run_epoch, member->config.prepared->run_epoch);
+    EXPECT_EQ(at_entry.execution_order_key, 1u);
+    EXPECT_EQ(at_entry.execution_group_seq, descriptor.armed_generation);
+    EXPECT_EQ(at_entry.execution_block_idx, block);
+    EXPECT_EQ(at_entry.execution_block_num, 2u);
+    EXPECT_EQ(at_entry.execution_subtask_slot, 2u);
+    EXPECT_EQ(at_entry.execution_pending_slot, scheduler_trace_source_index(SCHEDULER_CLUSTER_MIX_EXECUTION));
+    EXPECT_EQ(at_entry.execution_cluster_lane, 2u);
+    EXPECT_EQ(at_entry.execution_cluster_index, 1u);
     EXPECT_EQ(
-        cell->state, scheduler_prepared_state(SchedulerPreparedPhase::RETURNED, 0) | SCHEDULER_PREPARED_MIX_OWNED
+        at_entry.execution_identity_flags, SCHEDULER_TRACE_IDENTITY_CAPTURED | SCHEDULER_TRACE_EXECUTED |
+                                               SCHEDULER_TRACE_ORDERED | SCHEDULER_TRACE_GROUP |
+                                               SCHEDULER_TRACE_CLUSTER_GROUP
     );
-    EXPECT_EQ(f.signal(0)->groups[0].finished[2], 0u);
-    EXPECT_FALSE(f.task_done(0));
-    EXPECT_EQ(scheduler_read_error(f.run()), 0u);
+    EXPECT_EQ(trace->execution_block_idx, block);
+    EXPECT_EQ(trace->execution_block_num, 2u);
+    auto *binding = scheduler_execution_binding_at(fixture.base(), member->config.prepared, index);
+    EXPECT_EQ(binding->local_context.block_idx, 77);
+    EXPECT_EQ(binding->local_context.block_num, 99);
+    EXPECT_EQ(fixture.run()->scheduler_error, 0u);
 }
 
 TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCanChangeIt) {

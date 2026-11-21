@@ -42,6 +42,8 @@ struct SchedulerFaninWait {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     int64_t predecessor{SCHEDULER_TASK_REF_INVALID};
     uint32_t index{0};
+    uint64_t l2_first_pending_cycles{0};
+    int64_t l2_first_predecessor{SCHEDULER_TASK_REF_INVALID};
 };
 
 // The completion word has one task identity per run, and DONE is terminal.
@@ -151,6 +153,11 @@ struct SchedulerLocalProfilingState {
     uint64_t activity_buffers_offset{0};
     uint64_t protocol_layout_offset{0};
     SchedulerExecutorTaskTrace executor_trace{};
+    bool capture_l2{false};
+    struct {
+        uint64_t bound_cycles;
+        uint64_t fanin_seen_cycles;
+    } l2_mix[SCHEDULER_MIX_MEMBER_COUNT]{};
     int32_t timing_slots[SCHEDULER_LOCAL_EXECUTION_COUNT]{};
     uint32_t loop_iter{0};
     uint32_t published_mix_count{0};
@@ -624,20 +631,21 @@ static inline __aicore__ void scheduler_capture_execution_identity(
         base, local, slot.task_ref, static_cast<SubtaskSlot>(slot.subtask_slot), slot.block_idx
     )];
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, local->config.graph_summary_offset);
-    scheduler_observe_cache_line(&trace->execution_run_epoch);
+    // This execution owns the whole identity line and overwrites every field.
     trace->execution_run_epoch = summary->run_epoch;
-    trace->execution_order_key = UINT64_MAX;
-    trace->execution_group_seq = 0;
     uint32_t flags = SCHEDULER_TRACE_IDENTITY_CAPTURED;
     if (function_address != 0) flags |= SCHEDULER_TRACE_EXECUTED;
-    const auto &catalog = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
-    trace->execution_order_key = scheduler_task_catalog_order(base, catalog, static_cast<uint32_t>(slot.task_ref)).rank;
     if (slot.sync_start) flags |= SCHEDULER_TRACE_ORDERED;
     if (slot.cluster_mix) {
         const auto &group = local->mix_groups[pending_slot - SCHEDULER_CLUSTER_MIX_EXECUTION];
         trace->execution_order_key = group.rank;
         trace->execution_group_seq = group.generation;
         flags |= SCHEDULER_TRACE_GROUP | SCHEDULER_TRACE_CLUSTER_GROUP;
+    } else {
+        const auto &catalog = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
+        trace->execution_order_key =
+            scheduler_task_catalog_order(base, catalog, static_cast<uint32_t>(slot.task_ref)).rank;
+        trace->execution_group_seq = 0;
     }
     trace->execution_block_idx = static_cast<uint32_t>(local_context.block_idx);
     trace->execution_block_num = static_cast<uint32_t>(local_context.block_num);
@@ -646,7 +654,7 @@ static inline __aicore__ void scheduler_capture_execution_identity(
     trace->execution_cluster_index = static_cast<uint32_t>(local->config.shared_context->cluster_index);
     trace->execution_cluster_lane = local->config.self_lane;
     trace->execution_identity_flags = flags;
-    scheduler_publish_cache_line(&trace->execution_run_epoch);
+    if (!local->profiling->capture_l2) scheduler_publish_cache_line(&trace->execution_run_epoch);
 }
 
 // Host retains this zero metadata only for verified, already resolved nodes.
@@ -703,8 +711,17 @@ static inline __aicore__ bool scheduler_observe_fanin_prefix(
                 return false;
             }
             if (observed != SchedulerCompletionObservation::DONE) {
-                if (wait != nullptr && (wait->task_ref != task_ref || wait->index != next_fanin))
-                    *wait = {source, task_ref, predecessor, next_fanin};
+                if (wait != nullptr && (wait->task_ref != task_ref || wait->index != next_fanin)) {
+                    if (local->profiling != nullptr && local->profiling->capture_l2 &&
+                        wait->l2_first_pending_cycles == 0) {
+                        wait->l2_first_pending_cycles = scheduler_cycles();
+                        wait->l2_first_predecessor = predecessor;
+                    }
+                    wait->source = source;
+                    wait->task_ref = task_ref;
+                    wait->predecessor = predecessor;
+                    wait->index = next_fanin;
+                }
                 return true;
             }
         }
@@ -793,6 +810,34 @@ static inline __aicore__ __attribute__((noinline)) void scheduler_publish_dispat
     )];
     trace->worker_id = scheduler->worker_id();
     trace->task_ref = static_cast<uint64_t>(owner.task_ref);
+    if (profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL) {
+        // The same worker writes dispatch, identity and retirement. L2 publishes all lines at retirement.
+        if (slot_index >= SCHEDULER_CLUSTER_MIX_EXECUTION) {
+            const auto bank = slot_index - SCHEDULER_CLUSTER_MIX_EXECUTION;
+            const auto &group = scheduler->mix_groups[bank];
+            const auto &timing = scheduler->profiling->l2_mix[bank];
+            trace->state_probe_start_cycles = group.prepare_start_cycles;
+            trace->state_probe_end_cycles = timing.bound_cycles;
+            trace->dispatch_start_cycles = timing.fanin_seen_cycles;
+            if (group.subtask_slot == scheduler_mix_accountant_lane(group.active_mask)) {
+                const auto &proxy = scheduler->cluster_signal->l2_proxy[bank];
+                trace->l2_proxy_begin_cycles = scheduler_cluster_load_field(&proxy.prepare_cycles);
+                trace->l2_proxy_arm_cycles = scheduler_cluster_load_field(&proxy.arm_cycles);
+            }
+        } else {
+            const auto &token = scheduler->execution_tokens[slot_index];
+            trace->state_probe_start_cycles = token.discovery_cycles;
+            trace->state_probe_end_cycles = token.acquired_cycles;
+            trace->dispatch_start_cycles = dispatch_start_cycles;
+        }
+        const auto &wait = slot_index >= SCHEDULER_CLUSTER_MIX_EXECUTION ?
+                               scheduler->mix_groups[slot_index - SCHEDULER_CLUSTER_MIX_EXECUTION].wait :
+                               scheduler->execution_tokens[slot_index].wait;
+        trace->l2_first_pending_cycles = wait.l2_first_pending_cycles;
+        trace->l2_first_predecessor = wait.l2_first_predecessor;
+        trace->dispatch_end_cycles = ready_publish_cycles;
+        return;
+    }
     if (scheduler_phase_timing_enabled(profiling_level)) {
         if (slot_index >= SCHEDULER_CLUSTER_MIX_EXECUTION) {
             trace->state_probe_start_cycles = 0;
@@ -805,7 +850,9 @@ static inline __aicore__ __attribute__((noinline)) void scheduler_publish_dispat
         trace->dispatch_start_cycles = dispatch_start_cycles;
         trace->dispatch_loop_iter = scheduler->profiling->loop_iter;
     }
-    scheduler_publish_cache_line(trace);
     if (schedule_timing_enabled) trace->dispatch_end_cycles = ready_publish_cycles;
-    if (schedule_timing_enabled) scheduler_publish_cache_line(&trace->dispatch_start_cycles);
+    // Both trace lines must be visible before this worker returns to the executor.
+    scheduler_writeback_cache_line(trace);
+    if (schedule_timing_enabled) scheduler_writeback_cache_line(&trace->dispatch_start_cycles);
+    scheduler_cache_barrier();
 }

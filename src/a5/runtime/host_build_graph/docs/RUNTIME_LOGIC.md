@@ -423,8 +423,50 @@ Call acquisition completes in the same bounded invocation; it has no pending-bui
 result or separate binding-ready bit. Cooperative preparation requires an explicit
 lane and rejects predicates; ordinary execution tokens retain predicate evaluation.
 
-The Host orders tasks by Kahn generation, descending bottom level, then stable
-node identity. The pure-AIC catalog and the AIV catalog (which includes MIX)
+When a MIX member first accepts a descriptor, it validates the task and caches
+the sync-start flag, async-input flag and required issue floor for its lane.
+The member reuses those values while waiting for admission. Fanin completion
+and the current issue floor are still checked before execution.
+
+The Host first orders tasks by Kahn generation, descending bottom level and
+node identity. Flat graphs with zero deferred groups, zero device control
+nodes and no predicates are eligible for a local change to this order. For
+each wide SPMD task S, the Host estimates how many AICs and AIVs can run
+its blocks concurrently. For MIX, it caps the block count at the cluster count
+before multiplying by the number of compute lanes of each type. On 32 clusters,
+a multi-wave 1C1V task can use at most 32 AIVs. A pure AIV task can use both
+vector workers per cluster, up to 64 AIVs. S may be pure or MIX and may request
+sync-start.
+Each narrow task B considers only the next S needing at least half the workers
+on B's engine. An intervening MIX or sync-start task ends the search. If B
+and that nearest S fit together, B keeps its position and the search stops
+there, even if a wider task follows. If several tasks qualify for S, the Host
+moves the nearest B in the original order to the position immediately after S.
+
+B must be an ordinary pure task on that engine, request fewer than half its
+workers and have no sync-start requirement. Their combined demand must exceed
+the engine's capacity, S must have a greater bottom level, and the two original
+generations must differ by at most one. B cannot pass a direct successor.
+Each S moves at most one B, and each B can move only once. Cooperative tasks
+retain their relative order. The Host verifies that each producer still
+precedes its consumer before rebuilding the per-lane issue floors.
+
+The smaller bottom level of B is a structural proxy for flexibility. For
+offline validation, compare traces with the same input shapes, kernels and
+block configuration. Measure the gap from B's last block completion to the
+earliest start of any direct successor, using the end of the measured run for
+a sink. For S, compare the earliest and latest block entries and completions
+and inspect the intervals during which the tasks overlap on the same engine.
+The observed gap can include waits for cores, other inputs and scheduling.
+It does not establish how far B can safely move in time. Host binding uses
+the static graph and resource demands.
+
+A synchronous kernel completes on return and may signal another rank. A kernel
+that needs a signal from another rank must declare deferred completion and
+register its wait. Local pipeline waits and synchronization among blocks in a
+sync-start cohort follow their existing protocols.
+
+The pure-AIC catalog and the AIV catalog (which includes MIX)
 project that order onto the two engines. Each worker advances its private
 cursor after confirming that the current task has supplied all its blocks.
 Cross-engine predecessors must also have closed their supply before a consumer

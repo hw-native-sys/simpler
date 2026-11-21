@@ -63,7 +63,7 @@ static inline __aicore__ bool scheduler_bind_ticketed_execution(
     token.metadata = scheduler_load_dispatch_metadata(base, local, token.task_ref, profiling_level);
     if (!scheduler_task_uses_execution_tokens(token.metadata.flags))
         return scheduler_execution_token_fail(graph, local, run, token.task_ref, &token);
-    token.acquired_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+    token.acquired_cycles = scheduler_schedule_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     token.phase = SchedulerExecutionTokenPhase::WAIT_FANIN;
     return true;
 }
@@ -92,6 +92,8 @@ static inline __aicore__ bool scheduler_select_owned_execution(
         return true;
     SchedulerScalarScope selection(local, SchedPhaseKind::ScalarSelectOwnedExecution, token.task_ref);
     if (token.state != SchedulerDispatchSlotState::READY) {
+        const uint64_t fanin_seen =
+            profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL ? scheduler_cycles() : 0;
         if (token.predicate == SchedulerPredicateState::UNEVALUATED &&
             scheduler_task_has_predicate(token.metadata.flags)) {
             const auto result = scheduler_evaluate_task_predicate(graph, token.task_ref);
@@ -101,7 +103,7 @@ static inline __aicore__ bool scheduler_select_owned_execution(
                                                                          SchedulerPredicateState::FAIL;
         }
         if (token.predicate == SchedulerPredicateState::UNEVALUATED) token.predicate = SchedulerPredicateState::PASS;
-        const uint64_t start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+        const uint64_t start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : fanin_seen;
         scheduler_publish_dispatch_slot(base, local, index, token.metadata, profiling_level, start);
         *progress = true;
     }
@@ -217,6 +219,8 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
     }
     const bool trace_claim = sync && scheduler_protocol_enabled(local);
     const uint64_t before = trace_claim ? scheduler_protocol_cycles(local) : 0;
+    const uint64_t acquire_start =
+        profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL ? scheduler_cycles() : discovery_start;
     uint32_t block = blocks;
     bool closes_supply = false;
     if (fixed) {
@@ -250,7 +254,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
     token.block_idx = block;
     token.closes_supply = closes_supply;
     token.subtask_slot = lane;
-    token.discovery_cycles = discovery_start;
+    token.discovery_cycles = acquire_start;
     token.fanin = fanin;
     // A returned ordinary block proves input readiness for later blocks of the same task.
     token.next_fanin = previous == task_ref && !sync ? fanin.count : 0;

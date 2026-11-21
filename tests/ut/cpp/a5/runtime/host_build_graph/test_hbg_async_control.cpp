@@ -276,6 +276,86 @@ struct AsyncFixture {
     }
 };
 
+TEST(HbgCrossRankOrdering, DeferredPeerWaitLeavesCapacityForItsIndependentSignalProducer) {
+    // Two independent replicas. W registers a remote condition, P satisfies the other replica's W.
+    constexpr int blockers = 2 * SCHEDULER_EXECUTION_TOKEN_COUNT;
+    constexpr int tail = 2 + blockers;
+    constexpr int tasks = tail + 2;
+    std::vector<AsyncTaskPlanInput> inputs;
+    for (int ref = 0; ref < tasks; ++ref)
+        inputs.push_back(async_task(ref, ref >= 2 && ref < tail ? 2 : 1, LaneMask::aiv0(), ref == 0 ? 1 : 0));
+    std::array<std::unique_ptr<AsyncFixture>, 2> ranks;
+    for (auto &rank : ranks) {
+        rank = std::make_unique<AsyncFixture>(tasks, inputs);
+        auto &f = *rank;
+        std::vector<int32_t> preds;
+        for (int ref = 2; ref < tail; ++ref) {
+            f.graph.executable(ref, 1, {0});
+            preds.push_back(ref);
+        }
+        f.graph.executable(tail, 1, preds);
+        f.graph.executable(tail + 1, 1, {tail});
+        std::vector<SchedulerTaskMetadata> meta(f.storage.metadata, f.storage.metadata + tasks);
+        SchedulerTaskCatalogPlan catalog;
+        ASSERT_TRUE(scheduler_plan_task_catalog(meta, 1, f.storage.catalog_begin, &catalog));
+        SchedulerDependencyPlan deps;
+        ASSERT_TRUE(scheduler_plan_dependencies(f.graph.graph(), meta, {}, deps));
+        const bool promote =
+            scheduler_can_defer_side_tasks(false, f.plan.layout.group_count != 0, catalog.header.control_count, meta);
+        ASSERT_FALSE(promote);
+        ASSERT_TRUE(scheduler_order_task_catalog(deps, meta, &catalog, nullptr, promote));
+        ASSERT_EQ(catalog.header_offset, f.storage.task_catalog_offset);
+        scheduler_init_task_catalog(f.base(), catalog);
+        for (int worker = 0; worker < 3; ++worker)
+            f.local(worker)->config.engine_catalog = scheduler_task_catalog(f.base(), catalog.header, worker != 0);
+    }
+    for (int round = 0; round < 128; ++round) {
+        for (int rank = 0; rank < 2; ++rank) {
+            auto &f = *ranks[rank];
+            for (int worker : {1, 2}) {
+                auto *local = f.local(worker);
+                bool failed = false;
+                uint32_t slot = UINT32_MAX;
+                scheduler_find_local_execution(
+                    f.graph.graph(), f.base(), local, f.storage.run_control, 0, &failed, &slot
+                );
+                ASSERT_FALSE(failed);
+                if (slot == UINT32_MAX) continue;
+                bool permit = false;
+                ASSERT_TRUE(
+                    scheduler_check_entry_permit(f.graph.graph(), f.base(), local, f.storage.run_control, slot, &permit)
+                );
+                ASSERT_TRUE(permit);
+                ASSERT_TRUE(hbg_test_begin_execution(local, slot));
+                const auto task = local->execution_at(slot).task_ref;
+                if (task == 0) {
+                    f.register_counter(f.start(0, 0, 1, worker), 1);
+                    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[worker], 0, 0, 1, f.executions[worker]));
+                } else if (task == 1) {
+                    ranks[1 - rank]->signal[0] = 1;
+                }
+                ASSERT_TRUE(
+                    scheduler_complete_lane_execution<false>(
+                        f.graph.graph(), f.base(), local, f.storage.run_control, slot, 0
+                    )
+                );
+            }
+            for (int worker : {0, 1, 2})
+                f.check(worker);
+        }
+    }
+    for (auto &rank : ranks) {
+        auto &f = *rank;
+        EXPECT_EQ(f.task_control(1)->claim_seal, 1u)
+            << "occupied " << scheduler_execution_token_count(f.local(1)) << "+"
+            << scheduler_execution_token_count(f.local(2))
+            << " W.P=" << scheduler_completion_count(f.task_control(0)->completion_state) << " W.DONE=" << f.done(0)
+            << " signal=" << f.signal[0];
+        EXPECT_TRUE(f.done(tail + 1));
+        EXPECT_EQ(f.storage.run_control->scheduler_error, 0u);
+    }
+}
+
 TEST(HbgAsyncControl, DeferredCloseConsumesTheReturnProofWithoutRereadingGateOrJoin) {
     for (const bool condition_ready : {false, true}) {
         AsyncFixture f(1);

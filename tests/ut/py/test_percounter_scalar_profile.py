@@ -69,6 +69,7 @@ def test_scheduler_view_keeps_block_identity_and_deferred_publisher(tmp_path, le
     capture = Capture(runtime="percounter", level=level, scheduler_producer="aicore")
     capture.task(task_id=7, core_id=0, start=40, end=61, run_epoch=0)
     raw = capture.build()
+    claim_location = {"slot": 0, "mix": True, "participant_mask": 3} if level == 2 else {}
     raw["percounter_task_events"] = {
         "dropped": 0,
         "unmatched_deferred_updates": 0,
@@ -88,7 +89,7 @@ def test_scheduler_view_keeps_block_identity_and_deferred_publisher(tmp_path, le
                 **extra,
             }
             for block, kind, cycles, worker, cluster, lane, extra in [
-                (0, "claim", 10, 0, 0, 0, {"claim_start_cycles": 6}),
+                (0, "claim", 10, 0, 0, 0, {"claim_start_cycles": 6, **claim_location}),
                 (0, "ready", 30, 0, 0, 0, {}),
                 (0, "ready", 35, 2, 0, 1, {}),
                 (0, "kernel_end", 55, 0, 0, 0, {"kernel_start_cycles": 40}),
@@ -112,8 +113,22 @@ def test_scheduler_view_keeps_block_identity_and_deferred_publisher(tmp_path, le
         scheduler_task_producer="aicore",
         chip_swimlane_level=level,
         percounter_task_events=data["percounter_task_events"],
+        percounter_block_view=True,
     )
+    if level == 2:
+        default = generate_chrome_trace_json(
+            data["tasks"],
+            None,
+            runtime_name="percounter",
+            scheduler_task_producer="aicore",
+            chip_swimlane_level=level,
+            percounter_task_events=data["percounter_task_events"],
+        )["traceEvents"]
+        assert any(e.get("pid") == 7 and e["ph"] == "b" for e in default)
+        assert not any(e.get("pid") == 3 for e in default)
+        assert not any(e.get("pid") == 7 for e in trace["traceEvents"])
     view = [e for e in trace["traceEvents"] if e["pid"] == 3]
+    assert any(e.get("name", "").startswith("Kernel execution · ") for e in view) == (level >= 3)
     cycle_us = 1e6 / raw["metadata"]["clock_freq_hz"]
     assert any(e["name"] == "process_name" and e["args"]["name"] == "Scheduler View" for e in view)
     block_0 = [e for e in view if e["ph"] == "i" and e["args"]["block_index"] == 0]
@@ -242,3 +257,58 @@ def test_l2_ideal_ready_omits_host_completed_predecessors(tmp_path, folded):
         inline_completed_task_ids=(2,),
     )
     assert milestones["ideal_ready"] - milestones["claim"] == pytest.approx(35 * 1e6 / 50_000_000)
+
+
+def test_l2_physical_slots_keep_mix_members_and_deferred_settlement_separate():
+    from simpler_setup.tools.percounter.schedule_timing import schedule_events  # noqa: PLC0415
+
+    def event(kind, ts, lane, **fields):
+        return dict(
+            kind=kind,
+            time_us=ts,
+            run_epoch=1,
+            task_id=5,
+            block_index=0,
+            cluster_index=2,
+            cluster_lane=lane,
+            worker_id=10 + lane,
+            **fields,
+        )
+
+    rows = [
+        event("claim", 2, 1, slot=0, mix=True, participant_mask=7, claim_start_us=1),
+        event("mix_publish", 3, 1),
+        event("inputs_pending", 4, 0),
+        event("inputs_ready", 8, 0),
+        event("entry_commit", 10, 0),
+        event("entry_commit", 12, 1),
+        event("ready", 13, 0),
+        event("ready", 14, 1),
+        event("kernel_end", 21, 0, dispatch_us=14, kernel_start_us=15, finish_us=22),
+        event("kernel_end", 23, 1, dispatch_us=15, kernel_start_us=17, finish_us=24),
+        event("kernel_end", 25, 2, dispatch_us=16, kernel_start_us=18, finish_us=26),
+        event("defer_registered", 27, 2, deferred_group=9),
+        event("completion_issue", 23, 0, contribution=1),
+        event("completion_issue", 28, 1, contribution=1),
+        event("deferred_completion_issue", 40, 2, deferred_group=9, contribution=1),
+    ]
+    ev = list(schedule_events({"records": rows}, 7, lambda t: f"t{t}"))
+    names = {e["id2"]["local"]: e["name"] for e in ev if e["ph"] == "n"}
+    bars = [
+        (names[e["id2"]["local"]], e["name"].partition(" · ")[0], e["ts"], ev[i + 1]["ts"])
+        for i, e in enumerate(ev)
+        if e["ph"] == "b"
+    ]
+    assert ("C02 / MIX0 (AIV0 proxy)", "Prepare MIX descriptor → SSBUF publish", 2, 3) in bars
+    assert ("C02 / MIX0/AIC", "Predecessor pending → inputs observed", 4, 8) in bars
+    assert all(name != "Kernel execution" for _, name, _, _ in bars)
+    assert ("C02 / MIX0/AIV0", "Inputs proven → entry commitment", 8, 12) in bars
+    assert ("C02 / MIX0/AIC", "MIX rendezvous → selection", 10, 13) in bars
+    assert ("C02 / MIX0/AIC", "Output fence → completion issue", 22, 23) in bars
+    assert ("C02 / MIX0/AIV0", "Output fence → completion issue", 24, 28) in bars
+    assert ("C02 / deferred 0", "Defer registration → settlement issue", 27, 40) in bars
+    partial = [r for r in rows if not (r["kind"] == "kernel_end" and r["cluster_lane"] == 0)]
+    partial_issues = [
+        e for e in schedule_events({"records": partial}, 7, str) if e.get("name", "").startswith("Output fence →")
+    ]
+    assert [(e["ts"], e["args"]["worker_id"]) for e in partial_issues] == [(24, 11)]

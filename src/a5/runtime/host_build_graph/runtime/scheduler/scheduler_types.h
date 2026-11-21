@@ -696,11 +696,16 @@ struct alignas(64) SchedulerTaskTrace {
     uint64_t task_ref;
     uint64_t state_probe_start_cycles;
     uint64_t state_probe_end_cycles;
+    // L2 stores the proxy's descriptor preparation boundaries on one member per group.
+    uint64_t l2_proxy_begin_cycles;
+    uint64_t l2_proxy_arm_cycles;
 
     // This core owns execution timing through slot retirement.
     alignas(64) uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
     uint64_t ready_observe_cycles;
+    uint64_t l2_first_pending_cycles;
+    int64_t l2_first_predecessor;
 
     alignas(64) uint64_t dispatch_start_cycles;
     uint64_t dispatch_end_cycles;

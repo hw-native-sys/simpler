@@ -98,6 +98,49 @@ def test_ticket_and_primitive_inherit_only_direct_recorded_claim(caller, expecte
     assert "hbg_stage" not in rows["scalar_bypass_load"]
 
 
+def test_l3_claim_loads_preserve_source_and_exclusive_cycles():
+    from simpler_setup.tools.hbg.scalar_profile import apply_l3_detail_policy  # noqa: PLC0415
+
+    profile = partition(
+        [
+            window() | {"function_min_cycles": 1},
+            record("scalar_prepared_claim", 15, 30, 1),
+            record("scalar_gm_load", 20, 21, 2),
+            record("scalar_gm_load", 36, 39, 2),
+            record("scalar_cnt_notify_load", 42, 45, 2),
+            record("scalar_dcci_out", 50, 51, 1),
+            record("scalar_dsb_all", 54, 57, 1),
+        ],
+        [],
+    )
+    apply_l3_detail_policy(profile)
+    loads = [(r["kind"], r["start_cycles"], r["hbg_stage"]) for r in profile["rows"] if "load" in r["kind"]]
+    assert loads == [
+        ("scalar_gm_load", 20, "CLAIM_EXECUTE"),
+        ("scalar_gm_load", 36, "CLAIM_EXECUTE"),
+        ("scalar_cnt_notify_load", 42, "CLAIM_EXECUTE"),
+    ]
+    segments = {row["start_cycles"]: row for row in profile["exclusive"]}
+    for kind, begin, stage in loads:
+        assert (segments[begin]["kind"], segments[begin]["hbg_stage"]) == (kind, stage)
+    assert profile["exclusive_cycles"]["scalar_gm_load"] == 4
+    assert profile["exclusive_cycles"]["scalar_cnt_notify_load"] == 3
+    assert profile["exclusive_cycles"]["scalar_unattributed"] == 66
+    assert "scalar_dcci_out" not in profile["exclusive_cycles"]
+    assert profile["exclusive_cycles"]["scalar_dsb_all"] == 3
+    assert sum(profile["exclusive_cycles"].values()) == 90
+
+
+def test_hbg_l3_requires_a_source_tag_even_inside_a_claim():
+    from simpler_setup.tools.hbg.scalar_profile import apply_l3_detail_policy  # noqa: PLC0415
+
+    profile = partition(
+        [window(), record("scalar_prepared_claim", 15, 30, 1), record("scalar_bypass_load", 20, 21, 2)], []
+    )
+    with pytest.raises(ValueError, match="L3.*load source"):
+        apply_l3_detail_policy(profile)
+
+
 def test_nested_intervals_conserve_time_without_counting_parents_twice():
     records = [window(), record("scalar_fill_own_slots", 15, 35, 1), record("scalar_atomic_cas", 20, 25, 2)]
     kernels = [{"start_cycles": 40, "end_cycles": 80, "run_epoch": 1, "task_id": 7}]
@@ -316,7 +359,6 @@ def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path
     data = read_perf_data(raw)
     profile = data["scalar_profiles"][0]
     assert profile["complete"]
-    assert profile["exclusive_cycles"][phase] == 5
     assert sum(profile["exclusive_cycles"].values()) == 90
     output = tmp_path / "trace.json"
     generate_chrome_trace_json(
@@ -328,6 +370,12 @@ def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path
         scalar_profiles=data["scalar_profiles"],
     )
     details = [e for e in json.loads(output.read_text())["traceEvents"] if e["ph"] == "X" and e["pid"] == 2]
+    if function.startswith(("TRACE ·", "CONTROL ·")):
+        assert phase not in profile["exclusive_cycles"]
+        assert all(row["kind"] != phase for row in profile["rows"])
+        assert all(not e["name"].startswith(("TRACE ·", "CONTROL ·")) for e in details)
+        return
+    assert profile["exclusive_cycles"][phase] == 5
     parent = next(e for e in details if e["name"] == "DISPATCH · progress_mix_groups")
     child = next(e for e in details if e["name"].startswith(function + "("))
     assert child["name"] == f"{function}(t7)"

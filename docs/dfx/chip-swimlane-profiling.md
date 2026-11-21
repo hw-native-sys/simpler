@@ -141,8 +141,61 @@ Each type is numbered from zero using the complete captured core list, so idle
 cores keep their indices. A 32-AIC, 64-AIV capture shows active lanes from
 `AIC0`–`AIC31` followed by `AIV0`–`AIV63`. Task details retain the global worker ID.
 
-A5 `percounter` adds a task/block Scheduler View at L2 with Claim start, Claim,
-Ready, Kernel end and GM Completion issued markers. With complete predecessor
+A5 HBG resident L2 records successful scheduling transitions for each execution.
+In **AICore Schedule (L2)**, each worker has a lane per occupied slot. An ordinary
+execution starts at its successful claim attempt. A MIX member starts when it
+accepts its SSBUF descriptor. The next boundaries mark binding complete, the
+first observation of satisfied predecessors, READY publication, executor pickup,
+kernel entry and return, completion observation, and local release. Worker View
+shows the measured kernel interval. If the scheduler actually observes a pending
+predecessor, a separate interval starts at that observation and identifies the
+predecessor in its details. A deferred task can complete logically later.
+
+In both HBG and Percounter L2, Worker View displays kernel execution. Each
+`EXECUTE ·` slice uses the logical SPMD task color and retains the original
+member label in its details. It spans kernel entry to kernel return. Percounter
+retains executor pickup and the completion fence on its scheduling track.
+The scheduling lane resumes at kernel return.
+The resulting gap on that lane can overlap a running kernel on Worker View.
+
+To export a native Perfetto file from the converted L2 JSON, install
+`perfetto==0.59.1` in the project environment and run
+`python -m simpler_setup.tools.l2_pftrace trace.json trace.pftrace`.
+The native format preserves physical track order, task colors and dependency
+arrows across ranks. Counter series emitted by `--overhead` appear as native
+Perfetto counter tracks.
+
+Each cluster also has an AIV0 proxy lane per occupied MIX bank. The proxy times
+descriptor preparation up to the point just before the release of its generation.
+The next bar ends when the last captured member accepts the descriptor. Its
+details give the elapsed time for each observed member. A slot's wait can
+overlap execution on another slot. These intervals measure elapsed device time.
+Use L3 to attribute active Scalar work inside an interval.
+
+A5 `percounter` also exports **AICore Schedule (L2)** with physical cluster,
+slot, AIV0 proxy and MIX member lanes. Worker View uses the same cluster and
+role labels. A block's first unsuccessful fan-in probe and its successful
+proof split the interval after claim (ordinary) or SSBUF publication (MIX).
+MIX has one fan-in observer, the lowest participating lane. Each member's
+entry commitment and selection delimit its own rendezvous, which includes
+the task-wide gate when `sync_start` applies. A pure `sync_start` block
+uses its local arrival and selection. Executor pickup, kernel start, kernel
+return and the output fence delimit entry preparation and return handling.
+Each MIX member's lane shows the interval from its own output fence to its
+immediate completion credit. Separate deferred lanes pair registration and
+settlement by group, including remote settlement.
+
+These are elapsed intervals between observed transitions. Shared proof
+to member commitment includes the time before the member next runs.
+Publication and arrival checkpoints mark the issue site; successful
+selection observes the protocol's release conditions. Only the first
+failed dependency check is recorded per block. All subsequent failed polls
+are uninstrumented at L2. Measure capture inflation by dividing the L2
+mean AICore wall by the same workload's L0 mean on the same device.
+
+For a block lifetime instead, export Percounter L2 with `--percounter-block-view`.
+This Scheduler View shows Claim start, Claim,
+Ready, Kernel end and Completion issued markers. With complete predecessor
 evidence in `deps.json` and the same capture's completion records, Ideal ready
 marks the estimated dependency boundary, even when it precedes the claim.
 If dependencies were ready at claim time, the wait span begins at Claim.
@@ -155,9 +208,17 @@ for timing boundaries, storage limits and truncation behavior.
 
 ### A5 HBG Scalar detail at Level 3
 
-Level 3 records the resident AICore scheduler's memory operations individually
-and ordinary function spans lasting at least 1 us. Level 4 retains
-all function spans as well. The converter draws one nested lane per worker in
+L3 records `ld_dev` only during execution claims. The load wrapper identifies
+`ld_dev(GM)` for GM reads, including atomic-backed allocation words, and
+`ld_dev(CntNotify)` for reads from a mapped notification register. Each retained
+load is exported as `CLAIM_EXECUTE` even when a short enclosing function was
+omitted. HBG L3 requires an explicit GM or CntNotify load source. Generic
+`ld_dev` records are valid at HBG L4. L3 takes no DCCI timestamps and keeps
+both DSB variants. L4 includes the cache-maintenance and out-of-claim load details.
+Level 3 omits TRACE and CONTROL Scalar intervals, including direct memory
+and state observations inside them. Nested business functions can still
+record their work and primitives. The window summary counts no-progress loops.
+Level 4 retains recorder and control details. The converter draws one nested lane per worker in
 **AICore Scheduler**, labeled with its core type, worker ID and physical ID,
 for example `Cluster 00 / C / AIC_0 (physical 0)` or
 `Cluster 00 / V0 / AIV_32 (physical 18)`. AICore Scheduler and Worker View
@@ -166,7 +227,7 @@ View. Each Worker task's details retain dispatch, receive, kernel start/end,
 finish-observation timestamps, and dispatch-to-finish duration. Its visible
 bar still spans receive to kernel end. Worker dependency, dispatch and
 completion flows remain; Scheduler View mirror flows are omitted.
-Raw collection and its timing fields are unchanged. Standard L3 export carries
+Standard L3 export carries
 `cluster_index` and `cluster_lane` from each worker's runtime topology,
 including workers with no kernel executions. Older captures can reuse their
 execution identities; absent or conflicting topology is left ungrouped rather
@@ -193,8 +254,10 @@ The exporter reads `expected_task_count` from the workers’ graph contexts, che
 that all workers agree and exports their common value. The audit compares it
 with the frozen task table.
 
-L3 function spans shorter than 1 us are omitted on device; L4 retains every
-instrumented function span, including short empty polls. Atomic, bypass, DCCI
+At level 4, `SchedulerScalarTrace::append` measures submission of the
+preceding function record on the same core. Its own record is written after the measured
+interval. Gaps between observed calls remain visible. L4 retains every instrumented
+function span, including short empty polls. Atomic, bypass, DCCI
 and DSB leaves are retained regardless of duration; recorder intervals are also
 retained. The dispatch loop does not insert NOP backoff between discovery slices.
 Names identify real functions or explicitly named function sections; parent
@@ -220,11 +283,9 @@ not cross-core publication.
 partition through ordinary cached stores, without a staging buffer or batch
 drain. It does not issue a trace DCCI or DSB between tasks. Recording costs
 remain in enclosing function or unattributed time; primitive endpoints
-precede the record write. `SchedulerScalarTrace::finish` exposes the DCCI
-over every written trace line and the completion DSB as separate children.
-The Scalar window includes this terminal work. Publication of these four
-final observer/window rows and the header remains outside that window and
-inside the full device interval. The existing `batch_write_cycles` metric
+precede the record write. The Scalar window includes terminal cache publication.
+Level 3 writes just the final window record. Level 4 also records `SchedulerScalarTrace::finish`,
+its DCCI and its DSB. Publication of the final records and the header follows the window. The existing `batch_write_cycles` metric
 counts the measured terminal publication; it does not measure each direct
 record write. Older captures retain their per-drain stores/DCCI/DSB labels.
 
@@ -239,7 +300,7 @@ source selection, cooperative MIX, payload preparation, execution return,
 completion publication, dependency resolution, async CHECK/FINISH, and exit
 work. Return-value atomics are measured through the point where the Scalar can consume the result.
 
-Memory-operation leaves distinguish atomic read/FAA/CAS/exchange, bypass
+Full-detail L4 memory-operation leaves distinguish atomic read/FAA/CAS/exchange, bypass
 loads/stores, DCCI issue, and DSB completion waits. DCCI labels retain the
 single-line/entire-cache scope and selector. Each payload cache-line operation
 has its own interval. The recorder's self-observation uses a DCCI batch interval
@@ -257,7 +318,7 @@ delta by the clock frequency. This avoids floating-point cancellation and
 redundant decimal tails without rounding away counter resolution or events.
 Both 32-bit counter and 64-bit SDMA event-record reads in
 `SchedulerAsyncCompletionObserver` retain their original load width and expose
-one `ld_dev: return ready` event per executed read. The ready-pool probe's
+one bypass-load event per observed read at L4. The ready-pool probe's
 `scheduler_gm_query` calls use the same leaf label. These sub-microsecond leaves
 remain in L3 even when a short semantic parent is omitted.
 
@@ -323,7 +384,7 @@ Existing `metrics` entries
 carry the function threshold in cycles, the number of
 omitted short function intervals, nesting depth and the no-progress iteration
 count. Omissions are distinct from dropped records. `iterations_detailed=true`
-identifies per-iteration capture without polling aggregation.
+identifies level 4 per-iteration bookkeeping. Level 3 counts no-progress loops without timing them individually.
 The fixed scheduler record fields retain their existing shape.
 
 For a positive function threshold, omitted short parents can leave gaps in
@@ -816,8 +877,13 @@ The A5 wire trace contains only current timing and execution identity fields: a
 catalog discovery (0) and cooperative/group preparation (3) as ready sources.
 Graph captures also carry the expanded node map and Graph source.
 
-A5 HBG writes version 2 of the `aicore_execution_identities` section. Every
-version 2 execution carries a scheduling rank. The converter also reads
+A5 HBG execution identity version 3 adds `schedule_cycles` at L2. The four
+entries hold acquisition start, binding complete, predecessors observed and local
+release in device cycles. The optional `pending_fanin` pair carries the first
+observed pending predecessor's public task ID and device timestamp. One member
+of each MIX block also carries the proxy's
+preparation start and pre-release timestamp. Other levels write version 2.
+Both versions carry a scheduling rank. The converter also reads
 unversioned identity sections from earlier runs, including ordinary executions
 with a null rank. Full ranked L4 audits still require a rank for each execution.
 
@@ -1139,11 +1205,12 @@ same lane structure — the directory form repeats it once per Rank under the
   only on the leader thread.
 - **Scheduler View** (pid=3) — task-execution overlay using Scheduler
   dispatch/finish timestamps (level >= 2), with the same labels
-  as Worker View. HBG AICore L3/L4 puts these timestamps in Worker task
-  details instead of emitting this duplicate view; L2 and AICPU scheduling
-  retain the separate view. Percounter L2–L4 uses this view for task/block
+  as Worker View. HBG resident L2 uses this process for slot and MIX proxy
+  intervals. HBG resident L3/L4 exposes dispatch and finish in Worker task details.
+  Earlier L2 captures and AICPU scheduling use the dispatch/finish view. Percounter L3/L4 and the optional L2 block view use these task/block
   milestones. Numbered rows under a Percounter cluster display overlapping block
   lifetimes, and each marker identifies the actual worker.
+- **AICore Schedule (L2)** (Percounter, pid=7) shows physical slot, MIX proxy, member entry and deferred wait intervals.
 - **Worker View** (pid=4) — one swim-lane per physical worker:
   - `AIC_N` — matrix cores (receive → kernel end from level >= 1)
   - `AIV_N` — vector cores (receive → kernel end from level >= 1)

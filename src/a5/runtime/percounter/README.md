@@ -344,11 +344,13 @@ not another unstarted scheduling candidate.
 | ----- | ------------- |
 | 0 | Disabled; the uninstrumented lane implementation is compiled separately |
 | 1 | Kernel execution and final input acquisition, streamed through the shared collector |
-| 2 | L1 plus the Scheduler View with task/block milestones |
+| 2 | Physical scheduling slots and MIX handoffs; kernel execution in Worker View |
 | 3 | L2 plus nested AICore Scheduler function intervals of at least 1 microsecond |
 | 4 | L3 with every instrumented function interval retained, individual GM/SSBUF operations, cache issues and barriers, and Host orchestration phases |
 
-The Scheduler View groups events by task and block, including Graph body tasks.
+L2 opens on **AICore Schedule (L2)**. To follow block lifetimes instead, pass
+`--percounter-block-view` when converting the capture. The block view groups
+events by task and block, including Graph body tasks.
 Its `Cluster 00 / 2` style labels name additional display rows used when block
 lifetimes overlap in the same physical cluster. Marker details identify the
 actual worker, cluster and C/V0/V1 role.
@@ -378,7 +380,7 @@ intervals inside execution/service functions and computes exclusive time without
 double-counting parents. Worker View retains the original kernel intervals.
 
 L2 reserves up to 65,536 task-timing records per worker, bounded by the graph's
-block count, and up to 16,384 scheduler task events per worker. Each worker
+block count, and up to 24,576 scheduler task events per worker (16,384 at L3/L4). Each worker
 partition starts on its own cache line. Task-timing overflow fails the export.
 Milestone overflow is reported as `percounter_task_events.dropped`. L3/L4
 additionally reserve 8 MiB per worker slot. A compact

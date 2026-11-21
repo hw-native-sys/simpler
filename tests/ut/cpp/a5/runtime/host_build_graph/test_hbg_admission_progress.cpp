@@ -202,8 +202,12 @@ TEST(HbgResourceOrder, EarlierSelfClaimRemainsAnObligationWhenItsDirectoryAdvanc
     const auto &later = f.order(1);
     ASSERT_GT(later.required_floor[2], 0u);
     bool ready = true;
+    SchedulerClusterMixLocalState group{};
+    group.task_ref = 1;
+    group.rank = later.rank;
+    group.required_floor = later.required_floor[lane->config.self_lane];
     const auto check = [&] {
-        return scheduler_mix_lane_order_ready(f.graph.graph(), f.base(), lane, f.run(), 1, &ready);
+        return scheduler_mix_lane_order_ready(f.graph.graph(), f.base(), lane, f.run(), group, &ready);
     };
     ASSERT_TRUE(check());
     EXPECT_FALSE(ready);

@@ -110,6 +110,8 @@ SCALAR_OPERATIONS = {
     "scalar_dsb_all": ("MEM", "DSB: ALL completion wait"),
     "scalar_dsb_ddr": ("MEM", "DSB: DDR completion wait"),
     "scalar_bypass_load": ("MEM", "ld_dev: return ready"),
+    "scalar_gm_load": ("MEM", "ld_dev(GM): return ready"),
+    "scalar_cnt_notify_load": ("MEM", "ld_dev(CntNotify): return ready"),
     "scalar_bypass_store": ("MEM", "st_dev: issue"),
 }
 
@@ -225,6 +227,7 @@ def partition(records, kernels, *, nested_kernels=False):
                         "end_cycles": child["start_cycles"],
                         "task_id": node.get("task_id"),
                         "run_epoch": root["run_epoch"],
+                        **({"hbg_stage": node["hbg_stage"]} if "hbg_stage" in node else {}),
                     }
                 )
                 totals[kind] += child["start_cycles"] - cursor
@@ -322,6 +325,39 @@ def _business_stage(kind, caller=None, caller_stage=None):
     if stage in ("MEM", "OBSERVE") and caller_stage not in (None, "DISPATCH", "MEM", "OBSERVE", "CLAIM"):
         return caller_stage
     return stage
+
+
+def apply_l3_detail_policy(profile):
+    """Apply HBG L3 collection semantics to the view and preserve the exclusive-time partition."""
+
+    def visible(row):
+        kind = row["kind"]
+        if kind in ("scalar_gm_load", "scalar_cnt_notify_load"):
+            # The producer samples these only inside an execution claim at L3.
+            row["hbg_stage"] = "CLAIM_EXECUTE"
+            return True
+        if kind == "scalar_bypass_load":
+            raise ValueError("HBG L3 requires an explicit GM or CntNotify load source")
+        stage = row.get("hbg_stage") or SCALAR_OPERATIONS.get(kind, (None,))[0]
+        return stage not in ("TRACE", "CONTROL") and kind not in (
+            "scalar_dcci_out",
+            "scalar_dcci_single",
+            "scalar_dcci_entire",
+        )
+
+    profile["rows"] = [row for row in profile["rows"] if visible(row)]
+    for row in profile["exclusive"]:
+        if not visible(row):
+            duration = row["end_cycles"] - row["start_cycles"]
+            totals = profile["exclusive_cycles"]
+            kind = row["kind"]
+            totals[kind] -= duration
+            if not totals[kind]:
+                del totals[kind]
+            totals["scalar_unattributed"] = totals.get("scalar_unattributed", 0) + duration
+            row["kind"] = "scalar_unattributed"
+            row["task_id"] = None
+            row.pop("hbg_stage", None)
 
 
 def trace_events(profiles, *, pid, tid_base, display, streams=None, function_names=None, kernel_labels=None):

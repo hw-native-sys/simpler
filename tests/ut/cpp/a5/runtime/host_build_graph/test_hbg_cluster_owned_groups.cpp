@@ -528,26 +528,103 @@ TEST_P(HbgEarlierProducer, LaterMixAllowsOrdinaryProducerToReleaseTheEarlierTask
 INSTANTIATE_TEST_SUITE_P(EarlierMixOrPureSync, HbgEarlierProducer, ::testing::Bool());
 
 TEST(HbgClusterGroupOwnership, InvalidMemberCallPublishesFailedWithoutArriving) {
-    GmMixFixture fixture({{1, LaneMask::all()}}, false, 1);
-    ASSERT_TRUE(fixture.prepare_calls());
-    bool published = false;
-    ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
-    ASSERT_TRUE(published);
-    auto *member = fixture.locals[2];
-    uint64_t index = UINT64_MAX;
-    ASSERT_TRUE(scheduler_prepared_execution_index(fixture.base(), member->config.prepared, 0, 0, 2, &index));
-    scheduler_prepared_call_at(fixture.base(), member->config.prepared, index)->function_bin_addr = 0;
-    bool progress = false;
-    EXPECT_FALSE(
-        scheduler_cluster_mix_service(fixture.graph.graph(), fixture.base(), member, fixture.run(), 0, &progress)
-    );
-    const auto state = scheduler_prepared_control_at(fixture.base(), member->config.prepared, index)->state;
-    EXPECT_EQ(
-        state,
-        scheduler_prepared_state(SchedulerPreparedPhase::FAILED, member->worker_id()) | SCHEDULER_PREPARED_MIX_OWNED
-    );
-    EXPECT_EQ(fixture.signal(0)->groups[0].arrived[2], 0u);
-    EXPECT_EQ(fixture.signal(0)->groups[0].finished[2], 0u);
+    const struct {
+        const char *field;
+        void (*corrupt)(SchedulerPreparedCall &);
+    } invalid[] = {
+        {"kernel",
+         [](SchedulerPreparedCall &c) {
+             c.function_bin_addr = 0;
+         }},
+        {"run epoch",
+         [](SchedulerPreparedCall &c) {
+             ++c.run_epoch;
+         }},
+        {"execution index",
+         [](SchedulerPreparedCall &c) {
+             --c.execution_index;
+         }},
+        {"task",
+         [](SchedulerPreparedCall &c) {
+             ++c.task_ref;
+         }},
+        {"block",
+         [](SchedulerPreparedCall &c) {
+             ++c.block_idx;
+         }},
+        {"lane",
+         [](SchedulerPreparedCall &c) {
+             --c.subtask_slot;
+         }},
+        {"argument count",
+         [](SchedulerPreparedCall &c) {
+             c.num_args = SPMD_LOCAL_CONTEXT_INDEX + 1;
+         }},
+        {"LocalContext address",
+         [](SchedulerPreparedCall &c) {
+             c.args[SPMD_LOCAL_CONTEXT_INDEX] = c.args[SPMD_GLOBAL_CONTEXT_INDEX];
+         }},
+        {"GlobalContext address", [](SchedulerPreparedCall &c) {
+             c.args[SPMD_GLOBAL_CONTEXT_INDEX] = c.args[SPMD_LOCAL_CONTEXT_INDEX];
+         }},
+    };
+    for (const auto &[field, corrupt] : invalid) {
+        SCOPED_TRACE(field);
+        GmMixFixture fixture({{1, LaneMask::all()}}, false, 1);
+        ASSERT_TRUE(fixture.prepare_calls());
+        bool published = false;
+        ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
+        ASSERT_TRUE(published);
+        auto *member = fixture.locals[2];
+        uint64_t index = UINT64_MAX;
+        ASSERT_TRUE(scheduler_prepared_execution_index(fixture.base(), member->config.prepared, 0, 0, 2, &index));
+        corrupt(*scheduler_prepared_call_at(fixture.base(), member->config.prepared, index));
+        bool progress = false;
+        EXPECT_FALSE(
+            scheduler_cluster_mix_service(fixture.graph.graph(), fixture.base(), member, fixture.run(), 0, &progress)
+        );
+        const auto state = scheduler_prepared_control_at(fixture.base(), member->config.prepared, index)->state;
+        EXPECT_EQ(
+            state,
+            scheduler_prepared_state(SchedulerPreparedPhase::FAILED, member->worker_id()) | SCHEDULER_PREPARED_MIX_OWNED
+        );
+        EXPECT_EQ(fixture.signal(0)->groups[0].arrived[2], 0u);
+        EXPECT_EQ(fixture.signal(0)->groups[0].finished[2], 0u);
+        EXPECT_FALSE(fixture.task_done(0));
+        EXPECT_EQ(fixture.signal(0)->groups[0].accounted_generation, 0u);
+        EXPECT_EQ(
+            scheduler_prepared_control_at(fixture.base(), member->config.prepared, 0)->state,
+            scheduler_prepared_state(SchedulerPreparedPhase::BUILT)
+        );
+    }
+}
+
+TEST(HbgClusterGroupOwnership, InvalidPlanCannotClaimAnotherMembersPreparedRecord) {
+    for (const bool invalid_begin : {false, true}) {
+        SCOPED_TRACE(invalid_begin);
+        GmMixFixture fixture({{1, kAicAiv1}}, false, 1);
+        ASSERT_TRUE(fixture.prepare_calls());
+        bool published = false;
+        ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
+        ASSERT_TRUE(published);
+        auto *member = fixture.locals[2];
+        const auto *prepared = member->config.prepared;
+        auto *plan = scheduler_state_at<SchedulerExecutionPlan>(fixture.base(), prepared->plans_offset);
+        if (invalid_begin) plan->execution_begin = prepared->execution_count;
+        else plan->active_lane_count = 1;
+        bool progress = false;
+        ASSERT_FALSE(
+            scheduler_cluster_mix_service(fixture.graph.graph(), fixture.base(), member, fixture.run(), 0, &progress)
+        );
+        for (uint64_t index = 0; index < prepared->execution_count; ++index)
+            EXPECT_EQ(
+                scheduler_prepared_control_at(fixture.base(), prepared, index)->state,
+                scheduler_prepared_state(SchedulerPreparedPhase::BUILT)
+            );
+        EXPECT_EQ(fixture.signal(0)->groups[0].arrived[2], 0u);
+        EXPECT_EQ(fixture.signal(0)->groups[0].finished[2], 0u);
+        EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 0u);
+    }
 }
 
 TEST(HbgClusterOrder, ActualMemberFinAndAccountantReceiptProtectTheirOwnGeneration) {

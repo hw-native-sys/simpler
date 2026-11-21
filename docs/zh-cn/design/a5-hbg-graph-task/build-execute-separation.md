@@ -2,15 +2,15 @@
 
 全局自取与簇内 MIX 共用执行入口。每核从原自取记录或本 lane 的 MIX 记录执行；每簇 AIV0 发布 MIX 描述符，Host 计算的 rank 和每 lane 阈值约束互相冲突的资源承诺。任务形状和启动检查见[协作任务的 Host 准备与 Device 校验](admission-preparation.md)。
 
-设计参考 `atomic_probe/pa_scheduler/cross_core_only_scheduler` 的有序领取与固定归属。Host 根据现有数据和 Graph 控制依赖生成稳定拓扑序，提前构造不可变 Call。Device 按序分发，接收本执行者的数据并准备，条件满足后原地执行。性能裁决沿用[12 组 AICore L0 口径](#performance-retention-policy)。
+设计参考 `atomic_probe/pa_scheduler/cross_core_only_scheduler` 的有序领取与固定归属。Host 根据现有数据和 Graph 控制依赖生成稳定拓扑序，提前构造不可变 Call。Device 按序分发，接收本执行者的数据并准备，条件满足后原地执行。性能裁决沿用[7 组 AICore L0 口径](#performance-retention-policy)。
 
 修改范围为 A5 HBG 调度器、必要的 Host 布局、内部协议与 DFX；不新增 PyPTO 通知接口，不修改用户 kernel、前端语义或参数 ABI。
 
 调度优化必须由通用任务状态、依赖和资源合同驱动，不按模型名、特定 task 编号、shape 或固定图拓扑选择策略。SWA 等单例的泳道图用于提出和验证机制假设，不能替代通用性验收。
 
-**当前保留标准（2026-11-16 更新）：** CntNotify 扩展逐项对比上一保留版本的12组 AICore L0 均值总和；总和回退超过0.5%即撤回，不超过0.5%可以保留，并记录每组变化。MIX 握手的 +0.224% 总和回退在保留范围内。
+**当前保留标准（2026-11-20 更新）：** CntNotify 扩展逐项对比上一保留版本的 7 组 AICore L0 均值总和；总和回退超过0.5%即撤回，不超过0.5%可以保留，并记录每组变化。此前 MIX 握手的 +0.224% 是历史 12 组结果。
 
-性能主指标统一为 HBG 与 percounter 的 **AICore L0 wall**：各实际执行核的最晚 kernel end 减最早 kernel begin，包含中间调度和依赖等待，排除首末 kernel 外的 AICPU 启停开销。每组预热一次、正式测量十次；双卡每轮先 Device 会合，各卡按自己的时钟计算，再逐轮取 rank 最大值并求均值。缺失或非法端点直接判无效，不回退到 Device wall 或旧 percounter 调度循环窗口；历史数据保留原口径，不重新贴标。
+性能主指标统一为 HBG 与 percounter 的 **AICore L0 wall**：各实际执行核的最晚 kernel end 减最早 kernel begin，包含中间调度和依赖等待，排除首末 kernel 外的 AICPU 启停开销。每段预热后计时 5 轮，每个用例中两个版本各取 10 轮；双卡每轮先 Device 会合，各卡按自己的时钟计算，再逐轮取 rank 最大值并求均值。缺失或非法端点直接判无效，不回退到 Device wall 或旧 percounter 调度循环窗口；历史数据保留原口径，不重新贴标。
 
 <!-- markdownlint-disable-next-line MD033 -->
 <a id="a5-hardware-principles"></a>
@@ -37,7 +37,7 @@
 
 各分区最后一个有效领取者将该分区容量累加到 `next_block`；它累计的是已全部分配的分区覆盖量，不是逐 block 领取次数。总量达到 N 的唯一领取者在取得自己的执行记录后发布原有 supply seal。这样既保持所有前序 block 已有 owner 才开放后项的顺序约束，也避免每次领取再次竞争一个全局计数器。分区越界领取不回退、不产生执行权；单 block 任务保留单计数器路径。
 
-每个 task 增加四个 128B 分区；每个多 block task 额外最多四次分区关闭汇聚。必须计入这项空间和原子开销，以全套 12 组 AICore L0 总和验证同址争用降低是否覆盖成本；不能从 L3 的跨核累计耗时直接推算 L0 收益。
+每个 task 增加四个 128B 分区；每个多 block task 额外最多四次分区关闭汇聚。必须计入这项空间和原子开销，以全套 7 组 AICore L0 总和验证同址争用降低是否覆盖成本；不能从 L3 的跨核累计耗时直接推算 L0 收益。
 
 ### 三阶段怎样应用这些前提
 
@@ -161,7 +161,7 @@ probe 先把一批 ordinal 绑定为 `WaitingBuilt`，再逐槽 Claim、acquire�
 
 合法图的 task_count 不超过 INT32_MAX，fanin count 不超过32位字段范围，因此每项用64位编码 task_ref+1 与 next_fanin，零值表示空条目。缓存共128B/核，仅在本核使用，不新增共享通知或原子操作。
 
-等待中的 control 不绑定服务核，也不阻止扫描其他 control；不新增共享选主、通知副本或 ready 队列。前缀只保存当前完成来源的有效 DONE 证明；可靠 `ld_dev` 读到合法计数阈值、SET=1 或 GM `C=D=0` 可建立该证明，PENDING、供给关闭和参数就绪均不能代替它。操作减少与12组 L0 门禁分别验证。
+等待中的 control 不绑定服务核，也不阻止扫描其他 control；不新增共享选主、通知副本或 ready 队列。前缀只保存当前完成来源的有效 DONE 证明；可靠 `ld_dev` 读到合法计数阈值、SET=1 或 GM `C=D=0` 可建立该证明，PENDING、供给关闭和参数就绪均不能代替它。操作减少与 7 组 L0 门禁分别验证。
 
 ## 2. 从 task 有序开始：供给、预绑定、等待与退休
 
@@ -187,15 +187,23 @@ probe 先把一批 ordinal 绑定为 `WaitingBuilt`，再逐槽 Claim、acquire�
 
 **保证前驱排在后继前面，必须在 Host 排序时完成，并在目录发布前逐边验证。** 选择 Kahn 式拓扑分层，优先展开同层的独立分支；层内再按剩余依赖链长度排序。参考 [Kahn 原论文](https://doi.org/10.1145/368996.369025) 与 [拓扑分层定义](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.dag.topological_generations.html)。
 
-排序输入是已实例化的数据与 Graph 控制依赖 DAG。`level` 表示从源节点出发的最早拓扑层，`b_level` 表示到终点的最长剩余依赖链；初版均按边数计算，不假设已知 kernel 时长：
+Host 根据已实例化的数据与控制依赖计算两个层号。`level` 是从源节点出发的最早拓扑层，`b_level` 是到终点的最长剩余依赖链。两者均按边数计算。
 
 ```text
 level(v)   = 0                                      无前驱时
            = 1 + max(level(p), p 是 v 的前驱)          其他情况
 b_level(v) = 0                                      无后继时
            = 1 + max(b_level(s), s 是 v 的后继)        其他情况
-排序键      = (level 升序, b_level 降序, 原 node_ref 升序)
+基础排序键  = (level 升序, b_level 降序, 原 node_ref 升序)
 ```
+
+对于普通展开图，若 deferred 组数和 Device 控制节点数均为零，且图中没有 predicate，Host 可在基础顺序上局部调整。对每个宽 SPMD 任务 S，分别估算 AIC、AIV 的并发占用。MIX 先取 `min(block 数, 簇数)`，再乘每个 block 的相应计算 lane 数。32 簇上的 1C1V 即使有多波，也至多同时占用 32 个 AIV。纯 AIV 任务可以使用每簇两路 AIV，在同一设备上至多占用 64 个。纯任务和 MIX 均可作为 S，也可带 `sync_start`。每个窄任务 B 只考察其后在同一引擎上需求达到半数执行核的第一个 S。若先遇到另一个 MIX 或 `sync_start`，则停止。若 B 与最近的 S 能在该引擎同时放下，B 保持原位，也不会再为更远的宽任务让位。若多个 B 满足条件，S 选择在原顺序中离它最近的一个，把 B 移到 S 的紧后方。
+
+B 必须是该引擎上的普通纯任务，无 `sync_start`，且需求小于容量的一半。只有 B 和 S 的需求之和超过该引擎容量、S 的 `b_level` 大于 B、两者的原始 `level` 相差至多一层，才允许移动。B 移动时不能越过自己的任何直接后继。每个 S 至多移动一个 B，每个 B 至多移动一次。Host 逐边验证前驱仍排在后继之前，再按新 rank 重建各 lane 的发放门槛。协作任务间保持原相对顺序。
+
+Host 将 B 较短的剩余依赖链当作它可能可以晚发的依据。`b_level` 的单位是边数。验证实际效果时，离线对比相同输入形状、kernel 和 block 配置的两版 profiling。按 Device 时间戳计算 B 最后一块完成到其最早直接后继开始的间隔，B 为终点时取到本轮测量结束的间隔。对 S 列出其各个 block 最早和最晚的入核时刻、最早和最晚的完成时刻，同时检查 B、S 及其他工作在同一引擎上实际重叠的区间。观察到的间隔也包含等核、其他依赖及调度延迟，单凭它不能保证 B 可以推迟同样长的时间。Host 绑定时只使用上述静态信息。
+
+MIX 成员首次接收描述符时校验任务并保存本代的 `sync_start`、异步输入标记和本 lane 的发放门槛。随后使用已保存的值检查准入，执行前仍须观察实际前驱完成和当前发放进度。
 
 同层节点之间没有依赖；每条排序约束 `A → B` 都必须满足 `level(A) < level(B)` 和最终 `rank(A) < rank(B)`。这是拓扑分层，不是按最短路径距离做普通 BFS。Kahn 的零入度集合只用于 Host 规划，不恢复 Device ready_queue。
 
@@ -244,7 +252,7 @@ Host 必须先完成现有依赖图与目录校验，再发布和 H2D。非法�
 
 percounter 的实现位于 `src/a5/runtime/percounter/host/region_plan.h::build_tables` 与 `host/graph_template.h::build_graph_template`。它对普通节点按 b-level 降序，同分按 ID；长支路可能先深入几步再处理独立短支路。本方案把正向层号置于 b-level 之前，两者不能混称为同一个策略。
 
-[HEFT 原论文](https://disco.ethz.ch/courses/fs14/seminar/paper/Jochen/4.pdf) 可作为异构资源调度参考。本方案初版只用静态图信息，不要求 kernel 耗时模型；动态分发由 Device 裁定实际核，刚好一波按下文的 ID 映射。无完整通知关系时，纯 b-level 可能把通知生产者放到等待后继之后，见[固定 owner 下的排序反例](../../../investigations/2026-11-a5-hbg-blevel-fixed-owners.md)。其他排序候选也须先通过该进展约束，再保持 kernel、输入及资源协议一致，以 12 组 L0 总和判断，不按模型选择策略，也不在生产中保留历史兜底开关。
+[HEFT 原论文](https://disco.ethz.ch/courses/fs14/seminar/paper/Jochen/4.pdf) 可作为异构资源调度参考。本方案初版只用静态图信息，不要求 kernel 耗时模型；动态分发由 Device 裁定实际核，刚好一波按下文的 ID 映射。无完整通知关系时，纯 b-level 可能把通知生产者放到等待后继之后，见[固定 owner 下的排序反例](../../../investigations/2026-11-a5-hbg-blevel-fixed-owners.md)。其他排序候选也须先通过该进展约束，再保持 kernel、输入及资源协议一致，以 7 组 L0 总和判断，不按模型选择策略，也不在生产中保留历史兜底开关。
 
 ### Device 沿拓扑目录任务分发，前项全体发完再推进
 
@@ -338,7 +346,7 @@ Host 在 Graph 实例展开后，根据本次启动实际使用的簇数 `K` 为
 
 W 表示每个物理 worker 能同时持有的未退休自取 block 数。当前采用 W2，每核另有两份独立的 MIX 成员记录，分别对应两个 SSBUF bank；执行中的 block 也占其来源位置。自取窗口深度只改变待运行工作的持有量，单核一次仍执行一个 kernel。
 
-2026-11-18 的同结构 W1–W4 对照每组同设备预热 1 次、测量 10 次，按轮换顺序运行。12 项 AICore L0 均值总和为 W1 18.068514 ms、W4 18.234993 ms，W1 低 0.91%。其中 11 个回放用例逐版通过数值校验，原生 MoE 的 72/72 只记录性能运行。单个 SWA 的 W1/W4 为 0.209540/0.213708 ms，原生 MoE 为 0.604940/0.604284 ms。当时依据这批负载选择了 W1；其他图的依赖宽度、MIX 比例和控制服务会改变最合适的深度。
+2026-11-18 的同结构 W1–W4 对照每组同设备预热 1 次、测量 10 次，按轮换顺序运行。7 项 AICore L0 均值总和为 W1 18.068514 ms、W4 18.234993 ms，W1 低 0.91%。其中 11 个回放用例逐版通过数值校验，原生 MoE 的 72/72 只记录性能运行。单个 SWA 的 W1/W4 为 0.209540/0.213708 ms，原生 MoE 为 0.604940/0.604284 ms。当时依据这批负载选择了 W1；其他图的依赖宽度、MIX 比例和控制服务会改变最合适的深度。
 
 以下名称是目标协议，不表示当前源码已有同名状态：
 
@@ -655,7 +663,7 @@ Build 同时展示准备工作量和它与前驱计算的重叠；领取同时�
   Tensor 数据可见性或 MIX/sync_start 的许可与退休检查。
 - SRAM 访问不做 DCCI。业务输出发布、异步完成和消费者获取所需的 DSB 保留，
   MIX 成员在自己的成功返回路径写入 CntNotify 的 P；记账成员收齐本代所有活动 lane 的成功 FIN 后退役 bank。
-- 验证实际 AIC/AIV 访问、重复复位、P/Q 区分和资源回退；性能采用下面的 12 组
+- 验证实际 AIC/AIV 访问、重复复位、P/Q 区分和资源回退；性能采用下面的 7 组
   AICore L0 配对标准。启动复位和 Host 准备成本单列，不计作消失的工作。
 
 ### 异步条件与控制进度
@@ -680,7 +688,7 @@ Host 根据折叠控制节点、展开 Graph 后的实际依赖找出全部设�
 
 Host 和 Device 内部只保留 `SYNCHRONOUS`、`DEFERRED` 两态，不恢复 UNKNOWN 调度分支。注册入口验证并归一化每个 kernel，包括本次未使用的入口。Host 在 Graph 展开后只按本次实际可执行的 leaf kernel、每个活动 lane 选择容量；未使用的合法 DEFERRED 声明不会给纯同步图增加异步布局。补齐上游准确声明仍有价值：未知入口按最大容量保留异步上下文和 P/Q 完成协议，只有显式 SYNCHRONOUS 才能享受零布局和同步快速路径。
 
-- `SYNCHRONOUS`：Host 容量为零，无 group、lease 和条件数组；Device 跳过 begin、条件数量检查和 seal，只提交物理完成 P。
+- `SYNCHRONOUS` 任务在 kernel 返回时完成，可以向其他 rank 发信号。需要等待其他 rank 信号的 kernel 必须声明为 `DEFERRED` 并登记完成条件。本核流水线同步和同卡 `sync_start` 组内协作仍按各自协议执行。Host 为同步任务分配零条件容量，Device 只提交物理完成 P。
 - `DEFERRED`：Host 按已验证的条件上界和类型声明分配；Device 返回时提交 P，空登记或最终 CHECK 提交 Q。
 
 纯同步图的 async layout 大小为零，不准备异步上下文，不探测 activity，也不运行 CHECK 服务。混合图只为可能异步的 lane 保留资源；同步 lane 不因同 task 或同图中其他 lane 的能力而分配异步组。预备 context 明确写入零 async 字段和无效 group 索引，重放不能沿用先前执行的登记状态。
@@ -689,7 +697,7 @@ CntNotify 每任务目标贡献为 `block_num × (active_lane_count + possible_a
 
 SYNCHRONOUS 只描述自身完成语义，不表示前驱数据已经可见。前驱逻辑 DONE、正常依赖获取和必要的缓存/顺序操作仍然成立。Host 沿真实依赖传播 DEFERRED 祖先信息，只对确有此类祖先的任务设置输入获取标记；其他任务不查询全图 activity。所有执行计划都必须基于入口归一化后的能力完成这个计算，内部缺失或无效能力仍拒绝准备。带标记的消费者保留实际执行核上的获取。不能因为消费者自身同步就删除异步前驱的数据可见性保证。
 
-验证关注纯同步图零布局、混 lane 信用总数、DEFERRED 的零登记/实际 CHECK、UNKNOWN 和旧调用归一化、无效声明被拒绝和重放。未知入口即使本次没有实际登记也走空 seal；真实登记仍等待 CHECK 提交 Q，不能提前发布 DONE。性能仍使用同一份业务二进制与注册元数据，对照12组 AICore L0 wall；声明来源和实际生效覆盖需要一并记录，不把未传入 runtime 的源码分类当成优化已生效。
+验证关注纯同步图零布局、混 lane 信用总数、DEFERRED 的零登记/实际 CHECK、UNKNOWN 和旧调用归一化、无效声明被拒绝和重放。未知入口即使本次没有实际登记也走空 seal；真实登记仍等待 CHECK 提交 Q，不能提前发布 DONE。性能仍使用同一份业务二进制与注册元数据，对照 7 组 AICore L0 wall；声明来源和实际生效覆盖需要一并记录，不把未传入 runtime 的源码分类当成优化已生效。
 
 ### CntNotify 资源复用与控制状态选型
 
@@ -741,9 +749,9 @@ Host 规划按拓扑秩从近到远遍历真实前驱，遇到最近且容量足
 - 后继直接读计数器并比较自己的阈值；计数器在一轮中只增不减，旧阈值永久有效，无bitmap、旧快照、run内reset或bank转交。每轮READY前仅由AICPU清零链头一次，publication/capture lease继续保护生命周期。
 - canonical GM账本按task一次有界归档，不阻塞fanin ready、固定owner或资源退休。固定归档者可复用本核当前task的真实DONE证明，避免再次读取同一计数器；未命中仍观察阈值，SUPPLY_CLOSED不能代替DONE，error检查和唯一结账/退出统计不变。DFX记录真实P/Q贡献区间、累计阈值和退出计数；不伪造FAA返回ticket，也不以归档时刻代替逻辑ready。
 - 由持有的SET映射校验32B slot并派生+0x08地址，派生地址不独立map/unmap；容量不足的整链仍用GM路径。GM回退保留近期的自身ACK删除、已有观察证明复用和首次登记者单has_async。Host覆盖日志使用benchmark可见的TIMING级，记录`backend=SET-slot-offset`及计划/实际链数、eligible/mapped任务数。
-- 正式验收要求实际非零ADD覆盖，记录完整与部分覆盖；GM回退成功不算ADD通过。继续以12组AICore L0配对总和和0.5%回退门槛判断性能，不从硬件探针直接推导整网收益。
+- 正式验收要求实际非零ADD覆盖，记录完整与部分覆盖；GM回退成功不算ADD通过。继续以 7 组 AICore L0配对总和和0.5%回退门槛判断性能，不从硬件探针直接推导整网收益。
 
-本轮实际ADD启用验证：12组均确认eligible计算任务完整映射；11组数值通过，原生MoE沿用仅计时。AICore L0配对总和20.2296068→20.2704963 ms（+0.202%），符合0.5%保留门槛；SWA为0.2577120→0.2486034 ms（−3.534%），新版第19–21层为3.0837522→3.1455712 ms（+2.005%）。该结果不表示各case均加速。完整样本、实际设备、覆盖证据保存在 `artifacts/cnt-add-enable-20261117/RESULTS.md` 与JSON中。
+2026-11-17 的历史 ADD 启用验证：12 组均确认eligible计算任务完整映射；11组数值通过，原生MoE沿用仅计时。AICore L0配对总和20.2296068→20.2704963 ms（+0.202%），符合0.5%保留门槛；SWA为0.2577120→0.2486034 ms（−3.534%），新版第19–21层为3.0837522→3.1455712 ms（+2.005%）。该结果不表示各case均加速。完整样本、实际设备、覆盖证据保存在 `artifacts/cnt-add-enable-20261117/RESULTS.md` 与JSON中。
 
 <!-- markdownlint-disable-next-line MD033 -->
 <a id="performance-retention-policy"></a>
@@ -752,15 +760,15 @@ Host 规划按拓扑秩从近到远遍历真实前驱，遇到最近且容量足
 
 每项修改先对应到实测泳道图中的具体串行链，再查 `atomic_probe/ATOMIC_USAGE_GUIDE.md` 与同构探针的硬件证据。明确可减少的共享访存、等待或重复准备及保留的交权边界；不按函数 inclusive 时间直接估算可省开销，也不凭模型名称试参数。
 
-- 当前优化目标先减少同地址 atomic 请求，再减少 atomic 总调用及重复 ld_dev。每项策略比较同一组输入下12个 AICore L0 均值的总和及逐项变化：功能正确、明确消减冗余 atomic／ld_dev 且总和回退不超过0.5%时可保留，回退超过0.5%则撤回。计数减少和耗时收益分别提供证据，不能将新增 DCCI/DSB、普通读写或其他地址竞争隐去。percounter 作为定位参照，比较结论须由可比版本、输入及计时边界的实际对照支持。5 µs 交接用于分析关键路径，不能替代12组指标。
-- 最终性能以 AICore L0 `chip.run.runner_run.aicore_wall` 为准：在无 L1/L3 插桩的运行中，直接取所有实际 AIC/AIV kernel 的最晚 end 减最早 begin，包含首尾之间的调度空洞、依赖和通信等待，排除头尾 AICPU 开销。每组 1 次预热、10 次计时；无 kernel 的核不参与归并，缺失或无效时间戳不能用 Device wall 代替。HBG、基线及 percounter 必须核实同一首尾边界；percounter 原调度循环窗口不得直接冒充 kernel 首尾窗口。L1/L3 只用于定位。
+- 当前优化目标先减少同地址 atomic 请求，再减少 atomic 总调用及重复 ld_dev。每项策略比较同一组输入下 7 个 AICore L0 均值的总和及逐项变化：功能正确、明确消减冗余 atomic／ld_dev 且总和回退不超过0.5%时可保留，回退超过0.5%则撤回。计数减少和耗时收益分别提供证据，不能将新增 DCCI/DSB、普通读写或其他地址竞争隐去。percounter 作为定位参照，比较结论须由可比版本、输入及计时边界的实际对照支持。5 µs 交接用于分析关键路径，不能替代 7 组指标。
+- 最终性能以 AICore L0 `chip.run.runner_run.aicore_wall` 为准：在无 L1/L3 插桩的运行中，直接取所有实际 AIC/AIV kernel 的最晚 end 减最早 begin，包含首尾之间的调度空洞、依赖和通信等待，排除头尾 AICPU 开销。每个用例在同一设备分配内按 A×5、B×5、B×5、A×5 的顺序对照。A 为基线，B 为候选。每段先预热再计时 5 轮，预热排除在外。报告四段均值，并用每个版本各 10 轮的均值计算变化；无 kernel 的核不参与归并，缺失或无效时间戳不能用 Device wall 代替。HBG、基线及 percounter 必须核实同一首尾边界；percounter 原调度循环窗口不得直接冒充 kernel 首尾窗口。L1/L3 只用于定位。
 - 双卡用例每轮先做跨卡 Device 同步，再开始上述 L0 计时。测试启动门必须位于 AICPU 计时入口之前：两卡完成本轮入队后才允许设备会合，随后执行原有 AICPU/AICore 流程；同步门自身等待不计入 AICore L0；只有首末实际 kernel 之间的计算、调度空洞及通信等待计入，AICPU 启停与首末 kernel 之外的准备、退出不计入主指标。单卡不加门。每轮取两个 rank 的本卡耗时最大值，再对十轮求均值；不得跨卡相减硬件计数器或从旧样本减去估计的启动差。基线、候选与 percounter 均须使用同一门；旧的未同步双卡数据另标口径，不能直接作为新口径基线。
-- 性能验收使用 `dsv41_scheduler` 当前清单的 12 组配对对照，保持各组原 kernel、输入、图、sync_start 配置一致。11组回放须通过数值验证；新版原生 MoE 沿用已约定的72/72性能专用模式，明确标记 `numerical_validation:false`，不能把执行成功当作数值通过；全部 12 组（含 MoE 与 layers_19_21 通信场景）的 AICore L0 均值之和决定是否保留，同时披露逐项回退；Graph、MIX、sync_start、defer_wait 的通用功能另按上述合同验证。单个 SWA 或其他模型的收益不能替代全套结果。
+- 性能验收使用 `dsv41_scheduler` 当前清单的 7 组配对对照，保持各组原 kernel、输入、图、sync_start 配置一致。6 组回放须通过数值验证；新版原生 MoE 沿用已约定的72/72性能专用模式，明确标记 `numerical_validation:false`，不能把执行成功当作数值通过；全部 7 组（含 MoE 与 layers_19_21 通信场景）的 AICore L0 均值之和决定是否保留，同时披露逐项回退；Graph、MIX、sync_start、defer_wait 的通用功能另按上述合同验证。单个 SWA 或其他模型的收益不能替代全套结果。
 - 所有硬件任务使用 `task-submit --device auto --device-num N`，在任务内使用并记录实际 `TASK_DEVICE`；attention 单卡，同一分配内做配对对照，记录先后顺序。
 - L1/L3 也区分预热与正式采集；不从单条交接里扣除整次 L1−L0，不累加跨核或嵌套 span 冒充串行耗时。5 µs 判断同时报告低扰动观测、采集开销和未达标原因。
 - 对照完整目标方案前后，并保留各独立改动的归因。常规性能改动以综合收益决定保留，1% 收益也记录；已证明消减冗余 atomic／ld_dev 的结构性修改适用上述不超过0.5%回退的保留例外，超过0.5%则撤回；回退如实记录。无 ±5% 忽略区间。有收益的独立修改分别本地 commit，未经允许不 push。
 - Host 准备、实际 H2D、GM/SSBUF 和峰值内存单列；不能把工作搬出 L0 区间后不报告。历史测量与详细采集留在实验结果中，不回填本设计作为实施完成状态。
 
-比较容量时固定执行结构。每行列出 W1、W2、W3、W4 四档同卡耗时，报告 12 项总和和各档相对 W4 的变化。单列 `G_worker/G_dep`、block 起跑跨度、实际参与核数/组数和域内进展；首次 kernel 提前不能代替 12 组 L0 均值总和改善。
+比较容量时固定执行结构。每行列出 W1、W2、W3、W4 四档同卡耗时，报告 7 项总和和各档相对 W4 的变化。单列 `G_worker/G_dep`、block 起跑跨度、实际参与核数/组数和域内进展；首次 kernel 提前不能代替 7 组 L0 均值总和改善。
 
-12 组中的非通信清单：初版、DSL 半同步、DSL 全同步的 `c2a_full` 三组，加新版 PyPTO-lib 的 `swa`、`c2a_full`、`c1a_reindex`、`c1a_reuse`、`engram` 五组。各组均 1 次预热、10 次正式测量。另外 DSL 半同步与新版 PyPTO-lib 各自的 MoE 与 `layers_19_21` 共四组通信配置同样计入保留指标，合计12组。
+当前清单使用 `pypto_lib_latest` 的七个原生用例。单卡运行 `swa`、`c2a_full`、`c1a_reindex`、`c1a_reuse`、`engram`，双卡运行 `moe` 和 `layers_19_21`。用例集以 [list_cases.py](../../../../tests/fdwic/dsv41_scheduler/production/list_cases.py) 的输出为准。

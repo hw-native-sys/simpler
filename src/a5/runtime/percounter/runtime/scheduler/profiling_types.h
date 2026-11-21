@@ -141,6 +141,10 @@ enum class PercounterTaskEventKind : uint32_t {
     DeferRegistered,
     DeferredCompletionIssue,
     KernelEnd,
+    MixPublished,
+    InputsPending,
+    InputsReady,
+    EntryCommitted,
 };
 
 struct PercounterTaskEvent {
@@ -148,6 +152,9 @@ struct PercounterTaskEvent {
     uint64_t entry;
     uint64_t detail;  // Interval start, completion contribution or deferred group reference.
     PercounterTaskEventKind kind;
+    uint16_t slot;
+    uint8_t participant_mask;
+    uint8_t mix;
 };
 
 inline constexpr uint32_t PERCOUNTER_SCALAR_WORD_CAPACITY =

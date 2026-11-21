@@ -259,7 +259,8 @@ static inline __aicore__ bool scheduler_complete_lane_execution(
         completed_trace->kernel_start_cycles = executor_trace->kernel_start_cycles;
         completed_trace->kernel_end_cycles = executor_trace->kernel_end_cycles;
     }
-    if (chip_task_timing_enabled) {
+    const bool capture_l2 = profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL;
+    if (chip_task_timing_enabled && !capture_l2) {
         if (phase_timing_enabled) {
             completed_trace->complete_end_cycles = completion_phase_end;
         }
@@ -275,17 +276,28 @@ static inline __aicore__ bool scheduler_complete_lane_execution(
             );
         // Trace lines precede valid. The owning core finishes this retirement
         // before acknowledging EXIT; Host reads traces after all acknowledgements.
-    } else if (completed_trace != nullptr) {
+    } else if (!chip_task_timing_enabled && completed_trace != nullptr) {
         scheduler_publish_cache_line(&completed_trace->kernel_start_cycles);
     }
     // Failed completion bypasses the contribution's visibility fence. Its real
     // return must still precede a resource-lane acknowledgement.
     if (!PublishCompletion || !completion_ok || group_contributes) scheduler_cache_barrier();
-    if (completed_slot.cluster_mix && !scheduler_release_mix_lane(
-                                          graph, scheduler_state_base, scheduler, run_control, completed_slot,
-                                          pending_slot, PublishCompletion && completion_ok
-                                      ))
-        return false;
+    const bool released =
+        !completed_slot.cluster_mix || scheduler_release_mix_lane(
+                                           graph, scheduler_state_base, scheduler, run_control, completed_slot,
+                                           pending_slot, PublishCompletion && completion_ok
+                                       );
+    if (capture_l2) {
+        // Includes this lane's return notification. Deferred logical completion can happen later.
+        completed_trace->complete_end_cycles = scheduler_cycles();
+        scheduler_writeback_cache_line(completed_trace);
+        scheduler_writeback_cache_line(&completed_trace->kernel_start_cycles);
+        scheduler_writeback_cache_line(&completed_trace->dispatch_start_cycles);
+        scheduler_writeback_cache_line(&completed_trace->execution_run_epoch);
+        scheduler_cache_barrier();
+        scheduler_gm_store(completed_trace->valid, UINT64_C(1));
+    }
+    if (!released) return false;
     if constexpr (RecordProtocol) {
         if (completion_ok && completed_slot.sync_start && !completed_slot.cluster_mix &&
             scheduler_protocol_enabled(scheduler))

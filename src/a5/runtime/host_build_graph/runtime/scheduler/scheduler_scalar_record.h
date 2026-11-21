@@ -59,6 +59,34 @@ struct SchedulerScalarTrace {
     uint32_t storage_slots{0};
     uint32_t dropped{0};
     uint32_t depth{0};
+    uint32_t omitted_depth{UINT32_MAX};
+    bool capture_trace_control{true};
+    bool in_execution_claim{false};
+
+    // Direct memory and observation records inherit their caller's category.
+    inline __aicore__ __attribute__((always_inline)) bool omit_scope(SchedPhaseKind kind) const {
+        switch (kind) {
+        case SchedPhaseKind::ScalarGraphControl:
+        case SchedPhaseKind::ScalarCounterAccounting:
+        case SchedPhaseKind::ScalarLoopControl:
+        case SchedPhaseKind::ScalarAsyncService:
+        case SchedPhaseKind::ScalarAsyncCheck:
+        case SchedPhaseKind::ScalarExecutionIdentityCapture:
+        case SchedPhaseKind::ScalarGraphPayloadArguments:
+        case SchedPhaseKind::ScalarPublishIdle:
+        case SchedPhaseKind::ScalarTraceBeforeExecution:
+        case SchedPhaseKind::ScalarTraceBeforeCompletion:
+            return !capture_trace_control;
+        case SchedPhaseKind::ScalarTaskCompletionObserve:
+        case SchedPhaseKind::ScalarCachedCompletionObserve:
+        case SchedPhaseKind::ScalarCachedCompletionLookup:
+        case SchedPhaseKind::ScalarGraphFaninView:
+        case SchedPhaseKind::ScalarPreparedIndex:
+            return omitted_depth == depth;
+        default:
+            return false;
+        }
+    }
 
     inline __aicore__ __attribute__((always_inline)) void
     write(const SchedulerScalarRecord &record, uint32_t limit = detail_capacity) {
@@ -116,7 +144,7 @@ struct SchedulerScalarTrace {
         scheduler_scalar_raw_barrier();
     }
 
-    inline __aicore__ __attribute__((noinline)) void append(
+    inline __aicore__ __attribute__((always_inline)) void append(
         SchedPhaseKind kind, uint64_t begin, uint64_t end, int64_t task_ref = -1, uint32_t record_depth = 0,
         uint32_t calls = 1
     ) {
@@ -135,6 +163,10 @@ struct SchedulerScalarTrace {
 
     inline __aicore__ void end_iteration(bool progress) {
         if (buffer == nullptr) return;
+        if (!capture_trace_control) {
+            if (!progress) ++poll_loops;
+            return;
+        }
         const uint64_t begin = scheduler_scalar_clock();
         if (!progress) ++poll_loops;
         // EndIteration and its TraceAppend span are optional. Admit them together before the terminal reserve.
@@ -157,6 +189,10 @@ struct SchedulerScalarTrace {
              kind == SchedPhaseKind::ScalarLoopControl || kind == SchedPhaseKind::ScalarEndIteration ||
              kind == SchedPhaseKind::ScalarCompletions);
         if (direct_call) {
+            if (!capture_trace_control) {
+                append(kind, begin, end, task_ref, record_depth);
+                return;
+            }
             const uint64_t record_begin = scheduler_scalar_clock();
             append(kind, begin, end, task_ref, record_depth);
             const uint64_t record_end = scheduler_scalar_clock();
@@ -184,23 +220,25 @@ struct SchedulerScalarTrace {
     inline __aicore__ __attribute__((noinline)) void finish(uint64_t begin) {
         if (buffer == nullptr) return;
         uint64_t clean_end = 0;
-        clean_records(0, &clean_end);
+        clean_records(0, capture_trace_control ? &clean_end : nullptr);
         const uint64_t end = scheduler_scalar_clock();
         write_cycles += end - begin;
         const uint32_t first = storage_slots;
-        write(
-            {begin, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinish) | (1U << 16), 1},
-            SCHEDULER_SCALAR_RECORD_CAPACITY
-        );
-        write(
-            {begin, clean_end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinishClean) | (2U << 16),
-             (first + 3) / 4},
-            SCHEDULER_SCALAR_RECORD_CAPACITY
-        );
-        write(
-            {clean_end, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinishBarrier) | (2U << 16), 1},
-            SCHEDULER_SCALAR_RECORD_CAPACITY
-        );
+        if (capture_trace_control) {
+            write(
+                {begin, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinish) | (1U << 16), 1},
+                SCHEDULER_SCALAR_RECORD_CAPACITY
+            );
+            write(
+                {begin, clean_end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinishClean) | (2U << 16),
+                 (first + 3) / 4},
+                SCHEDULER_SCALAR_RECORD_CAPACITY
+            );
+            write(
+                {clean_end, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinishBarrier) | (2U << 16), 1},
+                SCHEDULER_SCALAR_RECORD_CAPACITY
+            );
+        }
         write(
             {window_start, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarWindow), 1},
             SCHEDULER_SCALAR_RECORD_CAPACITY
@@ -275,6 +313,33 @@ inline void scheduler_scalar_bind(SchedulerScalarTrace *) {}
 
 namespace {
 
+// Claim and result-load wrappers can be separated by an outlined call.
+// A core retains the attribution even if L3 omits a short enclosing function.
+class SchedulerExecutionClaimLoads {
+public:
+    inline __aicore__ __attribute__((always_inline)) explicit SchedulerExecutionClaimLoads(bool enabled = true) {
+        if constexpr (kSchedulerScalarInstrumentation) {
+            if (!enabled) return;
+            trace_ = scheduler_scalar_current();
+            if (trace_ != nullptr) {
+                previous_ = trace_->in_execution_claim;
+                trace_->in_execution_claim = true;
+            }
+        }
+    }
+    inline __aicore__ __attribute__((always_inline)) ~SchedulerExecutionClaimLoads() {
+        if constexpr (kSchedulerScalarInstrumentation) {
+            if (trace_ != nullptr) trace_->in_execution_claim = previous_;
+        }
+    }
+    SchedulerExecutionClaimLoads(const SchedulerExecutionClaimLoads &) = delete;
+    SchedulerExecutionClaimLoads &operator=(const SchedulerExecutionClaimLoads &) = delete;
+
+private:
+    SchedulerScalarTrace *trace_{nullptr};
+    bool previous_{false};
+};
+
 class SchedulerScalarBinding {
 public:
     inline __aicore__ SchedulerScalarBinding() = default;
@@ -323,7 +388,10 @@ template <typename Operation>
 static __aicore__ __attribute__((noinline)) void
 scheduler_scalar_memory_issue_runtime(SchedPhaseKind kind, uint32_t calls, Operation operation) {
     auto *trace = scheduler_scalar_current();
-    if (trace == nullptr) operation();
+    const bool dcci = kind == SchedPhaseKind::ScalarDcciOut || kind == SchedPhaseKind::ScalarDcciSingle ||
+                      kind == SchedPhaseKind::ScalarDcciEntire;
+    if (trace == nullptr || trace->omitted_depth == trace->depth || (dcci && !trace->capture_trace_control))
+        operation();
     else scheduler_scalar_observed_issue(trace, kind, calls, operation);
 }
 
@@ -331,7 +399,12 @@ template <typename Operation>
 static __aicore__ __attribute__((noinline)) auto
 scheduler_scalar_memory_result_runtime(SchedPhaseKind kind, Operation operation) {
     auto *trace = scheduler_scalar_current();
-    if (trace == nullptr) return operation();
+    if (trace == nullptr || trace->omitted_depth == trace->depth) return operation();
+    if (!trace->capture_trace_control &&
+        (kind == SchedPhaseKind::ScalarBypassLoad ||
+         ((kind == SchedPhaseKind::ScalarGmLoad || kind == SchedPhaseKind::ScalarCntNotifyLoad) &&
+          !trace->in_execution_claim)))
+        return operation();
     return scheduler_scalar_observed_result(trace, kind, operation);
 }
 
