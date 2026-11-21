@@ -314,13 +314,33 @@ stream is complete; it does not register the kernel again.
 [implementation](https://github.com/hicann/runtime/blob/8f16f26e162fd995ceb36c7c51d4c65414cc3063/src/runtime/core/src/stream/stream.cc#L1291)
 waits for device abort completion, clears task resources and queues, then restores
 normal stream state. The HCOMM backend additionally checks the returned stream
-state. No common cross-rank mission-stop barrier is introduced; the algorithm
-must make its request completion safe before the local L2 execution ends.
+state. Normal execution adds no common cross-rank mission-stop barrier; the
+algorithm must make its request completion safe before the local L2 execution
+ends. Terminal cleanup after failure separately coordinates all participating
+chips before freeing storage.
 
 A missing trigger or done is an execution failure, not an expected shutdown.
 Stream query errors retain their device error in platform diagnostics.
-Unconfirmed termination closes admission and retains modules, Events, P, W and
-streams. A prepared successor cannot activate or reset its predecessor's Events.
+Failure closes admission permanently. Successful abort plus stream-completion
+queries allow terminal cleanup without restoring admission or erasing the
+original run error. The abort covers every attempted launch, including one
+whose SDK call returned an error. Unconfirmed termination retains modules,
+Events, P, W and streams. A prepared successor cannot activate or reset its
+predecessor's Events.
+
+A child reports the first CCU failure with its lane closed and fails the
+remaining request frames in that batch. It retains the run owners. The parent
+waits for every chip to acknowledge that its native trigger producers have
+stopped before requesting any failure abort. After every chip acknowledges
+STOP, the parent authorizes the children to discard prepared storage.
+PREPARE observes native completion while retaining prepared carriers and
+their borrows. If an acknowledged stream abort still reports RUNNING, a
+later close resumes the outstanding phase and queries the remaining streams.
+A failed SDK call retains the affected owner and its original error.
+Public SDK success is the ownership boundary; simpler does not inspect
+or release SDK-internal physical resources. SDK-owned assigned instances are
+reclaimed through communicator destruction rather than a second instance
+destroy. A visible cleanup error preserves the remaining simpler owners.
 
 Users serialize requests to a single mission through full asynchronous task
 completion before publishing new parameters. The runtime does not automatically queue competing requests to one mission and

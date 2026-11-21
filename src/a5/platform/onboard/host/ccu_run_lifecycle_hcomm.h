@@ -27,6 +27,8 @@ struct HcommMissionStream {
     aclrtStream stream{};
 };
 
+enum class MissionStreamReleaseResult { RELEASED, PENDING, FAILED };
+
 class HcommMissionStreamPool final {
 public:
     HcommMissionStreamPool() = default;
@@ -35,7 +37,7 @@ public:
     HcommMissionStreamPool(HcommMissionStreamPool &&) = delete;
     HcommMissionStreamPool &operator=(HcommMissionStreamPool &&) = delete;
     HcommMissionStream acquire();
-    bool release(uint64_t handle);
+    MissionStreamReleaseResult release(uint64_t handle);
     bool close();
 
 private:

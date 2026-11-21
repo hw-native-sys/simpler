@@ -930,6 +930,10 @@ static void test_basic_window() {
 int main(int argc, char **argv) {
 #ifdef SIMPLER_TEST_CCU_BACKEND
     assert(argc == 3);
+    if (std::string(argv[2]).find("retry_") == 0) {
+        test_ccu_abort_retry(argv[2]);
+        return 0;
+    }
     if (std::string(argv[2]) == "modes") {
         test_ccu_communicator_modes(argv[1]);
         return 0;

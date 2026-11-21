@@ -421,6 +421,7 @@ TEST(DiagnosticCapacityRefusalPhaseTest, ARefusedRunLaunchesOnceCapacityReturns)
 
     // First launch: every owner's capacity is held by a run ahead.
     EXPECT_EQ(run.launch(), SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL);
+    EXPECT_EQ(simpler_query_run_completion(&run.runner, run.storage.handle()), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
     EXPECT_EQ(run.phase(), NativeRunPhase::Prepared)
         << "a refusal that submitted nothing latched a phase the next launch refuses";
     EXPECT_EQ(run.completion_rc(), kNoCompletionYet) << "a run that never started carries a completion code";

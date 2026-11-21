@@ -361,6 +361,7 @@ void ChipWorker::init(
         launch_run_on_stream_fn_ = module->optional<CallerStreamLaunchFn>("simpler_launch_run_on_stream");
         launch_run_joined_fn_ = module->required<SimplerJoinedLaunchFn>("simpler_launch_run_joined");
         poll_run_fn_ = module->required<SimplerNativeRunFn>("simpler_poll_run");
+        query_run_completion_fn_ = module->optional<SimplerNativeRunFn>("simpler_query_run_completion");
         wait_run_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run");
         wait_run_completion_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run_completion");
         finalize_run_fn_ = module->required<SimplerFinalizeRunFn>("simpler_finalize_run_with_delivery");
@@ -797,12 +798,14 @@ bool ChipWorker::teardown_report(SimplerTeardownReport *out) const {
 }
 
 std::exception_ptr ChipWorker::stop_and_cleanup_native_runs() {
+    if (terminal_reclamation_fenced_)
+        throw std::runtime_error("native resources are retained until terminal peer stop is confirmed");
     {
         std::lock_guard<std::mutex> lock(native_run_mu_);
         if (native_resource_references_ != 0)
             throw std::runtime_error("ChipWorker::finalize: external run resources still require checked release");
     }
-    if (ccu_cleanup_unconfirmed_) require_comm_cleanup_confirmed();
+    if (ccu_cleanup_unconfirmed_ || unconfirmed_ccu_run_count_ != 0) require_comm_cleanup_confirmed();
     std::exception_ptr lane_error;
     if (run_lane_ != nullptr) {
         run_lane_->stop_admission();
@@ -811,7 +814,7 @@ std::exception_ptr ChipWorker::stop_and_cleanup_native_runs() {
         } catch (...) {
             lane_error = std::current_exception();
         }
-        comm_reclamation_unconfirmed_ |= run_lane_->poisoned();
+        comm_reclamation_unconfirmed_ |= run_lane_->poisoned() && !ccu_terminal_reclaimed_;
     }
     {
         std::unique_lock<std::mutex> lock(native_run_mu_);
@@ -834,7 +837,7 @@ std::exception_ptr ChipWorker::stop_and_cleanup_native_runs() {
 
 bool ChipWorker::quiesce_host_uses() {
     validate_execution_process();
-    if (!unstopped_ccu_runs_.empty()) retain_unconfirmed_ccu_cleanup();
+    if (!unstopped_ccu_runs_.empty()) throw std::runtime_error("CCU runs still require a confirmed stop");
     validate_execution_context();
     if (execution_environment_ && execution_environment_->borrowed)
         throw std::runtime_error("Host use recovery requires an owned execution context");
@@ -872,7 +875,7 @@ bool ChipWorker::quiesce_host_uses() {
 
 void ChipWorker::finalize() {
     validate_execution_process();
-    if (!unstopped_ccu_runs_.empty()) retain_unconfirmed_ccu_cleanup();
+    if (!unstopped_ccu_runs_.empty()) throw std::runtime_error("CCU runs still require a confirmed stop");
     validate_execution_context();
     auto lane_error = stop_and_cleanup_native_runs();
     const size_t unproven = unproven_native_run_count();
@@ -991,6 +994,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     launch_run_on_stream_fn_ = nullptr;
     launch_run_joined_fn_ = nullptr;
     poll_run_fn_ = nullptr;
+    query_run_completion_fn_ = nullptr;
     wait_run_fn_ = nullptr;
     wait_run_completion_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
@@ -1328,7 +1332,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         throw RunPreparationRefused("unknown native run preparation purpose");
     if (purpose == SIMPLER_PREPARE_CAPTURE && (!execution_environment_ || !execution_environment_->borrowed))
         throw RunPreparationRefused("capture preparation requires a borrowed Kernel execution environment");
-    require_comm_cleanup_confirmed();
+    require_ccu_run_admission();
     try {
         config.validate();
     } catch (const std::invalid_argument &e) {
@@ -1342,7 +1346,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     bool allow_prepared_successor = false;
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
-        if (native_runs_closing_) throw RunPreparationRefused("native context is closing");
+        if (native_runs_closing_ || ccu_admission_closed_) throw RunPreparationRefused("native context is closing");
         if (!initialized_) throw RunPreparationRefused("ChipWorker not initialized; call init() first");
         if (slot_id >= runtime_bufs_.size())
             throw RunPreparationRefused("native-run slot is outside the runtime PipelineContract");
@@ -1547,6 +1551,25 @@ void ChipWorker::stop_chip_run_lane_admission() noexcept {
     if (run_lane_ != nullptr) run_lane_->stop_admission();
 }
 
+void ChipWorker::fence_chip_run_lane() noexcept {
+    if (ccu_terminal_finished_) return;
+    fence_chip_run_lane_impl(true);
+}
+
+void ChipWorker::fence_chip_run_lane_impl(bool require_peer_barrier) noexcept {
+    ccu_terminal_peer_barrier_required_ |= require_peer_barrier;
+    ccu_admission_closed_ = true;
+    terminal_reclamation_fenced_ = true;
+    if (run_lane_ != nullptr) run_lane_->fence_admission();
+}
+
+void ChipWorker::release_standalone_ccu_fence() noexcept {
+    if (ccu_terminal_peer_barrier_required_ || !communication_cleanup_confirmed() || !unstopped_ccu_runs_.empty())
+        return;
+    terminal_reclamation_fenced_ = false;
+    if (run_lane_ != nullptr) run_lane_->release_terminal_fence();
+}
+
 std::pair<int, bool> ChipWorker::observe_framework_submissions() {
     if (!run_lane_ || observe_framework_submissions_fn_ == nullptr)
         throw UnsupportedRuntimeOperation("runtime has no framework observation owner");
@@ -1644,6 +1667,7 @@ bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase
     case NativeRunOp::Wait:
         return phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED;
     case NativeRunOp::Finalize:
+    case NativeRunOp::QueryCompletion:
         return phase == NativeRunPhase::PREPARED || phase == NativeRunPhase::LAUNCHED ||
                phase == NativeRunPhase::REAPED;
     case NativeRunOp::Probe:
@@ -1662,7 +1686,10 @@ bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase
 
 ChipWorker::NativeRunLease
 ChipWorker::inspect_native_run_locked(const ChipWorkerNativeRun &run, NativeRunOp op, NativeRunEntry **entry_out) {
-    if (native_runs_closing_) return NativeRunLease::Reserved;
+    if (((native_runs_closing_ || terminal_reclamation_fenced_) && op != NativeRunOp::QueryCompletion) ||
+        (ccu_admission_closed_ &&
+         (op == NativeRunOp::Launch || op == NativeRunOp::ProbeSuccessor || op == NativeRunOp::RetainResources)))
+        return NativeRunLease::Reserved;
     const auto it = native_runs_.find(run.run_epoch);
     if (it == native_runs_.end()) return NativeRunLease::Absent;
     NativeRunEntry &entry = *it->second;
@@ -1896,7 +1923,7 @@ void ChipWorker::retain_native_run_resources_impl(
 
 ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream) {
     validate_execution_process();
-    require_comm_cleanup_confirmed();
+    require_ccu_run_admission();
     void *storage = nullptr;
     NativeRunOpLease held;
     const NativeRunLease lease = acquire_native_run_op(run, NativeRunOp::Launch, &storage, nullptr, &held);
@@ -1912,6 +1939,13 @@ ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun
     // does not itself prove that this call will be recorded.
     if (caller_stream != nullptr && !capture_prepared) validate_caller_stream(caller_stream);
 
+    bool prior_launch_attempted;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        auto &entry = *native_runs_.at(run.run_epoch);
+        prior_launch_attempted = entry.launch_attempted;
+        entry.launch_attempted = true;
+    }
     int rc = 0;
     std::exception_ptr failure;
     try {
@@ -1927,6 +1961,10 @@ ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun
         // Not a failure and not a device event: the backend admitted nothing
         // and submitted nothing, so there is no probe to take and no launch to
         // note. The run keeps its phase and is offered again when credit moves.
+        {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            native_runs_.at(run.run_epoch)->launch_attempted = prior_launch_attempted;
+        }
         return NativeLaunch::DiagnosticCreditFull;
     }
     if (failure == nullptr && rc != 0) {
@@ -1965,7 +2003,7 @@ bool ChipWorker::launch_native_run_joined(
     const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor, void *caller_stream
 ) {
     validate_execution_process();
-    require_comm_cleanup_confirmed();
+    require_ccu_run_admission();
     if (run.slot_id == predecessor.slot_id) {
         throw std::runtime_error("a native run cannot be ordered behind its own pipeline slot");
     }
@@ -1987,6 +2025,13 @@ bool ChipWorker::launch_native_run_joined(
     validate_execution_context();
     if (!supports_joined_native_launch()) return false;
 
+    bool prior_launch_attempted;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        auto &entry = *native_runs_.at(run.run_epoch);
+        prior_launch_attempted = entry.launch_attempted;
+        entry.launch_attempted = true;
+    }
     int rc = 0;
     bool declined = false;
     std::exception_ptr failure;
@@ -2009,6 +2054,10 @@ bool ChipWorker::launch_native_run_joined(
         // submitted nothing, either because it cannot order the two at all or
         // because an owner's capacity is held by a run ahead. Both leave the
         // run prepared, and the caller re-offers it rather than failing it.
+        {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            native_runs_.at(run.run_epoch)->launch_attempted = prior_launch_attempted;
+        }
         declined = true;
     } else if (failure == nullptr && rc != 0) {
         int poll_rc = 0;
@@ -2183,6 +2232,10 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     try {
         std::unique_lock<std::mutex> lk(native_run_mu_);
         const auto found = native_runs_.find(run_epoch);
+        if (terminal_reclamation_fenced_) {
+            outcome.fault = FinalizeFault::Reserved;
+            return outcome;
+        }
         if ((!teardown && native_runs_closing_) || found == native_runs_.end() || found->second->destruction_unknown ||
             (token != nullptr &&
              (found->second->lease_generation != token->generation || found->second->slot_id != token->slot_id)) ||
@@ -2394,6 +2447,10 @@ RunRetentionProbeReport ChipWorker::probe_run_retention(
     }
 
     RunRetentionProbeReport report{};
+    if (want_successor) {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        native_runs_.at(successor.run_epoch)->launch_attempted = true;
+    }
     const int rc =
         probe_run_retention_fn_(device_ctx_, storage, want_successor ? successor_storage : nullptr, &config, &report);
     if (rc != 0) {
@@ -2403,19 +2460,22 @@ RunRetentionProbeReport ChipWorker::probe_run_retention(
         );
     }
     if (want_successor) {
-        // The fixture drained the successor, so it is where an ordinary wait
-        // would have left it. The predecessor stays LAUNCHED on purpose: its
-        // drain, copy-back and DFX teardown are the production path, and
-        // finalize reaches all three from that phase.
-        note_native_run_completion(
-            successor.run_epoch,
-            report.successor_launch_rc != 0 ? report.successor_launch_rc : report.successor_drain_rc
-        );
+        const int successor_rc =
+            report.successor_launch_rc != 0 ? report.successor_launch_rc : report.successor_drain_rc;
+        if (successor_rc == 0) {
+            note_native_run_completion(successor.run_epoch, 0);
+        } else {
+            // The probe delivered a verdict, but a partial launch or failed drain
+            // still requires separate evidence of physical completion.
+            note_native_run_launched(successor.run_epoch);
+            note_native_run_result(successor.run_epoch, successor_rc);
+        }
     }
     return report;
 }
 
 void ChipWorker::cleanup_native_runs_noexcept() noexcept {
+    if (terminal_reclamation_fenced_) return;
     if (device_ctx_ == nullptr || finalize_run_fn_ == nullptr) {
         return;
     }
@@ -2697,7 +2757,7 @@ void ChipWorker::clear_comm_sessions() {
 
 void ChipWorker::retain_unconfirmed_ccu_cleanup() noexcept {
     ccu_cleanup_unconfirmed_ = true;
-    retain_unconfirmed_comm_cleanup();
+    fence_chip_run_lane_impl(false);
 }
 
 void ChipWorker::retain_unconfirmed_comm_cleanup() noexcept {
@@ -2714,7 +2774,7 @@ void ChipWorker::retain_unconfirmed_comm_stream(void *stream) {
 }
 
 void ChipWorker::require_comm_cleanup_confirmed() const {
-    if (comm_cleanup_unconfirmed_) {
+    if (!communication_cleanup_confirmed()) {
         throw std::runtime_error(
             "communication cleanup is unconfirmed; keeping communication owners, streams, device context and host "
             "runtime"
@@ -2722,9 +2782,62 @@ void ChipWorker::require_comm_cleanup_confirmed() const {
     }
 }
 
+void ChipWorker::require_ccu_run_admission() const {
+    if (ccu_admission_closed_) throw std::runtime_error("CCU failure permanently closed run admission");
+    require_comm_cleanup_confirmed();
+}
+
+void ChipWorker::require_native_ccu_producers_stopped() const {
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    for (const auto &item : native_runs_) {
+        const auto &entry = *item.second;
+        const bool never_launched = entry.phase == NativeRunPhase::PREPARED && !entry.launch_attempted;
+        if (entry.ops_in_flight != 0 || entry.finalize_reserved ||
+            (!entry.producer_stop_confirmed && entry.phase != NativeRunPhase::REAPED &&
+             (!never_launched || entry.destruction_unknown))) {
+            throw std::runtime_error("CCU terminal stop requires confirmed native producer completion");
+        }
+    }
+}
+
+void ChipWorker::observe_native_ccu_producers() {
+    std::vector<ChipWorkerNativeRun> pending;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        for (const auto &item : native_runs_) {
+            const auto &entry = *item.second;
+            if (entry.producer_stop_confirmed || entry.phase == NativeRunPhase::REAPED ||
+                (entry.phase == NativeRunPhase::PREPARED && !entry.launch_attempted))
+                continue;
+            // An unknown destructor outcome can never be made safe by reading
+            // through the old carrier again, even after device completion.
+            if (entry.destruction_unknown) continue;
+            pending.push_back({entry.slot_id, entry.lease_generation, item.first, 0, 0});
+        }
+    }
+    if (query_run_completion_fn_ == nullptr) return;
+    for (const auto &run : pending) {
+        void *storage = nullptr;
+        NativeRunOpLease held;
+        const auto lease = acquire_native_run_op(run, NativeRunOp::QueryCompletion, &storage, nullptr, &held);
+        if (lease != NativeRunLease::Acquired) continue;
+        int rc = SIMPLER_NATIVE_RUN_POLL_ERROR;
+        try {
+            rc = query_run_completion_fn_(device_ctx_, storage);
+        } catch (...) {
+            // A query failure supplies no evidence and must not displace the
+            // original run error. Every other producer is still observed.
+        }
+        if (rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) continue;
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        native_runs_.at(run.run_epoch)->producer_stop_confirmed = true;
+    }
+}
+
 void ChipWorker::require_comm_reclamation_safe() const {
     require_comm_cleanup_confirmed();
-    if (comm_reclamation_unconfirmed_ || (run_lane_ != nullptr && run_lane_->poisoned()) ||
+    if (terminal_reclamation_fenced_ || comm_reclamation_unconfirmed_ ||
+        (run_lane_ != nullptr && run_lane_->poisoned() && !ccu_terminal_reclaimed_) ||
         unproven_native_run_count() != 0) {
         throw std::runtime_error("communication resource reclamation is unconfirmed");
     }
@@ -3052,7 +3165,7 @@ uint64_t ChipWorker::register_ccu_callable(
     uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask,
     uint64_t allocation_id, uint32_t ccu_id
 ) {
-    require_comm_cleanup_confirmed();
+    require_ccu_run_admission();
     validate_execution_context();
     if (comm_register_ccu_callable_fn_ == nullptr)
         throw std::runtime_error("this runtime does not support native CCU registration");
@@ -3083,7 +3196,7 @@ uint64_t ChipWorker::register_ccu_callable(
 uint64_t ChipWorker::prepare_ccu_run_set(
     uint64_t comm_handle, const std::vector<uint64_t> &registrations, uint64_t generation, uint64_t dispatch_id
 ) {
-    require_comm_cleanup_confirmed();
+    require_ccu_run_admission();
     validate_execution_context();
     if (!comm_prepare_ccu_run_set_fn_) throw std::runtime_error("runtime has no CCU run-set backend");
     uint64_t id{}, workspace{};
@@ -3100,13 +3213,26 @@ uint64_t ChipWorker::prepare_ccu_run_set(
 }
 
 int ChipWorker::control_ccu_run_set(uint64_t comm_handle, uint64_t id, uint32_t operation) {
+    validate_execution_process();
+    const auto identity = std::make_tuple(comm_handle, id, UINT64_MAX);
+    if (operation == 4) {
+        fence_chip_run_lane_impl(false);
+        unconfirmed_ccu_runs_.insert(identity);
+        unconfirmed_ccu_run_count_ = unconfirmed_ccu_runs_.size();
+        observe_native_ccu_producers();
+        require_native_ccu_producers_stopped();
+    }
     validate_execution_context();
     if (!comm_control_ccu_run_set_fn_) throw std::runtime_error("runtime has no CCU run-set backend");
-    if (operation == 1) require_comm_cleanup_confirmed();
-    const auto identity = std::make_tuple(comm_handle, id, UINT64_MAX);
+    if (operation == 1) require_ccu_run_admission();
     const int rc = comm_control_ccu_run_set_fn_(reinterpret_cast<void *>(comm_handle), id, operation);
     if (operation == 1 && (rc == 0 || rc == COMM_RECLAMATION_UNCONFIRMED)) unstopped_ccu_runs_.insert(identity);
-    if ((operation == 3 || operation == 9) && rc == 0) unstopped_ccu_runs_.erase(identity);
+    if ((operation == 3 || operation == 4 || operation == 9) && rc == 0) unstopped_ccu_runs_.erase(identity);
+    if (operation == 4 && rc == 0) {
+        unconfirmed_ccu_runs_.erase(identity);
+        unconfirmed_ccu_run_count_ = unconfirmed_ccu_runs_.size();
+        release_standalone_ccu_fence();
+    }
     if (operation == 7 && rc == 0) {
         std::lock_guard<std::mutex> guard(ccu_preparation_mu_);
         const auto found = ccu_run_set_dispatches_.find({comm_handle, id});
@@ -3115,7 +3241,14 @@ int ChipWorker::control_ccu_run_set(uint64_t comm_handle, uint64_t id, uint32_t 
             ccu_run_set_dispatches_.erase(found);
         }
     }
-    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_ccu_cleanup();
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+        fence_chip_run_lane_impl(false);
+        if (operation == 4 || operation == 7) retain_unconfirmed_ccu_cleanup();
+        else {
+            unconfirmed_ccu_runs_.insert(identity);
+            unconfirmed_ccu_run_count_ = unconfirmed_ccu_runs_.size();
+        }
+    }
     if (rc < 0) throw std::runtime_error("CCU run-set control failed: " + std::to_string(rc));
     return rc;
 }
@@ -3132,7 +3265,7 @@ void ChipWorker::release_ccu_registration(uint64_t comm_handle, uint64_t id) {
 uint64_t ChipWorker::prepare_ccu_run(
     uint64_t comm_handle, uint64_t registration_id, uint64_t generation, uint64_t dispatch_id, uint64_t allocation_id
 ) {
-    require_comm_cleanup_confirmed();
+    require_ccu_run_admission();
     validate_execution_context();
     if (!comm_prepare_ccu_run_fn_) throw std::runtime_error("runtime has no CCU preparation backend");
     uint64_t workspace{};
@@ -3150,18 +3283,29 @@ uint64_t ChipWorker::prepare_ccu_run(
 
 int ChipWorker::control_ccu_run(uint64_t comm_handle, uint64_t allocation_id, uint32_t operation, uint64_t generation) {
     validate_execution_process();
-    if (operation == 4) retain_unconfirmed_ccu_cleanup();
+    const auto identity = std::make_tuple(comm_handle, allocation_id, generation);
+    if (operation == 4) {
+        fence_chip_run_lane_impl(false);
+        unconfirmed_ccu_runs_.insert(identity);
+        unconfirmed_ccu_run_count_ = unconfirmed_ccu_runs_.size();
+        observe_native_ccu_producers();
+        require_native_ccu_producers_stopped();
+    }
     validate_execution_context();
     if (!comm_control_ccu_run_fn_) throw std::runtime_error("runtime has no CCU run backend");
-    const auto identity = std::make_tuple(comm_handle, allocation_id, generation);
     if (operation == 1) {
-        require_comm_cleanup_confirmed();
+        require_ccu_run_admission();
         // Begin may partially launch before returning an error.
     }
     const int result =
         comm_control_ccu_run_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, operation, generation);
     if (operation == 1 && (result == 0 || result == COMM_RECLAMATION_UNCONFIRMED)) unstopped_ccu_runs_.insert(identity);
-    if ((operation == 3 || operation == 9) && result == 0) unstopped_ccu_runs_.erase(identity);
+    if ((operation == 3 || operation == 4 || operation == 9) && result == 0) unstopped_ccu_runs_.erase(identity);
+    if (operation == 4 && result == 0) {
+        unconfirmed_ccu_runs_.erase(identity);
+        unconfirmed_ccu_run_count_ = unconfirmed_ccu_runs_.size();
+        release_standalone_ccu_fence();
+    }
     if (operation == 7 && result == 0) {
         std::lock_guard<std::mutex> guard(ccu_preparation_mu_);
         const auto found = ccu_preparation_keys_.find(identity);
@@ -3170,9 +3314,78 @@ int ChipWorker::control_ccu_run(uint64_t comm_handle, uint64_t allocation_id, ui
             ccu_preparation_keys_.erase(found);
         }
     }
-    if (result == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_ccu_cleanup();
+    if (result == COMM_RECLAMATION_UNCONFIRMED) {
+        fence_chip_run_lane_impl(false);
+        if (operation == 4 || operation == 7) retain_unconfirmed_ccu_cleanup();
+        else {
+            unconfirmed_ccu_runs_.insert(identity);
+            unconfirmed_ccu_run_count_ = unconfirmed_ccu_runs_.size();
+        }
+    }
     if (result < 0) throw std::runtime_error("CCU run control failed with code " + std::to_string(result));
     return result;
+}
+
+void ChipWorker::control_ccu_terminal(uint32_t operation) {
+    validate_execution_process();
+    if (operation < 11 || operation > 13) throw std::invalid_argument("invalid CCU terminal phase");
+    if (ccu_terminal_finished_) return;
+    if (operation == 12 && ccu_terminal_stopped_) return;
+    fence_chip_run_lane();
+    if (operation == 11) {
+        {
+            std::unique_lock<std::mutex> lock(native_run_mu_);
+            native_run_ops_done_.wait(lock, [this] {
+                return std::all_of(native_runs_.begin(), native_runs_.end(), [](const auto &item) {
+                    const auto &entry = *item.second;
+                    return entry.phase != NativeRunPhase::PREPARING && entry.ops_in_flight == 0 &&
+                           !entry.finalize_reserved;
+                });
+            });
+        }
+        // The dedicated query observes later completion without the retirement
+        // side effects of ordinary poll/wait/finalize.
+        observe_native_ccu_producers();
+        require_native_ccu_producers_stopped();
+        ccu_terminal_prepared_ = true;
+        return;
+    }
+    if (!ccu_terminal_prepared_) throw std::runtime_error("CCU terminal native preflight is incomplete");
+    if (operation == 13 && !ccu_terminal_stopped_) throw std::runtime_error("CCU terminal stop is incomplete");
+    auto identities = unstopped_ccu_runs_;
+    identities.insert(unconfirmed_ccu_runs_.begin(), unconfirmed_ccu_runs_.end());
+    {
+        std::lock_guard<std::mutex> lock(ccu_preparation_mu_);
+        for (const auto &item : ccu_preparation_keys_)
+            identities.insert(item.first);
+        for (const auto &item : ccu_run_set_dispatches_)
+            identities.emplace(item.first.first, item.first.second, UINT64_MAX);
+    }
+    std::exception_ptr failure;
+    for (const auto &identity : identities) {
+        try {
+            const auto [comm, id, generation] = identity;
+            const uint32_t control = operation == 12 ? 4 : 7;
+            const int rc = generation == UINT64_MAX ? control_ccu_run_set(comm, id, control) :
+                                                      control_ccu_run(comm, id, control, generation);
+            if (rc != 0) throw std::runtime_error("CCU terminal control remains unconfirmed");
+        } catch (...) {
+            if (failure == nullptr) failure = std::current_exception();
+        }
+    }
+    if (failure != nullptr) std::rethrow_exception(failure);
+    require_comm_cleanup_confirmed();
+    if (operation == 12) {
+        ccu_terminal_stopped_ = true;
+    } else {
+        ccu_terminal_reclaimed_ = true;
+        terminal_reclamation_fenced_ = false;
+        if (run_lane_ != nullptr) run_lane_->release_terminal_fence();
+        (void)stop_and_cleanup_native_runs();
+        if (unproven_native_run_count() != 0)
+            throw std::runtime_error("CCU terminal cleanup retained native owners with unknown destruction");
+        ccu_terminal_finished_ = true;
+    }
 }
 
 void ChipWorker::comm_release_domain_windows(

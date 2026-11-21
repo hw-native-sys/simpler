@@ -13,6 +13,7 @@ import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import simpler.worker as worker_mod
@@ -193,18 +194,76 @@ def test_use_domain_only_records_keepalive_without_launch():
     assert worker._building_run_resources.requires_ordered_cleanup
 
 
-def test_task_failure_aborts_all_used_ccu_domains():
+@pytest.mark.parametrize("failed_phase", [11, 12, 13])
+def test_ccu_terminal_cleanup_joins_all_peers_and_retries_only_unfinished_phases(failed_phase):
+    completed = {phase: set() for phase in (11, 12, 13)}
+    failures = [True]
+
+    def control(_kind, chip, _command, payload, _timeout):
+        _, _, phase, _, _ = worker_mod._CCU_DOMAIN_REQUEST.unpack(payload)
+        if phase > 11:
+            assert completed[phase - 1] == {0, 1, 2}
+        if phase == failed_phase and chip == 1 and failures:
+            failures.pop()
+            raise RuntimeError("SDK stop is unconfirmed")
+        completed[phase].add(chip)
+        return payload
+
+    worker = Worker.__new__(Worker)
+    worker._worker = SimpleNamespace(control_payload=control)
+    worker._config = {"device_ids": [0, 1, 2]}
+    worker._py_control_timeout_s = 1
+    worker._ccu_terminal_error = None
+    worker._ccu_terminal_phase = 11
+    worker._ccu_terminal_acks = set()
+    worker._ccu_terminal_lock = threading.Lock()
+    worker._cleanup_journal = worker_mod.CleanupJournal()
+    worker._ccu_terminal_cleanup_pending = False
     first, second = _domain(), _domain(allocation_id=10)
-    first.name, second.name = "first", "second"
-    aborted = []
-    worker: Any = SimpleNamespace(_abort_ccu_domain=lambda handle: aborted.append(handle.name))
     resources = worker_mod._RunResources(ccu_domains={first.allocation_id: first, second.allocation_id: second})
-    error = RuntimeError("ordinary task failed")
-    with pytest.raises(RuntimeError, match="CCU run aborted") as result:
-        Worker._stop_run_ccu_domains(worker, resources, error)
-    assert result.value.__cause__ is error
-    assert aborted == ["first", "second"]
-    assert list(resources.ccu_domains) == [first.allocation_id, second.allocation_id]
+    original = RuntimeError("original native task failure")
+    with pytest.raises(RuntimeError, match="SDK stop"):
+        worker._stop_run_ccu_domains(resources, original)
+    assert worker._ccu_terminal_cleanup_pending
+    assert worker._ccu_terminal_error is original
+    assert completed[failed_phase] == {0, 2}
+    assert all(not completed[phase] for phase in range(failed_phase + 1, 14))
+    worker._finish_ccu_terminal_cleanup()
+    assert not worker._ccu_terminal_cleanup_pending
+    assert worker._ccu_terminal_error is original
+    assert completed == {11: {0, 1, 2}, 12: {0, 1, 2}, 13: {0, 1, 2}}
+
+
+def test_close_resumes_ccu_barrier_after_failed_run_and_failed_first_close():
+    parent = Worker(level=3, num_sub_workers=0)
+    parent._config["device_ids"] = [0, 1]
+    native = Mock()
+    parent._worker = native
+    calls = {0: [], 1: []}
+
+    def control(_kind, chip, _command, payload, _timeout):
+        phase = worker_mod._CCU_DOMAIN_REQUEST.unpack(payload)[2]
+        calls[chip].append(phase)
+        if chip == 1 and phase == 12 and calls[1].count(12) < 3:
+            raise RuntimeError("awaiting stream completion")
+        return payload
+
+    native.control_payload.side_effect = control
+    domain = _domain()
+    resources = worker_mod._RunResources(ccu_domains={domain.allocation_id: domain})
+    original = RuntimeError("execution failed")
+    with pytest.raises(RuntimeError, match="awaiting stream completion"):
+        parent._stop_run_ccu_domains(resources, original)
+    with pytest.raises(RuntimeError, match="awaiting stream completion"):
+        parent.close()
+    native.close.assert_not_called()
+    assert not parent._cleanup_journal.empty
+    assert calls == {0: [11, 12], 1: [11, 12, 12]}
+    parent.close()
+    assert calls == {0: [11, 12, 13], 1: [11, 12, 12, 12, 13]}
+    assert parent._ccu_terminal_error is original
+    assert parent._cleanup_journal.empty
+    native.close.assert_called_once()
 
 
 def test_abort_marks_unconfirmed_resources():
@@ -281,6 +340,18 @@ def test_l2_launches_only_on_begin_and_confirms_stop_before_reuse():
     second.finish()
     assert operations == [(1, 1), (3, 1), (7, 1), (1, 2), (3, 2), (7, 2)]
     assert not binding.active
+
+
+def test_l2_confirmed_abort_releases_active_use_but_keeps_admission_closed():
+    binding = ChipCcuBinding(SimpleNamespace(control_ccu_run=lambda *_: 0, prepare_ccu_run=lambda *_: 0), 10, 9, 1)
+    run = binding.prepare(1, 9)
+    run.begin()
+    assert run.abort()
+    assert not binding.active
+    with pytest.raises(RuntimeError, match="admission is closed"):
+        binding.prepare(2, 9)
+    with pytest.raises(RuntimeError, match="admission is closed"):
+        run.begin()
 
 
 @pytest.mark.parametrize("failed_operation", [1, 3, 7])

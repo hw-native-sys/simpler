@@ -217,6 +217,11 @@ struct ChipRunLaneState {
         worker->validate_execution_context();
     }
 
+    void require_reclamation_allowed() const {
+        if (retention_fenced)
+            throw std::runtime_error("chip run resources are retained until terminal peer stop is confirmed");
+    }
+
     // Retired capture carriers remain in fifo for backing/span ownership;
     // their external references no longer occupy an execution slot.
     static bool external_only(const ChipRunState &run) {
@@ -1024,6 +1029,7 @@ struct ChipRunLaneState {
     bool progress(const std::shared_ptr<ChipRunState> &target) {
         if (target->framework_owned && target->error != nullptr) std::rethrow_exception(target->error);
         if (target->phase == ChipRunState::Phase::TERMINAL || target->phase == ChipRunState::Phase::ENDED) return true;
+        if (retention_fenced) return false;
         worker->validate_execution_context();
         const auto front = execution_at(0);
         if (!front) throw std::runtime_error("chip run lane lost a nonterminal execution");
@@ -1282,6 +1288,7 @@ struct ChipRunLaneState {
     // lane must not launch, while the runs already launched keep their own
     // outcomes and their own drains.
     bool admission_stopped{false};
+    bool retention_fenced{false};
 };
 
 ChipRun::ChipRun(std::shared_ptr<ChipRunLaneState> lane, std::shared_ptr<ChipRunState> run) :
@@ -1305,6 +1312,7 @@ bool ChipRun::retire_framework(bool wait_for_own_completion, Deadline deadline) 
             std::lock_guard<std::mutex> lock(lane_->mu);
             if (!run_->framework_owned) throw std::logic_error("run has no framework observation owner");
             if (run_->framework_transferred) return true;
+            lane_->require_reclamation_allowed();
             lane_->worker->validate_execution_context();
             // Physical retirement is established already. A later cleanup request may
             // retry the same canonical carrier, without polling, launching or observing
@@ -1357,17 +1365,27 @@ bool ChipRun::wait_until(Deadline deadline) {
     lane_->validate_process();
     {
         std::unique_lock<std::mutex> lock(lane_->mu);
+        if (run_->phase == ChipRunState::Phase::TERMINAL) {
+            lane_->rethrow_run_error(run_);
+            return true;
+        }
+        lane_->require_reclamation_allowed();
         if (run_->prepare_purpose == SIMPLER_PREPARE_CAPTURE) {
             const auto released = [&] {
                 return run_->native_context_destroyed && run_->caller_last_use_proven;
             };
             bool complete;
             if (deadline == Deadline::max()) {
-                lane_->resource_changed.wait(lock, released);
+                lane_->resource_changed.wait(lock, [&] {
+                    return released() || lane_->retention_fenced;
+                });
                 complete = true;
             } else {
-                complete = lane_->resource_changed.wait_until(lock, deadline, released);
+                complete = lane_->resource_changed.wait_until(lock, deadline, [&] {
+                    return released() || lane_->retention_fenced;
+                });
             }
+            lane_->require_reclamation_allowed();
             if (complete) lane_->rethrow_run_error(run_);
             return complete;
         }
@@ -1377,6 +1395,7 @@ bool ChipRun::wait_until(Deadline deadline) {
         std::shared_ptr<ChipRunState> blocked_front;
         {
             std::unique_lock<std::mutex> lk(lane_->mu);
+            lane_->require_reclamation_allowed();
             if (run_->framework_owned && run_->error != nullptr && !run_->native_context_destroyed) {
                 // Only an explicit observer may retry known-intact carrier
                 // cleanup after a private transfer/poll failure. Admission
@@ -1446,6 +1465,7 @@ void ChipRun::activate() {
         lane_->rethrow_run_error(run_);
         return;
     }
+    lane_->require_reclamation_allowed();
     lane_->worker->validate_execution_context();
     if (run_->prepare_purpose == SIMPLER_PREPARE_CAPTURE) {
         if (run_->phase != ChipRunState::Phase::PREPARED || run_->external_resource_obligations == 0)
@@ -1478,6 +1498,7 @@ void ChipRun::abandon() {
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     if (run_->phase == ChipRunState::Phase::TERMINAL) return;
+    lane_->require_reclamation_allowed();
     if (run_->prepare_purpose == SIMPLER_PREPARE_CAPTURE) {
         // Retry only the original carrier's finalizer, never its launch. The
         // common Worker protocol admits known-intact cleanup retries and keeps
@@ -1564,6 +1585,7 @@ void ChipRun::retain_resources_into(std::unique_ptr<ChipRunResources> &out) {
     void *stream;
     {
         std::lock_guard<std::mutex> lock(lane_->mu);
+        lane_->require_reclamation_allowed();
         if (run_->prepare_purpose != SIMPLER_PREPARE_CAPTURE || run_->phase != ChipRunState::Phase::PREPARED)
             throw std::runtime_error("resource retention requires a capture Prepared run");
         if (lane_->worker == nullptr) throw std::runtime_error("capture run has no live native owner");
@@ -1837,6 +1859,7 @@ int32_t ChipRunLane::with_callable_addition(const std::function<int32_t()> &oper
 std::pair<int, bool> ChipRunLane::observe_framework_submissions() {
     state_->validate_process();
     std::lock_guard<std::mutex> lock(state_->mu);
+    state_->require_reclamation_allowed();
     if (state_->worker == nullptr) throw std::runtime_error("chip run lane has no observation owner");
     return state_->observe_framework();
 }
@@ -1844,6 +1867,7 @@ std::pair<int, bool> ChipRunLane::observe_framework_submissions() {
 void ChipRunLane::drain() {
     state_->validate_process();
     std::unique_lock<std::mutex> lk(state_->mu);
+    state_->require_reclamation_allowed();
     if (state_->worker != nullptr) state_->worker->validate_execution_context();
     if (std::any_of(state_->fifo.begin(), state_->fifo.end(), [](const auto &run) {
             return run->prepare_purpose == SIMPLER_PREPARE_CAPTURE;
@@ -1880,6 +1904,7 @@ void ChipRunLane::close(bool report_run_error) {
     // touched — `close_credit_gate` drains callers who need that mutex.
     {
         std::lock_guard<std::mutex> validate(state_->mu);
+        state_->require_reclamation_allowed();
         if (state_->worker != nullptr) state_->worker->validate_execution_context();
         if (std::any_of(state_->fifo.begin(), state_->fifo.end(), [](const auto &run) {
                 return run->prepare_purpose == SIMPLER_PREPARE_CAPTURE;
@@ -1904,6 +1929,7 @@ void ChipRunLane::close(bool report_run_error) {
         if (report_run_error && state_->poison != nullptr) std::rethrow_exception(state_->poison);
         return;
     }
+    state_->require_reclamation_allowed();
     while (const auto front = state_->execution_at(0)) {
         if (state_->drain_front(true) == ChipRunLaneState::DrainOutcome::CreditBlocked) {
             // The gate was detached above, so no release can reach a waiter
@@ -1942,12 +1968,27 @@ void ChipRunLane::stop_admission() noexcept {
     if (!state_->in_current_process()) return;
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->admission_stopped = true;
+    if (state_->retention_fenced) return;
     try {
         if (state_->worker != nullptr) state_->worker->validate_execution_context();
     } catch (...) {
         return;
     }
     state_->abandon_unlaunched();
+}
+
+void ChipRunLane::fence_admission() noexcept {
+    if (!state_->in_current_process()) return;
+    std::lock_guard<std::mutex> lock(state_->mu);
+    state_->admission_stopped = true;
+    state_->retention_fenced = true;
+    state_->resource_changed.notify_all();
+}
+
+void ChipRunLane::release_terminal_fence() noexcept {
+    if (!state_->in_current_process()) return;
+    std::lock_guard<std::mutex> lock(state_->mu);
+    state_->retention_fenced = false;
 }
 
 bool ChipRunLane::poisoned() const {

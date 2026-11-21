@@ -2541,6 +2541,28 @@ static int retire_completed_native_run(OnboardNativeRunContext *state) {
     return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
 }
 
+int simpler_query_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    try {
+        OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_query_run_completion");
+        if (state == nullptr || state->recording) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        const NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
+        if (state->physical_complete || (state->active_execution == nullptr && state->launch_not_started_proven))
+            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        if (phase == NativeRunPhase::Prepared || state->active_execution == nullptr)
+            return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        const auto &prepared = state->active_execution->prepared;
+        // A failed drain also retires the progress slot. Once its boundaries
+        // are gone, only the carrier's recorded physical evidence is usable.
+        if (!prepared || !prepared->resources_owned)
+            return prepared && prepared->physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE :
+                                                             SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (state->runner->enter_run_thread() != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        return state->runner->poll_execution(*state->active_execution);
+    } catch (...) {
+        return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    }
+}
+
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     try {
         OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
@@ -2703,6 +2725,7 @@ int simpler_probe_run_retention(
             // a zero: a context starts at -1 so a run that never completed cannot
             // read as success, and the fixture performed this run's launch and
             // drain, so it is what decides.
+            successor->physical_complete = successor_drain.physical_complete;
             successor->completion_rc = report->successor_drain_rc;
             successor->phase.store(NativeRunPhase::Complete, std::memory_order_release);
             emit_native_run_runner_wall(successor);

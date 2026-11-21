@@ -87,6 +87,7 @@ Newest first.
 - [2026-11 — CntNotify ADD completion chains and SET-slot access](2026-11-a5-hbg-cnt-notify-add-deferred.md) — withdrawal history retained; SET-slot +0x08 access was subsequently verified and authorized for re-enablement without a driver update.
 - [2026-11 — CntNotify completion bitmaps with DAG bank reuse](2026-11-a5-hbg-cnt-notify-completion-reuse.md) — rejected: strict-ancestor bank reuse resolves the observed notification-capacity failure, but the twelve-case AICore L0 sum regresses 5.959%; MIX handshakes and the Host mapping pool remain.
 - [2026-11 — CntNotify task flags and admission tail](2026-11-a5-hbg-cnt-notify-task-flags.md) — rejected: twelve-case AICore L0 sum regresses 1.756%; paired L3 shows increased scheduling visits and primitive traffic despite moving control fields to SRAM.
+- [2026-11 — CCU terminal cleanup evidence](2026-11-ccu-terminal-cleanup-evidence.md) — issue #3143: audits Runtime/driver, HCOMM, HCCL and PTO-ISA source, contracts and examples; records the decision to manage simpler-owned resources through public SDK results while leaving physical CCU resource reclamation to the SDK.
 
 - [2026-11 — A5 HBG early MIX Binding publication](2026-11-a5-hbg-mix-binding-preparation.md): withdrawn at the user's request after a 0.560% aggregate regression; single-writer signal changes remain.
 - [2026-11 — A5 HBG replicated completion notices](2026-11-a5-hbg-replicated-completion-notices.md): withdrawn despite measured gain; reduce same-address atomic requests through ownership and observation design.

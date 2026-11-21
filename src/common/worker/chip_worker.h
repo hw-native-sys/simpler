@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -353,6 +354,8 @@ public:
      * has not launched without launching it. @see ChipRunLane::stop_admission.
      */
     void stop_chip_run_lane_admission() noexcept;
+    /// Terminal CCU admission fence; keeps native carriers until DISCARD.
+    void fence_chip_run_lane() noexcept;
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64). An ID that is already
@@ -496,7 +499,12 @@ public:
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
         const std::string &host_shm_name = {}, const CommWorkspaceConfig *workspace_config = nullptr
     );
-    bool communication_cleanup_confirmed() const noexcept { return !comm_cleanup_unconfirmed_; }
+    bool communication_cleanup_confirmed() const noexcept {
+        return !comm_cleanup_unconfirmed_ && !ccu_cleanup_unconfirmed_ && unconfirmed_ccu_run_count_ == 0;
+    }
+    /// 11: fence native producers, 12: stop every CCU run, 13: discard stopped runs.
+    /// The caller joins all peers between phases; only phase 13 may release backing.
+    void control_ccu_terminal(uint32_t operation);
     uint64_t register_ccu_callable(
         uint64_t comm_handle, uint64_t collective_id, int32_t callable_id, const std::vector<uint32_t> &rank_ids,
         uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask,
@@ -756,6 +764,11 @@ private:
     void retain_unconfirmed_ccu_cleanup() noexcept;
     void retain_unconfirmed_comm_stream(void *stream);
     void require_comm_cleanup_confirmed() const;
+    void require_ccu_run_admission() const;
+    void require_native_ccu_producers_stopped() const;
+    void observe_native_ccu_producers();
+    void fence_chip_run_lane_impl(bool require_peer_barrier) noexcept;
+    void release_standalone_ccu_fence() noexcept;
     void require_comm_reclamation_safe() const;
 
     std::shared_ptr<RuntimeModule> runtime_module_;
@@ -786,6 +799,7 @@ private:
     CallerStreamLaunchFn launch_run_on_stream_fn_ = nullptr;
     SimplerJoinedLaunchFn launch_run_joined_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
+    SimplerNativeRunFn query_run_completion_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_completion_fn_ = nullptr;
     SimplerFinalizeRunFn finalize_run_fn_ = nullptr;
@@ -906,6 +920,8 @@ private:
     uint64_t base_comm_handle_ = 0;
     // Only matching, confirmed stream stop retires a launched CCU generation.
     std::set<std::tuple<uint64_t, uint64_t, uint64_t>> unstopped_ccu_runs_;
+    std::set<std::tuple<uint64_t, uint64_t, uint64_t>> unconfirmed_ccu_runs_;
+    std::atomic<size_t> unconfirmed_ccu_run_count_{0};
     std::mutex ccu_preparation_mu_;
     std::unordered_map<uint64_t, uint64_t> prepared_ccu_workspaces_;
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint64_t> ccu_preparation_keys_;
@@ -986,6 +1002,10 @@ private:
         bool finalize_reserved{false};
         /** Teardown progress is unknown, so no further call may reach this run. */
         bool destruction_unknown{false};
+        // PREPARED can survive a partially submitted launch failure.
+        bool launch_attempted{false};
+        // Physical stop observed without retiring the runtime's execution owners.
+        bool producer_stop_confirmed{false};
         /** First writer wins: an established error is never replaced by a later one. */
         int pending_rc{0};
         bool pending_rc_set{false};
@@ -999,6 +1019,7 @@ private:
     enum class NativeRunOp : uint8_t {
         Launch,
         Poll,
+        QueryCompletion,
         WaitCompletion,
         Wait,
         Finalize,
@@ -1221,7 +1242,14 @@ private:
     bool worker_sdma_enabled_ = false;
     // A backend retained communication references; device reset is not a cleanup proof.
     bool comm_cleanup_unconfirmed_ = false;
-    bool ccu_cleanup_unconfirmed_ = false;
+    std::atomic<bool> ccu_cleanup_unconfirmed_{false};
+    std::atomic<bool> ccu_admission_closed_{false};
+    bool ccu_terminal_prepared_ = false;
+    bool ccu_terminal_stopped_ = false;
+    bool ccu_terminal_reclaimed_ = false;
+    bool ccu_terminal_finished_ = false;
+    bool ccu_terminal_peer_barrier_required_ = false;
+    std::atomic<bool> terminal_reclamation_fenced_{false};
     std::unique_ptr<ChipRunLane> run_lane_;
     // Names a successful binding or an init whose rollback still needs close.
     // Cleared only after successful teardown. Control calls run on the owning

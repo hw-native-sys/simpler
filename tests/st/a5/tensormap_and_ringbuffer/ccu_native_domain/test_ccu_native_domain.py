@@ -334,33 +334,11 @@ def test_interleaved_callable_association_during_active_run(st_platform, st_devi
             os.close(started_writer)
 
 
-def _assert_unconfirmed_ccu_cleanup(worker, retained, outputs, child_pids, close_error):
-    assert close_error is not None and "Host mapping RECOVER failed" in str(close_error)
-    causes = []
-    cause: BaseException | None = close_error
-    while cause is not None:
-        causes.append(str(cause))
-        cause = cause.__cause__
-    assert any("communication cleanup is unconfirmed" in message for message in causes)
-    assert retained and not retained[0].freed
-    assert all(not output.closed for rank_outputs in outputs for output in rank_outputs)
-    assert worker._host_group_mappings is not None and worker._host_group_mappings.holds_resources
-    assert set(worker._chip_pids) == child_pids and len(worker._chip_shms) == len(child_pids)
-    assert all(shm.buf is not None for shm in worker._chip_shms)
-    assert not worker.teardown_reports()
-    for pid in child_pids:
-        os.kill(pid, 0)
-    with pytest.raises(RuntimeError, match="Host mapping RECOVER failed"):
-        worker.close()
-    assert not retained[0].freed and set(worker._chip_pids) == child_pids
-    print("CCU unconfirmed cleanup retains backing and child transports; close retry refused", flush=True)
-
-
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
 @pytest.mark.parametrize("fault", ["missing_done", "missing_trigger"])
-def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_device_ids, tmp_path, monkeypatch, fault):
+def test_mission_failure_allows_terminal_cleanup(st_platform, st_device_ids, tmp_path, monkeypatch, request, fault):
     log_root = tmp_path / "ascend"
     log_root.mkdir()
     monkeypatch.setenv("ASCEND_PROCESS_LOG_PATH", str(log_root))
@@ -377,6 +355,7 @@ def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_dev
     child_pids = set()
     exit_reader, exit_writer = os.pipe()
     os.set_blocking(exit_reader, False)
+    run_error = None
     child_exit = os._exit
 
     def observe_child_exit(code):
@@ -419,10 +398,10 @@ def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_dev
                 args.add_scalar({"missing_done": (1 << 64) - 2, "missing_trigger": 2}[fault])
                 orch.submit_next_level(callable_handle, args, config, worker=rank, ccu_bindings=bindings[rank])
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError) as failed_run:
             worker.run(fail_round)
-        assert retained and not retained[0].freed
-        assert worker._ordered_cleanup_error is not None
+        run_error = failed_run.value
+        assert retained, "failure occurred before CCU domain creation and fault injection"
         for device in st_device_ids[:2]:
             logs = list(log_root.glob(f"debug/device-{device}/device-*.log"))
             assert logs, f"no device logs for {fault} on device {device} under {log_root}"
@@ -443,8 +422,7 @@ def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_dev
             ), f"unexpected scheduler timeout evidence for {fault}"
         with pytest.raises(RuntimeError):
             worker.run(lambda *_: None)
-        assert not retained[0].freed
-        print(f"CCU {fault} observed; admission closed and domain retained", flush=True)
+        print(f"CCU {fault} observed; further run admission rejected", flush=True)
     finally:
         exit_records = bytearray()
         close_error = None
@@ -453,7 +431,6 @@ def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_dev
                 worker.close()
             except RuntimeError as error:
                 close_error = error
-                assert worker._ordered_cleanup_error is not None
             try:
                 while chunk := os.read(exit_reader, 4096):
                     exit_records.extend(chunk)
@@ -465,14 +442,30 @@ def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_dev
         child_exits = {
             int(pid): int(code) for record in exit_records.decode().splitlines() for pid, code in [record.split(":")]
         }
-        if worker._worker is not None:
-            assert not child_exits
-            _assert_unconfirmed_ccu_cleanup(worker, retained, outputs, child_pids, close_error)
-        else:
-            assert child_pids <= child_exits.keys(), "CCU chip child crashed or did not reach controlled exit"
-            for pid in child_pids:
-                assert child_exits[pid] in (0, 1), f"CCU chip child {pid} has unexpected exit code {child_exits[pid]}"
-            print(f"CCU chip children reached controlled exit: {child_exits}", flush=True)
+        if close_error is not None and close_error is not run_error:
+            raise close_error
+        assert worker._worker is None
+        assert retained and all(domain.freed for domain in retained)
+        assert all(output.closed for rank_outputs in outputs for output in rank_outputs)
+        assert not worker._chip_pids and not worker._chip_shms
+        assert child_pids <= child_exits.keys(), "CCU chip child crashed or did not reach controlled exit"
+        for pid in child_pids:
+            assert child_exits[pid] == 0, f"CCU chip child {pid} has unexpected exit code {child_exits[pid]}"
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+        worker._close_framework()
+        print(f"CCU chip children reached controlled exit: {child_exits}", flush=True)
+
+    monkeypatch.setattr(os, "_exit", child_exit)
+    from tests.st.a5.tensormap_and_ringbuffer.ccu_window_transfer.test_ccu_window_transfer import (  # noqa: PLC0415
+        _exercise_window_transfer,
+    )
+
+    replacement_pids = _exercise_window_transfer(
+        st_platform, st_device_ids[:2], tmp_path / "replacement", request, (0, 1)
+    )
+    assert replacement_pids and child_pids.isdisjoint(replacement_pids)
+    print(f"CCU {fault}: same-device transfer passed in new chip processes {sorted(replacement_pids)}", flush=True)
 
 
 @pytest.mark.platforms(["a5"])

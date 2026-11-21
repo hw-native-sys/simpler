@@ -4039,6 +4039,7 @@ NB_MODULE(_task_interface, m) {
             nb::call_guard<nb::gil_scoped_release>(),
             "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
         )
+        .def("_fence_chip_run_lane", &ChipWorker::fence_chip_run_lane, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "_stop_chip_run_lane_admission", &ChipWorker::stop_chip_run_lane_admission,
             nb::call_guard<nb::gil_scoped_release>(),
@@ -4473,6 +4474,7 @@ NB_MODULE(_task_interface, m) {
             "responsibility before result conversion or an allocation error; it does not imply a usable context."
         )
         .def("communication_cleanup_confirmed", &ChipWorker::communication_cleanup_confirmed)
+        .def("control_ccu_terminal", &ChipWorker::control_ccu_terminal, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "register_ccu_callable",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t collective_id, int32_t callable_id,
