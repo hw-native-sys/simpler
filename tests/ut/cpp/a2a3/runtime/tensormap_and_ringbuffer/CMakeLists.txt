@@ -109,6 +109,41 @@ a2a3_tmr_case(test_scalar_access_deps.cpp NO_OBJS
     LINK_OPTIONS ${_scalar_gc_link_option}
     TIMEOUT 20)
 
+# The blocking-WAIT progress contract drives the real submit, dispatch and
+# completion path with only the clock and platform register boundaries
+# replaced, so it compiles the production sources itself like the common
+# early-dispatch fixture's recipe, fixed to this arch.
+if(APPLE)
+    set(_twait_contract_gc -Wl,-dead_strip)
+else()
+    set(_twait_contract_gc -Wl,--gc-sections)
+endif()
+a2a3_tmr_case(test_twait_contract.cpp NO_OBJS
+    SOURCES
+        ${A2A3_RUNTIME_DIR}/ring_buffer.cpp
+        ${A2A3_RUNTIME_DIR}/shared/shared_memory.cpp
+        ${A2A3_RUNTIME_DIR}/shared/runtime_init.cpp
+        ${A2A3_RUNTIME_DIR}/shared/tensormap.cpp
+        ${A2A3_RUNTIME_DIR}/orchestrator.cpp
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler.cpp
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler_dispatch.cpp
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler_cold_path.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/aicpu_device_config.cpp
+        ${CMAKE_SOURCE_DIR}/support/device_time_stub.cpp
+        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/a2a3/platform/shared/aicpu/platform_regs.cpp
+    DEFINES SIMPLER_DFX=0
+    LINK a2a3_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_twait_contract_gc}
+    TIMEOUT 30)
+
+# The resource-cycle diagnosis model checker exercises the header-only
+# analyzer; its exhaustive enumeration gets a limit of its own.
+a2a3_tmr_case(test_twait_model.cpp TIMEOUT 180)
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it

@@ -24,6 +24,8 @@
 
 #pragma once
 
+#include "scheduler/twait_contract.h"
+
 #include <stdint.h>
 #include <string.h>
 
@@ -280,6 +282,17 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     Arg &operator=(Arg &&) = delete;
 
     bool has_error{false};
+    bool blocking_wait_{false};
+    bool capture_wait_proof_{false};
+    void capture_wait_proof(bool enabled = true) { capture_wait_proof_ = enabled; }
+    bool captures_wait_proof() const { return capture_wait_proof_; }
+    twait::Declaration blocking_declaration_{};
+    void set_blocking_wait(const twait::Declaration &declaration) {
+        blocking_wait_ = true;
+        blocking_declaration_ = declaration;
+    }
+    bool has_blocking_wait() const { return blocking_wait_; }
+    const twait::Declaration &blocking_wait() const { return blocking_declaration_; }
     const char *error_msg{nullptr};
     LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
@@ -324,6 +337,9 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
         explicit_dep_kinds_ = nullptr;
+        blocking_wait_ = false;
+        capture_wait_proof_ = false;
+        blocking_declaration_ = twait::Declaration{};
         allow_early_resolve_ = false;
         predicate_ = CoreTaskPredicate{};
         task_timing_slot_ = TASK_TIMING_SLOT_NONE;

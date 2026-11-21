@@ -391,7 +391,10 @@ bool OrchestratorState::init_data_from_layout(
     const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH], const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH]
 ) {
     auto *orch = this;
+    const uint64_t previous_generation = orch->twait_run_generation;
     *orch = OrchestratorState{};
+    orch->twait_run_generation = previous_generation + 1;
+    if (orch->twait_run_generation == 0) ++orch->twait_run_generation;
 
     orch->sm_header = reinterpret_cast<SharedMemoryHeader *>(sm_dev_base);
     orch->gm_heap_base = gm_heap;
@@ -473,6 +476,12 @@ static bool reset_orchestrator(
     // bitmap before any submit can read it as a producer, so entries left from
     // a previous run are unreachable.
     orch->submit_seq = 0;
+    if (++orch->twait_run_generation == 0) ++orch->twait_run_generation;
+    orch->twait_last_error = nullptr;
+    orch->twait_last_witness = twait::Witness{};
+    orch->twait_proofs.count = 0;
+    for (auto &declaration : orch->twait_declarations)
+        declaration = twait::RetainedDeclaration{};
 
     uint32_t next_epoch = orch->fanin_seen_current_epoch + 1;
     if (next_epoch == 0) {
