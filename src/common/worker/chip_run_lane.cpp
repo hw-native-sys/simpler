@@ -325,12 +325,14 @@ struct ChipRunLaneState {
                     if (run->error == nullptr) run->error = finalize_error;
                     poison_with(run, finalize_error);
                 }
+                run->native_context_destroyed = finalized;
                 release_device_spans(run, finalized);
             } else {
                 // Queued: it never crossed the launch boundary, so no device
                 // work of this run's can name a borrowed address and the
                 // reference is simply given back.
                 const bool plan_released = release_run_plan(run);
+                run->native_context_destroyed = plan_released;
                 release_device_spans(run, plan_released);
             }
             run->phase = ChipRunState::Phase::TERMINAL;
@@ -676,6 +678,7 @@ struct ChipRunLaneState {
                 run->error = poison;
                 run->poison_error = poison;
                 const bool plan_released = release_run_plan(run);
+                run->native_context_destroyed = plan_released;
                 release_device_spans(run, plan_released);
                 run->phase = ChipRunState::Phase::TERMINAL;
                 erase_from_fifo(run);
@@ -769,7 +772,7 @@ struct ChipRunLaneState {
         // Marking the run terminal without that leaves the carrier live for
         // the worker's whole life and makes the slot's reuse a claim rather
         // than a fact. A QUEUED run never crossed that boundary and owns no
-        // carrier, so it has nothing to retire.
+        // carrier, but may still own a waiting plan.
         bool finalized = true;
         if (run->phase == ChipRunState::Phase::PREPARED) {
             try {
@@ -784,7 +787,10 @@ struct ChipRunLaneState {
                 finalized = false;
                 poison_with(run, std::current_exception());
             }
+        } else {
+            finalized = release_run_plan(run);
         }
+        run->native_context_destroyed = finalized;
         // After the finalize, never before, for the reason `finish` gives: it
         // is the call that releases this run's bindings, so it is the point at
         // which the last consumer of a borrowed address is done. A finalize
@@ -1098,6 +1104,7 @@ struct ChipRunLaneState {
             run->error = poison;
             run->poison_error = poison;
             const bool plan_released = release_run_plan(run);
+            run->native_context_destroyed = plan_released;
             release_device_spans(run, plan_released);
             run->phase = ChipRunState::Phase::TERMINAL;
             erase_from_fifo(run);
@@ -1105,6 +1112,7 @@ struct ChipRunLaneState {
         }
         if (run->phase == ChipRunState::Phase::QUEUED && !run->activated) {
             const bool plan_released = release_run_plan(run);
+            run->native_context_destroyed = plan_released;
             release_device_spans(run, plan_released);
             run->phase = ChipRunState::Phase::TERMINAL;
             erase_from_fifo(run);
@@ -1617,30 +1625,36 @@ ChipRun ChipRunLane::submit(
 ) {
     state_->validate_process();
     std::lock_guard<std::mutex> lk(state_->mu);
-    state_->require_usable();
+    try {
+        state_->require_usable();
+    } catch (const ExecutionContextRefused &) {
+        throw;
+    } catch (const std::runtime_error &error) {
+        throw RunPreparationRefused(error.what());
+    }
     state_->require_eager_admission();
     if (lease.reserved != 0 || lease.generation == 0 || lease.slot_id >= state_->generations.size()) {
-        throw std::runtime_error("chip run lane received an invalid pipeline lease");
+        throw RunPreparationRefused("chip run lane received an invalid pipeline lease");
     }
     if (lease.generation < state_->generations[lease.slot_id]) {
-        throw std::runtime_error("chip run lane pipeline lease generation is stale");
+        throw RunPreparationRefused("chip run lane pipeline lease generation is stale");
     }
     for (const auto &candidate : state_->fifo) {
         if ((run_id != 0 && candidate->run_id == run_id) ||
             (dispatch_id != 0 && candidate->dispatch_id == dispatch_id)) {
-            throw std::runtime_error("chip run lane received a duplicate run or dispatch identity");
+            throw RunPreparationRefused("chip run lane received a duplicate run or dispatch identity");
         }
         if (!ChipRunLaneState::external_only(*candidate) && candidate->lease.slot_id == lease.slot_id) {
-            throw std::runtime_error("chip run lane pipeline slot is already occupied");
+            throw RunPreparationRefused("chip run lane pipeline slot is already occupied");
         }
     }
     if (state_->execution_size() >= state_->generations.size()) {
-        throw std::runtime_error("chip run lane capacity exceeded before native preparation");
+        throw RunPreparationRefused("chip run lane capacity exceeded before native preparation");
     }
     const auto executing_front = state_->execution_at(0);
     if (executing_front && executing_front->phase == ChipRunState::Phase::LAUNCHED &&
         dispatch_id < executing_front->dispatch_id) {
-        throw std::runtime_error("chip run lane cannot reorder before an active dispatch");
+        throw RunPreparationRefused("chip run lane cannot reorder before an active dispatch");
     }
     auto run = std::make_shared<ChipRunState>();
     run->callable_id = callable_id;
@@ -1686,7 +1700,11 @@ ChipRun ChipRunLane::submit(
         // `launch_ready_prefix` is noexcept — and this keeps the statement true by construction
         // rather than by that coincidence.
         const bool plan_released = state_->release_run_plan(run);
-        state_->release_device_spans(run, plan_released && !run->crossed_launch_fence);
+        const bool proven_done = plan_released && !run->crossed_launch_fence;
+        if (proven_done && run->phase == ChipRunState::Phase::QUEUED) {
+            run->native_context_destroyed = true;
+        }
+        state_->release_device_spans(run, proven_done);
         run->phase = ChipRunState::Phase::TERMINAL;
         auto it = std::find(state_->fifo.begin(), state_->fifo.end(), run);
         if (it != state_->fifo.end()) state_->fifo.erase(it);

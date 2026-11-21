@@ -460,6 +460,7 @@ TEST(ChipRunLaneCreditBlockTest, AnExpiredDeadlineRetiresThePreparedCarrier) {
 
     EXPECT_NE(std::find(g_events.begin(), g_events.end(), "finalize0"), g_events.end())
         << "the expired run's native carrier was never finalized";
+    EXPECT_FALSE(run.owner_recovery_required());
 
     // And the slot really is reusable: a later run takes it and launches.
     g_launch_rc[0] = 0;

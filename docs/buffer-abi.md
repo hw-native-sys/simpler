@@ -133,7 +133,7 @@ backend obtains the mapped address from `aclrtHostRegister`; the A5 backend uses
 until Buffer release. Subsequent calls and views reuse the registration while
 preserving their own offsets and geometry. MAP uses the Host backing directly.
 
-For A3 registration and unregistration, an unbound calling thread becomes
+For A3 and A5 registration and unregistration, an unbound calling thread becomes
 bound to the Worker's device context. If the calling thread already has a
 different context, the operation restores it before returning. A restoration
 failure after successful registration refuses the submission and keeps the
@@ -150,7 +150,7 @@ H2D/MAP arguments with a callable writer are rejected before preparation.
 Tensor remains 144 bytes and BufferDescriptor 88 bytes. Byte 141 is the per-call
 transfer carrier; bytes 142–143 remain padding. No mapping reference is stored in
 a Tensor or transmitted on the wire. Mapping ownership stays in the consumer's
-registry. For a local A5 TMR L3 Worker, each consuming child establishes or reuses
+registry. For a local A3 or A5 TMR L3 Worker, each consuming child establishes or reuses
 its mapping while preparing its MAP arguments, alongside native H2D handling.
 Outer arguments need no MAP declaration. Callback-created views of owned shared
 Host backing are supported; each child resolves its own Device address. Multiple
@@ -178,7 +178,9 @@ L3 terminal close can request a native owner drain while retaining Host backing.
 Only proven last use permits child use retirement; mappings are then explicitly
 unregistered before recovered owners finalize. Failed drain, unregistration or
 owner finalization retains cleanup records for retry. Child task errors and child
-exit alone do not supply this proof. See the
+exit alone do not supply this proof. A3 can retire uses when the native run
+reports safe cleanup. When this proof is unavailable, A3 retains the mapping
+and backing because it has no terminal device drain for Host MAP. See the
 [L3 recovery ordering](design/a5-host-ddr.md#l3-shared-tables).
 
 ```python

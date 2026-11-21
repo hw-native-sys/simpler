@@ -13,34 +13,20 @@
 
 #include "acl/acl.h"
 #include "device_runner.h"
-#include "host_log.h"
+#include "host_mapping_context.h"
 #include "runtime_c_api.h"
 
 namespace {
 
 template <typename Operation>
-int with_host_mapping_context(DeviceRunner &runner, int device, Operation operation) {
+int with_device_host_mapping(DeviceRunner &runner, int device, Operation operation) {
     if (runner.device_id() != device || device < 0 || runner.execution_mode_latch().is_kernel()) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
     rtContext_t primary = nullptr;
     const int lookup = rtGetPriCtxByDeviceId(device, &primary);
     if (lookup != 0) return lookup;
-    if (primary == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
-
-    rtContext_t previous = nullptr;
-    const int current = rtCtxGetCurrent(&previous);
-    if (current != 0 && current != ACL_ERROR_RT_CONTEXT_NULL) return current;
-    if (previous == primary) return operation();
-
-    const int rc = rtCtxSetCurrent(primary);
-    if (rc != 0) return rc;
-    const int operation_rc = operation();
-    if (current == ACL_ERROR_RT_CONTEXT_NULL) return operation_rc;
-    const int restore_rc = rtCtxSetCurrent(previous);
-    if (restore_rc == 0) return operation_rc;
-    LOG_ERROR("Host mapping could not restore caller context: %d (operation status: %d)", restore_rc, operation_rc);
-    return operation_rc == 0 ? SIMPLER_HOST_DDR_CONTEXT_RESTORE_FAILED : operation_rc;
+    return simpler::with_host_mapping_context(primary, operation);
 }
 
 }  // namespace
@@ -52,7 +38,7 @@ extern "C" int host_ddr_map_ctx(
     *mapped = 0;
     *registered = 0;
     try {
-        return with_host_mapping_context(*static_cast<DeviceRunner *>(ctx), device, [&]() -> int {
+        return with_device_host_mapping(*static_cast<DeviceRunner *>(ctx), device, [&]() -> int {
             auto *base = reinterpret_cast<void *>(host);
             void *address = nullptr;
             const int rc = aclrtHostRegister(base, bytes, ACL_HOST_REGISTER_MAPPED, &address);
@@ -70,7 +56,7 @@ extern "C" int host_ddr_map_ctx(
 extern "C" int host_ddr_unmap_ctx(DeviceContextHandle ctx, int device, uint64_t host) {
     if (!ctx || !host) return PTO_RUNTIME_ERR_INTERNAL;
     try {
-        return with_host_mapping_context(*static_cast<DeviceRunner *>(ctx), device, [host]() {
+        return with_device_host_mapping(*static_cast<DeviceRunner *>(ctx), device, [host]() {
             return aclrtHostUnregister(reinterpret_cast<void *>(host));
         });
     } catch (...) {
