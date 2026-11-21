@@ -91,8 +91,10 @@ inline const char *validate(OrchestratorState &orch, const CoreTaskArgs &args) {
         ChipTaskSlotState *barrier_state = nullptr;
         WaitReachEntry barrier_reach{};
         if (const char *error =
-                lookup(orch, producer.barrier, producer.barrier_generation, barrier_state, barrier_reach))
+                lookup(orch, producer.barrier, producer.barrier_generation, barrier_state, barrier_reach)) {
+            if (producer_state->task_state.load(std::memory_order_acquire) >= CHIP_TASK_COMPLETED) continue;
             return error;
+        }
         bool explicit_wait = false;
         for (uint32_t dependency = 0; dependency < args.explicit_dep_count(); ++dependency)
             explicit_wait |=
