@@ -78,6 +78,9 @@ struct alignas(64) PercounterMixSignal {
 static_assert(sizeof(PercounterMixSignal) == 128);
 static_assert(std::is_trivially_copyable_v<PercounterMixSignal> && std::is_standard_layout_v<PercounterMixSignal>);
 
+inline constexpr uint32_t PERCOUNTER_TERMINAL_MAX_STEPS = 6;
+inline constexpr uint32_t PERCOUNTER_TERMINAL_MAX_PREREQUISITES = 8;
+
 struct alignas(64) PercounterSsbufRegion {
     PercounterMixSignal mix[PERCOUNTER_PENDING_CAPACITY];
     volatile uint32_t mix_floor_rank;
@@ -87,7 +90,9 @@ struct alignas(64) PercounterSsbufRegion {
         [PERCOUNTER_CONTEXT_SSBUF_OFFSET - PERCOUNTER_SSBUF_REGION_OFFSET -
          PERCOUNTER_PENDING_CAPACITY * sizeof(PercounterMixSignal) - 12];
     PercounterInvocationContextSlot contexts[PLATFORM_CORES_PER_BLOCKDIM];
-    uint8_t tail_reserved[64];
+    volatile uint32_t terminal_ready[PLATFORM_CORES_PER_BLOCKDIM];
+    volatile uint32_t terminal_grant[PERCOUNTER_TERMINAL_MAX_STEPS];
+    uint8_t tail_reserved[64 - sizeof(terminal_ready) - sizeof(terminal_grant)];
 };
 static_assert(sizeof(PercounterSsbufRegion) == PERCOUNTER_SSBUF_REGION_SIZE);
 static_assert(
@@ -447,9 +452,15 @@ inline __aicore__ bool percounter_order_is_spmd(uint64_t entry) {
     return percounter_order_block_idx(entry) == PERCOUNTER_ORDER_BLOCK_IDX_SPMD;
 }
 
+struct PercounterTerminalPlan {
+    uint32_t step_count;
+    uint32_t steps[PERCOUNTER_TERMINAL_MAX_STEPS];
+    uint32_t prerequisite_count;
+    uint32_t prerequisites[PERCOUNTER_TERMINAL_MAX_PREREQUISITES];
+};
+
 /**
- * The device-visible header: where every other segment is, and how many entries
- * each order list holds.
+ * The device-visible header locates each segment and records list and cohort sizes.
  */
 struct alignas(128) PercounterControl {
     uint64_t task_count;
@@ -515,7 +526,8 @@ struct alignas(128) PercounterControl {
     // Both counters are monotone; equality after all blocks ran permits exit.
     alignas(128) uint64_t async_registered;
     uint64_t async_settled;
-    uint8_t async_reserved[112];
+    PercounterTerminalPlan terminal;
+    uint8_t async_reserved[112 - sizeof(PercounterTerminalPlan)];
 };
 static_assert(sizeof(PercounterControl) == 640);
 static_assert(
