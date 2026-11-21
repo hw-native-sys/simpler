@@ -80,6 +80,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
     if (report_epoch != 0) {
+        // A captured replay retains its prepared epoch. Reset the Core-owned
+        // ACK before publishing this execution's startup report.
+        my_hank->retired_epoch = 0;
+        // A repeated epoch makes aicore_done the fresh startup marker too.
+        OUT_OF_ORDER_STORE_BARRIER();
         // Native program run: `aicore_done` is payload, and `report_epoch` is
         // the marker that commits it. The barrier separates the two, so the
         // AICPU cannot see this run's epoch without the report it stands for.
@@ -288,6 +293,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         }
     }
 
+    if (report_epoch != 0) {
+        publish_aicore_epoch_and_wait(&my_hank->retired_epoch, &runtime->dev.teardown_gates[block_idx], report_epoch);
+        return;
+    }
     // Flush all dirty cache lines to HBM before kernel exit.
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
     // The exit acknowledgement follows quiescence; the AICPU opens the gate after it

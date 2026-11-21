@@ -14,8 +14,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 #include "aicore/aicore.h"
@@ -26,6 +28,46 @@
 #include "runtime.h"
 
 void aicore_execute(Runtime *runtime, int block_idx, CoreType core_type);
+
+#if defined(__linux__) && defined(SIMPLER_TEST_EPOCH_RETIREMENT)
+namespace {
+struct ReleasePollProbe {
+    volatile uint64_t *ack;
+    uint64_t epoch;
+    std::mutex mutex;
+    std::condition_variable changed;
+    unsigned visits = 0;
+    unsigned resumed = 0;
+    bool returned = false;
+};
+thread_local ReleasePollProbe *release_poll_probe = nullptr;
+}  // namespace
+
+extern "C" int __real_sched_yield();
+extern "C" int __wrap_sched_yield() {
+    auto *probe = release_poll_probe;
+    if (probe == nullptr || __atomic_load_n(probe->ack, __ATOMIC_ACQUIRE) != probe->epoch) return __real_sched_yield();
+    // Only the executor thread is intercepted, after ACK publication. Each
+    // visit proves that the production loop rejected the release it read.
+    std::unique_lock<std::mutex> lock(probe->mutex);
+    const unsigned visit = ++probe->visits;
+    probe->changed.notify_all();
+    probe->changed.wait(lock, [&] {
+        return probe->resumed >= visit;
+    });
+    return 0;
+}
+#endif
+
+AicoreExitTarget executor_exit_target(uint64_t reg, AicoreTeardownControl *gate, Handshake *report, uint64_t epoch) {
+#ifdef SIMPLER_TEST_EPOCH_RETIREMENT
+    return {reg, gate, &report->retired_epoch, epoch};
+#else
+    (void)report;
+    (void)epoch;
+    return {reg, gate};
+#endif
+}
 
 namespace {
 
@@ -282,7 +324,8 @@ Handshake publish_one_report(uint64_t epoch, CoreType core_type) {
         },
         std::chrono::seconds(5)
     ));
-    const AicoreExitTarget target{reinterpret_cast<uint64_t>(registers.data()), &control};
+    const AicoreExitTarget target =
+        executor_exit_target(reinterpret_cast<uint64_t>(registers.data()), &control, &runtime.get_workers()[0], epoch);
     EXPECT_EQ(platform_retire_aicore_group(&target, 1, platform_aicore_exit_deadline()), 0);
     EXPECT_TRUE(wait_until(
         [&] {
@@ -343,14 +386,15 @@ void check_retirement_before_idle(uint64_t epoch, CoreType core_type, uint32_t r
         ))
         std::_Exit(10);
     if (!aicore_report_accepted(&runtime.get_workers()[0], epoch)) std::_Exit(11);
-    const AicoreExitTarget target{reinterpret_cast<uint64_t>(registers.data()), &control};
+    const AicoreExitTarget target =
+        executor_exit_target(reinterpret_cast<uint64_t>(registers.data()), &control, &runtime.get_workers()[0], epoch);
     std::atomic<int32_t> rc{-2};
     std::thread retiring([&] {
         rc.store(platform_retire_aicore_group(&target, 1, platform_aicore_exit_deadline()), std::memory_order_release);
     });
     if (!wait_until(
             [&] {
-                return __atomic_load_n(&control.exit_request, __ATOMIC_ACQUIRE) != 0;
+                return load_register(RegId::DATA_MAIN_BASE) == AICORE_EXIT_SIGNAL;
             },
             std::chrono::seconds(2)
         ))
@@ -377,7 +421,9 @@ void check_retirement_before_idle(uint64_t epoch, CoreType core_type, uint32_t r
     retiring.join();
     worker.join();
     if (rc.load(std::memory_order_acquire) != 0 || load_register(RegId::FAST_PATH_ENABLE) != REG_SPR_FAST_PATH_CLOSE ||
-        load_register(RegId::COND) != __atomic_load_n(&control.exit_request, __ATOMIC_ACQUIRE))
+        (target.expected_epoch != 0 ?
+             *target.retired_epoch != epoch :
+             load_register(RegId::COND) != __atomic_load_n(&control.exit_request, __ATOMIC_ACQUIRE)))
         std::_Exit(17);
     std::_Exit(0);
 }
@@ -527,4 +573,229 @@ TEST(AicoreFreshnessDeathTest, UnstampedAicBeforeIdleRejectsRetainedNonce0) {
 }
 TEST(AicoreFreshnessDeathTest, UnstampedAivBeforeIdleRejectsRetainedNonce1) {
     EXPECT_EXIT(check_retirement_before_idle(0, CoreType::AIV, AICORE_EXIT_NONCE_1), testing::ExitedWithCode(0), "");
+}
+
+TEST(EpochRetirement, SilentOldAckAndLateAckDoNotClose) {
+    alignas(64) std::array<uint8_t, 65536> regs{};
+    AicoreTeardownControl gate{};
+    alignas(64) uint64_t ack = 7;
+    const AicoreExitTarget target{reinterpret_cast<uint64_t>(regs.data()), &gate, &ack, 0x100000007ULL};
+    platform_init_aicore_regs(target.reg_addr);
+    bool released = true;
+    EXPECT_EQ(platform_retire_aicore_group(&target, 1, 0, &released), -1);
+    EXPECT_FALSE(released);
+    EXPECT_EQ(gate.exit_request, 0U);
+    EXPECT_EQ(read_reg(target.reg_addr, RegId::FAST_PATH_ENABLE), REG_SPR_FAST_PATH_OPEN);
+    __atomic_store_n(&ack, target.expected_epoch, __ATOMIC_RELEASE);
+    EXPECT_EQ(gate.release_epoch, 0U);
+    EXPECT_EQ(read_reg(target.reg_addr, RegId::FAST_PATH_ENABLE), REG_SPR_FAST_PATH_OPEN);
+}
+
+TEST(EpochRetirement, PartialAckOnlyReleasesMatchingCore) {
+    alignas(64) std::array<uint8_t, 65536> regs[2]{};
+    AicoreTeardownControl gates[2]{};
+    uint64_t ack[2] = {UINT64_MAX, UINT64_MAX - 1};
+    AicoreExitTarget targets[2] = {
+        {reinterpret_cast<uint64_t>(regs[0].data()), &gates[0], &ack[0], UINT64_MAX},
+        {reinterpret_cast<uint64_t>(regs[1].data()), &gates[1], &ack[1], UINT64_MAX}
+    };
+    for (auto &t : targets)
+        platform_init_aicore_regs(t.reg_addr);
+    bool released[2] = {};
+    EXPECT_EQ(platform_retire_aicore_group(targets, 2, 0, released), -1);
+    EXPECT_TRUE(released[0]);
+    EXPECT_FALSE(released[1]);
+    EXPECT_EQ(gates[0].release_epoch, UINT64_MAX);
+    EXPECT_EQ(gates[1].release_epoch, 0U);
+    EXPECT_EQ(read_reg(targets[0].reg_addr, RegId::FAST_PATH_ENABLE), REG_SPR_FAST_PATH_CLOSE);
+    EXPECT_EQ(read_reg(targets[1].reg_addr, RegId::FAST_PATH_ENABLE), REG_SPR_FAST_PATH_OPEN);
+}
+
+#ifdef SIMPLER_TEST_EPOCH_RETIREMENT
+void check_epoch_runs(CoreType type) {
+    Runtime runtime;
+    auto &gate = runtime.get_teardown_gates()[0];
+    auto &ack = runtime.get_workers()[0].retired_epoch;
+    for (uint64_t epoch : {uint64_t(1), uint64_t(1), uint64_t(2), uint64_t(0x100000002ULL), UINT64_MAX, UINT64_MAX}) {
+        registers.fill(0);
+        g_report_epoch = epoch;
+        gate = {};
+        aicore_invalidate_retired_report(&runtime.get_workers()[0]);
+        g_first_register_paused.store(false, std::memory_order_release);
+        g_resume_first_register.store(false, std::memory_order_release);
+        g_pause_first_register.store(true, std::memory_order_release);
+        std::atomic<bool> returned{false};
+        store_register(RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
+        store_register(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+        std::thread worker([&] {
+            aicore_execute(&runtime, 0, type);
+            returned.store(true, std::memory_order_release);
+        });
+        if (!wait_until(
+                [&] {
+                    return g_first_register_paused.load(std::memory_order_acquire);
+                },
+                std::chrono::seconds(3)
+            ))
+            std::_Exit(36);
+        if (__atomic_load_n(&ack, __ATOMIC_ACQUIRE) != 0) std::_Exit(37);
+        g_resume_first_register.store(true, std::memory_order_release);
+        if (!wait_until(
+                [&] {
+                    return __atomic_load_n(&ack, __ATOMIC_ACQUIRE) == epoch;
+                },
+                std::chrono::seconds(3)
+            ))
+            std::_Exit(31);
+        const AicoreExitTarget target{reinterpret_cast<uint64_t>(registers.data()), &gate, &ack, epoch};
+        if (platform_retire_aicore_group(&target, 1, platform_aicore_exit_deadline()) != 0) std::_Exit(33);
+        if (!wait_until(
+                [&] {
+                    return returned.load(std::memory_order_acquire);
+                },
+                std::chrono::seconds(3)
+            ))
+            std::_Exit(34);
+        worker.join();
+        if (gate.release_epoch != epoch || gate.exit_request != 0) std::_Exit(35);
+    }
+    std::_Exit(0);
+}
+TEST(EpochRetirementDeathTest, AicRetiresAcrossRepeatedAndWideEpochs) {
+    EXPECT_EXIT(check_epoch_runs(CoreType::AIC), testing::ExitedWithCode(0), "");
+}
+TEST(EpochRetirementDeathTest, AivRetiresAcrossRepeatedAndWideEpochs) {
+    EXPECT_EXIT(check_epoch_runs(CoreType::AIV), testing::ExitedWithCode(0), "");
+}
+
+#if defined(__linux__) && defined(SIMPLER_TEST_EPOCH_RETIREMENT)
+void check_epoch_release_wait(CoreType type) {
+    Runtime runtime;
+    auto &gate = runtime.get_teardown_gates()[0];
+    auto &ack = runtime.get_workers()[0].retired_epoch;
+    for (uint64_t epoch : {uint64_t(1), uint64_t(0x100000002ULL), UINT64_MAX}) {
+        registers.fill(0);
+        gate = {};
+        g_report_epoch = epoch;
+        aicore_invalidate_retired_report(&runtime.get_workers()[0]);
+        store_register(RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
+        store_register(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+        ReleasePollProbe probe{&ack, epoch};
+        std::thread worker([&] {
+            release_poll_probe = &probe;
+            aicore_execute(&runtime, 0, type);
+            release_poll_probe = nullptr;
+            std::lock_guard<std::mutex> lock(probe.mutex);
+            probe.returned = true;
+            probe.changed.notify_all();
+        });
+        std::unique_lock<std::mutex> lock(probe.mutex);
+        auto await_poll = [&](unsigned visit) {
+            if (!probe.changed.wait_for(lock, std::chrono::seconds(3), [&] {
+                    return probe.visits >= visit || probe.returned;
+                }))
+                std::_Exit(51);
+            if (probe.returned || probe.visits != visit) std::_Exit(52);
+            if (__atomic_load_n(&ack, __ATOMIC_ACQUIRE) != epoch ||
+                load_register(RegId::FAST_PATH_ENABLE) != REG_SPR_FAST_PATH_OPEN)
+                std::_Exit(53);
+        };
+        // No retirement owner has closed the window or published release.
+        await_poll(1);
+        if (__atomic_load_n(&gate.release_epoch, __ATOMIC_ACQUIRE) != 0) std::_Exit(54);
+        // For wide epochs, the wrong value has the same low 32 bits.
+        const uint64_t wrong_epoch = epoch > UINT32_MAX ? uint32_t(epoch) : epoch + 1;
+        __atomic_store_n(&gate.release_epoch, wrong_epoch, __ATOMIC_RELEASE);
+        probe.resumed = 1;
+        probe.changed.notify_all();
+        await_poll(2);
+        if (__atomic_load_n(&gate.release_epoch, __ATOMIC_ACQUIRE) != wrong_epoch) std::_Exit(55);
+
+        const AicoreExitTarget target{reinterpret_cast<uint64_t>(registers.data()), &gate, &ack, epoch};
+        if (platform_retire_aicore_group(&target, 1, platform_aicore_exit_deadline()) != 0) std::_Exit(56);
+        if (load_register(RegId::FAST_PATH_ENABLE) != REG_SPR_FAST_PATH_CLOSE ||
+            load_register(RegId::DATA_MAIN_BASE) != AICPU_IDLE_TASK_ID ||
+            __atomic_load_n(&gate.release_epoch, __ATOMIC_ACQUIRE) != epoch)
+            std::_Exit(57);
+        probe.resumed = 2;
+        probe.changed.notify_all();
+        if (!probe.changed.wait_for(lock, std::chrono::seconds(3), [&] {
+                return probe.returned;
+            }))
+            std::_Exit(58);
+        lock.unlock();
+        worker.join();
+    }
+    std::_Exit(0);
+}
+#endif
+
+TEST(EpochRetirementDeathTest, AicWaitsForMatchingReleaseAfterAck) {
+#if defined(__linux__) && defined(SIMPLER_TEST_EPOCH_RETIREMENT)
+    EXPECT_EXIT(check_epoch_release_wait(CoreType::AIC), testing::ExitedWithCode(0), "");
+#else
+    GTEST_SKIP() << "Requires GNU ld sched_yield wrapping on Linux";
+#endif
+}
+TEST(EpochRetirementDeathTest, AivWaitsForMatchingReleaseAfterAck) {
+#if defined(__linux__) && defined(SIMPLER_TEST_EPOCH_RETIREMENT)
+    EXPECT_EXIT(check_epoch_release_wait(CoreType::AIV), testing::ExitedWithCode(0), "");
+#else
+    GTEST_SKIP() << "Requires GNU ld sched_yield wrapping on Linux";
+#endif
+}
+
+// Captured executions reuse the prepared epoch. Hold the real executor after
+// report publication and before it can observe this replay's EXIT.
+void check_replayed_epoch_before_idle(CoreType type) {
+    Runtime runtime;
+    constexpr uint64_t epoch = 0x100000007ULL;
+    auto &gate = runtime.get_teardown_gates()[0];
+    auto &report = runtime.get_workers()[0];
+    report.retired_epoch = epoch;
+    g_report_epoch = epoch;
+    registers.fill(0);
+    store_register(RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
+    g_first_register_paused.store(false, std::memory_order_release);
+    g_resume_first_register.store(false, std::memory_order_release);
+    g_pause_first_register.store(true, std::memory_order_release);
+    std::thread worker([&] {
+        aicore_execute(&runtime, 0, type);
+    });
+    if (!wait_until(
+            [&] {
+                return g_first_register_paused.load(std::memory_order_acquire);
+            },
+            std::chrono::seconds(5)
+        ))
+        std::_Exit(41);
+    if (!aicore_report_accepted(&report, epoch)) std::_Exit(42);
+    const AicoreExitTarget target{reinterpret_cast<uint64_t>(registers.data()), &gate, &report.retired_epoch, epoch};
+    bool released = true;
+    const int rc = platform_retire_aicore_group(&target, 1, 0, &released);
+    if (rc != -1 || released || gate.release_epoch != 0 ||
+        load_register(RegId::FAST_PATH_ENABLE) != REG_SPR_FAST_PATH_OPEN)
+        std::_Exit(43);
+    std::_Exit(0);
+}
+TEST(EpochRetirementDeathTest, ReplayedAicRejectsSameEpochAckBeforeIdle) {
+    EXPECT_EXIT(check_replayed_epoch_before_idle(CoreType::AIC), testing::ExitedWithCode(0), "");
+}
+TEST(EpochRetirementDeathTest, ReplayedAivRejectsSameEpochAckBeforeIdle) {
+    EXPECT_EXIT(check_replayed_epoch_before_idle(CoreType::AIV), testing::ExitedWithCode(0), "");
+}
+
+#endif
+
+TEST(EpochRetirement, MissingEpochAckAddressRejectsBeforeExit) {
+    alignas(64) std::array<uint8_t, 65536> regs{};
+    AicoreTeardownControl gate{};
+    const AicoreExitTarget target{reinterpret_cast<uint64_t>(regs.data()), &gate, nullptr, 7};
+    platform_init_aicore_regs(target.reg_addr);
+    bool released = true;
+    EXPECT_EQ(platform_retire_aicore_group(&target, 1, 0, &released), -1);
+    EXPECT_FALSE(released);
+    EXPECT_EQ(read_reg(target.reg_addr, RegId::DATA_MAIN_BASE), AICPU_IDLE_TASK_ID);
+    EXPECT_EQ(read_reg(target.reg_addr, RegId::FAST_PATH_ENABLE), REG_SPR_FAST_PATH_OPEN);
+    EXPECT_EQ(gate.release_epoch, 0U);
 }

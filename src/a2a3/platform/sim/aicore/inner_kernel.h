@@ -210,3 +210,13 @@ inline void acknowledge_aicore_cond_nonce_and_wait(AicoreTeardownControl *contro
     }
     wait_for_post_close_release(&control->post_close_release);
 }
+
+// The current startup report commits a cleared ACK. After EXIT, publish the
+// exact epoch once, then wait on the CPU-owned post-CLOSE release line.
+inline void publish_aicore_epoch_and_wait(volatile uint64_t *ack, AicoreTeardownControl *control, uint64_t epoch) {
+    __atomic_store_n(ack, epoch, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&control->release_epoch, __ATOMIC_ACQUIRE) != epoch) {
+        SPIN_WAIT_HINT();
+    }
+    OUT_OF_ORDER_STORE_BARRIER();
+}

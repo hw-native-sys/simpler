@@ -31,6 +31,7 @@ constexpr int kCores = 6;
 std::array<std::atomic<int>, kCores> opened{};
 std::array<std::atomic<int>, kCores> retired{};
 std::array<uint32_t, kCores> conditions{};
+std::array<Handshake *, kCores> expected_reports{};
 std::atomic<int> batches{0};
 std::atomic<int> deadlines{0};
 std::mutex init_mutex;
@@ -90,7 +91,16 @@ bool assign_owned(Context &, Runtime *, int, long) {
 
 uint32_t platform_get_physical_cores_count() { return kCores; }
 static uint64_t test_report_epoch = 0;
+uint64_t test_exit_epoch() {
+#ifdef SIMPLER_TEST_EPOCH_RETIREMENT
+    return test_report_epoch;
+#else
+    return 0;
+#endif
+}
+
 static std::atomic<int> nonce_batches{0};
+static std::atomic<int> epoch_batches{0};
 extern "C" uint64_t get_platform_run_result_epoch() { return test_report_epoch; }
 uint64_t platform_aicore_exit_deadline() { return ++deadlines; }
 uint64_t read_reg(uint64_t, RegId) { return AICORE_IDLE_VALUE; }
@@ -113,7 +123,8 @@ void platform_init_aicore_regs(uint64_t address) {
 }
 
 int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t count, uint64_t, bool *released) {
-    ++nonce_batches;
+    if (test_exit_epoch() == 0) ++nonce_batches;
+    else ++epoch_batches;
     ++batches;
     bool timed_out = false;
     for (size_t i = 0; i < count; ++i) {
@@ -122,11 +133,22 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
         if (core >= kCores) continue;
         EXPECT_EQ(opened[core].load(), 1);
         EXPECT_NE(targets[i].teardown, nullptr);
+        EXPECT_EQ(targets[i].expected_epoch, test_exit_epoch());
+#ifdef SIMPLER_TEST_EPOCH_RETIREMENT
+        if (test_exit_epoch() != 0) EXPECT_EQ(targets[i].retired_epoch, &expected_reports[core]->retired_epoch);
+#else
+        EXPECT_EQ(targets[i].retired_epoch, nullptr);
+#endif
         ++retired[core];
         const bool success = !(silent_first_core && core == 0);
         if (released != nullptr) released[i] = success;
         if (success && targets[i].teardown != nullptr) {
-            __atomic_store_n(&targets[i].teardown->post_close_release, AICORE_POST_CLOSE_RELEASE, __ATOMIC_RELEASE);
+            if (targets[i].expected_epoch != 0) {
+                __atomic_store_n(targets[i].retired_epoch, targets[i].expected_epoch, __ATOMIC_RELEASE);
+                __atomic_store_n(&targets[i].teardown->release_epoch, targets[i].expected_epoch, __ATOMIC_RELEASE);
+            } else {
+                __atomic_store_n(&targets[i].teardown->post_close_release, AICORE_POST_CLOSE_RELEASE, __ATOMIC_RELEASE);
+            }
         }
         timed_out |= !success;
     }
@@ -186,6 +208,7 @@ protected:
     void SetUp() override {
         test_report_epoch = 0;
         nonce_batches = 0;
+        epoch_batches = 0;
         batches = 0;
         deadlines = 0;
         pause_open = false;
@@ -201,6 +224,7 @@ protected:
         ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
         for (int i = 0; i < kCores; ++i) {
             auto &handshake = runtime->dev.workers[i];
+            expected_reports[i] = &handshake;
             handshake.physical_core_id = i;
             handshake.core_type = i < 2 ? CoreType::AIC : CoreType::AIV;
             handshake.aicore_done = 1;
@@ -218,8 +242,11 @@ protected:
         for (int i = 0; i < kCores; ++i) {
             EXPECT_EQ(retired[i].load(), 1) << "core " << i;
             EXPECT_EQ(
+                runtime->get_teardown_gates()[i].release_epoch, silent_first_core && i == 0 ? 0U : test_exit_epoch()
+            );
+            EXPECT_EQ(
                 runtime->get_teardown_gates()[i].post_close_release,
-                silent_first_core && i == 0 ? 0U : AICORE_POST_CLOSE_RELEASE
+                silent_first_core && i == 0 || test_exit_epoch() != 0 ? 0U : AICORE_POST_CLOSE_RELEASE
             ) << "core "
               << i;
         }
@@ -597,16 +624,18 @@ TEST_F(SchedulerRetirement, InitializationClearsRequestAndReleaseForEveryCore) {
         auto &control = runtime->dev.teardown_gates[i];
         control.post_close_release = AICORE_POST_CLOSE_RELEASE;
         control.exit_request = 9;
+        control.release_epoch = UINT64_MAX;
     }
     ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
     for (int i = 0; i < kCores; ++i) {
         const auto &control = runtime->dev.teardown_gates[i];
         EXPECT_EQ(control.post_close_release, 0u);
         EXPECT_EQ(control.exit_request, 0u);
+        EXPECT_EQ(control.release_epoch, 0U);
     }
 }
 
-TEST_F(SchedulerRetirement, NativeModeClaimsOnlyAfterCurrentReportAndUsesCondNonce) {
+TEST_F(SchedulerRetirement, NativeModeClaimsOnlyAfterCurrentReportAndUsesMatchingProtocol) {
     test_report_epoch = 42;
     ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
     for (int i = 0; i < kCores; ++i) {
@@ -619,7 +648,12 @@ TEST_F(SchedulerRetirement, NativeModeClaimsOnlyAfterCurrentReportAndUsesCondNon
     EXPECT_EQ(nonce_batches.load(), 0);
     handshake();
     expect_once();
-    EXPECT_EQ(nonce_batches.load(), 1);
+    EXPECT_EQ(nonce_batches.load(), test_exit_epoch() == 0 ? 1 : 0);
+    EXPECT_EQ(epoch_batches.load(), test_exit_epoch() == 0 ? 0 : 1);
+    for (int i = 0; i < kCores; ++i) {
+        EXPECT_EQ(runtime->get_teardown_gates()[i].release_epoch, test_exit_epoch());
+        EXPECT_EQ(runtime->dev.workers[i].aicore_done, 0U);
+    }
     test_report_epoch = 0;
 }
 TEST_F(SchedulerRetirement, UnstampedModeUsesNonceAfterOwnershipPublication) {
