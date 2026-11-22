@@ -49,12 +49,12 @@ void set_reason(RunRetentionProbeReport &report, const char *reason) {
  * does not support replay identities shared by repeated model executions.
  */
 bool successor_has_started(const DeviceRunnerBase::PreparedExecution &prepared) {
-    const Runtime *device_runtime = prepared.kernel_args.args.runtime_args;
-    if (device_runtime == nullptr || prepared.num_aicore <= 0) return false;
+    const RuntimeSharedState *shared_state = prepared.kernel_args.shared_state();
+    if (shared_state == nullptr || prepared.num_aicore <= 0) return false;
     const size_t count = static_cast<size_t>(prepared.num_aicore);
     std::vector<Handshake> workers(count);
     const size_t bytes = sizeof(Handshake) * count;
-    if (rtMemcpy(workers.data(), bytes, device_runtime->get_workers(), bytes, RT_MEMCPY_DEVICE_TO_HOST) != 0) {
+    if (rtMemcpy(workers.data(), bytes, shared_state->workers, bytes, RT_MEMCPY_DEVICE_TO_HOST) != 0) {
         return false;
     }
     for (const Handshake &worker : workers) {

@@ -13,18 +13,16 @@ orchestration. Prepared information survives each execution; mutable scheduling
 state is initialized at the device boundary that excludes its previous writers.
 There is no separate Host-submitted reset task or new AICore launch ABI.
 
-Kernel-mode preparation initializes a new descriptor's handshake region once.
-The initial slots are ready before recording. If a retained graph still owns a
-slot's old backing, preparation initializes only the new backing's worker
-reports and restores the caller's thread capture mode before graph submission.
-The recorded descriptor DMA carries the host-owned prefix and excludes worker
-reports so replay preserves the current AICore startup reports. Preparation
-requires successful initialization and restoration before it can publish.
+Onboard Program and Kernel deliver the runtime descriptor and initial image in
+the AICPU launch. AICPU resolves both sections from checked offsets in the RTS-delivered packet. The entry gate
+initializes the writable state before schedulers start consuming the image.
+Caller-stream ordering also applies to prerequisite copies such as the A5
+scheduler state. A recorded model can run repeatedly or be destroyed before
+its first execution.
 
-Recording a publication does not prove that its DMA has executed. Captured
-descriptor copies always remain in the graph and do not populate the eager
-prefix cache. Destroying an unexecuted model therefore cannot make a later
-eager call omit its required descriptor publication.
+The AICPU entry restores the complete prepared HBG image from the RTS packet to the shared writable arena.
+Scheduler pointers use addresses in that arena, and the packet carries zero image references.
+Each replay starts from the snapshot recorded for that launch.
 
 | Region | Preserved information | Per-execution state |
 | ------ | --------------------- | ------------------- |
@@ -35,7 +33,7 @@ eager call omit its required descriptor publication.
 | Handshake | Core identity/report payload for observation | Report-valid and READY markers after acknowledged retirement |
 | Native result storage | Allocation and retained fault evidence | Current result publication and callback aggregation |
 
-Only used task entries are restored. Inline-completed tasks retain their
+The restored image contains the used task entries. Inline-completed tasks retain their
 prepared completed initial state instead of being treated as pending device
 work. Weights and caller-owned persistent tensor contents are not workspace to
 clear. Address/scalar changes and Host-control changes are preparation changes,

@@ -19,6 +19,8 @@
 #include <mutex>
 #include <vector>
 
+#include "host/run_resource_cost.h"
+
 /**
  * Admission state for a device context that sizes its own concurrency.
  *
@@ -41,9 +43,9 @@
  * ever, and inferring it from an untouched slot's absent storage would admit
  * every slot before anything had been demonstrated.
  *
- * Capacity is a count of identities, never a byte budget. This class holds no
- * byte figure and makes no allocation decision; whether a request fits is the
- * allocator's answer, reported back here only as proof or as a refusal.
+ * Capacity counts proven identities plus one exploratory slot. Resource costs
+ * are observational footprints; shared regions can appear in multiple sets.
+ * Actual allocation feasibility belongs to the workspace ledger.
  */
 class AutoAdmissionState {
 public:
@@ -127,6 +129,7 @@ public:
         if (enabled_ || granted == 0) return;
         plans_.resize(granted);
         proven_.assign(granted, false);
+        proven_cost_.assign(granted, RunResourceCost{});
         enabled_ = true;
     }
 
@@ -147,10 +150,15 @@ public:
      *
      * The commit is the proof, so this is called on the success path whether or
      * not it allocated anything.
+     *
+     * `cost` is what the set's commit committed. It is recorded for the
+     * exploratory-set test and for reporting, and it never changes a proof.
      */
-    void note_proven(uint32_t slot) {
+    void note_proven(uint32_t slot, const RunResourceCost &cost = {}) {
         std::scoped_lock lk(mu_);
-        if (slot < proven_.size()) proven_[slot] = true;
+        if (slot >= proven_.size()) return;
+        proven_[slot] = true;
+        proven_cost_[slot] = cost;
     }
 
     /**
@@ -164,7 +172,9 @@ public:
      */
     void clear_proven(uint32_t slot) {
         std::scoped_lock lk(mu_);
-        if (slot < proven_.size()) proven_[slot] = false;
+        if (slot >= proven_.size()) return;
+        proven_[slot] = false;
+        proven_cost_[slot] = RunResourceCost{};
     }
 
     bool proven(uint32_t slot) const {
@@ -206,6 +216,22 @@ public:
         const uint32_t probe = token_owner_ == kNoOwner ? 1u : 0u;
         const uint32_t offered = prefix > directory_limit - probe ? directory_limit : prefix + probe;
         return std::max<uint32_t>(1u, std::min(offered, directory_limit));
+    }
+
+    /** What the set on `slot` committed when it proved the slot. */
+    RunResourceCost proven_cost(uint32_t slot) const {
+        std::scoped_lock lk(mu_);
+        return slot < proven_.size() && proven_[slot] ? proven_cost_[slot] : RunResourceCost{};
+    }
+
+    /**
+     * The largest footprint among the proven sets.
+     *
+     * Shared regions count in every holder; this is not an allocation estimate.
+     */
+    RunResourceCost max_proven_cost() const {
+        std::scoped_lock lk(mu_);
+        return max_proven_cost_locked();
     }
 
     // ------------------------------------------------------------------- token
@@ -466,10 +492,21 @@ private:
         return prefix;
     }
 
+    RunResourceCost max_proven_cost_locked() const {
+        RunResourceCost largest{};
+        for (size_t slot = 0; slot < proven_.size(); ++slot) {
+            if (!proven_[slot]) continue;
+            const RunResourceCost &cost = proven_cost_[slot];
+            if (cost.total_bytes() > largest.total_bytes()) largest = cost;
+        }
+        return largest;
+    }
+
     mutable std::mutex mu_;
     bool enabled_{false};
     uint32_t token_owner_{kNoOwner};
     uint64_t token_epoch_{0};
     std::vector<SlotPlan> plans_;
     std::vector<bool> proven_;
+    std::vector<RunResourceCost> proven_cost_;
 };

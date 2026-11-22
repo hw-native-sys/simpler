@@ -227,9 +227,11 @@ TEST(HandshakeReportEpoch, ANativeLaunchProjectsThisRunsIdentity) {
     k_args.run_result_epoch = kRunNPlus1;
 
     AicoreLaunchArgs args{};
+    k_args.runtime_descriptor_bytes = RUNTIME_LAUNCH_DESCRIPTOR_BYTES;
     fill_shared_launch_args(args, k_args);
     EXPECT_EQ(args.report_epoch, kRunNPlus1);
     EXPECT_EQ(args.enable_profiling_flag, k_args.enable_profiling_flag);
+    EXPECT_EQ(args.runtime_args, 0u);
 }
 
 // A kernel/persistent launch projects 0, which is what selects the protocol

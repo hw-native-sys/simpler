@@ -37,9 +37,10 @@ def test_finite_workspace_refusal_preserves_graphs(tmp_path, request, runtime):
     output = probe_output(f"capacity-{runtime}-device-{device}-")
     write_input_identities(output, identity)
     stdout = run_probe(command, device, output)
+    refused = -1004 if runtime == "host_build_graph" else -1007
     assert re.search(
         rf"CAPTURE_WORKSPACE_CAPACITY_PASS runtime={runtime} budget=268435456 "
-        r"models=3 grants=2 offset_views=2 refused=-1007 recovered=1",
+        rf"models=3 grants=2 offset_views=2 refused={refused} recovered=1",
         stdout,
     )
     for stage in (
@@ -69,6 +70,19 @@ def test_cumulative_workspace_release_readmits_same_request(tmp_path, request, r
     output = probe_output(f"cumulative-{runtime}-device-{device}-")
     write_input_identities(output, identity)
     stdout = run_probe(command, device, output)
+    if runtime == "host_build_graph":
+        assert (
+            "CAPTURE_SHARED_HEAP_CAPACITY_PASS runtime=host_build_graph budget=268435456 request=33554432 "
+            "models=9 grants=2 same_pressure_recovered=1"
+        ) in stdout
+        for stage in (
+            "heap-does-not-scale-with-retained-models",
+            "retained-models-share-workspace",
+            "same-pressure-readmitted",
+            "workspace-reclaimed",
+        ):
+            assert f"stage={stage} rc=0" in stdout
+        return
     match = re.search(
         rf"CAPTURE_CUMULATIVE_CAPACITY_PASS runtime={runtime} budget=268435456 request=33554432 "
         r"accepted=([3-8]) maximum_models=9 grants=2 refused=-1007 same_pressure_recovered=1",

@@ -32,7 +32,7 @@ inline bool admit_kernel_launch_entry(
     const auto *packet = static_cast<const unsigned char *>(view.args_base) + LAUNCH_ENVELOPE_HEADER_BYTES;
     return consume_kernel_invocation(
         packet, kernel_invocation_bytes(registered.tensor_count, registered.scalar_count), registered,
-        {reinterpret_cast<uint64_t>(&runtime), run_epoch}, output
+        {view.runtime_descriptor_offset, view.runtime_descriptor_bytes, run_epoch}, output
     );
 }
 

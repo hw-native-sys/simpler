@@ -9,13 +9,30 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <dlfcn.h>
+
 // SDK substitutes exercise preload accounting without owning a device.
 extern "C" int rtDeviceReset(int) { return 0; }
 extern "C" int aclrtResetDevice(int device) { return rtDeviceReset(device); }
-extern "C" int rtFree(void *) { return 0; }
+namespace {
+bool delegate_free = false;
+thread_local bool inside_free = false;
+}  // namespace
+extern "C" void set_delegated_free(int enabled) { delegate_free = enabled != 0; }
+extern "C" int rtFree(void *ptr) {
+    if (!delegate_free || inside_free) return 0;
+    inside_free = true;
+    const int rc = reinterpret_cast<int (*)(void *)>(dlsym(RTLD_DEFAULT, "rtFree"))(ptr);
+    inside_free = false;
+    return rc;
+}
 extern "C" int aclrtDestroyEvent(void *) { return 0; }
 extern "C" int aclmdlRICaptureGetInfo(void *, void *status, void **model) {
     *static_cast<int *>(status) = 0;
     *model = nullptr;
     return 0;
+}
+
+extern "C" int sdk_internal_free(void *ptr) {
+    return reinterpret_cast<int (*)(void *)>(dlsym(RTLD_DEFAULT, "rtFree"))(ptr);
 }

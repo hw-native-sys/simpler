@@ -82,9 +82,9 @@ inline SchedulerGraphView aicore_scheduler_graph_view(const SchedulerWorkerConte
         context.graph_storage_address,
         context.graph_task_count,
         context.task_window_last_index,
-        context.scheduler_state_base_address,
+        context.native_graph_address,
         context.native_header_offset,
-        context.scheduler_state_bytes,
+        context.native_graph_bytes,
         static_cast<uint32_t>(context.original_task_count),
     };
 }

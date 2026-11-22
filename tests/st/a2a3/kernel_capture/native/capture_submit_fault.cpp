@@ -18,7 +18,9 @@
 #include <cstring>
 #include <utility>
 #include "runtime/mem.h"
-#include "common/kernel_args.h"
+#include "common/aicore_runtime_packet.h"
+#include "capture_inline_packet.h"
+#include "capture_recovery.h"
 #include "runtime/kernel.h"
 #include "runtime/rts/rts_kernel.h"
 
@@ -82,10 +84,16 @@ extern "C" rtError_t rtKernelLaunchWithHandleV2(
     const int rc = real(handle, key, blocks, args, sm, stream, config);
     if (armed && rc == 0) ++result.accepted_core;
     if (observe_publications && rc == 0 && args != nullptr && args->args != nullptr &&
-        args->argsSize == sizeof(AicoreLaunchArgs)) {
-        AicoreLaunchArgs launch{};
+        args->argsSize == sizeof(AicoreRuntimePacket)) {
+        AicoreRuntimePacket launch{};
         std::memcpy(&launch, args->args, sizeof(launch));
-        captured_submission.launches.push_back({launch.runtime_args, captured_submission.publications.size()});
+        DeviceRuntimeLaunchDesc descriptor{};
+        std::memcpy(&descriptor, launch.descriptor, sizeof(launch.descriptor));
+        captured_submission.launches.push_back(
+            {descriptor.shared_state_addr, descriptor.scheduler_bootstrap.worker_context_base,
+             descriptor.scheduler_bootstrap.runtime_mode, descriptor.worker_count,
+             captured_submission.publications.size()}
+        );
     }
     return rc;
 }
@@ -97,6 +105,23 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     static auto real = next_symbol<decltype(&rtsLaunchCpuKernel)>("rtsLaunchCpuKernel");
     note_submission();
     if (armed) ++result.cpu_calls;
+    if (observe_publications) {
+        const auto packet = capture_test::observe_inline_cpu_packet(args);
+        captured_submission.cpu_launches.push_back(
+            {packet.valid, packet.image.bytes, packet.image.working_address, packet.image.reference_count}
+        );
+        if (packet.valid && packet.image_section &&
+            capture_test::record_boot_fault_prefix(packet.image_section, stream)) {
+            const auto *start = static_cast<const unsigned char *>(args->baseArgs.args);
+            std::vector<unsigned char> copy(start, start + args->baseArgs.argsSize);
+            auto image = packet.image;
+            image.mutable_prefix_bytes = 0;
+            std::memcpy(copy.data() + (packet.image_section - start), &image, sizeof(image));
+            auto injected = *args;
+            injected.baseArgs.args = copy.data();
+            return real(function, blocks, stream, config, &injected);
+        }
+    }
     return real(function, blocks, stream, config, args);
 }
 

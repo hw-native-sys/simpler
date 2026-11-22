@@ -24,13 +24,6 @@ class CallArgumentSnapshot;
 class ChipWorker;
 struct CallConfig;
 
-enum class NativeSubmissionDisposition : int { Pending, Submitting, Submitted, Cancelled, Retired };
-
-struct NativeSubmissionCleanup {
-    NativeSubmissionDisposition disposition{NativeSubmissionDisposition::Pending};
-    bool carrier_retired{false};
-};
-
 // Native invocation storage shared by every view of the same capsule token.
 // The framework graph remains the model owner.
 class NativeSubmissionState : public std::enable_shared_from_this<NativeSubmissionState> {
@@ -46,10 +39,9 @@ public:
     void submit();
     // The stock graph's first token anchors its exact model generation. Other
     // tokens from that scope reuse the notice, never a bare reused handle.
-    void retain_model_resources(int &registration_started, const NativeSubmissionState *model_anchor = nullptr);
+    void register_model_destroy_notice(int &registration_started, const NativeSubmissionState *model_anchor = nullptr);
     bool model_destroyed() const;
-    void cancel_pending(NativeSubmissionCleanup &outcome);
-    void release_resources();
+    bool release_model_resources();
 
     bool cancel(std::exception_ptr reason);
     bool done();
@@ -68,7 +60,7 @@ private:
     std::unique_ptr<Backing> backing_;
 
     void *active_acl_model() const;
-    bool carrier_retired() const;
+    bool run_released() const;
     void validate_process() const;
     void finish_operation() noexcept;
 };

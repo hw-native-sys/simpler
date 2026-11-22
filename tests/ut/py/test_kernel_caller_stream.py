@@ -51,9 +51,9 @@ def _close_case(lib, ctx, *, run, pending, streams, device_buffers, host_buffers
     if pending:
         lib.simpler_finalize_run(ctx, run)
     close_rc = lib.finalize_device(ctx)
-    if faults is not None and (faults.descriptor_copy_failures() != 0 or faults.descriptor_kernel_guard_hits() != 0):
+    if faults is not None and (faults.entry_record_failures() != 0 or faults.entry_kernel_guard_hits() != 0):
         assert close_rc != 0
-        assert faults.descriptor_source_frees() == 0
+        assert faults.entry_event_destroys() == 0
         for stream in streams:
             assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
     else:
@@ -80,6 +80,7 @@ def _run(arch, runtime, device, faults_path=None):
     if faults is not None:
         faults.bind_test_log.argtypes = [ctypes.c_void_p]
         assert faults.bind_test_log(lib._handle) == 0
+        faults.arm_entry_record_failure.argtypes = [ctypes.c_void_p]
     lib.rtSetDevice.argtypes = [ctypes.c_int]
     assert lib.rtSetDevice(device) == 0
     contexts = _CallerContexts(lib, device)
@@ -151,13 +152,13 @@ def _run(arch, runtime, device, faults_path=None):
             )
             pending = True
             if faults is not None:
-                assert faults.arm_descriptor_copy_failure() == 0
+                faults.arm_entry_record_failure(stream)
                 launches = faults.core_launch_call_count()
                 rc = lib.simpler_launch_run_on_stream(ctx, run, stream, None)
                 assert rc == -4321, rc
-                assert faults.descriptor_copy_failures() == 1
+                assert faults.entry_record_failures() == 1
                 assert faults.core_launch_call_count() == launches
-                assert faults.descriptor_source_frees() == 0
+                assert faults.entry_event_destroys() == 0
                 assert lib.simpler_finalize_run(ctx, run) != 0
                 pending = False
                 # Partial enqueue cannot publish the clean no-submission receipt.
@@ -167,10 +168,10 @@ def _run(arch, runtime, device, faults_path=None):
                     lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
                     != 0
                 )
-                assert faults.descriptor_copy_failures() == 1
+                assert faults.entry_record_failures() == 1
                 for _ in range(2):
                     assert lib.finalize_device(ctx) != 0
-                    assert faults.descriptor_source_frees() == 0
+                    assert faults.entry_event_destroys() == 0
                 return
             # No synchronization separates caller writes from launch. These
             # buffers stay alive through the caller's final read below.
@@ -236,7 +237,7 @@ def test_borrowed_launch_orders_caller_work(arch, runtime, request):
         for runtime in ("host_build_graph", "tensormap_and_ringbuffer")
     ],
 )
-def test_descriptor_enqueue_failure_retains_ownership(arch, runtime, task_queue, request):
+def test_entry_enqueue_failure_retains_ownership(arch, runtime, task_queue, request):
     shim = request.getfixturevalue("kernel_close_faults")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     environment = {**os.environ, "LD_PRELOAD": str(shim), "TASK_QUEUE_ENABLE": task_queue}

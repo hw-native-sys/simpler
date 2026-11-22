@@ -315,11 +315,12 @@ static inline __aicore__ bool scheduler_initialize_local_config(
     }
     if (graph->native_header_offset != 0) {
         const auto *header = scheduler_native_header_checked(
-            graph->scheduler_state_address, graph->scheduler_state_bytes, graph->native_header_offset,
-            graph->task_count, graph->original_task_count
+            graph->native_graph_address, graph->native_graph_bytes, graph->native_header_offset, graph->task_count,
+            graph->original_task_count
         );
         if (header == nullptr || header->run_epoch != summary->run_epoch ||
-            graph->scheduler_state_address != reinterpret_cast<uint64_t>(base))
+            graph->native_graph_address != context->native_graph_address ||
+            graph->native_graph_bytes != context->native_graph_bytes)
             return false;
         local->control_peer_cursor = static_cast<uint32_t>(context->worker_index + 1);
     }

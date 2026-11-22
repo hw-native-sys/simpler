@@ -344,7 +344,8 @@ void prime_joined(ChipWorker &worker) {
 ChipWorkerNativeRun prepare(ChipWorker &worker, uint32_t slot, uint64_t generation) {
     ChipStorageTaskArgs args{};
     return worker.prepare_native_run_on_slot(
-        1, &args, CallConfig{}, slot, generation, generation, generation, nullptr, 0, false, NativeRunProvenance{}
+        1, &args, CallConfig{}, slot, generation, generation, generation, nullptr, 0, false, NativeRunProvenance{},
+        worker.prepare_run_fn_
     );
 }
 

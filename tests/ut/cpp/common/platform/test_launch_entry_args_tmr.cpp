@@ -21,6 +21,7 @@ using namespace launch_entry_args_test;
 // Everything below is about values only this runtime's descriptor carries.
 #include "tensormap_and_ringbuffer/entry_args.h"
 #include "tensormap_and_ringbuffer/kernel_launch_admission.h"
+#include "aicpu/runtime_launch_view.h"
 
 namespace {
 // A run's entry values, as a caller's ChipStorageTaskArgs would supply them.
@@ -35,6 +36,16 @@ ChipStorageTaskArgs entry_args(int32_t tensors, int32_t scalars, uint64_t scalar
         args.add_scalar(scalar_seed + static_cast<uint64_t>(i));
     return args;
 }
+
+PlatformEntryArgs entry_view(const KernelArgs &header) {
+    PlatformEntryArgs view{
+        &header, header.entry_args_offset, header.entry_tensor_count, header.entry_scalar_count,
+        header.entry_args_source
+    };
+    view.runtime_descriptor_offset = header.runtime_section.descriptor_offset;
+    view.runtime_descriptor_bytes = header.runtime_descriptor_bytes;
+    return view;
+}
 }  // namespace
 
 TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedArguments) {
@@ -42,23 +53,30 @@ TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedA
     runtime.set_active_callable_id(3);
     runtime.set_orch_args(args);
     helper.args.run_result_epoch = 19;
-    ASSERT_EQ(prepare(), 0);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
     const simpler::tmr::KernelCallableIdentity registered{3, 7, 0, 1};
     ASSERT_EQ(helper.prepare_kernel_invocation(registered), 0);
     runtime.set_orch_args(entry_args(0, 1, 0x2222));
     ASSERT_EQ(publish(true), 0);
     EXPECT_TRUE(slot.workers_initialized);
-    EXPECT_EQ(rts.last_copy_bytes, runtime_device_initialized_prefix_size(runtime));
-    KernelArgs header{};
-    std::memcpy(&header, helper.launch_payload(), sizeof(header));
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_EQ(slot.runtime_args, nullptr);
+    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    auto copied = copy_launch();
+    const auto &header = *static_cast<const KernelArgs *>(copied.data());
     EXPECT_EQ(header.run_result_data_base, 0u);
     EXPECT_EQ(header.run_result_epoch, 19u);
     EXPECT_EQ(header.entry_args_source, static_cast<uint32_t>(EntryArgsSource::KernelInvocation));
-    PlatformEntryArgs view{
-        helper.launch_payload(), header.entry_args_offset, header.entry_tensor_count, header.entry_scalar_count,
-        header.entry_args_source
-    };
-    const auto *resident = reinterpret_cast<const Runtime *>(slot.runtime_args);
+    EXPECT_EQ(header.entry_args_offset, 192U);
+    EXPECT_EQ(header.image_section.offset, 0u);
+    EXPECT_EQ(header.image_section.bytes, 0u);
+    EXPECT_EQ(header.runtime_descriptor_bytes, 192U);
+    EXPECT_EQ(header.runtime_section.packet_bytes, copied.bytes);
+    EXPECT_EQ(header.runtime_section.descriptor_offset + header.runtime_descriptor_bytes, copied.bytes);
+    const auto view = entry_view(header);
+    RuntimeLaunchView owner;
+    const auto *resident = owner.bind(header);
+    ASSERT_NE(resident, nullptr);
     simpler::tmr::EntryArgsStorage decoded{};
     ASSERT_TRUE(
         simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, header.run_result_epoch, &decoded)
@@ -82,24 +100,119 @@ TEST_F(LaunchEntryArgs, KernelPacketRejectsUndeclaredScalarBeforePublication) {
     runtime.set_active_callable_id(3);
     runtime.set_orch_args(entry_args(0, 1, 73));
     helper.args.run_result_epoch = 19;
-    ASSERT_EQ(prepare(), 0);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
     EXPECT_EQ(helper.prepare_kernel_invocation({3, 7, 0, 0}), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(rts.copies, 0);
     ASSERT_EQ(helper.prepare_kernel_invocation({3, 7, 0, 1}), 0);
     EXPECT_EQ(publish(true), 0);
 }
 
+TEST_F(LaunchEntryArgs, KernelPacketBorrowsCallerTensorDataWithoutHostInputRelocations) {
+    std::array<float, 4> caller_data{1, 2, 3, 4};
+    const uint32_t shape[] = {4};
+    ChipTensor tensor{};
+    tensor.init_external(caller_data.data(), sizeof(caller_data), shape, 1, DataType::FLOAT32, AddressSpace::DEVICE);
+    ChipStorageTaskArgs incoming;
+    incoming.add_tensor(tensor);
+    incoming.add_scalar(73);
+    runtime.set_active_callable_id(3);
+    runtime.set_orch_args(incoming);
+    helper.args.run_result_epoch = 19;
+    const simpler::tmr::KernelCallableIdentity identity{3, 7, 1, 1};
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    ASSERT_EQ(helper.prepare_kernel_invocation(identity), 0);
+    ASSERT_EQ(helper.publish_runtime_args(true, this, rts.sink, true), 0);
+    auto copied = copy_launch();
+    const auto &header = *static_cast<const KernelArgs *>(copied.data());
+    const auto view = entry_view(header);
+    RuntimeLaunchView owner;
+    const auto *local = owner.bind(header);
+    ASSERT_NE(local, nullptr);
+    simpler::tmr::EntryArgsStorage decoded{};
+    ASSERT_TRUE(simpler::tmr::admit_kernel_launch_entry(*local, view, identity, 19, &decoded));
+    EXPECT_EQ(decoded.tensor(0).buffer.addr, reinterpret_cast<uint64_t>(caller_data.data()));
+    EXPECT_EQ(decoded.scalar(0), 73U);
+    EXPECT_EQ(caller_data, (std::array<float, 4>{1, 2, 3, 4}));
+    EXPECT_EQ(slot.runtime_args, nullptr);
+    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    EXPECT_EQ(allocator.committed_bytes(), sizeof(RuntimeSharedState));
+    EXPECT_EQ(rts.copies, 0);
+}
+
+TEST_F(LaunchEntryArgs, RuntimeSectionSurvivesPacketMoveAndRejectsInvalidFraming) {
+    runtime.set_active_callable_id(3);
+    runtime.set_orch_args(entry_args(0, 1, 73));
+    helper.args.run_result_epoch = 19;
+    const simpler::tmr::KernelCallableIdentity identity{3, 7, 0, 1};
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    ASSERT_EQ(helper.prepare_kernel_invocation(identity), 0);
+    ASSERT_EQ(publish(true), 0);
+    const auto copied = copy_launch();
+    std::vector<RtsLaunchCopy::Block> storage((copied.bytes + 8 + 63) / 64);
+    auto *packet = reinterpret_cast<unsigned char *>(storage.data()) + 8;
+    std::memcpy(packet, copied.data(), copied.bytes);
+    auto &header = *reinterpret_cast<KernelArgs *>(packet);
+    RuntimeLaunchView owner;
+    Runtime *local = owner.bind(header);
+    ASSERT_NE(local, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(local) % 64, 0U);
+    const auto view = entry_view(header);
+    simpler::tmr::EntryArgsStorage decoded{};
+    ASSERT_TRUE(simpler::tmr::admit_kernel_launch_entry(*local, view, identity, 19, &decoded));
+    EXPECT_EQ(decoded.scalar(0), 73U);
+
+    const KernelArgs valid = header;
+    for (uint32_t offset : {0u, header.entry_args_offset, valid.runtime_section.descriptor_offset - 1, UINT32_MAX}) {
+        header.runtime_section.descriptor_offset = offset;
+        EXPECT_EQ(owner.bind(header), nullptr) << offset;
+    }
+    header = valid;
+    --header.runtime_section.packet_bytes;
+    EXPECT_EQ(owner.bind(header), nullptr);
+    header = valid;
+    --header.runtime_descriptor_bytes;
+    EXPECT_EQ(owner.bind(header), nullptr);
+    header = valid;
+    header.entry_tensor_count = UINT32_MAX;
+    EXPECT_EQ(owner.bind(header), nullptr);
+    header = valid;
+    header.entry_args_source = static_cast<uint32_t>(EntryArgsSource::Descriptor);
+    EXPECT_EQ(owner.bind(header), nullptr);
+    header = valid;
+    const auto binding_offset = header.entry_args_offset + sizeof(SimplerKernelInvocationHeader);
+    simpler::tmr::EagerKernelBinding binding{};
+    std::memcpy(&binding, packet + binding_offset, sizeof(binding));
+    ++binding.runtime_descriptor_offset;
+    std::memcpy(packet + binding_offset, &binding, sizeof(binding));
+    EXPECT_EQ(owner.bind(header), nullptr);
+    EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*local, view, identity, 19, &decoded));
+    EXPECT_EQ(decoded.scalar(0), 73U);
+}
+
 TEST_F(LaunchEntryArgs, KernelPacketCannotSilentlyFallBackWhenLaunchTransportIsRefused) {
     runtime.set_active_callable_id(3);
     runtime.set_orch_args(entry_args(0, 1, 0x3333));
     helper.args.run_result_epoch = 21;
-    ASSERT_EQ(prepare(), 0);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
     ASSERT_EQ(helper.prepare_kernel_invocation({3, 8, 0, 1}), 0);
     EXPECT_EQ(publish(false), PTO_RUNTIME_ERR_UNSUPPORTED);
     EXPECT_EQ(rts.copies, 0);
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_EQ(helper.launch_payload(), nullptr);
     EXPECT_EQ(publish(true), 0);
+}
+
+TEST_F(LaunchEntryArgs, KernelDescriptorCannotPublishWithoutItsValidatedInvocation) {
+    runtime.set_active_callable_id(3);
+    runtime.set_orch_args(entry_args(0, 1, 73));
+    helper.args.run_result_epoch = 19;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    EXPECT_EQ(publish(true), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_FALSE(helper.runtime_args_published());
+    EXPECT_EQ(helper.launch_payload(), nullptr);
+    EXPECT_EQ(rts.copies, 0);
+    ASSERT_EQ(helper.prepare_kernel_invocation({3, 7, 0, 1}), 0);
+    ASSERT_EQ(publish(true), 0);
 }
 
 // The published values are the ones prepare captured. A successor's prepare
@@ -233,8 +346,9 @@ TEST_F(LaunchEntryArgs, TheDescriptorsWireOffsetsAreFixed) {
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, pmu_event_type), 140U + ccu_bytes);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, dump_args_level), 144U + ccu_bytes);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_), 192U);
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, workers), 34048U)
-        << "the handshake region's address is what the first publication's length and the device both depend on";
+    EXPECT_LT(
+        offsetof(DeviceRuntimeLaunchDesc, shared_state_addr), offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_)
+    );
     EXPECT_EQ(sizeof(simpler::tmr::EntryArgsStorage), 33856U);
     EXPECT_EQ(
         offsetof(DeviceRuntimeLaunchDesc, entry_tensor_count_), runtime_launch_entry_args_plan(runtime).control_offset
@@ -361,15 +475,14 @@ TEST_F(LaunchEntryArgs, ADescriptorRouteRunAdoptsNothing) {
 // included.
 TEST_F(LaunchEntryArgs, AnIdenticalWarmPrefixIsNotRepublished) {
     runtime.set_orch_args(entry_args(3, 2, 0x1234));
-    ASSERT_EQ(run_once(true), 0);  // first publication onto the block: full prefix
+    ASSERT_EQ(run_once(true), 0);
     ASSERT_TRUE(slot.workers_initialized);
     helper.release_run_view();
 
     rts = {};
     ASSERT_EQ(run_once(true), 0);
-    EXPECT_EQ(rts.copies, 1) << "the first warm publication has nothing to compare against";
-    EXPECT_EQ(rts.last_copy_bytes, runtime_launch_entry_args_plan(runtime).descriptor_bytes_when_launched);
-    EXPECT_EQ(slot.published_prefix_bytes, rts.last_copy_bytes);
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_EQ(slot.published_prefix_bytes, runtime_launch_entry_args_plan(runtime).descriptor_bytes_when_launched);
     helper.release_run_view();
 
     // Same callable, same shape, same config: the prefix is byte-identical.
@@ -512,26 +625,30 @@ TEST_F(LaunchEntryArgs, ADescriptorFallbackLeavesNoRecordToMatch) {
     EXPECT_GT(slot.published_prefix_bytes, 0U);
 }
 
-TEST_F(LaunchEntryArgs, ColdUnexecutedRecordingCannotSuppressFirstEagerCopy) {
-    runtime.set_orch_args(entry_args(2, 1, 0x7777));
+TEST_F(LaunchEntryArgs, CapturedKernelDescriptorDoesNotDependOnLaterEagerPreparation) {
     runtime.set_aicpu_thread_num(3);
-    rts.allow_sync_initialization = true;
-    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
-    ASSERT_TRUE(slot.workers_initialized);
-    const size_t prefix_bytes = runtime_launch_entry_args_plan(runtime).descriptor_bytes_when_launched;
-    const std::vector<std::byte> untouched(prefix_bytes, std::byte{kDeviceMark});
-
-    rts.recording = true;
+    ASSERT_EQ(prepare_kernel(), 0);
     ASSERT_EQ(publish_for_launch(helper, this, rts.sink, true), 0);
-    EXPECT_EQ(rts.copies, 1);
-    EXPECT_EQ(std::memcmp(slot.runtime_args, untouched.data(), prefix_bytes), 0);
+    EXPECT_EQ(rts.copies, 0);
+    auto captured = copy_launch();
+    RuntimeLaunchView view;
+    const auto &captured_header = *static_cast<const KernelArgs *>(captured.data());
+    auto *descriptor = view.bind(captured_header);
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_EQ(descriptor->get_aicpu_thread_num(), 3);
     helper.release_run_view();
-
-    rts = {};
-    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    runtime.set_aicpu_thread_num(5);
+    ASSERT_EQ(prepare_kernel(), 0);
     ASSERT_EQ(publish(true), 0);
-    EXPECT_EQ(rts.copies, 1);
-    EXPECT_EQ(device_descriptor().aicpu_thread_num, 3);
+    auto eager = copy_launch();
+    descriptor = view.bind(*static_cast<const KernelArgs *>(eager.data()));
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_EQ(descriptor->get_aicpu_thread_num(), 5);
+    descriptor = view.bind(captured_header);
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_EQ(descriptor->get_aicpu_thread_num(), 3);
+    EXPECT_EQ(slot.runtime_args, nullptr);
+    EXPECT_EQ(rts.copies, 0);
 }
 
 TEST_F(LaunchEntryArgs, UnexecutedRecordingCannotSuppressTheFollowingEagerCopy) {
@@ -591,9 +708,8 @@ TEST_F(LaunchEntryArgs, AReplacementAllocationInheritsNoRecord) {
     rts = {};
     ASSERT_EQ(run_once(true), 0);
     EXPECT_EQ(rts.copies, 1);
-    EXPECT_EQ(rts.last_copy_bytes, runtime_device_initialized_prefix_size(runtime))
-        << "a fresh block is initialized, not matched";
-    EXPECT_EQ(slot.published_prefix_bytes, 0U) << "the initializing route records nothing";
+    EXPECT_EQ(rts.last_copy_bytes, runtime_launch_entry_args_plan(runtime).descriptor_bytes_when_launched);
+    EXPECT_GT(slot.published_prefix_bytes, 0U);
 }
 
 // Both routes send exactly one descriptor copy, and the launch route's is the
@@ -601,8 +717,7 @@ TEST_F(LaunchEntryArgs, AReplacementAllocationInheritsNoRecord) {
 // is one no record covers: a first publication onto the block, a fallback, and
 // the first launch-route publication.
 TEST_F(LaunchEntryArgs, EitherRouteSendsExactlyOneCopy) {
-    // Take the first publication out of the way: it carries the whole
-    // initialized prefix whichever route is permitted.
+    // Establish initialized shared storage and a prior descriptor publication.
     ASSERT_EQ(run_once(false), 0);
     ASSERT_TRUE(slot.workers_initialized);
     helper.release_run_view();
@@ -626,24 +741,18 @@ TEST_F(LaunchEntryArgs, EitherRouteSendsExactlyOneCopy) {
     EXPECT_LT(rts.last_copy_bytes, descriptor_route_bytes);
 }
 
-// The first publication onto a block sends the whole initialized prefix, entry
-// storage included, so it stays on the descriptor route even when the launch
-// route is permitted — the values are already in the copy.
-TEST_F(LaunchEntryArgs, TheFirstPublicationOntoABlockStaysOnTheDescriptor) {
+TEST_F(LaunchEntryArgs, FreshDescriptorCanUseLaunchEnvelopeAfterSharedInitialization) {
     ASSERT_EQ(run_once(true), 0);
+    EXPECT_EQ(rts.shared_initializations, 1);
     EXPECT_EQ(rts.copies, 1);
-    EXPECT_EQ(rts.last_copy_bytes, runtime_device_initialized_prefix_size(runtime));
-    EXPECT_EQ(helper.launch_payload_bytes(), sizeof(KernelArgs));
-    EXPECT_EQ(device_descriptor().entry_args_source_, static_cast<uint32_t>(EntryArgsSource::Descriptor))
-        << "values sent inside the prefix must not also be claimed as launch arguments";
-
-    // Only a reuse takes the launch route, and it publishes less than the
-    // initialization did.
+    EXPECT_EQ(rts.last_copy_bytes, runtime_launch_entry_args_plan(runtime).descriptor_bytes_when_launched);
+    EXPECT_EQ(helper.launch_payload_bytes(), LAUNCH_ENVELOPE_HEADER_BYTES);
+    EXPECT_EQ(device_descriptor().entry_args_source_, static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope));
     helper.release_run_view();
     rts = {};
     ASSERT_EQ(run_once(true), 0);
-    EXPECT_EQ(rts.copies, 1);
-    EXPECT_LT(rts.last_copy_bytes, runtime_device_initialized_prefix_size(runtime));
+    EXPECT_EQ(rts.shared_initializations, 0);
+    EXPECT_EQ(rts.copies, 0);
 }
 
 // The production publication step, driven through `publish_for_launch` — the
@@ -672,8 +781,7 @@ TEST_F(LaunchEntryArgs, EveryCaptureAnswerRoutesThroughTheProductionPublishStep)
     int stream_storage = 0;
     auto *stream = static_cast<rtStream_t>(&stream_storage);
 
-    // Initialize the block first: a first publication carries the whole prefix
-    // and stays on the descriptor whatever the query says.
+    // Establish a prior publication before varying the capture query.
     capture = {};
     ASSERT_EQ(prepare(), 0);
     ASSERT_EQ(publish_for_launch(helper, stream, rts.sink), 0);
@@ -692,11 +800,14 @@ TEST_F(LaunchEntryArgs, EveryCaptureAnswerRoutesThroughTheProductionPublishStep)
         EXPECT_EQ(capture.queries, 1) << "the permit asks once, and never retries";
         EXPECT_EQ(capture.last_stream, stream) << "it must ask about the stream the launch will submit on";
         EXPECT_TRUE(helper.runtime_args_published());
-        EXPECT_EQ(rts.copies, 1);
+        EXPECT_EQ(rts.copies, answer.expect_launch_route ? 0 : 1);
 
         const bool launched = answer.expect_launch_route;
         if (launched) {
-            EXPECT_GT(helper.launch_payload_bytes(), sizeof(KernelArgs));
+            EXPECT_EQ(
+                helper.launch_payload_bytes(),
+                LAUNCH_ENVELOPE_HEADER_BYTES + runtime_launch_entry_args_plan(runtime).payload_bytes
+            );
         } else {
             EXPECT_EQ(helper.launch_payload_bytes(), sizeof(KernelArgs));
         }
@@ -772,14 +883,15 @@ TEST_F(LaunchEntryArgs, KernelAdmissionRejectsNonFullMaintenanceBeforePacketCons
     runtime.set_active_callable_id(3);
     runtime.set_orch_args(entry_args(0, 1, 73));
     helper.args.run_result_epoch = 19;
-    ASSERT_EQ(prepare(), 0);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
     ASSERT_EQ(helper.prepare_kernel_invocation({3, 7, 0, 1}), 0);
     ASSERT_EQ(publish(true), 0);
-    PlatformEntryArgs view{
-        helper.launch_payload(), LAUNCH_ENVELOPE_HEADER_BYTES, 0, 1,
-        static_cast<uint32_t>(EntryArgsSource::KernelInvocation)
-    };
-    const auto *resident = reinterpret_cast<const Runtime *>(slot.runtime_args);
+    auto copied = copy_launch();
+    const auto &header = *static_cast<const KernelArgs *>(copied.data());
+    auto view = entry_view(header);
+    RuntimeLaunchView owner;
+    const auto *resident = owner.bind(header);
+    ASSERT_NE(resident, nullptr);
     simpler::tmr::EntryArgsStorage output{};
     for (uint32_t policy : {1u, 2u, 99u}) {
         view.cache_maintenance = policy;

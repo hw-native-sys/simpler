@@ -48,6 +48,7 @@
 #include "call_config.h"
 #include "chip_callable_layout.h"
 #include "common/core_type.h"
+#include "common/aicore_runtime_packet.h"
 #include "common/host_api.h"
 #include "common/platform_config.h"
 #include "common/sdma_warmup_layout.h"
@@ -355,38 +356,6 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
 
     LaunchTransactionResult transaction;
     try {
-        if (!outcome.prepared->recording && outcome.prepared->dfx.diagnostics_any()) {
-            std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
-            for (auto &[key, reference] : external_run_references_) {
-                if (reference->identity != outcome.prepared->identity) continue;
-                if (reference->scope_stats_window) {
-                    scope_stats_collector_.abandon_run(reference->identity.run_epoch);
-                    reference->scope_stats_window = false;
-                }
-                if (reference->swimlane_window) {
-                    if (!chip_swimlane_collector_.abandon_run(reference->identity.run_epoch)) {
-                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
-                        return outcome;
-                    }
-                    reference->swimlane_window = false;
-                }
-                if (reference->args_dump_window) {
-                    if (!dump_collector_.abandon_run(reference->identity.run_epoch)) {
-                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
-                        return outcome;
-                    }
-                    reference->args_dump_window = false;
-                }
-                if (reference->pmu_window) {
-                    if (!pmu_collector_.abandon_run(reference->identity.run_epoch)) {
-                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
-                        return outcome;
-                    }
-                    pmu_lease_.release(reference->identity.run_epoch);
-                    reference->pmu_window = false;
-                }
-            }
-        }
         transaction = launch_execution_impl(*outcome.prepared, std::move(permit));
     } catch (...) {
         // Backend exceptions carry no proof that the device saw no submission.
@@ -397,7 +366,8 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
     outcome.progress = transaction.progress;
     outcome.receipt = std::move(transaction.receipt);
     if (transaction.progress == LaunchProgress::NotStarted) {
-        withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
+        if (!outcome.prepared->diagnostic_window_open)
+            withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
         bool caller_retired = false;
         try {
             caller_retired = submission_storage_[outcome.prepared->pipeline_slot]->caller_order->retire(
@@ -417,7 +387,7 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
         outcome.active = std::move(active);
     }
     const auto *execution = outcome.active ? outcome.active->prepared.get() : outcome.prepared.get();
-    if (outcome.poisoned() && (execution == nullptr || !execution->recording)) {
+    if (outcome.poisoned() && (execution == nullptr || !execution->caller_owns_submission)) {
         // Ownership and the launch result survive a failure in recovery itself.
         try {
             recover_device_or_mark_unusable(outcome.rc);
@@ -427,6 +397,10 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
 }
 
 DeviceRunnerBase::DeviceRunnerBase() {
+    heap_pool_ =
+        std::make_shared<ScratchPool>(&arena_alloc_trampoline, &arena_free_trampoline, this, [this](void *raw) {
+            on_heap_released(raw);
+        });
     // The sub-owners exist before the first grant is committed, because the
     // commit hands each of them its own per-set storage.
     queued_waits_ = std::make_unique<QueuedStreamWaits>(make_acl_event_ops());
@@ -454,7 +428,7 @@ DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_
     for (auto &storage : staged.temporary_storage)
         storage = std::make_shared<PreparedRunResources::TemporaryStorage>();
     staged.graph_definition_staging = RunResourceSlots<RetainedGraphStaging>::build(granted);
-    staged.scheduler_state_storage = RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>>::build(granted);
+    staged.scheduler_state_storage = RunResourceSlots<SchedulerBindStorage>::build(granted);
     staged.orchestration_scratch = RunResourceSlots<std::shared_ptr<void>>::build(granted);
     staged.prepare_plans = RunResourceSlots<std::shared_ptr<void>>::build(granted);
     staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
@@ -466,6 +440,7 @@ DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_
     staged.device_run_timing = RunResourceSlots<DeviceRunTiming>::build(granted);
     staged.device_timing_armed = RunResourceSlots<bool>::build(granted);
     staged.host_phase_runs = RunResourceSlots<HostPhaseRunState>::build(granted);
+    staged.run_resource_costs = RunResourceSlots<RunResourceCost>::build(granted);
     staged.run_boundaries_observed = RunBoundaryLedger::build(granted);
 
     // Arena banks carry constructor arguments. Built here rather than filled
@@ -507,6 +482,7 @@ void DeviceRunnerBase::commit_run_resources(size_t granted, RunResourceStaging &
     device_run_timing_.commit(std::move(staged.device_run_timing));
     device_timing_armed_.commit(std::move(staged.device_timing_armed));
     host_phase_runs_.commit(std::move(staged.host_phase_runs));
+    run_resource_costs_.commit(std::move(staged.run_resource_costs));
     run_boundaries_observed_.commit(std::move(staged.run_boundaries_observed));
     if (queued_waits_ != nullptr) queued_waits_->commit(std::move(staged.queued_waits));
     if (boundary_marks_ != nullptr) boundary_marks_->commit(std::move(staged.boundary_marks));
@@ -538,8 +514,8 @@ bool DeviceRunnerBase::set_run_resource_grant(size_t granted) {
         }
     }
     for (const std::shared_ptr<ArenaBank> &bank : arena_banks_) {
-        if (bank != nullptr &&
-            (bank->gm_heap.is_committed() || bank->gm_sm.is_committed() || bank->runtime_pool.is_committed())) {
+        if (bank != nullptr && (bank->gm_heap->arena.is_committed() || bank->gm_sm->arena.is_committed() ||
+                                bank->runtime_pool->arena.is_committed())) {
             return false;
         }
     }
@@ -567,7 +543,7 @@ bool DeviceRunnerBase::set_run_resource_grant(size_t granted) {
 uint64_t DeviceRunnerBase::arena_bank_gm_heap_base(uint32_t bank_id) const {
     if (bank_id >= arena_banks_.size()) return 0;
     const ArenaBank &bank = *arena_banks_[bank_id];
-    return bank.gm_heap.is_committed() ? reinterpret_cast<uint64_t>(bank.gm_heap.base()) : 0;
+    return bank.gm_heap->arena.is_committed() ? reinterpret_cast<uint64_t>(bank.gm_heap->arena.base()) : 0;
 }
 
 uint64_t DeviceRunnerBase::retained_temp_addr(uint32_t slot_id) const {
@@ -643,10 +619,9 @@ bool DeviceRunnerBase::retire_caller_buffer_carrier(const void *owner, const Nat
             return entry.owner == owner && entry.identity == identity && identity.run_epoch != 0;
         });
     if (reserved == native_run_reservations_.end()) return false;
-    std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    for (const auto &[key, reference] : external_run_references_) {
-        if (reference->identity == identity) caller_device_buffers_.detach_reference(key);
-    }
+    // Ordinary lane reservations leave slot borrows with their caller.
+    if (!reserved->independent_preparation) return true;
+    caller_device_buffers_.detach_reference(owner);
     // The reservation still belongs to this exact call; a delayed close cannot erase a successor.
     caller_device_buffers_.release(static_cast<uint64_t>(identity.pipeline_slot) + 1, false);
     return true;
@@ -788,11 +763,11 @@ void *DeviceRunnerBase::arena_region_backing(uint32_t bank_id, std::size_t regio
     const ArenaBank &bank = *arena_banks_[bank_id];
     switch (static_cast<WorkspaceManager::ArenaRegion>(region_index)) {
     case WorkspaceManager::ArenaRegion::GmHeap:
-        return bank.gm_heap.raw_backing();
+        return bank.gm_heap->arena.raw_backing();
     case WorkspaceManager::ArenaRegion::GmSm:
-        return bank.gm_sm.raw_backing();
+        return bank.gm_sm->arena.raw_backing();
     case WorkspaceManager::ArenaRegion::RuntimePool:
-        return bank.runtime_pool.raw_backing();
+        return bank.runtime_pool->arena.raw_backing();
     default:
         return nullptr;
     }
@@ -821,6 +796,17 @@ void DeviceRunnerBase::rollback_workspace_claims() {
 
 void DeviceRunnerBase::commit_workspace_claims() { AutoAdmissionState::commit_claims(); }
 
+static uint32_t bank_for_region(const RegionBanks &banks, std::size_t region_index) {
+    switch (region_index) {
+    case 0:
+        return banks.heap;
+    case 1:
+        return banks.sm;
+    default:
+        return banks.image;
+    }
+}
+
 /**
  * The facts `RunResourceGrowth` decides against, from this runner's own state.
  *
@@ -837,7 +823,8 @@ public:
         announces_(granted_) {
         reserved_ = runner_->snapshot_native_run_reservations(reservations_.data(), reservations_.size());
         for (std::size_t i = 0; i < granted_; ++i) {
-            announces_[i] = ArenaRegionAnnounce{runner_, static_cast<uint32_t>(i)};
+            const uint32_t bank = static_cast<uint32_t>(i);
+            announces_[i] = ArenaRegionAnnounce{runner_, RegionBanks{bank, bank, bank}};
         }
     }
 
@@ -874,17 +861,24 @@ public:
         ArenaBank &bank = *runner_->arena_banks_[slot];
         auto region_gave_up = [](void *ctx, std::size_t region_index, ArenaRegionDisposition what, void *base) {
             auto *a = static_cast<ArenaRegionAnnounce *>(ctx);
-            (void)region_index;
-            a->runner->note_arena_region_disposition(a->bank, what, base);
+            a->runner->note_arena_region_disposition(bank_for_region(a->banks, region_index), what, base);
         };
         void *announce_ctx = &announces_[slot];
-        out[0] =
-            ArenaRegionRequest{&bank.gm_heap, &bank.cached_gm_heap_size, 0, "gm_heap", nullptr, nullptr, region_gave_up,
-                               announce_ctx};
-        out[1] = ArenaRegionRequest{&bank.gm_sm, &bank.cached_gm_sm_size, 0,           "gm_sm", nullptr,
-                                    nullptr,     region_gave_up,          announce_ctx};
+        out[0] = ArenaRegionRequest{
+            &bank.gm_heap->arena, &bank.gm_heap->cached_size, 0, "gm_heap", nullptr, nullptr, region_gave_up,
+            announce_ctx
+        };
+        out[1] = ArenaRegionRequest{
+            &bank.gm_sm->arena, &bank.gm_sm->cached_size, 0, "gm_sm", nullptr, nullptr, region_gave_up, announce_ctx
+        };
         out[2] = ArenaRegionRequest{
-            &bank.runtime_pool, &bank.cached_runtime_arena_size, 0, "runtime_pool", nullptr, nullptr, region_gave_up,
+            &bank.runtime_pool->arena,
+            &bank.runtime_pool->cached_size,
+            0,
+            "runtime_pool",
+            nullptr,
+            nullptr,
+            region_gave_up,
             announce_ctx
         };
         return kRegionCount;
@@ -897,6 +891,8 @@ public:
     }
 
     void withdraw_run_resource_proof(uint32_t slot) override { runner_->clear_run_resource_proof(slot); }
+
+    void trim_idle_scratch() override {}  // Fixed heap backing belongs to the context.
 
     int reclaim_obsolete() override { return runner_->reclaim_workspace_obsolete(); }
 
@@ -962,7 +958,10 @@ void DeviceRunnerBase::note_run_resources_proven(uint32_t pipeline_slot, std::ui
     if (!auto_admission_.enabled()) return;
     const AutoAdmissionState::SlotPlan plan = auto_admission_.plan(pipeline_slot);
     if (plan.epoch == run_epoch) auto_admission_.release_growth_token(pipeline_slot);
-    auto_admission_.note_proven(pipeline_slot);
+    RunResourceCost cost;
+    if (const RunResourceCost *recorded = run_resource_costs_.find(pipeline_slot); recorded != nullptr)
+        cost = *recorded;
+    auto_admission_.note_proven(pipeline_slot, cost);
     // The claims are the run's own references now; nothing is given back.
     commit_workspace_claims();
     prepare_plans_[pipeline_slot].reset();
@@ -970,14 +969,20 @@ void DeviceRunnerBase::note_run_resources_proven(uint32_t pipeline_slot, std::ui
 }
 
 int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) {
-    if (!auto_admission_.enabled()) return 0;
+    if (!auto_admission_.enabled()) {
+        release_heap_lease(pipeline_slot);
+        return 0;
+    }
     if (pipeline_slot >= temporary_storage_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const AutoAdmissionState::SlotPlan plan = auto_admission_.plan(pipeline_slot);
     // Already gone, or taken over by a later run: nothing of this epoch's is
     // held, so the caller's unwind has nothing to do and may say so. Epoch zero
     // names whatever plan the slot holds, which is what a caller abandoning a
     // run whose prepare never returned an identity can say.
-    if (plan.phase == AutoAdmissionState::Phase::None) return 0;
+    if (plan.phase == AutoAdmissionState::Phase::None) {
+        release_heap_lease(pipeline_slot);
+        return 0;
+    }
     if (run_epoch != 0 && plan.epoch != run_epoch) return 0;
     const std::uint64_t epoch = plan.epoch;
     // A plan whose run could still have reached the device is not a plan to
@@ -992,6 +997,7 @@ int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_e
         );
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
+    release_heap_lease(pipeline_slot);
     release_plan_epoch_refs(pipeline_slot, epoch);
     prepare_plans_[pipeline_slot].reset();
     if (plan.plan_stamped) {
@@ -1004,17 +1010,16 @@ int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_e
     return 0;
 }
 
-int DeviceRunnerBase::reference_bank_arenas(
-    uint32_t arena_bank, const ArenaRegionRequest *requests, std::size_t count
-) {
+int DeviceRunnerBase::reference_bank_arenas(RegionBanks banks, const ArenaRegionRequest *requests, std::size_t count) {
     for (std::size_t i = 0; i < count; ++i) {
         const DeviceArena *arena = requests[i].arena;
         // A region asked to hold nothing has no backing and no consumer. Its
         // previous block was reported detached by the transaction, so nothing
         // here has to speak for it.
         if (arena == nullptr || !arena->is_committed()) continue;
+        const uint32_t bank = bank_for_region(banks, i);
         const WorkspaceManager::RegionKey region =
-            WorkspaceManager::arena_region(arena_bank, static_cast<WorkspaceManager::ArenaRegion>(i));
+            WorkspaceManager::arena_region(bank, static_cast<WorkspaceManager::ArenaRegion>(i));
         // The ledger is keyed by what its own allocation callback handed over,
         // which is the raw block — `base()` is the forward-aligned address
         // inside it and is not the same value when the platform returns an
@@ -1041,7 +1046,7 @@ int DeviceRunnerBase::reference_bank_arenas(
             why = "its release was attempted and the outcome is unconfirmed: ownership of the allocation is unknown";
         }
         LOG_ERROR(
-            "setup_static_arena: bank %u region %s could not register this run as a consumer of %p: %s", arena_bank,
+            "setup_static_arena: bank %u region %s could not register this run as a consumer of %p: %s", bank,
             requests[i].name, owned, why
         );
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1173,7 +1178,7 @@ bool DeviceRunnerBase::workspace_report(SimplerWorkspaceReport *out) const { ret
 int DeviceRunnerBase::detach_retained_temporary(uint32_t slot) {
     std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
     auto &current = temporary_storage_[slot];
-    if (current.use_count() == 1) {
+    if (current->run_leases.load(std::memory_order_relaxed) == 0) {
         current->backing.reset();
         return 0;
     }
@@ -1342,9 +1347,11 @@ int DeviceRunnerBase::acquire_graph_staging(
     return 0;
 }
 
-int DeviceRunnerBase::stage_launch_metadata(uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count) {
+int DeviceRunnerBase::stage_launch_metadata(
+    uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count, std::vector<HbgImageReference> *owner
+) {
     if (pipeline_slot >= submission_storage_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    return submission_storage_[pipeline_slot]->args.staged_launch_metadata.prepare(regions, count);
+    return submission_storage_[pipeline_slot]->args.staged_launch_metadata.prepare(regions, count, true, owner);
 }
 
 int DeviceRunnerBase::publish_graph_section(
@@ -1387,7 +1394,14 @@ int DeviceRunnerBase::acquire_scheduler_state_storage(
     }
 
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    auto &storage = scheduler_state_storage_[pipeline_slot];
+    auto &bind = scheduler_state_storage_[pipeline_slot];
+    void *host = nullptr;
+    if (device_out == nullptr || host_out == nullptr || bind.host.acquire(bytes, alignment, &host) != 0) return -1;
+    // Swimlane collection reads back this run's scheduler state after execution.
+    const bool reported = host_phase_runs_[pipeline_slot].chip_swimlane_level != ChipSwimlaneLevel::DISABLED;
+    std::shared_ptr<RetainedSchedulerStorage> reported_storage;
+    auto &storage = reported ? reported_storage : shared_scheduler_state_;
+    if (reported) retired_prepared_schedulers_.reserve(retired_prepared_schedulers_.size() + 1);
     const RetainedSchedulerStorage::Status status = PreparedRunResources::acquire_scheduler(
         storage, retired_prepared_schedulers_, bytes, alignment,
         [this](size_t raw_bytes) -> void * {
@@ -1400,19 +1414,16 @@ int DeviceRunnerBase::acquire_scheduler_state_storage(
         [this](void *ptr) {
             return mem_alloc_.free(ptr);
         },
-        device_out, host_out
+        device_out
     );
     if (status == RetainedSchedulerStorage::Status::Ok) {
-        // Not a failure of this acquire: the slot kept a block it could not
-        // release, the allocator still tracks and counts it, and the slot
-        // refuses to grow until its terminal release.
+        if (reported) retired_prepared_schedulers_.push_back(storage);
+        bind.device = storage;
+        *host_out = host;
+        // A failed free leaves the superseded block tracked until teardown.
         void *held = storage->held_after_failed_release();
         if (held != nullptr) {
-            LOG_WARN(
-                "scheduler-state storage: slot %u still holds device block %p from a failed release; the allocator "
-                "owns it and this slot refuses further growth",
-                pipeline_slot, held
-            );
+            LOG_WARN("scheduler-state storage: retained device block %p after failed release", held);
         }
         return 0;
     }
@@ -1424,39 +1435,15 @@ int DeviceRunnerBase::acquire_scheduler_state_storage(
 }
 
 int DeviceRunnerBase::release_scheduler_state_storage() {
-    int first_error = 0;
-    uint32_t slot = 0;
-    for (auto &entry : scheduler_state_storage_) {
-        if (!entry) {
-            ++slot;
-            continue;
-        }
-        if (entry.use_count() > 1) return PTO_RUNTIME_ERR_INVALID_STATE;
-        const int rc = entry->release([this, slot](void *ptr) {
-            const int free_rc = mem_alloc_.free(ptr);
-            if (free_rc != 0) {
-                // Recorded before the entry is cleared. The address stays in
-                // the allocator's tracking map with its bytes still committed,
-                // so reclamation is unknown rather than proven and the block
-                // reaches the allocator's own terminal sweep.
-                LOG_ERROR(
-                    "scheduler-state storage: release of slot %u device block %p failed: %d; it stays committed in "
-                    "the allocator for its terminal sweep",
-                    slot, ptr, free_rc
-                );
-            }
-            return free_rc;
-        });
-        if (rc != 0 && first_error == 0) first_error = rc;
-        ++slot;
-    }
-    return first_error;
+    if (!shared_scheduler_state_) return 0;
+    if (shared_scheduler_state_.use_count() != 1) return PTO_RUNTIME_ERR_INVALID_STATE;
+    return shared_scheduler_state_->release([this](void *ptr) {
+        return mem_alloc_.free(ptr);
+    });
 }
 
 void DeviceRunnerBase::abandon_scheduler_state_storage() {
-    for (auto &entry : scheduler_state_storage_) {
-        if (entry) entry->abandon();
-    }
+    if (shared_scheduler_state_) shared_scheduler_state_->abandon();
     for (auto &entry : retired_prepared_schedulers_)
         entry->abandon();
     retired_prepared_schedulers_.clear();
@@ -1510,7 +1497,7 @@ void DeviceRunnerBase::release_graph_definition_staging() {
 int DeviceRunnerBase::clear_temporary_buffer() {
     int first = 0;
     for (auto &storage : temporary_storage_) {
-        if (storage.use_count() > 1) return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (storage->run_leases.load(std::memory_order_relaxed) != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
         const int rc = storage->release(workspace_, [this](void *ptr) {
             const int unmap_rc = drop_child_memory_host_view(ptr);
             return unmap_rc != 0 ? unmap_rc : mem_alloc_.free(ptr);
@@ -1520,23 +1507,54 @@ int DeviceRunnerBase::clear_temporary_buffer() {
     return first;
 }
 
-void *DeviceRunnerBase::acquire_pooled_gm_heap(uint32_t arena_bank) {
+void *DeviceRunnerBase::acquire_pooled_gm_heap(uint32_t pipeline_slot, uint32_t arena_bank) {
+    {
+        std::lock_guard<std::mutex> lock(heap_lease_mutex_);
+        if (pipeline_slot < heap_leases_.size() && heap_leases_[pipeline_slot].valid())
+            return heap_leases_[pipeline_slot].base;
+    }
     if (arena_bank >= arena_banks_.size()) return nullptr;
-    DeviceArena &arena = this->arena_bank(arena_bank).gm_heap;
+    DeviceArena &arena = this->arena_bank(arena_bank).gm_heap->arena;
     if (!arena.is_committed()) return nullptr;
     return arena.base();
 }
 
+void *DeviceRunnerBase::prepared_heap_base(uint32_t pipeline_slot, uint64_t run_epoch) const {
+    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
+    for (const auto &entry : prepared_uses_) {
+        if (entry.identity.pipeline_slot == pipeline_slot && entry.identity.run_epoch == run_epoch)
+            return entry.use.resources()->heap_lease_.base;
+    }
+    return nullptr;
+}
+
+void DeviceRunnerBase::release_heap_lease(uint32_t pipeline_slot) {
+    ScratchPool::Lease lease;
+    {
+        std::lock_guard<std::mutex> lock(heap_lease_mutex_);
+        if (pipeline_slot >= heap_leases_.size()) return;
+        lease = heap_leases_[pipeline_slot];
+        heap_leases_[pipeline_slot] = {};
+    }
+    if (lease.valid() && heap_pool_) heap_pool_->release(lease);
+}
+
+void DeviceRunnerBase::on_heap_released(void *raw) {
+    if (workspace_.enabled() && raw != nullptr) workspace_.note_unpublished(raw);
+    std::lock_guard<std::mutex> lock(heap_backing_mutex_);
+    heap_backing_ = {};
+}
+
 void *DeviceRunnerBase::acquire_pooled_gm_sm(uint32_t arena_bank) {
     if (arena_bank >= arena_banks_.size()) return nullptr;
-    DeviceArena &arena = this->arena_bank(arena_bank).gm_sm;
+    DeviceArena &arena = this->arena_bank(arena_bank).gm_sm->arena;
     if (!arena.is_committed()) return nullptr;
     return arena.base();
 }
 
 void *DeviceRunnerBase::acquire_pooled_runtime_arena(uint32_t arena_bank) {
     if (arena_bank >= arena_banks_.size()) return nullptr;
-    DeviceArena &arena = this->arena_bank(arena_bank).runtime_pool;
+    DeviceArena &arena = this->arena_bank(arena_bank).runtime_pool->arena;
     if (!arena.is_committed()) return nullptr;
     return arena.base();
 }
@@ -1565,11 +1583,14 @@ void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
 }
 
 int DeviceRunnerBase::setup_static_arena(
-    uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    uint32_t pipeline_slot, RegionBanks banks, bool pooled_heap, size_t gm_heap_size, size_t gm_sm_size,
+    size_t runtime_arena_size, bool shared_runtime_arena
 ) {
-    if (arena_bank >= arena_banks_.size()) {
-        LOG_ERROR("arena bank %u is outside [0, %zu)", arena_bank, arena_banks_.size());
-        return PTO_RUNTIME_ERR_INTERNAL;
+    for (uint32_t bank : {banks.heap, banks.sm, banks.image}) {
+        if (bank >= arena_banks_.size()) {
+            LOG_ERROR("arena bank %u is outside [0, %zu)", bank, arena_banks_.size());
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
     }
     // Context prewarm reaches this function without a prepare transaction. The
     // region setters only target an active scope, so establish a context-epoch
@@ -1583,6 +1604,83 @@ int DeviceRunnerBase::setup_static_arena(
             LOG_ERROR("setup_static_arena: context workspace plan initialization failed");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+    }
+    ScratchPool::Lease pool_lease;
+    bool lease_held = false;
+    auto release_pool_lease = RAIIScopeGuard([&]() {
+        if (lease_held && heap_pool_) heap_pool_->release(pool_lease);
+    });
+    if (pooled_heap) {
+        const size_t configured = heap_pool_->capacity();
+        if (configured != 0 && configured != gm_heap_size) {
+            LOG_ERROR(
+                "HBG heap capacity is fixed: requested=%zu configured=%zu bytes; create a new context to change it",
+                gm_heap_size, configured
+            );
+            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        }
+        const uint32_t heap_bank = banks.heap;
+        set_workspace_plan_region(WorkspaceManager::arena_region(heap_bank, WorkspaceManager::ArenaRegion::GmHeap));
+        set_workspace_plan_region_backing(arena_region_backing(heap_bank, 0));
+        if (!heap_pool_->covers(gm_heap_size) && auto_admission_.enabled()) {
+            const int permission = claim_growth_permission(
+                pipeline_slot, workspace_prepare_state().epoch, AutoAdmissionState::Phase::Committing
+            );
+            if (permission != 0) return permission;
+        }
+        struct PoolAttempt {
+            DeviceRunnerBase *runner;
+            size_t bytes;
+            ScratchPool::Lease *lease;
+        } pool_attempt{this, gm_heap_size, &pool_lease};
+        const auto stage_pool = [](void *ctx) -> GrowthAttempt {
+            auto *a = static_cast<PoolAttempt *>(ctx);
+            if (active_workspace_plan()) active_workspace_plan()->last_refusal = WorkspaceManager::AcquireRefusal::None;
+            ScratchPool::Lease lease;
+            const int rc = a->runner->heap_pool_->acquire(a->bytes, &lease);
+            if (rc == 0) {
+                *a->lease = lease;
+                return GrowthAttempt::Served;
+            }
+            return classify_growth_refusal(workspace_prepare_state().last_refusal);
+        };
+        const GrowthAttempt growth =
+            grow_with_one_retry(pipeline_slot, /*rollback_before_retry=*/true, stage_pool, &pool_attempt);
+        if (growth != GrowthAttempt::Served) {
+            const bool manual_quota =
+                !auto_admission_.enabled() && growth == GrowthAttempt::Refused &&
+                workspace_prepare_state().last_refusal == WorkspaceManager::AcquireRefusal::OverQuota;
+            const int refusal =
+                report_growth_refusal(pipeline_slot, AutoAdmissionState::Phase::Committing, gm_heap_size, growth);
+            rollback_workspace_claims();
+            if (refusal != 0) return refusal;
+            if (manual_quota) return SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        lease_held = true;
+        if (workspace_.enabled()) {
+            const WorkspaceManager::RegionKey region =
+                WorkspaceManager::arena_region(heap_bank, WorkspaceManager::ArenaRegion::GmHeap);
+            if (!workspace_.reference(pool_lease.raw, workspace_prepare_state().epoch)) {
+                LOG_ERROR(
+                    "setup_static_arena: pooled heap %p could not register this run as a consumer", pool_lease.raw
+                );
+                rollback_workspace_claims();
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+            workspace_.note_published(region, pool_lease.raw);
+            commit_workspace_claims();
+            auto backing = workspace_.retain_backing(pool_lease.raw);
+            if (!backing) {
+                rollback_workspace_claims();
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+            std::lock_guard<std::mutex> lock(heap_backing_mutex_);
+            heap_backing_ = std::move(backing);
+        }
+        gm_heap_size = 0;
+    } else {
+        release_heap_lease(pipeline_slot);
     }
     // Three independent device_malloc'd buffers: GM heap, shared memory,
     // prebuilt runtime arena. Split out from a single large allocation because
@@ -1598,61 +1696,76 @@ int DeviceRunnerBase::setup_static_arena(
     // together until publication.
     const int reclaim_rc = reclaim_prepared_storage();
     if (reclaim_rc != 0) return reclaim_rc;
-    auto &cached_bank = arena_banks_[arena_bank];
-    std::shared_ptr<ArenaBank> previous_bank;
-    bool bank_committed = false;
+    // Replacement is per region. Other regions in the same bank keep their
+    // current addresses, even when a prepared run retains one of them.
+    std::vector<std::pair<std::shared_ptr<ArenaRegion> *, std::shared_ptr<ArenaRegion>>> previous_regions;
+    bool regions_committed = false;
+    auto restore_regions = RAIIScopeGuard([&]() {
+        if (regions_committed || previous_regions.empty()) return;
+        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
+        for (auto &entry : previous_regions) {
+            auto retired = std::find_if(
+                retired_prepared_regions_.begin(), retired_prepared_regions_.end(), [&](const auto &retired) {
+                    return retired.holds(entry.second);
+                }
+            );
+            *entry.first = std::move(entry.second);
+            if (retired != retired_prepared_regions_.end()) retired_prepared_regions_.erase(retired);
+        }
+    });
     {
         std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        if (cached_bank.use_count() > 1) {
-            auto next = std::make_shared<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, this);
-            PreparedRunResources::RetiredArena retired;
-            const int retain_rc = retired.retain(cached_bank, workspace_);
+        for (size_t i = 0; i < 3; ++i) {
+            auto &region = arena_bank(bank_for_region(banks, i)).region(i);
+            if (region.use_count() <= 1) continue;
+            // Bind only builds the next launch's host image. A retained run
+            // can reuse the same write target until a larger layout is needed.
+            if (i == 2 && shared_runtime_arena && runtime_arena_size != 0 && runtime_arena_size <= region->cached_size)
+                continue;
+            if (previous_regions.empty()) {
+                previous_regions.reserve(3);
+                retired_prepared_regions_.reserve(retired_prepared_regions_.size() + 3);
+            }
+            auto next = std::make_shared<ArenaRegion>(&arena_alloc_trampoline, &arena_free_trampoline, this);
+            PreparedRunResources::RetiredRegion retired;
+            const int retain_rc = retired.retain(region, workspace_);
             if (retain_rc != 0) return retain_rc;
-            retired_prepared_arenas_.push_back(std::move(retired));
-            previous_bank = cached_bank;
-            cached_bank = std::move(next);
+            retired_prepared_regions_.push_back(std::move(retired));
+            previous_regions.emplace_back(&region, region);
+            region = std::move(next);
             prebuilt_runtime_arena_cache_.invalidate();
         }
     }
-    auto restore_bank = RAIIScopeGuard([&]() {
-        if (previous_bank && !bank_committed) {
-            std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-            // Other banks can retire while this allocation transaction runs.
-            auto retired =
-                std::find_if(retired_prepared_arenas_.begin(), retired_prepared_arenas_.end(), [&](const auto &entry) {
-                    return entry.holds(previous_bank);
-                });
-            cached_bank = std::move(previous_bank);
-            if (retired != retired_prepared_arenas_.end()) retired_prepared_arenas_.erase(retired);
-        }
-    });
-    ArenaBank &bank = this->arena_bank(arena_bank);
+    ArenaBank &heap_bank = arena_bank(banks.heap);
+    ArenaBank &sm_bank = arena_bank(banks.sm);
+    ArenaBank &image_bank = arena_bank(banks.image);
 
     // The ledger keys a block by the one region that owns it, and the arena
     // allocation callback sees only a byte count, so each region names itself
     // just before its own backing is staged.
-    ArenaRegionAnnounce announce{this, arena_bank};
+    ArenaRegionAnnounce announce{this, banks};
     auto name_region = [](void *ctx, std::size_t region_index) {
         auto *a = static_cast<ArenaRegionAnnounce *>(ctx);
+        const uint32_t bank = bank_for_region(a->banks, region_index);
         a->runner->set_workspace_plan_region(
-            WorkspaceManager::arena_region(a->bank, static_cast<WorkspaceManager::ArenaRegion>(region_index))
+            WorkspaceManager::arena_region(bank, static_cast<WorkspaceManager::ArenaRegion>(region_index))
         );
-        a->runner->set_workspace_plan_region_backing(a->runner->arena_region_backing(a->bank, region_index));
+        a->runner->set_workspace_plan_region_backing(a->runner->arena_region_backing(bank, region_index));
     };
     // The two boundaries at which a region stops publishing a block without a
     // successor taking over. Reported to the ledger, which owns the block the
     // arena is only using.
     auto region_gave_up = [](void *ctx, std::size_t region_index, ArenaRegionDisposition what, void *base) {
         auto *a = static_cast<ArenaRegionAnnounce *>(ctx);
-        (void)region_index;
-        a->runner->note_arena_region_disposition(a->bank, what, base);
+        a->runner->note_arena_region_disposition(bank_for_region(a->banks, region_index), what, base);
     };
     ArenaRegionRequest requests[] = {
-        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size, "gm_heap", name_region, &announce, region_gave_up,
-         &announce},
-        {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size, "gm_sm", name_region, &announce, region_gave_up, &announce},
-        {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool", name_region,
-         &announce, region_gave_up, &announce},
+        {&heap_bank.gm_heap->arena, &heap_bank.gm_heap->cached_size, gm_heap_size, "gm_heap", name_region, &announce,
+         region_gave_up, &announce},
+        {&sm_bank.gm_sm->arena, &sm_bank.gm_sm->cached_size, gm_sm_size, "gm_sm", name_region, &announce,
+         region_gave_up, &announce},
+        {&image_bank.runtime_pool->arena, &image_bank.runtime_pool->cached_size, runtime_arena_size, "runtime_pool",
+         name_region, &announce, region_gave_up, &announce},
     };
     constexpr size_t kRegionCount = sizeof(requests) / sizeof(requests[0]);
     // What this call would have to replace, decided before anything is staged.
@@ -1682,15 +1795,15 @@ int DeviceRunnerBase::setup_static_arena(
         DeviceRunnerBase *runner;
         ArenaRegionRequest *requests;
         std::size_t count;
-        uint32_t bank;
+        RegionBanks banks;
         BankArenaSetupOutcome outcome{};
-    } attempt{this, requests, kRegionCount, arena_bank};
+    } attempt{this, requests, kRegionCount, banks};
     const auto stage_bank = [](void *ctx) {
         auto *a = static_cast<ArenaAttempt *>(ctx);
         if (active_workspace_plan()) active_workspace_plan()->last_refusal = WorkspaceManager::AcquireRefusal::None;
         a->outcome = run_bank_arena_setup(
-            a->requests, a->count, /*owns_prebuilt_cache=*/a->bank == 0, &a->runner->prebuilt_runtime_arena_cache_,
-            DeviceArena::kDefaultBaseAlign
+            a->requests, a->count, /*owns_prebuilt_cache=*/a->banks.image == 0,
+            &a->runner->prebuilt_runtime_arena_cache_, DeviceArena::kDefaultBaseAlign
         );
         if (a->outcome.rc == 0) return GrowthAttempt::Served;
         return classify_growth_refusal(workspace_prepare_state().last_refusal);
@@ -1699,17 +1812,27 @@ int DeviceRunnerBase::setup_static_arena(
         workspace_prepare_state().pipeline_slot, /*rollback_before_retry=*/true, stage_bank, &attempt
     );
     BankArenaSetupOutcome outcome = attempt.outcome;
-    bank_committed = outcome.rc == 0;
+    regions_committed = outcome.rc == 0;
     if (outcome.rc == 0 && workspace_.enabled()) {
         // Publication transferred ownership to the regions. A later reference
         // failure must not roll those current blocks back into obsolete storage.
         commit_workspace_claims();
-        // Every region this bank now publishes is used by this plan, including
+        // Every region this run now publishes is used by this plan, including
         // the ones whose existing capacity was enough and therefore allocated
         // nothing. A plan that read and wrote a region without registering as
         // its consumer would let a later growth treat those bytes as free.
-        const int ref_rc = reference_bank_arenas(arena_bank, requests, kRegionCount);
+        const int ref_rc = reference_bank_arenas(banks, requests, kRegionCount);
         if (ref_rc != 0) return ref_rc;
+    }
+    if (outcome.rc == 0) {
+        ScratchPool::Lease previous;
+        {
+            std::lock_guard<std::mutex> lock(heap_lease_mutex_);
+            if (pipeline_slot >= heap_leases_.size()) heap_leases_.resize(pipeline_slot + 1);
+            previous = std::exchange(heap_leases_[pipeline_slot], pool_lease);
+            lease_held = false;
+        }
+        if (previous.valid()) heap_pool_->release(previous);
     }
     if (outcome.rc != 0) {
         const int failed = outcome.transaction.failed_region;
@@ -1717,9 +1840,9 @@ int DeviceRunnerBase::setup_static_arena(
         const size_t requested =
             (failed >= 0 && static_cast<size_t>(failed) < kRegionCount) ? requests[failed].requested_size : 0;
         LOG_ERROR(
-            "setup_static_arena: staging %s (%zu bytes) failed on bank %u; this bank keeps its committed addresses "
-            "and capacities",
-            name, requested, arena_bank
+            "setup_static_arena: staging %s (%zu bytes) failed on banks heap=%u sm=%u image=%u; the selected banks "
+            "keep their committed addresses and capacities",
+            name, requested, banks.heap, banks.sm, banks.image
         );
         const bool manual_quota = !auto_admission_.enabled() && growth == GrowthAttempt::Refused &&
                                   workspace_prepare_state().last_refusal == WorkspaceManager::AcquireRefusal::OverQuota;
@@ -1888,8 +2011,6 @@ int DeviceRunnerBase::finalize() {
     if (external_buffer_borrows_live()) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
-    // External release may be synchronizing a stream; reset must not overlap it.
-    std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
     // Fatal teardown stops host readers even while their backing remains held.
     if (can_accept_run() && prepared_storage_in_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (device_id_ == -1) return finalize_unbound();
@@ -2083,31 +2204,48 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
         rc = prepare_submission_slot_resources(static_cast<uint32_t>(slot));
         if (rc != 0) return rc;
     }
-    // Reserve the slot capacity before recording. The first prepare initializes
-    // its private worker state and owns any initialization failure.
+    // Reserve each slot and initialize its private workers before recording.
     for (auto &storage : submission_storage_) {
-        rc = reserve_slot_runtime_args(kernel_runtime_, mem_alloc_, storage->args, 0);
+        rc = reserve_slot_runtime_args(kernel_runtime_, mem_alloc_, storage->args, 0, /*launch_owned=*/true);
         if (rc != 0) return rc;
     }
-    return 0;
+    return prepare_spare_submission_storage(control_stream);
 }
 
-PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
-    PersistentArgsOps ops{};
-    ops.context = this;
-    ops.alloc = [](void *context, size_t bytes) -> void * {
-        return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.alloc(bytes);
-    };
-    ops.free_ = [](void *context, void *ptr) -> int {
-        return static_cast<DeviceRunnerBase *>(context)->mem_alloc_.free(ptr);
-    };
-    ops.copy_h2d = [](void *, void *dst, size_t dst_bytes, const void *src, size_t src_bytes) -> int {
-        return static_cast<int>(rtMemcpy(dst, dst_bytes, src, src_bytes, RT_MEMCPY_HOST_TO_DEVICE));
-    };
-    ops.fill_arch_fields = [](void *context, KernelArgs *args, uint64_t device_id) -> int {
-        return static_cast<DeviceRunnerBase *>(context)->fill_persistent_arch_fields(args, device_id);
-    };
-    return ops;
+int DeviceRunnerBase::prepare_spare_submission_storage(void *control_stream) {
+    // Two spare generations cover the first two replacements across all slots.
+    // Further retained models use the ordinary on-demand allocation path.
+    constexpr size_t spare_count = 2;
+    spare_submission_storage_.reserve(spare_count);
+    for (size_t i = 0; i < spare_count; ++i) {
+        auto storage = make_submission_storage();
+        auto &args = storage->args;
+        int alloc_rc = 0;
+        args.shared_state = static_cast<RuntimeSharedState *>(mem_alloc_.alloc(sizeof(RuntimeSharedState), &alloc_rc));
+        if (args.shared_state == nullptr) break;
+        spare_submission_storage_.push_back(std::move(storage));
+        if (alloc_rc != 0) return alloc_rc;
+        constexpr size_t bytes = sizeof(RuntimeSharedState::workers);
+        if constexpr (PLATFORM_BATCH_SPARE_WORKER_CLEARS) {
+            const int rc = aclrtMemsetAsync(args.shared_state, bytes, 0, bytes, control_stream);
+            if (rc != 0) return rc;
+            args.worker_initialization_pending = true;
+        } else {
+            const int rc = aclrtMemset(args.shared_state, bytes, 0, bytes);
+            if (rc != 0) return rc;
+            args.workers_initialized = true;
+        }
+    }
+    if constexpr (PLATFORM_BATCH_SPARE_WORKER_CLEARS) {
+        if (spare_submission_storage_.empty()) return 0;
+        const int rc = aclrtSynchronizeStreamWithTimeout(control_stream, timeout_config_.stream_sync_timeout_ms);
+        if (rc != 0) return rc;
+        for (auto &storage : spare_submission_storage_) {
+            storage->args.worker_initialization_pending = false;
+            storage->args.workers_initialized = true;
+        }
+    }
+    return 0;
 }
 
 int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
@@ -2118,20 +2256,6 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
     }
 
     int rc = register_callable_on_device(callable_id, control_stream);
-    if (rc != 0) return rc;
-
-    // Idempotent: only the first prepared callable allocates. The uploaded
-    // Runtime keeps its per-callable and per-invocation fields at the sentinels
-    // Runtime() sets, because no callable is bound into this image: a launch
-    // resolves its own target, and writing one here would make every launch
-    // run whichever callable was prepared first.
-    //
-    // One set of execution resources, and this context reads no pipeline depth.
-    // The kernel contract `build_kernel_pipeline_contract_impl` produces and
-    // the init entry validates declares depth 2, which nothing consumes — the
-    // number is the contract's, not this owner's, and one set is what a context
-    // admitting a single invocation at a time needs.
-    rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
     if (rc != 0) return rc;
 
     return kernel_exec_state_.mark_ready_enqueued();
@@ -2291,7 +2415,9 @@ void DeviceRunnerBase::log_run_failure(const PreparedExecution &prepared, int rc
         "pipeline_slot=%u cid=%d chip_hash=0x%lx chip_dev=0x%lx runtime_args=%p",
         device_id_, static_cast<const void *>(this), rc, prepared.identity.run_epoch, prepared.identity.generation,
         prepared.identity.dispatch_id, prepared.pipeline_slot, cid, chip_hash, chip_dev,
-        static_cast<void *>(prepared.kernel_args.args.runtime_args)
+        prepared.kernel_args.args.runtime_descriptor_bytes == 0 ?
+            static_cast<void *>(prepared.kernel_args.args.runtime_args) :
+            nullptr
     );
 }
 
@@ -2301,16 +2427,15 @@ void DeviceRunnerBase::print_handshake_results(const KernelArgsHelper &kernel_ar
     if (!HostLogger::get_instance().is_enabled(simpler::log::LogLevel::DEBUG)) {
         return;
     }
-    if (stream_aicpu_ == nullptr || worker_count <= 0 || kernel_args.args.runtime_args == nullptr) {
+    if (stream_aicpu_ == nullptr || worker_count <= 0 || kernel_args.shared_state() == nullptr) {
         return;
     }
 
     // Allocate temporary buffer to read handshake data from device
     std::vector<Handshake> workers(worker_count);
     size_t total_size = sizeof(Handshake) * static_cast<size_t>(worker_count);
-    int rc = rtMemcpy(
-        workers.data(), total_size, kernel_args.args.runtime_args->get_workers(), total_size, RT_MEMCPY_DEVICE_TO_HOST
-    );
+    int rc =
+        rtMemcpy(workers.data(), total_size, kernel_args.shared_state()->workers, total_size, RT_MEMCPY_DEVICE_TO_HOST);
     if (rc != 0) {
         // The buffer holds no device content on this path, so it is not
         // printed. A diagnostic read carries no run verdict.
@@ -3030,7 +3155,7 @@ extern "C" int bind_callable_to_runtime_impl(
     const uint64_t *ring_dep_pool
 );
 
-int DeviceRunnerBase::validate_capture_prepare_args(int32_t callable_id, const void *args) const {
+int DeviceRunnerBase::validate_caller_submission_args(int32_t callable_id, const void *args) const {
     if (args == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const auto found = callables_.find(callable_id);
     if (found == callables_.end()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
@@ -3042,7 +3167,6 @@ int DeviceRunnerBase::validate_capture_prepare_args(int32_t callable_id, const v
         const auto &tensor = call.tensor(i);
         if (tensor.address_space == AddressSpace::HOST && tensor.transfer == TensorTransfer::NONE &&
             signature[i] != ArgDirection::IN) {
-            LOG_ERROR("capture preparation: HOST/NONE argument %d must be read-only", i);
             return PTO_RUNTIME_ERR_UNSUPPORTED;
         }
     }
@@ -3211,17 +3335,17 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (abandon_device_resources) {
         if (!prepared_resources_can_abandon()) return PTO_RUNTIME_ERR_INVALID_STATE;
         std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        for (const auto &[key, reference] : external_run_references_)
-            caller_device_buffers_.release_reference(key, true);
-        external_run_references_.clear();
         prepared_uses_.clear();
     } else if (prepared_storage_in_use()) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
+    // A failed bind may still hold its selected generation before publication.
+    for (auto &bind : scheduler_state_storage_)
+        bind = {};
     if (abandon_device_resources) {
-        for (auto &bank : retired_prepared_arenas_)
+        for (auto &bank : retired_prepared_regions_)
             bank.abandon_after_device_failure();
-        retired_prepared_arenas_.clear();
+        retired_prepared_regions_.clear();
         for (auto &storage : retired_temporary_storage_)
             storage->abandon();
         retired_temporary_storage_.clear();
@@ -3231,6 +3355,12 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     } else {
         const int retired_rc = reclaim_prepared_storage();
         if (retired_rc != 0) return retired_rc;
+    }
+    // A partially initialized spare may still have work on the control stream.
+    while (!spare_submission_storage_.empty()) {
+        const int rc = release_submission_storage(*spare_submission_storage_.back(), abandon_device_resources);
+        if (rc != 0) return rc;
+        spare_submission_storage_.pop_back();
     }
     if (!abandon_device_resources && execution_mode_latch().is_kernel()) {
         const int rc = kernel_exec_state_.begin_close();
@@ -3437,16 +3567,31 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // allocator, not after it.
     for (auto &bank : arena_banks_) {
         if (abandon_device_resources) {
-            bank->gm_heap.abandon_after_device_failure();
-            bank->gm_sm.abandon_after_device_failure();
-            bank->runtime_pool.abandon_after_device_failure();
+            bank->gm_heap->arena.abandon_after_device_failure();
+            bank->gm_sm->arena.abandon_after_device_failure();
+            bank->runtime_pool->arena.abandon_after_device_failure();
         } else {
-            bank->gm_heap.release();
-            bank->gm_sm.release();
-            bank->runtime_pool.release();
+            bank->gm_heap->arena.release();
+            bank->gm_sm->arena.release();
+            bank->runtime_pool->arena.release();
         }
     }
     prebuilt_runtime_arena_cache_.invalidate();
+    if (heap_pool_) {
+        if (abandon_device_resources) {
+            heap_pool_->abandon();
+        } else {
+            heap_pool_->reset();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(heap_lease_mutex_);
+        heap_leases_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(heap_backing_mutex_);
+        heap_backing_ = {};
+    }
 
     if (abandon_device_resources) {
         abandon_scheduler_state_storage();
@@ -3468,9 +3613,24 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // Host observations retire independently of the retained device targets.
     // Their backing is released with submission storage below.
     device_timing_armed_.fill(false);
-    {
+    if (abandon_device_resources) {
         std::lock_guard<std::mutex> lock(run_result_mu_);
         run_result_storage_.clear();
+        reported_pool_.abandon();
+    } else {
+        int result_rc = 0;
+        {
+            std::lock_guard<std::mutex> lock(run_result_mu_);
+            for (auto &entry : run_result_storage_) {
+                result_rc = read_result_evidence(entry.second);
+                if (result_rc != 0) break;
+            }
+            // Keep every epoch until all evidence reads succeed, so retrying
+            // finalize can still reach an unobserved region.
+            if (result_rc == 0) run_result_storage_.clear();
+        }
+        capture(result_rc);
+        if (result_rc == 0) capture(reported_pool_.finalize());
     }
 
     // The AICore register-address tables are device constants committed once per
@@ -3513,20 +3673,10 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // must not bypass these owners.
     if (rc != 0 && !abandon_device_resources) return rc;
 
-    // Kernel-mode context resources. The argument blocks route through
-    // mem_alloc_, so they are released before its finalize below; the streams
-    // and events do not, and go after them so a caller that inspects the
-    // teardown sees arguments released while their owning context still
-    // exists. Both are no-ops on a program-mode context.
-    if (abandon_device_resources) {
-        persistent_args_.abandon();
-    } else {
-        const int args_rc = persistent_args_.finalize_once();
-        if (args_rc != 0 && rc == 0) rc = args_rc;
+    if (!abandon_device_resources) {
         const int close_rc = kernel_exec_state_.close();
         if (close_rc != 0 && rc == 0) rc = close_rc;
-        kernel_cleanup_failed =
-            kernel_cleanup_failed || (execution_mode_latch().is_kernel() && (args_rc != 0 || close_rc != 0));
+        kernel_cleanup_failed = kernel_cleanup_failed || (execution_mode_latch().is_kernel() && close_rc != 0);
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
@@ -3612,9 +3762,9 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     max_vector_cores_ = 0;
     aicore_kernel_binary_.clear();
     for (auto &bank : arena_banks_) {
-        bank->cached_gm_heap_size = 0;
-        bank->cached_gm_sm_size = 0;
-        bank->cached_runtime_arena_size = 0;
+        bank->gm_heap->cached_size = 0;
+        bank->gm_sm->cached_size = 0;
+        bank->runtime_pool->cached_size = 0;
     }
     if (abandon_device_resources) {
         LOG_WARN("Fatal teardown: host-side ownership cleared without further device calls");
@@ -3652,20 +3802,23 @@ int DeviceRunnerBase::ensure_aicore_binary_registered() {
     return 0;
 }
 
-int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args) {
+int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgsHelper &helper) {
     const int registration_rc = ensure_aicore_binary_registered();
     if (registration_rc != 0) return registration_rc;
     // `AicoreLaunchArgs` is the host-side image of the entry's parameter list
     // and is defined per-arch beside the entry's ABI, in common/kernel_args.h.
     // The driver copies `argsSize` bytes during the launch call, so a stack
     // local satisfies its host-buffer lifetime requirement.
-    AicoreLaunchArgs args{};
-    fill_shared_launch_args(args, k_args);
-    fill_arch_launch_args(args, k_args);
-    rtArgsEx_t rt_args;
-    std::memset(&rt_args, 0, sizeof(rt_args));
-    rt_args.args = &args;
-    rt_args.argsSize = sizeof(args);
+    AicoreRuntimePacket packet{};
+    fill_shared_launch_args(packet.args, helper.args);
+    fill_arch_launch_args(packet.args, helper.args);
+    rtArgsEx_t rt_args{};
+    rt_args.args = &packet;
+    rt_args.argsSize = sizeof(packet.args);
+    if (helper.uses_rts_runtime_args()) {
+        if (!helper.read_aicore_descriptor(packet.descriptor)) return PTO_RUNTIME_ERR_INTERNAL;
+        rt_args.argsSize = sizeof(packet);
+    }
 
     rtTaskCfgInfo_t cfg = {};
     cfg.schemMode = RT_SCHEM_MODE_BATCH;
@@ -3733,32 +3886,6 @@ DeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, 
     return region.payload;
 }
 
-int DeviceRunnerBase::initialize_result_storage(PreparedSubmissionStorage &backing) {
-    if (backing.device_result != nullptr && backing.result_allocation_rc != 0) {
-        const int free_rc = mem_alloc_.free(backing.device_result);
-        if (free_rc != 0) return free_rc;
-        backing.device_result = nullptr;
-        backing.result_allocation_rc = 0;
-    }
-    if (backing.device_result == nullptr) {
-        backing.device_result = mem_alloc_.alloc(sizeof(NativeInvocationResultStorage), &backing.result_allocation_rc);
-        backing.result_initialized = false;
-        if (backing.result_allocation_rc != 0) {
-            return execution_mode_latch().is_kernel() ? backing.result_allocation_rc : PTO_RUNTIME_ERR_INTERNAL;
-        }
-    }
-    if (backing.device_result == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    if (!backing.result_initialized) {
-        // Cold initialization includes the independent replay-evidence tail.
-        // Reused backing preserves that tail rather than replaying this clear.
-        const NativeInvocationResultStorage cold{};
-        const int rc = rtMemcpy(backing.device_result, sizeof(cold), &cold, sizeof(cold), RT_MEMCPY_HOST_TO_DEVICE);
-        if (rc != 0) return rc;
-        backing.result_initialized = true;
-    }
-    return 0;
-}
-
 int DeviceRunnerBase::ensure_device_run_result_region(
     const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
 ) {
@@ -3780,17 +3907,36 @@ int DeviceRunnerBase::ensure_device_run_result_region(
     std::lock_guard<std::mutex> lock(run_result_mu_);
     auto [it, inserted] = run_result_storage_.try_emplace(run_epoch);
     RunResultStorage &storage = it->second;
-    if (inserted) storage.pipeline_slot = pipeline_slot;
-    if (storage.pipeline_slot != pipeline_slot) return PTO_RUNTIME_ERR_INTERNAL;
-    if (!storage.backing) storage.backing = submission_storage_[pipeline_slot];
-    auto &backing = *storage.backing;
-    const int rc = initialize_result_storage(backing);
-    storage.device_ptr = backing.device_result;
-    if (rc != 0) return rc;
-    storage.initialized = backing.result_initialized;
-    // A live call owns its allocation through the map. An unclaimed current
-    // slot keeps its allocation as an idle cache; late observers use the map.
-    kernel_args.args.run_result_data_base = reinterpret_cast<uint64_t>(storage.device_ptr);
+    if (inserted) {
+        storage.pipeline_slot = pipeline_slot;
+        bool free_failure = false;
+        const int acquire_rc = reported_pool_.acquire(
+            run_epoch, pipeline_slot, sizeof(NativeInvocationResultStorage), &storage.lease, &free_failure
+        );
+        if (acquire_rc != 0) {
+            // A nonnull output of a failed allocation stays owned by the pool
+            // and by this epoch, so the next prepare retries the checked free.
+            if (storage.lease.device_ptr == nullptr) run_result_storage_.erase(it);
+            // A failed free keeps its raw platform code in every mode; an
+            // allocation failure is the runtime's internal error in Program.
+            if (free_failure) return acquire_rc;
+            return execution_mode_latch().is_kernel() ? acquire_rc : PTO_RUNTIME_ERR_INTERNAL;
+        }
+        storage.initialized = storage.lease.initialized;
+    } else if (storage.pipeline_slot != pipeline_slot) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (!storage.initialized) {
+        // Cold initialization includes the independent replay-evidence tail.
+        // A reused idle region preserves that tail instead of clearing it.
+        const NativeInvocationResultStorage cold{};
+        const int rc = rtMemcpy(storage.lease.device_ptr, sizeof(cold), &cold, sizeof(cold), RT_MEMCPY_HOST_TO_DEVICE);
+        if (rc != 0) return rc;
+        reported_pool_.mark_initialized(storage.lease);
+        storage.lease.initialized = true;
+        storage.initialized = true;
+    }
+    kernel_args.args.run_result_data_base = reinterpret_cast<uint64_t>(storage.lease.device_ptr);
     kernel_args.args.run_result_epoch = run_epoch;
     return 0;
 }
@@ -3827,7 +3973,8 @@ int DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t ru
     if (!storage.initialized) return 0;
     if (storage.read != RunRecordRead::NotAttempted) return storage.transfer_rc;
     storage.transfer_rc = rtMemcpy(
-        &storage.region, sizeof(storage.region), storage.device_ptr, sizeof(storage.region), RT_MEMCPY_DEVICE_TO_HOST
+        &storage.region, sizeof(storage.region), storage.lease.device_ptr, sizeof(storage.region),
+        RT_MEMCPY_DEVICE_TO_HOST
     );
     storage.read = storage.transfer_rc == 0 ? RunRecordRead::Ok : RunRecordRead::Failed;
     if (storage.transfer_rc != 0) {
@@ -3838,16 +3985,81 @@ int DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t ru
     return storage.transfer_rc;
 }
 
-void DeviceRunnerBase::release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved) {
+DeviceRunnerBase::ResultRegionSnapshot
+DeviceRunnerBase::result_region_snapshot(uint64_t run_epoch, uint32_t pipeline_slot) const {
+    std::lock_guard<std::mutex> lock(run_result_mu_);
+    ResultRegionSnapshot snapshot;
+    const auto it = run_result_storage_.find(run_epoch);
+    if (it == run_result_storage_.end() || it->second.pipeline_slot != pipeline_slot) return snapshot;
+    snapshot.found = true;
+    snapshot.device_ptr = it->second.lease.device_ptr;
+    snapshot.initialized = it->second.initialized;
+    snapshot.retain_evidence = it->second.retain_evidence;
+    snapshot.evidence_observed = it->second.evidence_observed;
+    snapshot.observed_evidence = it->second.observed_evidence;
+    return snapshot;
+}
+
+void DeviceRunnerBase::set_result_retain_evidence(uint64_t run_epoch, uint32_t pipeline_slot) {
+    std::lock_guard<std::mutex> lock(run_result_mu_);
+    auto result = run_result_storage_.find(run_epoch);
+    if (result != run_result_storage_.end() && result->second.pipeline_slot == pipeline_slot)
+        result->second.retain_evidence = true;
+}
+
+int DeviceRunnerBase::read_result_evidence(RunResultStorage &storage) {
+    if (!storage.initialized || !storage.retain_evidence || storage.evidence_observed) return 0;
+    NativeInvocationEvidence evidence;
+    const auto *address =
+        static_cast<const uint8_t *>(storage.lease.device_ptr) + offsetof(NativeInvocationResultStorage, evidence);
+    const int read_rc = rtMemcpy(&evidence, sizeof(evidence), address, sizeof(evidence), RT_MEMCPY_DEVICE_TO_HOST);
+    if (read_rc != 0) {
+        LOG_WARN("rtMemcpy(run_result evidence) D2H failed: %d", read_rc);
+        ACL_LOG_ERROR_DETAIL(read_rc);
+        return read_rc;
+    }
+    storage.observed_evidence = evidence.read_after_exit();
+    storage.evidence_observed = true;
+    last_observed_result_region_.found = true;
+    last_observed_result_region_.device_ptr = storage.lease.device_ptr;
+    last_observed_result_region_.initialized = storage.initialized;
+    last_observed_result_region_.retain_evidence = storage.retain_evidence;
+    last_observed_result_region_.evidence_observed = true;
+    last_observed_result_region_.observed_evidence = storage.observed_evidence;
+    if (storage.observed_evidence.kind != NativeInvocationEvidence::Kind::None) {
+        LOG_ERROR(
+            "native invocation evidence: kind=%u code=%d source=%u faults=%llu",
+            static_cast<unsigned>(storage.observed_evidence.kind), storage.observed_evidence.terminal.code,
+            static_cast<unsigned>(storage.observed_evidence.terminal.source),
+            static_cast<unsigned long long>(storage.observed_evidence.fault_count)
+        );
+    }
+    return 0;
+}
+
+int DeviceRunnerBase::finish_result_release(RunResultStorage &storage) {
+    // The replay-evidence tail lives in this epoch's region, so it must be read
+    // before the pool reuses or frees the allocation. A failed read keeps the
+    // epoch and its region for the caller's retry.
+    const int evidence_rc = read_result_evidence(storage);
+    if (evidence_rc != 0) return evidence_rc;
+    // A poisoned driver admits no per-resource free. The context retains the
+    // region until its verified reset or terminal quarantine path.
+    if (!can_accept_run()) return 0;
+    // Cache ordinary sequential results. A diagnostic window finishes its own allocation.
+    const int rc = reported_pool_.release(storage.lease, true, !storage.retain_evidence);
+    if (rc != 0) return rc;
+    run_result_storage_.erase(storage.lease.run_epoch);
+    return 0;
+}
+
+int DeviceRunnerBase::release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved) {
     std::lock_guard<std::mutex> lock(run_result_mu_);
     const auto it = run_result_storage_.find(run_epoch);
-    if (!last_use_proved || it == run_result_storage_.end() || it->second.pipeline_slot != pipeline_slot) return;
-    // A poisoned driver admits no per-resource free. The context retains the
-    // allocation until its verified reset or terminal quarantine path.
-    if (!can_accept_run()) return;
-    // Drop this call's observation lease. The shared submission owner still
-    // protects model references and performs retryable device cleanup.
-    run_result_storage_.erase(it);
+    if (it == run_result_storage_.end() || it->second.pipeline_slot != pipeline_slot) return 0;
+    if (!last_use_proved) return 0;
+    RunResultStorage &storage = it->second;
+    return finish_result_release(storage);
 }
 
 RunRecordRead DeviceRunnerBase::device_run_result_read_status(uint32_t pipeline_slot, uint64_t run_epoch) const {
@@ -3951,7 +4163,7 @@ int DeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &c
 
     // First `block_dim` cores are AIC; remaining ~2/3 are AIV. The rule is host
     // state: every consumer of it runs on the host and needs it before any core
-    // has reported. `dev.workers[]` is not written here — it sits outside the
+    // has reported. `RuntimeSharedState::workers` is not written here — it sits outside the
     // per-run uploaded prefix, the device owns every word of it once the block
     // has been initialized, and a host store would only be published by
     // accident on a block's first publication.
@@ -4024,61 +4236,81 @@ static_assert(sizeof(aclmdlRICaptureStatus) == sizeof(uint32_t));
 static_assert(alignof(aclmdlRICaptureStatus) == alignof(uint32_t));
 static_assert(ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE == 1);
 
-int DeviceRunnerBase::validate_caller_stream(rtStream_t caller, bool *recording) {
-    if (recording != nullptr) *recording = false;
+int DeviceRunnerBase::validate_caller_stream(rtStream_t caller) {
     if (caller == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
     int rc = enter_run_thread();
-    if (rc != 0) return rc;
+    if (rc != 0 || execution_mode_latch().is_kernel()) return rc;
     aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI model = nullptr;
     rc = aclmdlRICaptureGetInfo(caller, &status, &model);
     if (rc != 0) return rc;
-    if (status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE && recording != nullptr) {
-        *recording = true;
-        return 0;
-    }
     if (status != ACL_MODEL_RI_CAPTURE_STATUS_NONE) return PTO_RUNTIME_ERR_UNSUPPORTED;
     return 0;
 }
 
-bool DeviceRunnerBase::capture_diagnostics_supported(const PreparedExecution &prepared) const {
+bool DeviceRunnerBase::caller_diagnostics_supported(const PreparedExecution &prepared) const {
     const auto &dfx = prepared.dfx;
     if (!dfx.diagnostics_any()) return true;
     if (dfx.dep_gen_enabled || dfx.output_prefix.empty()) return false;
     if (dfx.chip_swimlane_enabled())
-        return supports_swimlane_capture() && !dfx.dump_args_enabled() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
-    if (dfx.dump_args_enabled()) return supports_args_dump_capture() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
-    if (dfx.pmu_enabled) return supports_pmu_capture() && !dfx.scope_stats_enabled;
-    return supports_scope_stats_capture() && prepared.scope_stats_capacity.required &&
+        return supports_caller_swimlane() && !dfx.dump_args_enabled() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
+    if (dfx.dump_args_enabled()) return supports_caller_args_dump() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
+    if (dfx.pmu_enabled) return supports_caller_pmu() && !dfx.scope_stats_enabled;
+    return supports_caller_scope_stats() && prepared.scope_stats_capacity.required &&
            prepared.scope_stats_capacity.complete() && dfx.scope_stats_enabled;
 }
 
-int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
-    if (!execution_mode_latch().is_kernel() || !capture_diagnostics_supported(prepared) ||
-        prepared.join.predecessor_owner != nullptr)
+int DeviceRunnerBase::prepare_caller_submission(void *owner, PreparedExecution &prepared) {
+    if (!execution_mode_latch().is_kernel() || (prepared.dfx.diagnostics_any() && !prepared.diagnostic_window_open))
         return PTO_RUNTIME_ERR_UNSUPPORTED;
-    std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
-    std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    for (auto &[key, reference] : external_run_references_) {
-        if (!(reference->identity == prepared.identity)) continue;
-        if (reference->release_requested || reference->closing || reference->recording ||
-            reference->caller_stream != prepared.caller_stream || reference->resources != prepared.prepared_resources ||
-            !prepared.streams.ready())
+    if (!prepared.prepared_resources || !prepared.streams.ready()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!caller_device_buffers_.retain_reference(owner, static_cast<uint64_t>(prepared.pipeline_slot) + 1))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    try {
+        if (!workspace_.preserve_run_record(prepared.pipeline_slot, prepared.identity.run_epoch)) {
+            caller_device_buffers_.release_reference(owner, false);
             return PTO_RUNTIME_ERR_INVALID_STATE;
-        reference->recording = true;
-        prepared.recording = true;
-        if (prepared.kernel_args.args.run_result_data_base != 0)
-            submission_storage_[prepared.pipeline_slot]->retain_replay_evidence = true;
-        // A retained block must publish even if eager left an identical prefix.
-        submission_storage_[prepared.pipeline_slot]->args.published_prefix_bytes = 0;
-        return 0;
+        }
+    } catch (...) {
+        caller_device_buffers_.release_reference(owner, false);
+        throw;
     }
-    return PTO_RUNTIME_ERR_INVALID_STATE;
+    prepared.caller_owns_submission = true;
+    if (prepared.kernel_args.args.run_result_data_base != 0)
+        set_result_retain_evidence(prepared.identity.run_epoch, prepared.pipeline_slot);
+    prepared.prepared_resources->submission_->args.published_prefix_bytes = 0;
+    return 0;
+}
+
+void DeviceRunnerBase::yield_caller_submission(void *owner, const NativeRunIdentity &identity) {
+    caller_device_buffers_.detach_reference(owner);
+    caller_device_buffers_.release(static_cast<uint64_t>(identity.pipeline_slot) + 1, false);
+    release_device_run_timing(identity.pipeline_slot);
+    release_native_run(owner);
+    release_native_run_reservation(owner);
+}
+
+int DeviceRunnerBase::finish_caller_submission(ActiveExecution &active) {
+    const auto &prepared = *active.prepared;
+    const int rc =
+        active.progress == LaunchProgress::Partial ?
+            sync_stream_pair(prepared.streams.aicpu, prepared.streams.aicore) :
+            aclrtSynchronizeStreamWithTimeout(prepared.caller_stream, timeout_config_.stream_sync_timeout_ms);
+    if (rc != 0) return rc;
+    auto &storage = *prepared.prepared_resources->submission_;
+    int retire_rc = storage.caller_order->end_external_use(prepared.identity);
+    if (retire_rc == 0) retire_rc = storage.caller_order->retire(prepared.identity);
+    if (retire_rc == 0) retire_rc = storage.fence->retire(prepared.identity);
+    if (retire_rc == 0) note_prepared_waits_consumed(prepared.identity);
+    return retire_rc;
 }
 
 int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink) {
     return submission_storage_[prepared.pipeline_slot]->caller_order->fork(prepared.identity, sink, [&] {
-        const int rc = publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink, prepared.recording);
+        const int rc = publish_for_launch(
+            prepared.kernel_args, prepared.streams.aicpu, sink, prepared.caller_owns_submission,
+            execution_mode_latch().is_kernel()
+        );
         if (rc == 0 && prepared.kernel_args.args.run_result_data_base != 0) {
             std::lock_guard<std::mutex> lock(run_result_mu_);
             run_result_storage_.at(prepared.identity.run_epoch).initialized = true;
@@ -4099,36 +4331,77 @@ int DeviceRunnerBase::queue_caller_exit(const PreparedExecution &prepared) {
 
 namespace {
 template <typename RuntimeType>
-auto prepared_initial_publication(const RuntimeType &runtime, int) -> decltype(runtime.prepared_publication()) {
-    return runtime.prepared_publication();
+auto prepared_shared_resources(const RuntimeType &runtime, int) -> decltype(runtime.prepared_shared_resources()) {
+    return runtime.prepared_shared_resources();
 }
 template <typename RuntimeType>
-std::shared_ptr<const void> prepared_initial_publication(const RuntimeType &, long) {
+std::vector<std::shared_ptr<const void>> prepared_shared_resources(const RuntimeType &, long) {
     return {};
 }
 }  // namespace
 
 int DeviceRunnerBase::retain_prepared_run_resources(
-    PreparedExecution &prepared, uint32_t bank_id, int32_t callable_id
+    PreparedExecution &prepared, RegionBanks banks, int32_t callable_id
 ) {
     std::shared_ptr<const void> streams;
     const int streams_rc = prepare_execution_streams(prepared, &streams);
     if (streams_rc != 0) return streams_rc;
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
     const uint32_t slot = prepared.pipeline_slot;
-    if (slot >= run_image_stagings_.size() || bank_id >= arena_banks_.size() || prepared.prepared_resources)
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    auto bank = arena_banks_[bank_id];
+    if (slot >= run_image_stagings_.size() || prepared.prepared_resources) return PTO_RUNTIME_ERR_INVALID_STATE;
+    std::vector<std::shared_ptr<ArenaRegion>> selected;
     std::vector<WorkspaceManager::BackingLease> leases;
-    for (void *raw : {bank->gm_heap.raw_backing(), bank->gm_sm.raw_backing(), bank->runtime_pool.raw_backing()}) {
-        if (raw == nullptr || !workspace_.owns(raw)) continue;
-        auto lease = workspace_.retain_backing(raw);
-        if (!lease) return PTO_RUNTIME_ERR_INVALID_STATE;
-        leases.push_back(std::move(lease));
+    for (size_t i = 0; i < 3; ++i) {
+        const uint32_t bank_id = bank_for_region(banks, i);
+        if (bank_id >= arena_banks_.size()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        const auto &region = arena_bank(bank_id).region(i);
+        // A zero-sized region has no consumer; pooled heap backing lives in
+        // ScratchPool and is held by its own lease below.
+        void *raw = region->arena.raw_backing();
+        if (raw == nullptr) continue;
+        if (workspace_.owns(raw)) {
+            auto lease = workspace_.retain_backing(raw);
+            if (!lease) return PTO_RUNTIME_ERR_INVALID_STATE;
+            leases.push_back(std::move(lease));
+        }
+        selected.push_back(region);
     }
+    ScratchPool::Lease heap_lease;
+    {
+        std::lock_guard<std::mutex> lease_lock(heap_lease_mutex_);
+        if (slot < heap_leases_.size()) {
+            heap_lease = heap_leases_[slot];
+            heap_leases_[slot] = {};
+        }
+    }
+    // The set's committed footprint, taken while every source is still named
+    // here: the heap lease moves into the published resources below.
+    RunResourceCost cost;
+    if (heap_lease.valid()) {
+        cost.heap_bytes = heap_lease.capacity;
+    } else if (arena_banks_[banks.heap]->gm_heap->arena.is_committed()) {
+        cost.heap_bytes = arena_banks_[banks.heap]->gm_heap->arena.total_size();
+    }
+    cost.image_bytes = arena_banks_[banks.image]->runtime_pool->arena.total_size();
+    cost.shared_memory_bytes = arena_banks_[banks.sm]->gm_sm->arena.total_size();
+    auto &scheduler = scheduler_state_storage_[slot].device;
+    if (scheduler) cost.scheduler_bytes = scheduler->device_capacity();
+    {
+        std::lock_guard<std::mutex> result_lock(run_result_mu_);
+        const auto result = run_result_storage_.find(prepared.identity.run_epoch);
+        if (result != run_result_storage_.end() && result->second.pipeline_slot == slot)
+            cost.reported_bytes = result->second.lease.bytes;
+    }
+    auto release_heap_on_fail = RAIIScopeGuard([&]() {
+        if (heap_lease.valid() && heap_pool_) heap_pool_->release(heap_lease);
+    });
+    const bool image_in_launch = prepared.kernel_args.has_execution_image();
     auto resources = std::make_shared<PreparedRunResources>(
-        run_image_stagings_[slot], scheduler_state_storage_[slot], std::move(bank), std::move(leases)
+        image_in_launch ? nullptr : run_image_stagings_[slot], std::move(scheduler), std::move(selected),
+        std::move(leases)
     );
+    resources->take_heap_lease(heap_pool_, heap_lease);
+    heap_lease = {};
     if (callable_id >= 0) {
         auto callable = callables_.find(callable_id);
         if (callable == callables_.end()) return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -4140,9 +4413,9 @@ int DeviceRunnerBase::retain_prepared_run_resources(
         if (!temporary->backing) return PTO_RUNTIME_ERR_INVALID_STATE;
     }
     resources->streams_ = std::move(streams);
-    resources->temporary_ = std::move(temporary);
+    resources->hold_temporary(std::move(temporary));
     resources->submission_ = submission_storage_[slot];
-    resources->retain_initial_publication(prepared_initial_publication(*prepared.runtime, 0));
+    resources->retain_shared_resources(prepared_shared_resources(*prepared.runtime, 0));
     auto published = PreparedRunResources::publish_owner(resources);
     prepared_uses_.reserve(prepared_uses_.size() + 1);
     prepared_resource_owners_.erase(
@@ -4157,69 +4430,27 @@ int DeviceRunnerBase::retain_prepared_run_resources(
     prepared_resource_owners_.push_back(published);
     prepared_uses_.push_back({prepared.identity, PreparedRunUse(std::move(resources))});
     prepared.prepared_resources = std::move(published);
+    run_resource_costs_[slot] = cost;
     return 0;
 }
 
-int DeviceRunnerBase::retain_external_run_resources(
-    PreparedExecution &prepared, void *caller_stream, void **out_reference, NativeRunPreparePurpose purpose
-) {
-    if (out_reference == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    *out_reference = nullptr;
-    if (caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    if (!capture_diagnostics_supported(prepared) ||
-        (prepared.dfx.diagnostics_any() && !execution_mode_latch().is_kernel()))
-        return PTO_RUNTIME_ERR_UNSUPPORTED;
-    std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
-    bool recording = false;
-    int rc = validate_caller_stream(
-        caller_stream, execution_mode_latch().is_kernel() && purpose == SIMPLER_PREPARE_CAPTURE ? &recording : nullptr
-    );
+int DeviceRunnerBase::prepare_caller_diagnostics(PreparedExecution &prepared) {
+    if (!caller_diagnostics_supported(prepared)) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    int rc = prepare_submission_resources(prepared);
     if (rc != 0) return rc;
-    if (!can_accept_run() || (execution_mode_latch().is_kernel() && !kernel_exec_state_.accepts_dispatch()))
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    const auto &resources = prepared.prepared_resources;
-    if (!resources || !resources->callable_ || !resources->submission_ ||
-        resources->submission_ != submission_storage_[prepared.pipeline_slot] ||
-        resources->submission_->args.runtime_args == nullptr ||
-        resources->submission_->args.runtime_upload_source == nullptr)
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    // External -> native -> storage is the diagnostic admission lock order.
-    // Duplicate retention must be refused before pool allocation or replacement
-    // of an earlier successful artifact, including after that reference ended.
-    std::unique_lock<std::mutex> native_lock;
-    if (prepared.dfx.diagnostics_any()) {
-        native_lock = std::unique_lock<std::mutex>(native_run_mu_);
-        if (active_native_run_count_ != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
-    }
-    {
-        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        const auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
-            return entry.identity == prepared.identity;
-        });
-        if (use == prepared_uses_.end() || !use->use.can_retain_external_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    }
-    rc = prepare_submission_resources(prepared);
-    if (rc != 0) return rc;
-    auto reference = std::make_unique<ExternalRunReference>();
-    reference->identity = prepared.identity;
-    reference->resources = resources;
-    reference->callable = resources->callable_;
-    reference->managed_backing.reserve(resources->backing_.size() + 1);
-    for (const auto &backing : resources->backing_)
-        reference->managed_backing.emplace_back(backing);
-    if (resources->temporary_ && resources->temporary_->backing)
-        reference->managed_backing.emplace_back(resources->temporary_->backing);
-    reference->caller_stream = caller_stream;
+    // Another independent prepare may bind the same TMR arena before this run submits.
+    prebuilt_runtime_arena_cache_.invalidate();
+    if (!prepared.dfx.diagnostics_any()) return 0;
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    if (active_native_run_count_ != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
     // The native claim remains excluded throughout pool construction/window admission.
-    if (prepared.dfx.diagnostics_any()) {
-        if (scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch) ||
-            pmu_collector_.recorded_window_open(prepared.identity.run_epoch) ||
-            chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch) ||
-            dump_collector_.recorded_window_open(prepared.identity.run_epoch))
-            return PTO_RUNTIME_ERR_INVALID_STATE;
-        rc = prepare_collector_storage(*prepared.runtime, prepared);
-        if (rc != 0) return rc;
-    }
+    if (scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+        pmu_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+        chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+        dump_collector_.recorded_window_open(prepared.identity.run_epoch))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    rc = prepare_collector_storage(*prepared.runtime, prepared);
+    if (rc != 0) return rc;
     bool dump_armed = false;
     bool pmu_armed = false;
     bool swimlane_armed = false;
@@ -4266,7 +4497,6 @@ int DeviceRunnerBase::retain_external_run_resources(
             return refusal == simpler::dfx::runs::AdmissionRefusal::Capacity ?
                        SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
                        PTO_RUNTIME_ERR_INTERNAL;
-        reference->swimlane_window = true;
         prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
     }
     if (prepared.dfx.dump_args_enabled()) {
@@ -4278,7 +4508,6 @@ int DeviceRunnerBase::retain_external_run_resources(
                 prepared.identity.run_epoch, prepared.dfx.output_prefix, prepared.dfx.dump_args_level
             ))
             return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
-        reference->args_dump_window = true;
         prepared.kernel_args.args.args_dump_run_terminal_bank = 0;
     }
     if (prepared.dfx.pmu_enabled) {
@@ -4292,7 +4521,6 @@ int DeviceRunnerBase::retain_external_run_resources(
                 pmu_lease_.state_name()
             ))
             return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
-        reference->pmu_window = true;
         prepared.kernel_args.args.pmu_run_terminal_bank = 0;
     }
     if (prepared.dfx.scope_stats_enabled) {
@@ -4303,128 +4531,49 @@ int DeviceRunnerBase::retain_external_run_resources(
                 prepared.identity.run_epoch, prepared.dfx.output_prefix, prepared.scope_stats_capacity
             ))
             return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
-        reference->scope_stats_window = true;
         // Replay overwrites terminal counters; none can certify a window total.
         prepared.kernel_args.args.scope_stats_run_terminal_bank = 0;
     }
-    void *key = reference.get();
-    std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
-        return entry.identity == prepared.identity;
-    });
-    if (use == prepared_uses_.end()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    // Allocate bookkeeping before changing obligations. A duplicate is refused
-    // even if the earlier reference was released before the original run ended.
-    external_run_references_.emplace(key, std::move(reference));
-    RAIIScopeGuard rollback_reference([&] {
-        if (published) return;
-        caller_device_buffers_.release_reference(key, false);
-        external_run_references_.erase(key);
-    });
-    if ((purpose == SIMPLER_PREPARE_CAPTURE &&
-         !caller_device_buffers_.retain_reference(key, static_cast<uint64_t>(prepared.pipeline_slot) + 1)) ||
-        !use->use.retain_external_use())
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    // A cached TMR image names this bank. Its next bind must take the normal
-    // arena acquisition path so retention can replace the backing before writes.
-    prebuilt_runtime_arena_cache_.invalidate();
-    prepared.caller_stream = caller_stream;
-    *out_reference = key;
     published = true;
+    prepared.diagnostic_window_open = true;
     return 0;
 }
 
-int DeviceRunnerBase::release_external_run_resources(void *key) {
-    if (key == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
-    ExternalRunReference *reference = nullptr;
-    {
-        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        const auto found = external_run_references_.find(key);
-        if (found == external_run_references_.end()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-        reference = found->second.get();
+int DeviceRunnerBase::reclaim_caller_backing(PreparedExecution &prepared) {
+    if (const auto &resources = prepared.prepared_resources) {
+        // Preserve allocation identities across a failed free, after dropping the live leases.
+        auto &backing = prepared.closing_backing;
+        backing.reserve(resources->backing_.size() + 1);
+        backing.assign(resources->backing_.begin(), resources->backing_.end());
+        if (resources->temporary_ && resources->temporary_->backing)
+            backing.emplace_back(resources->temporary_->backing);
+        prepared.closing_callable = resources->callable_;
+        prepared.prepared_resources.reset();
     }
-    int rc = validate_current_context();
-    if (rc != 0) return rc;
-    {
-        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        // Release promises no external reuse. A failed synchronization still
-        // retains backing, but must not prevent an owned fatal reset forever.
-        reference->release_requested = true;
+    const int rc = reclaim_prepared_storage();
+    return rc != 0 ? rc : workspace_.release_prepared_backing(prepared.closing_backing);
+}
+
+int DeviceRunnerBase::close_caller_diagnostics(PreparedExecution &prepared) {
+    if (!prepared.diagnostic_window_open) return 0;
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    for (size_t index = 0; index < active_native_run_count_; ++index) {
+        if (active_native_runs_[index].identity != prepared.identity) return PTO_RUNTIME_ERR_INVALID_STATE;
     }
-    rc = enter_run_thread();
-    if (rc != 0) return rc;
-    if (!reference->closing) {
-        rc = validate_caller_stream(reference->caller_stream);
-        if (rc != 0) return rc;
-        // This synchronization supplements the caller's external-use promise;
-        // it cannot establish destruction or completion on other replay streams.
-        rc = aclrtSynchronizeStreamWithTimeout(reference->caller_stream, timeout_config_.stream_sync_timeout_ms);
-        if (rc != 0) return rc;
-        if (reference->recording) {
-            auto &storage = *reference->resources->submission_;
-            rc = storage.caller_order->end_recording(reference->identity);
-            if (rc == 0) rc = storage.caller_order->retire(reference->identity);
-            if (rc == 0) rc = storage.fence->retire(reference->identity);
-            if (rc != 0) return rc;
-        }
-        if (reference->scope_stats_window || reference->pmu_window || reference->swimlane_window ||
-            reference->args_dump_window) {
-            // Raw replay is caller-ordered. Its drained stream plus the external
-            // end promise stops producers; the lock excludes a new native run
-            // while the collector establishes its reader-quiescence boundary.
-            std::lock_guard<std::mutex> native_lock(native_run_mu_);
-            for (size_t index = 0; index < active_native_run_count_; ++index) {
-                if (!reference->recording || active_native_runs_[index].identity != reference->identity)
-                    return PTO_RUNTIME_ERR_INVALID_STATE;
-            }
-            if (reference->swimlane_window) {
-                if (!chip_swimlane_collector_.close_recorded_window(
-                        reference->identity.run_epoch, timeout_config_.stream_sync_timeout_ms
-                    ))
-                    return PTO_RUNTIME_ERR_INTERNAL;
-                reference->swimlane_window = false;
-            }
-            if (reference->scope_stats_window) {
-                rc = scope_stats_collector_.close_recorded_window(reference->identity.run_epoch);
-                if (rc != 0) return rc;
-                reference->scope_stats_window = false;
-            }
-            if (reference->args_dump_window) {
-                rc = dump_collector_.close_recorded_window(reference->identity.run_epoch);
-                if (rc != 0) return rc;
-                reference->args_dump_window = false;
-            }
-            if (reference->pmu_window) {
-                rc = pmu_collector_.close_recorded_window(reference->identity.run_epoch);
-                if (rc != 0) return rc;
-                pmu_lease_.release(reference->identity.run_epoch);
-                reference->pmu_window = false;
-            }
-        }
-        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
-            return entry.identity == reference->identity;
-        });
-        if (use == prepared_uses_.end()) return PTO_RUNTIME_ERR_INVALID_STATE;
-        // External end never proves internal completion. An unfinished record
-        // keeps its own backing after this reference ends; confirmed Program
-        // reset may later discharge it, while a borrowed device stays isolated.
-        use->use.note_external_use_ended();
-        if (use->use.obligations_ended()) prepared_uses_.erase(use);
-        reference->closing = true;
-        reference->resources.reset();
+    const auto epoch = prepared.identity.run_epoch;
+    int rc = 0;
+    if (prepared.dfx.chip_swimlane_enabled())
+        rc = chip_swimlane_collector_.close_recorded_window(epoch, timeout_config_.stream_sync_timeout_ms) ?
+                 0 :
+                 PTO_RUNTIME_ERR_INTERNAL;
+    else if (prepared.dfx.scope_stats_enabled) rc = scope_stats_collector_.close_recorded_window(epoch);
+    else if (prepared.dfx.dump_args_enabled()) rc = dump_collector_.close_recorded_window(epoch);
+    else if (prepared.dfx.pmu_enabled) {
+        rc = pmu_collector_.close_recorded_window(epoch);
+        if (rc == 0) pmu_lease_.release(epoch);
     }
-    // Retired owners keep every failing address for retry. The closing token
-    // and callable lease keep the context/code alive until this succeeds.
-    rc = reclaim_prepared_storage();
-    if (rc != 0) return rc;
-    rc = workspace_.release_prepared_backing(reference->managed_backing);
-    if (rc != 0) return rc;
-    std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    caller_device_buffers_.release_reference(key, false);
-    external_run_references_.erase(key);
-    return 0;
+    if (rc == 0) prepared.diagnostic_window_open = false;
+    return rc;
 }
 
 void DeviceRunnerBase::note_workspace_run_fact(const NativeRunIdentity &identity, WorkspaceManager::RunFact fact) {
@@ -4450,32 +4599,17 @@ void DeviceRunnerBase::note_prepared_waits_consumed(const NativeRunIdentity &ide
 
 bool DeviceRunnerBase::prepared_storage_in_use() const {
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    return !prepared_uses_.empty() || prepared_storage_has_external_references_locked();
+    return !prepared_uses_.empty() || has_live_prepared_owners_locked();
 }
 
-bool DeviceRunnerBase::prepared_storage_has_external_references_locked() const {
-    // Closing external references remain registered until cleanup succeeds,
-    // even after their resource pointer has moved into retirement.
-    if (!external_run_references_.empty()) return true;
+bool DeviceRunnerBase::has_live_prepared_owners_locked() const {
     return std::any_of(prepared_resource_owners_.begin(), prepared_resource_owners_.end(), [](const auto &owner) {
         return !owner.expired();
     });
 }
 
-bool DeviceRunnerBase::prepared_resources_block_fatal_reset() const {
-    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
-    return execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM &&
-           std::any_of(external_run_references_.begin(), external_run_references_.end(), [](const auto &entry) {
-               return !entry.second->release_requested;
-           });
-}
-
 bool DeviceRunnerBase::prepared_resources_can_abandon() const {
-    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
-    return execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM && terminal_reset_confirmed() &&
-           std::all_of(external_run_references_.begin(), external_run_references_.end(), [](const auto &entry) {
-               return entry.second->release_requested;
-           });
+    return execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM && terminal_reset_confirmed();
 }
 
 int DeviceRunnerBase::reclaim_prepared_storage() {
@@ -4486,9 +4620,9 @@ int DeviceRunnerBase::reclaim_prepared_storage() {
     // A cache's publication still protects its address. Once no preparation
     // retains it, remove the additional lease so ordinary idle trimming works.
     for (auto &storage : temporary_storage_)
-        if (storage.use_count() == 1) storage->backing.reset();
+        if (storage->run_leases.load(std::memory_order_relaxed) == 0) storage->backing.reset();
     for (auto it = retired_temporary_storage_.begin(); it != retired_temporary_storage_.end();) {
-        if (it->use_count() > 1) {
+        if ((*it)->run_leases.load(std::memory_order_relaxed) != 0) {
             ++it;
             continue;
         }
@@ -4529,7 +4663,7 @@ int DeviceRunnerBase::reclaim_prepared_storage() {
             it = retired_prepared_schedulers_.erase(it);
         }
     }
-    for (auto it = retired_prepared_arenas_.begin(); it != retired_prepared_arenas_.end();) {
+    for (auto it = retired_prepared_regions_.begin(); it != retired_prepared_regions_.end();) {
         if (it->in_use()) {
             ++it;
             continue;
@@ -4539,7 +4673,7 @@ int DeviceRunnerBase::reclaim_prepared_storage() {
             if (first_error == 0) first_error = rc;
             ++it;
         } else {
-            it = retired_prepared_arenas_.erase(it);
+            it = retired_prepared_regions_.erase(it);
         }
     }
     return first_error;
@@ -4560,39 +4694,55 @@ std::shared_ptr<PreparedSubmissionStorage> DeviceRunnerBase::make_submission_sto
     return storage;
 }
 
-int DeviceRunnerBase::prepare_run_storage(uint32_t slot, bool capture_preparation) {
-    // Called after slot reservation and context attachment, before any bind or
-    // prepare writes. Eager reuse keeps the cache when no old preparation owns it.
+int DeviceRunnerBase::prepare_run_storage(uint32_t slot) {
     std::shared_ptr<PreparedSubmissionStorage> backing;
     {
         std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
         if (slot >= submission_storage_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        scheduler_state_storage_[slot].device.reset();
         auto &current = submission_storage_[slot];
         if (current.use_count() != 1) {
-            auto next = make_submission_storage();
+            auto next =
+                spare_submission_storage_.empty() ? make_submission_storage() : spare_submission_storage_.back();
             retired_submission_storage_.push_back(current);
             current = std::move(next);
+            if (!spare_submission_storage_.empty()) spare_submission_storage_.pop_back();
         }
-        if (!capture_preparation || current->args.workers_initialized) return 0;
         backing = current;
     }
-    // The exact slot reservation still excludes another writer after the lock
-    // is released. On failure the new backing stays owned for cleanup or retry.
-    int restore_error = 0;
-    const int rc = reserve_slot_runtime_args(
-        kernel_runtime_, mem_alloc_, backing->args, 0, RuntimeWorkerInit::DuringRecording, &restore_error
+    auto &args = backing->args;
+    if (!execution_mode_latch().is_kernel() || args.workers_initialized) return 0;
+    if (args.shared_state == nullptr) {
+        args.shared_state = static_cast<RuntimeSharedState *>(mem_alloc_.alloc(sizeof(RuntimeSharedState)));
+        if (args.shared_state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // Initialize once on the registration stream. This allocation's first use
+    // can occur long after context initialization, while prior runs still own
+    // every preallocated generation. Runtime constructors zero the workers array
+    // on all backends. Its reports belong to the cores after initialization.
+    auto stream = kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
+    const int rc = initialize_private_workers(
+        stream, args.shared_state, sizeof(RuntimeSharedState::workers), timeout_config_.stream_sync_timeout_ms,
+        args.worker_initialization_pending
     );
-    if (restore_error != 0) kernel_execution_state().poison(restore_error);
+    if (rc == 0) args.workers_initialized = true;
     return rc;
 }
 
 int DeviceRunnerBase::release_submission_storage(PreparedSubmissionStorage &storage, bool abandon) {
+    if (!abandon && storage.args.worker_initialization_pending) {
+        const int rc = initialize_private_workers(
+            kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu), storage.args.shared_state,
+            sizeof(RuntimeSharedState::workers), timeout_config_.stream_sync_timeout_ms,
+            storage.args.worker_initialization_pending
+        );
+        if (rc != 0) return rc;
+    }
     if (abandon) {
         storage.caller_order->abandon();
         storage.fence->abandon();
         abandon_slot_persistent_args(storage.args);
         storage.device_wall = nullptr;
-        storage.device_result = nullptr;
         return 0;
     }
     // Event owners refuse outstanding waits. Do not drop their backing if that
@@ -4601,26 +4751,8 @@ int DeviceRunnerBase::release_submission_storage(PreparedSubmissionStorage &stor
     if (rc != 0) return rc;
     rc = storage.fence->release();
     if (rc != 0) return rc;
-    if (storage.retain_replay_evidence && storage.device_result != nullptr && storage.result_initialized &&
-        !storage.evidence_observed) {
-        NativeInvocationEvidence evidence;
-        const auto *address =
-            static_cast<const uint8_t *>(storage.device_result) + offsetof(NativeInvocationResultStorage, evidence);
-        const int read_rc = rtMemcpy(&evidence, sizeof(evidence), address, sizeof(evidence), RT_MEMCPY_DEVICE_TO_HOST);
-        if (read_rc != 0) return read_rc;
-        storage.observed_evidence = evidence.read_after_exit();
-        storage.evidence_observed = true;
-        if (storage.observed_evidence.kind != NativeInvocationEvidence::Kind::None) {
-            LOG_ERROR(
-                "native invocation evidence: kind=%u code=%d source=%u faults=%llu",
-                static_cast<unsigned>(storage.observed_evidence.kind), storage.observed_evidence.terminal.code,
-                static_cast<unsigned>(storage.observed_evidence.terminal.source),
-                static_cast<unsigned long long>(storage.observed_evidence.fault_count)
-            );
-        }
-    }
     rc = release_slot_persistent_args(storage.args, mem_alloc_);
-    for (void **ptr : {&storage.device_wall, &storage.device_result}) {
+    for (void **ptr : {&storage.device_wall}) {
         if (*ptr == nullptr) continue;
         const int free_rc = mem_alloc_.free(*ptr);
         if (free_rc == 0) *ptr = nullptr;
@@ -4847,7 +4979,7 @@ DeviceRunnerBase::note_joined_launch(const NativeRunJoin &join, const NativeRunI
 }
 
 int DeviceRunnerBase::open_own_boundary_wait(const PreparedExecution &prepared, void **core_done_out) {
-    if (prepared.recording) {
+    if (prepared.caller_owns_submission) {
         *core_done_out =
             run_fence(prepared.pipeline_slot).boundary_event(prepared.identity, RunCompletionFence::StreamRole::Aicore);
         return *core_done_out == nullptr ? PTO_RUNTIME_ERR_INVALID_STATE : 0;
@@ -6112,7 +6244,7 @@ size_t DeviceRunnerBase::native_run_claim_count() const {
 
 bool DeviceRunnerBase::try_reserve_native_run(
     const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor,
-    bool capture_preparation, const NativeRunIdentity &identity
+    bool independent_preparation, const NativeRunIdentity &identity
 ) {
     if (owner == nullptr || pipeline_slot >= granted_run_resource_sets_ || arena_bank >= granted_run_resource_sets_) {
         return false;
@@ -6125,11 +6257,11 @@ bool DeviceRunnerBase::try_reserve_native_run(
             return false;
         }
         const bool holds_claim = native_run_claim_index(reservation.owner) < active_native_run_count_;
-        if (capture_preparation || reservation.capture_preparation) {
+        if (independent_preparation || reservation.independent_preparation) {
             // A completed node has retained its backing before another bind may
             // detach it. An unfinished prepare still owns shared arena/config
             // mutation until publication succeeds or cleanup removes its reservation.
-            if (!capture_preparation || !reservation.capture_preparation || holds_claim ||
+            if (!independent_preparation || !reservation.independent_preparation || holds_claim ||
                 reservation.preparation_state != NativeRunPreparationState::Prepared)
                 return false;
         } else if (!allow_prepared_successor || !reservation.permits_prepared_successor || !holds_claim) {
@@ -6139,9 +6271,12 @@ bool DeviceRunnerBase::try_reserve_native_run(
 
     for (NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr) {
-            native_run_observations_.insert(NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}});
-            reservation =
-                NativeRunReservation{owner, pipeline_slot, arena_bank, allow_prepared_successor, capture_preparation};
+            native_run_observations_.insert(
+                NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}, independent_preparation}
+            );
+            reservation = NativeRunReservation{
+                owner, pipeline_slot, arena_bank, allow_prepared_successor, independent_preparation
+            };
             reservation.identity = identity;
             reservation.identity.pipeline_slot = pipeline_slot;
             return true;
@@ -6224,11 +6359,19 @@ bool DeviceRunnerBase::owns_native_run_observation(const void *owner) const {
            native_run_observations_.end();
 }
 
-bool DeviceRunnerBase::native_runs_outstanding() const {
+bool DeviceRunnerBase::native_runs_outstanding(bool include_caller_owners) const {
     std::lock_guard<std::mutex> lk(native_run_mu_);
-    if (!native_run_observations_.empty()) return true;
+    for (const auto &observation : native_run_observations_) {
+        if (include_caller_owners || !observation.caller_owned) return true;
+    }
     for (const NativeRunReservation &reservation : native_run_reservations_) {
-        if (reservation.owner != nullptr) return true;
+        if (reservation.owner == nullptr) continue;
+        // An independently prepared run already holds its own callable lease.
+        // A prepare still in progress must finish acquiring that lease first.
+        if (!include_caller_owners && reservation.independent_preparation &&
+            reservation.preparation_state == NativeRunPreparationState::Prepared)
+            continue;
+        return true;
     }
     return false;
 }
@@ -6239,6 +6382,7 @@ bool DeviceRunnerBase::fresh_callable_addition_allowed() const {
     {
         std::lock_guard<std::mutex> lock(native_run_mu_);
         for (const auto &row : native_run_observations_) {
+            if (row.caller_owned) continue;
             if (row.kind == NativeRunObservation::Kind::RunOwner) return false;
             bindings = true;
             // Registration may wait its own control task, never an old caller pair.
@@ -6251,13 +6395,6 @@ bool DeviceRunnerBase::fresh_callable_addition_allowed() const {
     if (!bindings) return true;
     return execution_mode_latch_.is_kernel() && kernel_exec_state_.accepts_dispatch() && accepts_new_run() &&
            !prepared_storage_in_use();
-}
-
-bool DeviceRunnerBase::has_external_run_reference(const NativeRunIdentity &identity) const {
-    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
-    return std::any_of(external_run_references_.begin(), external_run_references_.end(), [&](const auto &row) {
-        return row.second->identity == identity;
-    });
 }
 
 void DeviceRunnerBase::retain_framework_observation(const RunStreams &streams) {

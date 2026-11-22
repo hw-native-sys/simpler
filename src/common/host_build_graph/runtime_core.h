@@ -93,7 +93,7 @@ struct RuntimeArenaLayout {
     // therefore not known when this layout is built. bind grows the device region
     // to cover it once orchestration ends.
     //
-    // The copied zone is padded to a CHIP_ALIGN_SIZE boundary, so that tail begins
+    // Both ends of the copied zone are CHIP_ALIGN_SIZE aligned, so that tail begins
     // exactly at off_copied_end: the copied zone and the shared-memory image are
     // adjacent on the device and travel as one copy.
     //
@@ -169,6 +169,15 @@ static_assert(
  * commits/attaches the arena before Phase 2/3.
  */
 RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity);
+
+/**
+ * Phase 1 with the run's reachable scheduler-queue populations. A run whose
+ * graph is already known supplies them so the arena holds queue slots sized to
+ * the graph; the task-capacity form above reserves the capacity limits and is
+ * for callers without a graph.
+ */
+RuntimeArenaLayout
+runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity, const ReadyQueueCapacities &ready_queue_capacities);
 
 /**
  * Phase 2 — write the data half of the runtime arena: standalone fields,

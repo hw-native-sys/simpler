@@ -155,7 +155,7 @@ void SchedulerContext::build_payload(
         // Gated task: hand the idle AICore the source payload (non-zero = gate) and
         // let it fill args[0..num_args) itself during its doorbell wait, instead of
         // paying the arg-vector write on this scheduler thread.
-        dispatch_payload.src_payload = reinterpret_cast<uint64_t>(&payload);
+        dispatch_payload.src_payload = reinterpret_cast<uint64_t>(&payload.argument_source());
     } else {
         // Ready task: fill args here; src_payload = 0 signals AICore to run on pickup.
         dispatch_payload.src_payload = 0;
@@ -1283,7 +1283,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         return -1;
     }
 
-    Handshake *hank = static_cast<Handshake *>(runtime->dev.workers);
+    Handshake *hank = static_cast<Handshake *>(runtime->get_workers());
 
     LOG_INFO("Thread %d: dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;

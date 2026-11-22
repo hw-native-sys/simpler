@@ -55,7 +55,9 @@ inline uint64_t pack(
     const auto from = sm_layout::segment_offsets(capacity);
     const auto to = segments(used);
     always_assert(to.end <= static_cast<uint64_t>(INT32_MAX));
-    std::memset(out, 0, static_cast<size_t>(to.fanin_pool));
+    const uint64_t records_end = to.storage + used.submitted_tasks * sizeof(TaskImageStorage);
+    std::memset(out, 0, to.storage);
+    std::memset(out + records_end, 0, to.fanin_pool - records_end);
     new (out) TaskImageStatus{};
     const auto copy_pool = [&](uint64_t destination, uint64_t origin, uint64_t bytes) {
         std::memcpy(out + destination, source + origin, static_cast<size_t>(bytes));
@@ -74,6 +76,7 @@ inline uint64_t pack(
     auto *fanins = reinterpret_cast<int32_t *>(out + to.fanin_pool);
     auto *records = reinterpret_cast<TaskImageStorage *>(out + to.storage);
     for (uint64_t i = 0; i < used.submitted_tasks; ++i) {
+        std::memset(&records[i], 0, sizeof(records[i]));
         auto &record = *new (&records[i]) TaskImageStorage{};
         const auto &input = source_storage[i];
         const auto &payload = input.payload;

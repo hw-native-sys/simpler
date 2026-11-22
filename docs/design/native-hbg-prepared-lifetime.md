@@ -16,106 +16,59 @@ A completed execution is not authorization to destroy a model's backing.
 | -------- | ---------------------- |
 | Caller context, stream and external tensors | Caller-owned; valid through all recorded and in-flight uses. |
 | Callable code and registration | Simpler retains the actual callable lease; referenced code cannot be unregistered. Unrelated callables remain independent. |
-| Runtime/graph image and publication description | Preparation retains the actual image backing and immutable publication description. |
-| Pinned launch/copy sources and argument packets | Submission storage holds the bytes read by recorded copies and launches. |
-| Arena, shared memory, heap and scheduler storage | Preparation retains each backing version and workspace lease until its last use ends. |
+| Runtime descriptor and initial HBG execution image | Onboard Program and Kernel identify both sections by offset and length in the RTS launch packet. RTS owns the snapshot for execution and retains it with a captured model for replay. |
+| HBG writable execution arena | Simpler shares the current allocation across ordered runs. Each prepared run retains the allocation named by its launch packet. On A2/A3 and A5 the entry restores the complete RTS-delivered image to this arena before scheduling. |
+| Pinned sources for explicit copies | Simpler submission storage retains pinned sources for the lifetime of recorded copies and any in-flight DMA. |
+| Shared state and scheduler resources | Simpler retains the shared AICPU/AICore backing, each workspace lease, and scheduler notification and counter owners until the last use. Both device roles receive the same shared addresses. |
+| HBG GM heap | Preparation retains a fixed heap lease through its last use, including external model uses. |
 | Internal streams, fences and caller-order events | Actual stream generation and event storage survive their recording/execution/wait references. |
-| Program input staging | Retained as real backing for ordinary Program resource retention; this does not enable Program capture. |
+| Program input staging | Owned by the ordinary eager Program run through observation and cleanup. |
 
-Host orchestration scratch and draft mirrors may be reused only after extraction
-has ended their readers. The final image and recorded sources have a different,
-longer lifetime. Host descriptions may end after their last read; the addresses
-they describe remain protected independently.
+Host orchestration scratch and draft mirrors can be reused after extraction has
+ended their readers. RTS launch snapshots and the Simpler-owned sources of
+recorded DMA carry their respective replay lifetimes. Borrowed device addresses
+in either carrier refer to separately retained backing.
 
-Slot and bank caches do not own permission to overwrite a retained version.
-Equal-capacity writes can require new storage. Image, scheduler, arena, temporary
-and submission storage detach from retained predecessors before reuse. Retired
-owners keep their raw addresses and failed-release records reachable; workspace
-accounting cannot recycle an address still held by a prepared owner.
+Host snapshots and pinned DMA sources retain their per-run contents. The writable
+HBG arena and ordinary A5 scheduler storage can serve multiple retained runs at
+the same address because each execution initializes them in stream order. When
+a graph outgrows the current allocation, previous runs keep their recorded
+addresses through their last use. A5 scheduler storage read back for profiling
+remains private to its run.
 
-## Retaining a preparation
+HBG heap leases protect allocation lifetime, not historical scratch contents.
+Same-context ordered preparations share one fixed-capacity allocation even while
+models remain retained. Capacity and base remain fixed from the first successful
+prepare allocation until context teardown. Oversized graphs fail before device
+submission. Neither normal retirement nor workspace pressure trims the heap.
+Failed finalization preserves the preparation and its heap lease for retry.
+Heap sharing does not apply to
+caller-owned persistent tensors, immutable images or retained diagnostic evidence.
 
-Call the existing C interface before capture starts:
+## Framework-owned runs
 
-```cpp
-int simpler_retain_run_resources(
-    DeviceContextHandle ctx, RuntimeHandle runtime,
-    void *caller_stream, RuntimeHandle *out_reference);
-```
+A framework model ticket holds the submitted run directly. Prepare snapshots
+the execution image. The run owns the backing that the submission references
+while its pipeline slot can accept another run. A model destroy notification
+allows the framework to finalize each run after its last use. The same
+notification can serve multiple nodes in one model.
 
-The run must be Prepared. `out_reference` receives an independent resource token,
-not an executable run handle. Exactly one retention is permitted per original
-run, including if that reference is released before the original run ends.
-The original run still requires its own finalization.
+## Native caller-owned runs
 
-Onboard retention covers actual non-DFX backing for Kernel and ordinary Program
-preparations. Native A3 TMR capture additionally retains ScopeStats-only backing;
-native A3 TMR/HBG capture retains PMU-only backing through the same prepared
-resource owner. See the
-[ScopeStats capture contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection)
-and [PMU capture contract](../dfx/pmu-profiling.md#native-a3-capturereplay)
-for shared-pool ordering, driver protection and release obligations. Other
-diagnostic combinations remain refused. Program remains eager-only.
-SIM returns `UNSUPPORTED` and clears a supplied output reference. Retention
-success alone does not advertise a backend's device replay support; use the
-[execution support limits](native-capture-common-contract.md#support-and-qualification-limits).
+Prepare each Kernel node with `simpler_prepare_caller_run` and submit it with
+`simpler_submit_run_on_stream`. Keep the original run storage, borrowed
+context, stream and tensors valid until checked finalization. A successful
+submission returns execution capacity while preserving the backing named by
+the launch. Other nodes can reuse the slot.
 
-Retaining code, internal streams and backing does not retain an external device
-context, caller stream or tensor owner on the caller's behalf. Those objects must
-remain valid. A context cannot be destroyed or have its grant changed while
-prepared resources remain in use.
+After destroying or cancelling the model, end outstanding uses on every
+execution stream and call `simpler_finalize_run` for each original run. A
+partial submission needs the same cleanup. A failed stream drain or reader
+settlement leaves the run available for retry. Call finalization from a thread
+that can use the borrowed device context and synchronize streams.
 
-## Ending external use and releasing
-
-```cpp
-int simpler_release_run_resources(
-    DeviceContextHandle ctx, RuntimeHandle reference);
-```
-
-Before calling release, the caller must finish model destruction or capture
-cancellation, stop future uses, and complete all in-flight uses on every execution
-stream. Ending one recording or destroying the original Host run is insufficient.
-The API cannot infer these external facts from a reference count. Calling
-release promises that the reference will not be used for future execution,
-even if synchronization fails and ordinary release remains retryable.
-
-Release validates the context and caller stream and synchronizes that retained
-caller stream with the configured timeout. That synchronization supplements the
-caller's promise; it does not prove completion on other replay streams. A failed
-synchronization returns its error without consuming the reference. Do not invoke
-release from an RTS callback that forbids synchronization/device operations.
-
-Once external use ends, internal obligations remain separate: actual device exit
-or a proven no-submission outcome, consumed waits, returned copyback, released
-bindings and ended Host ownership. Only their combined completion permits
-reclamation. Returning storage to an idle cache is a valid release; immediate
-freeing of every allocation is not required.
-
-## Failures and cleanup
-
-The caller completes the RTS-required capture/model teardown after recording
-failure. Simpler reports the submission error and retains its own potentially
-referenced resources. Partial submission is not rollback or no-submission proof.
-Recording finalization does not synchronize, reset the caller's device or invent
-execution completion.
-
-An ordinary resource-release failure keeps an unconsumed token and failed
-addresses for retry. Once release has been requested, the token cannot be used
-for further execution. Successful frees are not repeated. A binding-cleanup
-failure keeps the original carrier alive; finalization retries do not repeat
-copyback that already returned.
-
-External release and retry reclaim only that reference's obsolete managed
-backing, preserve reusable cached storage, and do not retry another reference's
-failed frees. Successful recovery leaves unrelated quarantined backing and
-unconfirmed use obligations intact.
-
-Ending external use cannot discharge unproved internal use. Unrequested external
-references still block an owned Program fatal reset. When that reset is confirmed
-and the existing confirmed-reset resource retirement consumes release-requested
-references, their tokens become invalid. They must not be released or retried
-after that retirement, even if close ultimately returns a nonzero code. The final
-close return code alone proves neither reset confirmation nor continued token
-validity. A borrowed Kernel context stays isolated and is never reset by Simpler.
-Missing or dropped diagnostic records do not revoke a runtime's independent
-physical proof, and log contents do not grant reclamation.
+For diagnostics, the original run owns its window and associated collector
+resources. Before finalization, stop other producers sharing the pool. After
+finalization, flush diagnostics to observe artifact publication. See the
+[ScopeStats contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection)
+and the [PMU contract](../dfx/pmu-profiling.md#native-a3-capturereplay).

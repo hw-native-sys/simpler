@@ -22,7 +22,7 @@ scheduler_native_region_valid(uint64_t bytes, uint64_t offset, uint64_t count, u
 
 inline __aicore__ bool scheduler_native_header_extent_valid(uint64_t base, uint64_t bytes, uint64_t offset) {
     return base != 0 && base % SCHEDULER_STATE_ALIGNMENT == 0 && bytes <= UINT64_MAX - base &&
-           offset >= sizeof(SchedulerRunControl) &&
+           offset >= SCHEDULER_STATE_ALIGNMENT &&
            scheduler_native_region_valid(
                bytes, offset, 1, sizeof(SchedulerNativeGraphHeader), alignof(SchedulerNativeGraphHeader)
            );

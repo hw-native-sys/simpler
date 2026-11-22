@@ -803,13 +803,14 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     // READY publishes this run's timeout; no writer changes it during execution.
     const uint64_t timeout_cycles = scheduler_gm_query(run_control->scheduler_timeout_cycles);
     scheduler_observe_cache_line(&context->graph_task_count);
+    if constexpr (WithNativeGraph) scheduler_observe_cache_line(&context->native_graph_address);
     const SchedulerGraphView graph{
         context->graph_storage_address,
         context->graph_task_count,
         context->task_window_last_index,
-        context->scheduler_state_base_address,
+        WithNativeGraph ? context->native_graph_address : 0,
         WithNativeGraph ? context->native_header_offset : 0,
-        context->scheduler_state_bytes,
+        WithNativeGraph ? context->native_graph_bytes : 0,
         static_cast<uint32_t>(context->original_task_count),
     };
     SchedulerWorkerStats stats{};
@@ -830,7 +831,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     const bool native_extent_valid =
         graph.native_header_offset == 0 ||
         scheduler_native_header_extent_valid(
-            graph.scheduler_state_address, graph.scheduler_state_bytes, graph.native_header_offset
+            graph.native_graph_address, graph.native_graph_bytes, graph.native_header_offset
         );
     bool config_valid =
         native_extent_valid &&

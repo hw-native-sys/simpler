@@ -61,6 +61,7 @@ int main() {
     DeviceRunner runner;
     Runtime runtime;
     runtime.dev = {};
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
     MemoryAllocator allocator;
     SlotPersistentArgs slot;
     NativeRunIdentity id{1, 1, 1, 0};

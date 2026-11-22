@@ -12,7 +12,13 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <cstdlib>
+#include <future>
+#include <thread>
+#include <type_traits>
 #include "host/prepared_run_resources.h"
+
+static_assert(!std::is_copy_constructible_v<PreparedRunResources>);
+static_assert(!std::is_copy_assignable_v<PreparedRunResources>);
 
 namespace {
 void end_host_use(PreparedRunUse &use) {
@@ -51,18 +57,6 @@ TEST(PreparedRunUse, DeviceCompletionDoesNotProveQueuedWaitConsumption) {
     EXPECT_FALSE(use.obligations_ended());
     use.note_waits_consumed();
     EXPECT_TRUE(use.obligations_ended());
-}
-
-TEST(PreparedRunUse, ExternalUseNeedsItsOwnEndProofEvenAfterAllLocalUseEnds) {
-    PreparedRunUse use(make_preparation());
-    ASSERT_TRUE(use.retain_external_use());
-    EXPECT_FALSE(use.retain_external_use());
-    use.note(WorkspaceManager::RunFact::NoDeviceSubmission);
-    end_host_use(use);
-    EXPECT_FALSE(use.obligations_ended());
-    use.note_external_use_ended();
-    EXPECT_TRUE(use.obligations_ended());
-    EXPECT_FALSE(use.retain_external_use());
 }
 
 TEST(PreparedRunUse, UnsubmittedRunNeedsNoDeviceWaitButLaunchedFactOverridesIt) {
@@ -111,7 +105,7 @@ TEST(PreparedRunResources, UnheldImageReusesCapacityAndInvalidRequestKeepsCache)
     EXPECT_EQ(cache, previous);
 }
 
-TEST(PreparedRunResources, SchedulerDetachProtectsBothSidesAndFailureKeepsOriginal) {
+TEST(PreparedRunResources, SchedulerSharesCapacityAndRetainsOldDeviceAddressOnlyAcrossGrowth) {
     std::shared_ptr<RetainedSchedulerStorage> cache;
     std::vector<std::shared_ptr<RetainedSchedulerStorage>> retired;
     bool fail_allocate = false;
@@ -122,38 +116,43 @@ TEST(PreparedRunResources, SchedulerDetachProtectsBothSidesAndFailureKeepsOrigin
         std::free(p);
         return 0;
     };
-    void *device = nullptr, *host = nullptr;
+    void *first = nullptr;
     ASSERT_EQ(
-        PreparedRunResources::acquire_scheduler(cache, retired, 256, 64, allocate, release, &device, &host),
+        PreparedRunResources::acquire_scheduler(cache, retired, 256, 64, allocate, release, &first),
         RetainedSchedulerStorage::Status::Ok
     );
-    auto original = cache;
     auto held =
         std::make_shared<PreparedRunResources>(nullptr, cache, nullptr, std::vector<WorkspaceManager::BackingLease>{});
-    std::memset(device, 0x5a, 256);
-    std::memset(host, 0xa5, 256);
-    void *next_device = nullptr, *next_host = nullptr;
+    std::memset(first, 0x5a, 256);
+
     fail_allocate = true;
-    EXPECT_EQ(
-        PreparedRunResources::acquire_scheduler(cache, retired, 256, 64, allocate, release, &next_device, &next_host),
-        RetainedSchedulerStorage::Status::DeviceUnavailable
-    );
-    EXPECT_EQ(cache, original);
-    EXPECT_TRUE(retired.empty());
-    fail_allocate = false;
+    void *second = nullptr;
     ASSERT_EQ(
-        PreparedRunResources::acquire_scheduler(cache, retired, 256, 64, allocate, release, &next_device, &next_host),
+        PreparedRunResources::acquire_scheduler(cache, retired, 128, 64, allocate, release, &second),
         RetainedSchedulerStorage::Status::Ok
     );
-    EXPECT_NE(device, next_device);
-    EXPECT_NE(host, next_host);
-    EXPECT_EQ(static_cast<unsigned char *>(device)[255], 0x5a);
-    EXPECT_EQ(static_cast<unsigned char *>(host)[255], 0xa5);
-    EXPECT_EQ(retired.size(), 1U);
+    EXPECT_EQ(first, second);
+    EXPECT_EQ(
+        PreparedRunResources::acquire_scheduler(cache, retired, 512, 64, allocate, release, &second),
+        RetainedSchedulerStorage::Status::DeviceUnavailable
+    );
+    EXPECT_EQ(second, nullptr);
+    EXPECT_EQ(cache->device_addr(), first);
+    EXPECT_TRUE(retired.empty());
+
+    fail_allocate = false;
+    ASSERT_EQ(
+        PreparedRunResources::acquire_scheduler(cache, retired, 512, 64, allocate, release, &second),
+        RetainedSchedulerStorage::Status::Ok
+    );
+    EXPECT_NE(first, second);
+    ASSERT_EQ(retired.size(), 1U);
+    EXPECT_EQ(retired.front()->device_addr(), first);
+    std::memset(second, 0xa5, 512);
+    EXPECT_EQ(static_cast<unsigned char *>(first)[255], 0x5a);
     held.reset();
-    original.reset();
-    ASSERT_EQ(retired[0].use_count(), 1);
-    EXPECT_EQ(retired[0]->release_preserving_failure(release), 0);
+    ASSERT_EQ(retired.front().use_count(), 1);
+    EXPECT_EQ(retired.front()->release_preserving_failure(release), 0);
     EXPECT_EQ(cache->release_preserving_failure(release), 0);
 }
 
@@ -209,18 +208,45 @@ struct ReusedArenaBackend {
 };
 }  // namespace
 
-TEST(PreparedRunResources, RetiredArenaPinsBackingUntilItsAddressesAreDetached) {
-    ReusedArenaBackend backend;
+TEST(PreparedRunResources, RetainingImageDoesNotKeepSiblingHeapAlive) {
+    std::vector<void *> freed;
     auto bank = std::make_shared<PreparedRunResources::ArenaBank>(
+        [](void *, size_t bytes) {
+            return std::malloc(bytes);
+        },
+        [](void *ctx, void *ptr) {
+            static_cast<std::vector<void *> *>(ctx)->push_back(ptr);
+            std::free(ptr);
+        },
+        &freed
+    );
+    bank->gm_heap->arena.reserve(64, 64);
+    bank->runtime_pool->arena.reserve(64, 64);
+    ASSERT_NE(bank->gm_heap->arena.commit(), nullptr);
+    ASSERT_NE(bank->runtime_pool->arena.commit(), nullptr);
+    void *heap = bank->gm_heap->arena.raw_backing();
+    void *image = bank->runtime_pool->arena.raw_backing();
+    auto held = std::make_shared<PreparedRunResources>(
+        nullptr, nullptr, bank->runtime_pool, std::vector<WorkspaceManager::BackingLease>{}
+    );
+    bank.reset();
+    EXPECT_EQ(freed, std::vector<void *>{heap});
+    held.reset();
+    EXPECT_EQ(freed, (std::vector<void *>{heap, image}));
+}
+
+TEST(PreparedRunResources, RetiredRegionPinsBackingUntilItsAddressesAreDetached) {
+    ReusedArenaBackend backend;
+    auto bank = std::make_shared<PreparedRunResources::ArenaRegion>(
         &ReusedArenaBackend::allocate, &ReusedArenaBackend::release_arena, &backend
     );
-    bank->runtime_pool.reserve(64, 64);
-    ASSERT_NE(bank->runtime_pool.commit(), nullptr);
+    bank->arena.reserve(64, 64);
+    ASSERT_NE(bank->arena.commit(), nullptr);
     auto original = std::make_shared<PreparedRunResources>(
         nullptr, nullptr, bank,
         std::vector<WorkspaceManager::BackingLease>{backend.workspace.retain_backing(backend.address)}
     );
-    PreparedRunResources::RetiredArena retired;
+    PreparedRunResources::RetiredRegion retired;
     ASSERT_EQ(retired.retain(bank, backend.workspace), 0);
     bank.reset();
     EXPECT_NE(retired.reclaim(backend.workspace), 0);
@@ -247,14 +273,14 @@ TEST(PreparedRunResources, RetiredArenaPinsBackingUntilItsAddressesAreDetached) 
     EXPECT_TRUE(backend.workspace.idle_backing(replacement));
 }
 
-TEST(PreparedRunResources, RetiredArenaAbandonMakesNoDeviceCalls) {
+TEST(PreparedRunResources, RetiredRegionAbandonMakesNoDeviceCalls) {
     ReusedArenaBackend backend;
-    auto bank = std::make_shared<PreparedRunResources::ArenaBank>(
+    auto bank = std::make_shared<PreparedRunResources::ArenaRegion>(
         &ReusedArenaBackend::allocate, &ReusedArenaBackend::release_arena, &backend
     );
-    bank->runtime_pool.reserve(64, 64);
-    ASSERT_NE(bank->runtime_pool.commit(), nullptr);
-    PreparedRunResources::RetiredArena retired;
+    bank->arena.reserve(64, 64);
+    ASSERT_NE(bank->arena.commit(), nullptr);
+    PreparedRunResources::RetiredRegion retired;
     ASSERT_EQ(retired.retain(bank, backend.workspace), 0);
     bank.reset();
     retired.abandon_after_device_failure();
@@ -263,14 +289,14 @@ TEST(PreparedRunResources, RetiredArenaAbandonMakesNoDeviceCalls) {
     EXPECT_FALSE(backend.workspace.must_keep(backend.address));
 }
 
-TEST(PreparedRunResources, RetiredArenaReleaseFailureRemainsOwnedByWorkspace) {
+TEST(PreparedRunResources, RetiredRegionReleaseFailureRemainsOwnedByWorkspace) {
     ReusedArenaBackend backend;
-    auto bank = std::make_shared<PreparedRunResources::ArenaBank>(
+    auto bank = std::make_shared<PreparedRunResources::ArenaRegion>(
         &ReusedArenaBackend::allocate, &ReusedArenaBackend::release_arena, &backend
     );
-    bank->runtime_pool.reserve(64, 64);
-    ASSERT_NE(bank->runtime_pool.commit(), nullptr);
-    PreparedRunResources::RetiredArena retired;
+    bank->arena.reserve(64, 64);
+    ASSERT_NE(bank->arena.commit(), nullptr);
+    PreparedRunResources::RetiredRegion retired;
     ASSERT_EQ(retired.retain(bank, backend.workspace), 0);
     bank.reset();
     backend.retire_run();
@@ -285,10 +311,10 @@ TEST(PreparedRunResources, RetiredArenaReleaseFailureRemainsOwnedByWorkspace) {
     EXPECT_EQ(backend.frees, 0);
 }
 
-TEST(PreparedRunResources, RetiredUnmanagedArenaFreesExactlyOnce) {
+TEST(PreparedRunResources, RetiredUnmanagedRegionFreesExactlyOnce) {
     WorkspaceManager workspace;
     int frees = 0;
-    auto bank = std::make_shared<PreparedRunResources::ArenaBank>(
+    auto bank = std::make_shared<PreparedRunResources::ArenaRegion>(
         [](void *, size_t bytes) {
             return std::malloc(bytes);
         },
@@ -298,9 +324,9 @@ TEST(PreparedRunResources, RetiredUnmanagedArenaFreesExactlyOnce) {
         },
         &frees
     );
-    bank->gm_heap.reserve(64, 64);
-    ASSERT_NE(bank->gm_heap.commit(), nullptr);
-    PreparedRunResources::RetiredArena retired;
+    bank->arena.reserve(64, 64);
+    ASSERT_NE(bank->arena.commit(), nullptr);
+    PreparedRunResources::RetiredRegion retired;
     ASSERT_EQ(retired.retain(bank, workspace), 0);
     EXPECT_NE(retired.reclaim(workspace), 0);
     EXPECT_EQ(frees, 0);
@@ -309,22 +335,6 @@ TEST(PreparedRunResources, RetiredUnmanagedArenaFreesExactlyOnce) {
     EXPECT_EQ(frees, 1);
     ASSERT_EQ(retired.reclaim(workspace), 0);
     EXPECT_EQ(frees, 1);
-}
-
-TEST(PreparedRunUse, ExternalCloseCannotReplaceInternalCompletionProof) {
-    PreparedRunUse use(make_preparation());
-    ASSERT_TRUE(use.retain_external_use());
-    use.note(WorkspaceManager::RunFact::Launched);
-    end_host_use(use);
-    EXPECT_TRUE(use.host_ended());
-    EXPECT_FALSE(use.internal_obligations_ended());
-    use.note_external_use_ended();
-    EXPECT_FALSE(use.obligations_ended());
-    use.note(WorkspaceManager::RunFact::DrainProvedComplete);
-    EXPECT_FALSE(use.internal_obligations_ended());
-    use.note_waits_consumed();
-    EXPECT_TRUE(use.internal_obligations_ended());
-    EXPECT_TRUE(use.obligations_ended());
 }
 
 TEST(PreparedRunResources, PublishedOwnerLifetimeIsIndependentOfInternalUseCopies) {
@@ -352,4 +362,27 @@ TEST(PreparedRunResources, OwnerCopiesKeepTheSameRegisteredLifetime) {
     EXPECT_FALSE(owner.expired());
     copy.reset();
     EXPECT_TRUE(owner.expired());
+}
+
+TEST(PreparedRunResources, TemporaryLeasesEndAcrossIndependentOwnerThreads) {
+    auto storage = std::make_shared<PreparedRunResources::TemporaryStorage>();
+    auto first = make_preparation();
+    auto second = make_preparation();
+    first->hold_temporary(storage);
+    second->hold_temporary(storage);
+    ASSERT_EQ(storage->run_leases.load(std::memory_order_relaxed), 2u);
+    std::promise<void> start;
+    auto ready = start.get_future().share();
+    std::thread owner([resource = std::move(first), ready]() mutable {
+        ready.wait();
+        resource.reset();
+    });
+    start.set_value();
+    second.reset();
+    auto successor = make_preparation();
+    successor->hold_temporary(storage);
+    owner.join();
+    EXPECT_EQ(storage->run_leases.load(std::memory_order_relaxed), 1u);
+    successor.reset();
+    EXPECT_EQ(storage->run_leases.load(std::memory_order_relaxed), 0u);
 }

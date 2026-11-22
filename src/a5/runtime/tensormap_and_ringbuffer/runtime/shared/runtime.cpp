@@ -29,7 +29,8 @@ Runtime::Runtime() {
     // because the CApi functions don't exist when compiled for device.
 
     // Initialize the device-copied descriptor (`dev`).
-    memset(dev.workers, 0, sizeof(dev.workers));
+    memset(host_shared_state_.workers, 0, sizeof(host_shared_state_.workers));
+    dev.shared_state_addr = reinterpret_cast<uint64_t>(&host_shared_state_);
     dev.worker_count = 0;
     dev.chip_swimlane_level = 0;
     dev.pmu_event_type = 0;
@@ -198,11 +199,9 @@ LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt) {
     return plan;
 }
 
-// The first publication onto an allocation adds the handshake region, so it
-// starts from the ctor-zeroed host copy rather than from whatever rtMalloc
-// left. Return gates are initialized by the AICPU before window-open.
-size_t runtime_device_initialized_prefix_size(const Runtime &) {
-    return offsetof(DeviceRuntimeLaunchDesc, teardown_gates);
-}
+// Shared worker state is initialized independently of the descriptor.
+size_t runtime_device_initialized_prefix_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }
 
 size_t runtime_device_extent_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }
+
+size_t runtime_device_launch_size(const Runtime &) { return RUNTIME_LAUNCH_DESCRIPTOR_BYTES; }

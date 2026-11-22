@@ -235,11 +235,11 @@ TEST_F(SchedulerRetirement, NewGenerationClearsEveryReturnGateBeforePublication)
     context->assign_own_clusters(1);
     ASSERT_EQ(context->retire_all_cores(), 0);
     for (int i = 0; i < kCores; ++i)
-        ASSERT_EQ(runtime->dev.teardown_gates[i].post_close_release, AICORE_POST_CLOSE_RELEASE);
+        ASSERT_EQ(runtime->get_teardown_gates()[i].post_close_release, AICORE_POST_CLOSE_RELEASE);
     context->deinit();
     ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, 0), 0);
     for (int i = 0; i < kCores; ++i)
-        EXPECT_EQ(runtime->dev.teardown_gates[i].post_close_release, 0U);
+        EXPECT_EQ(runtime->get_teardown_gates()[i].post_close_release, 0U);
 }
 
 TEST_F(SchedulerRetirement, EmergencyBeforeInitializationRetiresLateCores) {
@@ -443,13 +443,13 @@ TEST_F(SchedulerRetirement, NonemptyGraphStillWaitsForItsLastTask) {
 
 TEST_F(SchedulerRetirement, InitializationClearsRequestAndReleaseForEveryCore) {
     for (int i = 0; i < kCores; ++i) {
-        auto &control = runtime->dev.teardown_gates[i];
+        auto &control = runtime->get_teardown_gates()[i];
         control.post_close_release = AICORE_POST_CLOSE_RELEASE;
         control.exit_request = 9;
     }
     ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, 0), 0);
     for (int i = 0; i < kCores; ++i) {
-        const auto &control = runtime->dev.teardown_gates[i];
+        const auto &control = runtime->get_teardown_gates()[i];
         EXPECT_EQ(control.post_close_release, 0u);
         EXPECT_EQ(control.exit_request, 0u);
     }

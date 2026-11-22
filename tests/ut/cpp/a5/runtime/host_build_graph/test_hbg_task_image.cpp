@@ -75,10 +75,16 @@ TEST_F(TaskImageTest, PublishesArgumentsAndPredicatesWithoutAicpuSchedulingState
     auto relocated = image(layout.end);
     ASSERT_NE(packed, nullptr);
     ASSERT_NE(relocated, nullptr);
+    std::memset(packed.get(), 0xa5, layout.end);
+    std::memset(relocated.get(), 0x5a, layout.end);
     EXPECT_EQ(
         task_image::pack(source, kTasks, usage, {0x10000, 256}, static_cast<char *>(packed.get()), 0), layout.end
     );
     EXPECT_EQ(task_image_error_code(packed.get())->load(), SIMPLER_ERROR_NONE);
+    ASSERT_EQ(
+        task_image::pack(source, kTasks, usage, {0x10000, 256}, static_cast<char *>(relocated.get()), 0), layout.end
+    );
+    EXPECT_EQ(std::memcmp(packed.get(), relocated.get(), layout.end), 0);
     std::memcpy(relocated.get(), packed.get(), layout.end);
     auto graph =
         scheduler_ordinary_graph_view(reinterpret_cast<uint64_t>(relocated.get()) + layout.storage, kTasks, kTasks - 1);

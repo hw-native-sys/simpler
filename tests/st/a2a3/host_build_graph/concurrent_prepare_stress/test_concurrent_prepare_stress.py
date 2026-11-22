@@ -9,17 +9,10 @@
 # -----------------------------------------------------------------------------------------------------------
 """Concurrent-prepare overlap stress for host_build_graph.
 
-Drives a 2-deep native-run pipeline over the two arena banks: run i is
-*prepared* (which runs its full bind — arena build + host orchestration) while
-run i-1 is still launched-but-not-finalized. That is exactly the
-``overlaps_active_run`` path (a successor prepared into bank B while a
-predecessor executes in bank A), which the ordinary blocking run() never hits.
-
-Each iteration uses distinct input data, so any cross-run interference between
-the two banks' runtimes/orchestrators (e.g. a shared or under-initialized
-orchestrator) would corrupt a result and fail the golden check. The point is to
-exercise the concurrent-prepare bind path under many alternating-bank
-iterations, not to measure anything.
+Run i prepares in one pipeline slot while run i-1 executes on the device.
+Each slot builds its own host image. The device executions reuse the context's
+writable arena in order. Every iteration has distinct inputs so the golden
+check detects state or arguments leaking between runs.
 
 Four arms drive the same pipeline through :meth:`_drive_pipeline` and read the
 same ``assert_native_overlap`` verdict, so each negative arm differs from the
@@ -60,7 +53,7 @@ from simpler_setup.tools.strace_timing import NativeOverlapError, assert_native_
 
 _VECTOR_KERNELS = "../vector_example/kernels"
 _SIZE = 128 * 128
-_ITERS = 40  # 20 reuses per bank
+_ITERS = 40  # 20 reuses per slot
 # A negative arm needs only enough adjacent pairs for the analyzer to have one
 # to reject; the stress count buys nothing once the property is absent.
 _CONTROL_ITERS = 3
@@ -75,7 +68,7 @@ _ARM_CALLABLE_ID = 1
 
 @scene_test(level=2, runtime="host_build_graph")
 class TestConcurrentPrepareStressHbg(SceneTestCase):
-    """Prepare-while-active stress over the two pipeline banks (a2a3 onboard)."""
+    """Prepare-while-active stress across two pipeline slots (a2a3 onboard)."""
 
     CALLABLE = {
         "orchestration": {
@@ -171,7 +164,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         inputs but the buffers back the resolved descriptors, and the output is
         copied back at finalize.
         """
-        # Distinct inputs per iteration so golden catches cross-bank interference.
+        # Distinct inputs per iteration so golden catches cross-run interference.
         params = {"a": 1.0 + iteration, "b": 2.0 + 0.5 * iteration}
         test_args = self.generate_args(params)
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
@@ -186,7 +179,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         # Block to the completion fence; the lane finalizes (validate +
         # copy-back) as part of reaching terminal.
         chip_run.wait(-1.0)
-        # Distinct per-iteration data → a corrupted/aliased bank fails this.
+        # Distinct per-iteration data → corrupted run state fails this.
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def _drive_pipeline(self, chip_worker, callable_id, orch_sig, config, iters, inflight_limit, config_for=None):
@@ -197,7 +190,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         compatible successor. At ``inflight_limit=2`` a submission therefore
         lands while its predecessor is still in flight, and the predecessor's
         ``wait`` prepares it (its full bind — arena build + host orchestration)
-        against the other bank, i.e. the overlaps_active_run path. At
+        in the other slot, exercising the overlaps_active_run path. At
         ``inflight_limit=1`` every run reaches terminal before the next is
         submitted, so no bind can coexist with a device window.
 
@@ -215,14 +208,14 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
             self._retire(inflight.pop(0))
 
     def test_concurrent_prepare_overlap(self, st_platform, st_worker, capfd, drain_host_log):
-        """Golden-check a 2-deep overlapping pipeline over both arena banks.
+        """Golden-check a 2-deep pipeline that reuses shared device scratch.
 
-        Each submission prepares (fully binds) its run against one bank while the
-        predecessor is still active in the other, exercising the
+        Each submission prepares in its own slot while the predecessor is
+        still active on the device, exercising the
         ``overlaps_active_run`` path many times with distinct data.
         """
         if st_platform != "a2a3":
-            pytest.skip("concurrent native prepare / two-bank pipeline is an a2a3 onboard path")
+            pytest.skip("concurrent native prepare / two-slot pipeline is an a2a3 onboard path")
 
         orch_sig = self.CALLABLE["orchestration"]["signature"]
         callable_obj = self.build_callable(st_platform)
@@ -257,7 +250,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         arm below, which is tied to a fallback with an expiry date.
         """
         if st_platform != "a2a3":
-            pytest.skip("concurrent native prepare / two-bank pipeline is an a2a3 onboard path")
+            pytest.skip("concurrent native prepare / two-slot pipeline is an a2a3 onboard path")
 
         orch_sig = self.CALLABLE["orchestration"]["signature"]
         callable_obj = self.build_callable(st_platform)
@@ -293,7 +286,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         so the trace still comes out with device diagnostics on.
         """
         if st_platform != "a2a3":
-            pytest.skip("concurrent native prepare / two-bank pipeline is an a2a3 onboard path")
+            pytest.skip("concurrent native prepare / two-slot pipeline is an a2a3 onboard path")
 
         orch_sig = self.CALLABLE["orchestration"]["signature"]
         callable_obj = self.build_callable(st_platform)
@@ -334,7 +327,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         reset produces an artifact without it.
         """
         if st_platform != "a2a3":
-            pytest.skip("concurrent native prepare / two-bank pipeline is an a2a3 onboard path")
+            pytest.skip("concurrent native prepare / two-slot pipeline is an a2a3 onboard path")
 
         orch_sig = self.CALLABLE["orchestration"]["signature"]
         callable_obj = self.build_callable(st_platform)

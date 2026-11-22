@@ -16,6 +16,8 @@
 
 #include "kernel_platform_ops.h"
 
+#include <thread>
+
 #include <acl/acl.h>
 #include <runtime/rt.h>
 
@@ -103,4 +105,23 @@ KernelContextOps make_onboard_kernel_context_ops() {
     ops.create_event = &create_event;
     ops.destroy_event = &destroy_event;
     return ops;
+}
+
+int initialize_private_workers(void *stream, void *workers, size_t bytes, int timeout_ms, bool &pending) {
+    aclrtContext context = nullptr;
+    int rc = aclrtGetCurrentContext(&context);
+    if (rc != ACL_SUCCESS) return rc;
+    std::thread initializer([&] {
+        rc = aclrtSetCurrentContext(context);
+        if (rc != ACL_SUCCESS) return;
+        if (!pending) {
+            rc = aclrtMemsetAsync(workers, bytes, 0, bytes, stream);
+            if (rc != ACL_SUCCESS) return;
+            pending = true;
+        }
+        rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_ms);
+        if (rc == ACL_SUCCESS) pending = false;
+    });
+    initializer.join();
+    return rc;
 }

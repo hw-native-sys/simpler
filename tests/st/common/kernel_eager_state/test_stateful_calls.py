@@ -105,6 +105,11 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
                 faults = ctypes.CDLL(None)
                 faults.bind_test_rts.argtypes = [ctypes.c_void_p]
                 assert faults.bind_test_rts(lib._handle) == 0
+                faults.set_binding_release_result.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                faults.set_binding_release_result(ctypes.cast(lib.release_run_bindings_impl, ctypes.c_void_p), 0)
+                faults.set_publication_result.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                publication = ctypes.cast(lib.publish_run_image_impl, ctypes.c_void_p)
+                faults.set_publication_result(publication, 0)
             if borrowed:
                 assert lib.rtSetDevice(device) == 0
                 assert lib.rtCtxGetCurrent(ctypes.byref(caller_context)) == 0
@@ -145,20 +150,18 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
             rejected.add_scalar(777)
             rejected_config = CallConfig()
             rejected_config.runtime_env.ring_task_window = 64
-            rejected_config.runtime_env.ring_heap = (
-                (1 << 28) if runtime == "tensormap_and_ringbuffer" and refusal_phase == "prepare" else 1 << 20
-            )
+            rejected_config.runtime_env.ring_heap = 1 << 20
             if refusal_phase == "launch":
-                # The facade, lane, Worker and C API validate this stream first.
-                # Refuse the runner's launch preflight before it queues any work.
-                faults.arm_capture_query_failure.argtypes = [ctypes.c_void_p, ctypes.c_int]
-                faults.arm_capture_query_failure(stream, 5)
-            elif runtime == "host_build_graph":
-                faults.arm_copy_failure()
-            with pytest.raises(RunPreparationRefused, match="-4321" if refusal_phase == "launch" else None):
+                faults.arm_launch_publication_failure()
+            else:
+                faults.set_publication_result(publication, -4321)
+            with pytest.raises(RunPreparationRefused, match="-4321"):
                 owner.submit(handle, rejected, config=rejected_config, caller_stream=stream.value)
             if refusal_phase == "launch":
-                assert faults.capture_query_failure_hits() == 1
+                assert faults.launch_publication_failure_hits() == 1
+            assert faults.publication_call_count() == 1
+            assert faults.actual_publication_rc() == 0
+            faults.set_publication_result(publication, 0)
             # The same Worker and Buffer accept a valid invocation after rollback.
             empty = TaskArgs()
             empty.add_tensor(view, TensorArgType.INOUT)

@@ -74,6 +74,7 @@ struct Control {
     uint64_t c2c_address{0x12340000};
     size_t c2c_calls{0};
     std::function<int(void *, void *, size_t, const std::string &)> aicpu_payload;
+    std::vector<std::vector<unsigned char>> aicpu_argument_copies;
     size_t binary_register_calls{0};
     size_t event_create_calls{0};
     size_t event_destroy_calls{0};
@@ -92,6 +93,8 @@ struct Control {
     int registration_launch_rc{0};
     std::vector<int> registered_ids;
     std::vector<void *> registration_streams;
+    size_t async_memset_calls{0};
+    size_t fail_async_memset{0};
     int stream_sync_rc{0};
     std::function<void()> stream_sync_hook;
     std::vector<void *> observed_streams;

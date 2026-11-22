@@ -63,6 +63,7 @@ struct Transport {
     int resolve_failure_at = -1;
     int resolve_calls = 0;
     int launches = 0;
+    std::vector<unsigned char> launch_payload;
     ~Transport() {
         for (auto &binary : binaries)
             dlclose(binary->module);
@@ -166,7 +167,11 @@ extern "C" rtError_t
 rtsLaunchCpuKernel(rtFuncHandle function, uint32_t, rtStream_t, const rtKernelLaunchCfg_t *, rtCpuKernelArgs_t *args) {
     ++transport->launches;
     if (transport->launch_error != 0 && !transport->execute_on_launch_error) return transport->launch_error;
-    const int rc = reinterpret_cast<int (*)(void *)>(function)(args->baseArgs.args);
+    transport->launch_payload.resize(args->baseArgs.argsSize);
+    EXPECT_EQ(args->baseArgs.hostInputInfoNum, 0u);
+    EXPECT_EQ(args->baseArgs.hostInputInfoPtr, nullptr);
+    std::memcpy(transport->launch_payload.data(), args->baseArgs.args, args->baseArgs.argsSize);
+    const int rc = reinterpret_cast<int (*)(void *)>(function)(transport->launch_payload.data());
     return transport->launch_error != 0 ? transport->launch_error : rc;
 }
 
@@ -434,5 +439,42 @@ TEST_F(LoadOwnership, EnqueueErrorAfterExecutingCleanupUsesOriginalAcknowledgeme
     ASSERT_EQ(Finalize(loader), 0);
     EXPECT_EQ(state.launches, launches);
     EXPECT_TRUE(state.allocations.empty());
+}
+
+TEST_F(LoadOwnership, RtsReceivesTheWholePacketWithBorrowedDeviceAddresses) {
+    host::LoadAicpuOp loader;
+    ASSERT_EQ(Bootstrap(loader), 0);
+    ASSERT_EQ(Init(loader), 0);
+    uint64_t caller_value = 73;
+    struct Packet {
+        uint32_t inline_offset;
+        uint64_t borrowed_address;
+        uint64_t inline_value;
+    } packet{offsetof(Packet, inline_value), reinterpret_cast<uint64_t>(&caller_value), 41};
+    ASSERT_EQ(loader.LaunchBuiltInOp(nullptr, &packet, sizeof(packet), 1, host::KernelNames::RunName), 0);
+    ASSERT_EQ(state.launch_payload.size(), sizeof(packet));
+    Packet received{};
+    std::memcpy(&received, state.launch_payload.data(), sizeof(received));
+    ASSERT_EQ(received.inline_offset, offsetof(Packet, inline_value));
+    EXPECT_EQ(received.inline_value, 41U);
+    EXPECT_EQ(received.borrowed_address, reinterpret_cast<uint64_t>(&caller_value));
+    EXPECT_EQ(caller_value, 73U);
+    EXPECT_EQ(Finalize(loader), 0);
+    caller_value = 99;
+    EXPECT_EQ(caller_value, 99U);
+}
+
+TEST_F(LoadOwnership, InvalidPacketSizeFailsBeforeRtsSubmission) {
+    host::LoadAicpuOp loader;
+    ASSERT_EQ(Bootstrap(loader), 0);
+    ASSERT_EQ(Init(loader), 0);
+    uint64_t payload = 0;
+    const int launches = state.launches;
+    EXPECT_NE(loader.LaunchBuiltInOp(nullptr, &payload, 0, 1, host::KernelNames::RunName), 0);
+    EXPECT_NE(
+        loader.LaunchBuiltInOp(nullptr, &payload, static_cast<size_t>(UINT32_MAX) + 1, 1, host::KernelNames::RunName), 0
+    );
+    EXPECT_EQ(state.launches, launches);
+    EXPECT_EQ(Finalize(loader), 0);
 }
 }  // namespace

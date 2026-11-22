@@ -45,6 +45,7 @@ def build_probe(
     build: Path,
     *,
     retained_models: bool = False,
+    shared_heap: bool = False,
     args_dump: bool = False,
     runtime_name: str = "host_build_graph",
     platform: str = "a2a3",
@@ -52,7 +53,7 @@ def build_probe(
     build.mkdir(parents=True, exist_ok=True)
     compiler = KernelCompiler(platform)
     kernel = compiler.compile_incore(
-        str(_NATIVE / ("hbg_inout_step.cpp" if retained_models else "hbg_step.cpp")),
+        str(_NATIVE / ("hbg_inout_step.cpp" if retained_models and not shared_heap else "hbg_step.cpp")),
         core_type="aiv",
         pto_isa_root=ensure_pto_isa_root(),
         extra_include_dirs=compiler.get_orchestration_include_dirs(runtime_name),
@@ -64,7 +65,7 @@ def build_probe(
         build_dir=str(build),
     )
     child = CoreCallable.build(
-        signature=[D.INOUT, D.SCALAR] if retained_models else [D.IN, D.OUT, D.SCALAR],
+        signature=[D.INOUT, D.SCALAR] if retained_models and not shared_heap else [D.IN, D.OUT, D.SCALAR],
         binary=extract_text_section(kernel),
     )
     chip = ChipCallable.build(
@@ -72,6 +73,8 @@ def build_probe(
         func_name=(
             "args_dump_capture_orchestration"
             if args_dump
+            else "hbg_shared_heap_orchestration"
+            if shared_heap
             else "hbg_inout_orchestration"
             if retained_models
             else "hbg_capture_orchestration"
@@ -152,12 +155,37 @@ def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
     )
     (tmp_path / "retained-models.log").write_text(result.stdout + result.stderr)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}\nDevice logs: {logs}"
-    assert "hbg_retained_models PASS models=2 references=2 replays=6 eager=1 elements=16" in result.stdout
+    assert "hbg_retained_models PASS models=2 original_runs=2 replays=6 eager=1 elements=16" in result.stdout
     for stage in ("a-recorded", "b-prepared", "b-recorded", "b1", "a1", "b2", "a2", "b3", "b-after-a-release", "eager"):
         assert f"state={stage} verified=48" in result.stdout
     for stage in ("a-retains-callable", "a-retains-context", "b-retains-callable", "b-retains-context"):
         assert f"stage={stage} rc=0" in result.stdout
-    assert "stage=same-carrier-and-slot rc=0" in result.stdout
+    assert "stage=same-pipeline-slot rc=0" in result.stdout
+
+
+@pytest.mark.platforms(["a2a3", "a5"])
+def test_hbg_retained_models_replay_fixed_heap_after_oversize_refusal(tmp_path, request):
+    binaries = build_probe(
+        tmp_path, retained_models=True, shared_heap=True, platform=request.config.getoption("--platform")
+    )
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    logs = tmp_path / "ascend-shared-heap"
+    logs.mkdir()
+    result = subprocess.run(
+        [binaries[0], device, *binaries[1:], "heap"],
+        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    (tmp_path / "shared-heap.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}\nDevice logs: {logs}"
+    assert "hbg_retained_models PASS models=2 original_runs=2 replays=6 eager=1 elements=16" in result.stdout
+    for stage in ("a-recorded", "b-prepared", "b-recorded", "b1", "a1", "b2", "a2", "b3", "eager", "b-after-a-release"):
+        assert f"state={stage} verified=48" in result.stdout
+    assert "state=heap-capacity-refused verified=48" in result.stdout
+    assert result.stdout.index("state=eager verified=48") < result.stdout.index("state=b-after-a-release verified=48")
 
 
 def _run_capture_probe(command, run, env, *, timeout=180):
@@ -209,11 +237,11 @@ def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path)
             assert stdout.count("stage=resident-bootstrap-failed rc=0") == 2
             assert "stage=restore-injected-graph-view rc=0" in stdout
         else:
-            assert "stage=restore-injected-arena-binding rc=0" in stdout
+            assert "stage=restore-injected-task-capacity rc=0" in stdout
             device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
-            assert device_log.count("host-orch: prebuilt_arena_base is null") == 2, device_log
+            assert device_log.count("host-orch: sm_handle->attach_populated failed") == 2, device_log
     assert stdout.count("verified=16") == 3
-    assert "stage=release-after-destroy rc=0" in stdout
+    assert "stage=finalize-after-destroy rc=0" in stdout
 
 
 @pytest.mark.parametrize(
@@ -236,7 +264,17 @@ def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path)
         "post-handshake-boot-failure-and-same-model-recovery",
     ],
 )
-def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scenario):
+def test_hbg_model_replays_with_original_run(hbg_capture_probe, request, scenario):
+    _check_model_lifecycle(hbg_capture_probe, request, scenario)
+
+
+@pytest.mark.platforms(["a2a3", "a5"])
+@pytest.mark.parametrize("scenario", [14, 15], ids=["larger-eager-run-between-replays", "zero-replays"])
+def test_hbg_model_with_caller_owned_run(hbg_capture_probe, request, scenario):
+    _check_model_lifecycle(hbg_capture_probe, request, scenario)
+
+
+def _check_model_lifecycle(hbg_capture_probe, request, scenario):
     _, binaries = hbg_capture_probe
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
@@ -259,20 +297,17 @@ def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scena
     if scenario == 5:
         assert "stage=reject-capture-predecessor rc=0" in result.stdout
     if 7 <= scenario <= 11:
-        assert "stage=finalize-during-capture rc=0" in result.stdout
-        assert "stage=release-live-capture-rejected rc=0" in result.stdout
-        assert "stage=release-refusal-keeps-capture rc=0" in result.stdout
+        assert "stage=original-run-retains-callable rc=0" in result.stdout
         assert "cancelled-capture-cleaned cycle=0" in result.stdout
         assert result.stdout.count("stage=capture-did-not-execute rc=0") == 2
         assert result.stdout.count("stage=destroy-model rc=0") == (1 if scenario >= 9 else 2)
-        assert result.stdout.count("stage=release-after-destroy rc=0") == 2
+        assert result.stdout.count("stage=finalize-after-destroy rc=0") == 2
         assert result.stdout.count("verified=16") == 3
     if scenario == 8:
         assert "stage=capture-end-invalid-argument rc=0" in result.stdout
     if 9 <= scenario <= 11:
         assert "stage=failed-end-no-model rc=0" in result.stdout
         assert "stage=other-capture-ended rc=0" in result.stdout
-        assert "stage=external-reference-retains-callable rc=0" in result.stdout
     if scenario == 9:
         assert "failed-capture-end rc=107025 expected=107025" in result.stdout
     if scenario in (10, 11):
@@ -281,11 +316,20 @@ def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scena
     if scenario == 11:
         assert "partial-capture core=1 cpu=0 after=0 boundary=0 conflict=107032 launch=107032" in result.stdout
         assert "stage=partial-capture-stops-submission rc=0" in result.stdout
-        assert "finalize-capture rc=107032 expected=107032" in result.stdout
+        assert "finalize-after-last-use rc=107032 expected=107032" in result.stdout
     if scenario in (12, 13):
         _check_fault_recovery(scenario, platform, result.stdout, logs)
     captures = 2 if 7 <= scenario <= 11 else 1
-    replays = 0 if scenario == 3 else (5 if scenario in (12, 13) else 3)
+    if scenario in (14, 15):
+        assert "stage=finalize-after-destroy rc=0" in result.stdout
+    if scenario == 14:
+        assert "stage=shared-runtime-workspace rc=0" in result.stdout
+        assert "stage=larger-image rc=0" in result.stdout
+        if platform == "a5":
+            assert "stage=shared-scheduler-workspace rc=0" in result.stdout
+        assert result.stdout.index("stage=shared-runtime-workspace rc=0") < result.stdout.index("replay=2 verified=16")
+        assert result.stdout.index("stage=larger-image rc=0") < result.stdout.index("replay=3 verified=16")
+    replays = 0 if scenario in (3, 15) else (5 if scenario in (12, 13) else 3)
     assert (
         f"hbg_capture PASS scenario={scenario} replays={replays} prepare={captures} launch={captures}" in result.stdout
     )
@@ -350,10 +394,12 @@ def test_hbg_retained_models_publish_swimlane_observations(tmp_path, request, re
     (tmp_path / "swimlane-native.log").write_text(result.stdout + result.stderr)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "stage=swimlane-flush rc=0" in result.stdout
+    eager = result.stdout.index("state=eager verified=48")
+    replay_after_eager = "state=b-after-a-release verified=48"
     if replay:
-        assert result.stdout.index("state=eager verified=48") < result.stdout.index(
-            "state=b-after-a-release verified=48"
-        )
+        assert eager < result.stdout.index(replay_after_eager)
+    else:
+        assert replay_after_eager not in result.stdout
     ordinary = json.loads((output / "eager/chip_swimlane_records.json").read_text())
     assert ordinary["aicore_tasks"] and not ordinary["metadata"].get("collection", {}).get("recorded_window")
     assert not (output / "unused").exists()

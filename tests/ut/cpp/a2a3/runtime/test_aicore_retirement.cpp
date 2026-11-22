@@ -402,7 +402,9 @@ TEST(AicoreFreshnessDeathTest, UnstampedAivRetiresAfterFailureBeforeIdle) {
 
 // Only handshake storage is used by these idle-worker tests. Keep host-side
 // orchestration and the profiling service out of this executor-level fixture.
-Runtime::Runtime() {
+Runtime::Runtime() :
+    dev{} {
+    dev.shared_state_addr = reinterpret_cast<uint64_t>(&host_shared_state_);
     std::memset(get_workers(), 0, sizeof(Handshake) * RUNTIME_MAX_WORKER);
     std::memset(get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * RUNTIME_MAX_WORKER);
 }

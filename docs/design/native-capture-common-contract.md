@@ -18,26 +18,20 @@ There is no separate capture executor or prepared-call cache.
 
 The native interfaces are declared in
 [`runtime_c_api.h`](../../src/common/worker/runtime_c_api.h).
-Capture is exposed through these native C interfaces; the Python Worker and
-ChipWorker interfaces continue to submit eager runs.
+The Python framework adapter also uses these interfaces. Its model ticket
+holds the original run and the caller's tensor owners until model destruction.
 The common API shape does not establish capture support for every backend.
 
 ## Preparation and eligibility
 
-Use `simpler_prepare_run` outside capture with a `NativeRunDescriptor`:
+Onboard Kernel callers use `simpler_prepare_caller_run` when they own the
+original run through its last stream or model use. The same entry accepts
+eager streams and recording streams. Ordinary lane-managed runs continue to
+use `simpler_prepare_run`. Both entries take the current `NativeRunDescriptor`.
+Rebuild native callers against that layout. Simulation returns `UNSUPPORTED`
+for caller-owned stream submissions.
 
-| `prepare_purpose` | Contract |
-| ----------------- | -------- |
-| `SIMPLER_PREPARE_EAGER` (zero) | Ordinary preparation; cannot be upgraded to recording at launch. |
-| `SIMPLER_PREPARE_CAPTURE` | Kernel capture preparation; rejects unsupported Host effects before orchestration. |
-
-All native callers must rebuild against the current `NativeRunDescriptor`
-layout. `simpler_prepare_run` and `simpler_run` use that same descriptor.
-A zero purpose preserves eager behavior; it does not make an older descriptor
-layout compatible.
-Simulation rejects capture-purpose preparation with `UNSUPPORTED`.
-
-Capture preparation rejects writable HOST/NONE tensor arguments, including OUT
+Caller-owned preparation rejects writable HOST/NONE tensor arguments, including OUT
 and INOUT, before user Host orchestration. Read-only IN controls may determine
 fixed graph structure and task arguments. Their source values are consumed at
 prepare time; changing those values afterwards does not change an existing
@@ -51,30 +45,31 @@ is separate from starting user tasks.
 
 ## Recording and replay
 
-The caller retains the preparation before `CaptureBegin`. The required order is:
+The framework queue registers a model-destroy callback before enqueueing its
+first native node. Further nodes in the same model can use that registration.
+The registration identifies the model and owns no native execution slot.
+When the queue invokes the node, the framework calls `simpler_prepare_caller_run`
+and calls `simpler_submit_run_on_stream` on the caller stream. A successful submission returns the slot
+for another node and leaves the original run with the ticket. The recorded
+tasks can execute zero or more times. After the caller ends all model uses,
+checked cleanup finalizes the original run and releases its tensor owners.
+The destroy callback itself only records the notification. When a live run still owns the previous
+slot backing, prepare initializes the replacement worker reports once on a
+private stream. Replay preserves the worker reports written by the device.
+
+Native callers can prepare before entering capture. Each node has its own
+original run handle and storage address through finalization.
 
 ```text
-prepare_run(CAPTURE) -> retain_run_resources
-  -> RTS CaptureBegin -> launch_run_on_stream -> RTS CaptureEnd
-  -> finalize the original Host run
-  -> RTS model execute / ordered copies / synchronization
-  -> destroy or cancel the model and end every external use
-  -> release_run_resources
+simpler_prepare_caller_run -> RTS CaptureBegin -> simpler_submit_run_on_stream -> RTS CaptureEnd
+  -> RTS model execute / synchronize (zero or more times)
+  -> destroy the model -> simpler_finalize_run
 ```
 
-The exact native entry names are `simpler_prepare_run`,
-`simpler_retain_run_resources`, `simpler_launch_run_on_stream`,
-`simpler_finalize_run` (or `simpler_finalize_run_with_delivery`) and
-`simpler_release_run_resources`. Model operations belong to the caller's RTS API.
-
-Active recording requires Kernel mode, capture-purpose preparation, a matching
-retained reference and caller stream, and no predecessor argument. Diagnostics
-allow ScopeStats alone on native A3 TMR, or one of PMU, ArgsDump and Swimlane
-on native A3 TMR/HBG.
-Each supported family reserves and arms its collection window during retention,
-before capture; other diagnostic families and combinations remain refused. Duplicate recording,
-invalidated capture and unsupported combinations are refused. A capture query or
-refusal does not prove that accepted device work has completed.
+Supported native diagnostic families use this same original run. Prepare
+reserves and arms its collection window before recording. Finalization settles
+the window after the caller has ended all uses. The existing diagnostic flush
+reports when artifact writing completes.
 
 Publication precedes the entry fork. The AICore stream waits for that fork;
 completion events follow the corresponding device kernels, and the caller's
@@ -82,22 +77,25 @@ exit dependency follows both sides. Recorded waits must have valid records in
 the captured dependency graph. Caller-stream input copies, model execution and
 output copies must preserve their data dependencies.
 
-For a recording, `simpler_poll_run` reports a poll error and both native wait
-entries return `UNSUPPORTED`; none reports execution completion. Finalization
-ends the original Host run without synchronizing recorded device execution or
-copying Program outputs. The retained reference remains responsible for future
-model uses. Resource and failed-release rules are specified in the
-[resource lifetime contract](native-hbg-prepared-lifetime.md).
+HBG Kernel eager calls and captured models in one context share GM heap scratch.
+The caller must order complete invocations, including publication copies and
+both device roles, in a single execution domain. Use one ordered caller stream
+or dependencies that establish the equivalent order across streams. Retaining
+several models does not permit concurrent execution against that heap. Separate
+contexts have separate pools. Preparation itself does not overwrite shared heap;
+A5 Graph argument publication into the heap is recorded and replayed before its
+consumers. Heap contents are invocation-local; persistent outputs remain in
+caller-owned tensors. No new model owner or implicit cross-stream ordering is added.
 
-Diagnostic-enabled models and eager runs sharing one context's collector pool
-must execute in one caller-ordered domain, with no concurrent producers. Multiple
-resource references and collection windows may coexist. Before releasing any
-such reference, the caller must finish **all** producers sharing that
-pool and start none until release returns. Closing one window does not close
-another live window. Synchronizing the retained caller stream or counting
-references cannot prove that a raw model replay on another stream has stopped;
-the caller establishes that ordering. This contract adds neither a second owner
-nor a whole-context stream synchronization operation. Aggregate sample and
+The caller establishes the last-use boundary, including model destruction or
+cancellation and all outstanding executions on other streams. Poll and wait
+cannot establish this boundary. Finalization drains the caller stream and
+keeps resources on a failed drain for retry. A partial submission also needs
+checked cleanup on its actual execution streams.
+
+Diagnostic-enabled models and eager runs sharing a collector pool execute in
+one caller-ordered domain. Stop all producers using that pool before finalizing
+any one of its runs. Each run closes its own window. Aggregate sample and
 publication semantics are specified in the
 [ScopeStats capture contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection),
 the [PMU capture contract](../dfx/pmu-profiling.md#native-a3-capturereplay),
@@ -141,7 +139,7 @@ device.
 ## Support and qualification limits
 
 A3 HBG coverage exercises bounded dependency, early-dispatch and nested-Graph
-computations, changing device input contents, original Host-run finalization,
+computations, changing device input contents, original-run finalization after model destruction,
 multiple retained models with persistent INOUT tensors, and model/resource
 cleanup. Separate native TMR scenarios exercise cold replay, serial retained
 models, multiple prepared nodes, unexecuted-model destruction and a controlled

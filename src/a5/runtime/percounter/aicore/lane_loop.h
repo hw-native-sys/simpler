@@ -1997,7 +1997,9 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
  * READY straight to the register release and into its loop.
  */
 inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
-    __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
+    __gm__ Handshake *handshake =
+        (__gm__ Handshake *)(&reinterpret_cast<__gm__ RuntimeSharedState *>(runtime->dev.shared_state_addr)
+                                  ->workers[block_idx]);
     __gm__ PercounterControl *control =
         reinterpret_cast<__gm__ PercounterControl *>(runtime->dev.scheduler_bootstrap.worker_context_base);
     percounter_observe_cache_line(handshake);
@@ -2071,7 +2073,9 @@ inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int bl
     // acknowledging, and complete the preceding GM writes first.
     wait_for_aicpu_exit_signal();
     OUT_OF_ORDER_STORE_BARRIER();
-    acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+    acknowledge_aicore_cond_nonce_and_wait(
+        &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime->dev.shared_state_addr)->teardown_gates[block_idx]
+    );
 }
 
 }  // namespace

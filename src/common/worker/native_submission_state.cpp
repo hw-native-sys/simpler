@@ -92,9 +92,11 @@ struct NativeSubmissionState::Backing {
         caller_stream(caller_stream),
         submission(
             [this](bool framework) {
-                if (purpose == SIMPLER_PREPARE_CAPTURE) {
-                    prepared->activate();
-                    return *prepared;
+                if (registration_claimed) {
+                    this->worker->submit_caller_owned_run(
+                        this->callable_id, this->values.args(), this->config, this->caller_stream, model_run
+                    );
+                    return model_run;
                 }
                 try {
                     this->worker->validate_execution_context();
@@ -118,8 +120,8 @@ struct NativeSubmissionState::Backing {
                     }
                 }
                 return this->worker->submit_chip_run(
-                    this->callable_id, this->values.args(), this->config, nullptr, 0, this->caller_stream,
-                    SIMPLER_PREPARE_EAGER, nullptr, framework
+                    this->callable_id, this->values.args(), this->config, nullptr, 0, this->caller_stream, nullptr,
+                    framework
                 );
             },
             framework_eligible
@@ -132,12 +134,10 @@ struct NativeSubmissionState::Backing {
     CallArgumentSnapshot values;
     const CallConfig config;
     void *const caller_stream;
-    // Selection and native-operation admission share the submission mutex.
-    std::optional<NativeRunPreparePurpose> purpose;
     bool registration_claimed{false};
     bool operation_in_progress{false};
-    std::optional<ChipRun> prepared;
-    std::unique_ptr<ChipRunResources> resources;
+    // Written by the one submitter and observed after submission settles.
+    ChipRun model_run;
     std::shared_ptr<AclCaptureModelNotice> model_notice;
     std::exception_ptr preparation_error;
     QueuedSubmission<ChipRun> submission;
@@ -159,11 +159,10 @@ NativeSubmissionState::~NativeSubmissionState() noexcept {
         (void)backing_.release();
         return;
     }
-    if (backing_->purpose != SIMPLER_PREPARE_CAPTURE || !backing_->registration_claimed) return;
+    if (!backing_->registration_claimed) return;
     try {
         // Unknown cleanup retains the exact native storage and HOST values.
-        if (!carrier_retired() || (backing_->resources && backing_->resources->has_reference()))
-            (void)backing_.release();
+        if (!run_released()) (void)backing_.release();
     } catch (...) {
         (void)backing_.release();
     }
@@ -178,23 +177,17 @@ void NativeSubmissionState::finish_operation() noexcept {
     backing_->operation_in_progress = false;
 }
 
-bool NativeSubmissionState::carrier_retired() const {
-    return !backing_->prepared || backing_->prepared->carrier_retired_for_submission();
-}
+bool NativeSubmissionState::run_released() const { return backing_->model_run.carrier_retired_for_submission(); }
 
 void NativeSubmissionState::submit() {
     auto &state = *backing_;
     state.submission.submit(
         [&] {
             if (state.operation_in_progress) throw RunPreparationRefused("native resource operation is in progress");
-            if (!state.purpose) state.purpose = SIMPLER_PREPARE_EAGER;
         },
         [&] {
-            if (state.purpose == SIMPLER_PREPARE_CAPTURE) {
+            if (state.registration_claimed) {
                 if (state.preparation_error) std::rethrow_exception(state.preparation_error);
-                if (!state.registration_claimed || !state.prepared || !state.resources ||
-                    !state.resources->has_reference())
-                    throw RunPreparationRefused("capture submission requires registered native resources");
                 if (!state.model_notice || model_notice_observed(*state.model_notice) ||
                     active_acl_model() != state.model_notice->model || model_notice_observed(*state.model_notice))
                     throw RunPreparationRefused("ACL capture model changed before submission");
@@ -222,7 +215,7 @@ void *NativeSubmissionState::active_acl_model() const {
     return model;
 }
 
-void NativeSubmissionState::retain_model_resources(
+void NativeSubmissionState::register_model_destroy_notice(
     int &registration_started, const NativeSubmissionState *model_anchor
 ) {
     registration_started = 0;
@@ -247,6 +240,10 @@ void NativeSubmissionState::retain_model_resources(
         if (state.submission.framework_claimed_)
             throw RunPreparationRefused("capture registration cannot take a framework eager token");
         if (!state.owner) throw RunPreparationRefused("capture registration requires a native shared Worker owner");
+        if (!state.owner->execution_environment_ || !state.owner->execution_environment_->borrowed)
+            throw RunPreparationRefused("model registration requires a borrowed Kernel context");
+        if (state.values.has_writable_host_arguments())
+            throw RunPreparationRefused("model registration requires read-only HOST arguments");
         if (state.config.diagnostics_any())
             throw RunPreparationRefused("framework capture does not prepare diagnostic resources during recording");
     };
@@ -260,20 +257,11 @@ void NativeSubmissionState::retain_model_resources(
     {
         std::lock_guard<std::mutex> lock(state.submission.mutex_);
         admissible();
-        state.purpose = SIMPLER_PREPARE_CAPTURE;
         state.registration_claimed = true;
         state.operation_in_progress = true;
         registration_started = 1;
     }
     try {
-        state.prepared.emplace();
-        (void)owner->submit_chip_run(
-            state.callable_id, state.values.args(), state.config, nullptr, 0, state.caller_stream,
-            SIMPLER_PREPARE_CAPTURE, &*state.prepared
-        );
-        state.prepared->retain_resources_into(state.resources);
-        // The retained run pins this Worker and its loaded ACL provider.
-        // Neither this preparation nor registration emits a captured run.
         void *const model = active_acl_model();
         if (anchor) {
             if (anchor->worker != owner.get() || anchor->stream != state.caller_stream || anchor->model != model ||
@@ -301,75 +289,38 @@ bool NativeSubmissionState::model_destroyed() const {
     return !state.operation_in_progress && state.model_notice && model_notice_observed(*state.model_notice);
 }
 
-void NativeSubmissionState::cancel_pending(NativeSubmissionCleanup &outcome) {
+bool NativeSubmissionState::release_model_resources() {
     validate_process();
     auto &state = *backing_;
-    bool cancelled = false;
+    using Phase = QueuedSubmission<ChipRun>::Phase;
+    bool cancelled;
     {
         std::lock_guard<std::mutex> lock(state.submission.mutex_);
-        if (state.operation_in_progress || state.submission.phase_ == QueuedSubmission<ChipRun>::Phase::Submitting) {
-            outcome = {NativeSubmissionDisposition::Submitting, false};
-            return;
+        if (state.operation_in_progress || state.submission.phase_ == Phase::Submitting)
+            throw RunPreparationRefused("native submission or model registration is in progress");
+        if (state.submission.phase_ == Phase::Submitted && !state.registration_claimed)
+            throw RunPreparationRefused("ordinary submission has its own observation owner");
+        if (state.model_notice && !model_notice_observed(*state.model_notice))
+            throw RunPreparationRefused("native run release requires the ACL model destroy notice");
+        if (state.submission.phase_ == Phase::Pending) {
+            auto reason = state.preparation_error;
+            if (!reason)
+                reason = std::make_exception_ptr(RunPreparationRefused("native submission cancelled before submit"));
+            state.submission.cancel_locked(reason);
+            state.submission.changed_.notify_all();
         }
-        const auto reason =
-            state.preparation_error ?
-                state.preparation_error :
-                std::make_exception_ptr(RunPreparationRefused("native submission cancelled before submit"));
-        cancelled = state.submission.cancel_locked(reason);
-        outcome = {static_cast<NativeSubmissionDisposition>(state.submission.phase_), false};
-        if (state.purpose != SIMPLER_PREPARE_CAPTURE) {
-            if (!state.purpose) {
-                outcome.carrier_retired = true;
-            } else {
-                throw RunPreparationRefused("native carrier cleanup requires capture registration");
-            }
-        } else {
-            state.operation_in_progress = true;
-        }
-    }
-    if (cancelled) state.submission.changed_.notify_all();
-    if (state.purpose != SIMPLER_PREPARE_CAPTURE) return;
-    try {
-        try {
-            if (state.prepared) state.prepared->abandon();
-        } catch (...) {
-            outcome.carrier_retired = carrier_retired();
-            if (!outcome.carrier_retired) throw;
-            // Historical submission errors remain in their observation.
-        }
-        outcome.carrier_retired = carrier_retired();
-    } catch (...) {
-        finish_operation();
-        throw;
-    }
-    finish_operation();
-}
-
-void NativeSubmissionState::release_resources() {
-    validate_process();
-    auto &state = *backing_;
-    {
-        std::lock_guard<std::mutex> lock(state.submission.mutex_);
-        if (state.operation_in_progress) throw RunPreparationRefused("native resource operation is in progress");
-        if (state.submission.phase_ == QueuedSubmission<ChipRun>::Phase::Pending ||
-            state.submission.phase_ == QueuedSubmission<ChipRun>::Phase::Submitting)
-            throw RunPreparationRefused("native resource release requires settled submission or cancellation");
+        cancelled = state.submission.phase_ == Phase::Cancelled;
         state.operation_in_progress = true;
     }
     try {
-        if (!carrier_retired())
-            throw RunPreparationRefused("native resource release requires original carrier retirement");
-        if (state.resources) {
-            if (state.model_notice && !model_notice_observed(*state.model_notice))
-                throw RunPreparationRefused("native resource release requires the ACL model destroy notice");
-            state.resources->release();
-            state.resources.reset();
-        }
+        state.model_run.finalize_after_last_use();
+        state.model_run = {};
     } catch (...) {
         finish_operation();
         throw;
     }
     finish_operation();
+    return cancelled;
 }
 
 bool NativeSubmissionState::cancel(std::exception_ptr reason) {
@@ -389,7 +340,7 @@ bool NativeSubmissionState::wait_until(ChipRun::Deadline deadline) { return back
 void NativeSubmissionState::claim_framework() {
     auto &state = *backing_;
     state.submission.claim_framework([&] {
-        if (state.operation_in_progress || state.purpose == SIMPLER_PREPARE_CAPTURE)
+        if (state.operation_in_progress || state.registration_claimed)
             throw RunPreparationRefused("framework eager ownership cannot take a capture token");
     });
 }
@@ -418,18 +369,14 @@ bool NativeSubmissionState::retire_framework(bool wait_for_own_completion, ChipR
 }
 bool NativeSubmissionState::owner_recovery_required() {
     validate_process();
-    std::optional<ChipRun> prepared;
-    bool capture;
     {
         std::lock_guard<std::mutex> lock(backing_->submission.mutex_);
-        if (backing_->operation_in_progress) return true;
-        capture = backing_->purpose == SIMPLER_PREPARE_CAPTURE;
-        if (capture) {
-            if (backing_->resources && backing_->resources->has_reference()) return true;
-            prepared = backing_->prepared;
-        }
+        if (backing_->operation_in_progress ||
+            backing_->submission.phase_ == QueuedSubmission<ChipRun>::Phase::Submitting)
+            return true;
+        if (backing_->registration_claimed)
+            return !run_released() || (backing_->model_notice && !model_notice_observed(*backing_->model_notice));
     }
-    if (capture) return prepared && !prepared->carrier_retired_for_submission();
     return backing_->submission.owner_recovery_required();
 }
 void NativeSubmissionState::retire() {
@@ -437,13 +384,14 @@ void NativeSubmissionState::retire() {
     auto &state = *backing_;
     {
         std::lock_guard<std::mutex> lock(state.submission.mutex_);
-        if (state.operation_in_progress) throw RunPreparationRefused("native resource operation is in progress");
+        if (state.operation_in_progress || state.submission.phase_ == QueuedSubmission<ChipRun>::Phase::Submitting)
+            throw RunPreparationRefused("native submission or resource operation is in progress");
         state.operation_in_progress = true;
     }
     try {
-        if (state.purpose == SIMPLER_PREPARE_CAPTURE &&
-            (!carrier_retired() || (state.resources && state.resources->has_reference())))
-            throw RunPreparationRefused("cannot retire native capture owners before checked cleanup");
+        if (state.registration_claimed &&
+            (!run_released() || (state.model_notice && !model_notice_observed(*state.model_notice))))
+            throw RunPreparationRefused("cannot retire a model's token before its last use");
         state.submission.retire();
         state.owner.reset();
     } catch (...) {
