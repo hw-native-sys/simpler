@@ -83,7 +83,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 }
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
-void SchedulerContext::complete_slot_task(
+LoopAction SchedulerContext::complete_slot_task(
     ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] SubtaskSlot subslot,
     [[maybe_unused]] int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
     ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
@@ -128,26 +128,17 @@ void SchedulerContext::complete_slot_task(
                     payload_per_core_[core_id][expected_reg_task_id & 1].local_context.block_idx, core_id, primary_error
                 );
             }
-            // Keep the scheduler channel's own first code/thread diagnostic.
-            // The Host primary is the common fatal-channel CAS winner above.
-            expected = SIMPLER_ERROR_NONE;
-            if (sched_->sm_header->sched_error_code.compare_exchange_strong(
-                    expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
-                )) {
-                sched_->sm_header->sched_error_thread.store(thread_idx, std::memory_order_relaxed);
-            }
-            completed_.store(true, std::memory_order_release);
-            return;
+            handle_failure(thread_idx, simpler::tmr::LocalSchedulerFailure{sched_->sm_header, slab_err});
+            return LoopAction::BREAK_LOOP;
         }
 
         uint32_t cond_count = deferred_slab->count;
         if (cond_count > MAX_COMPLETIONS_PER_TASK) {
-            int32_t expected = SIMPLER_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
+            handle_failure(
+                thread_idx,
+                simpler::tmr::LocalSchedulerFailure{sched_->sm_header, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED}
             );
-            completed_.store(true, std::memory_order_release);
-            return;
+            return LoopAction::BREAK_LOOP;
         }
 
         if (cond_count > 0) {
@@ -178,7 +169,7 @@ void SchedulerContext::complete_slot_task(
                             target._pad = 0;
                         }
                         deferred_slab->count = cond_count - i;
-                        return;
+                        return LoopAction::BREAK_LOOP;
                     }
                     sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
                     SPIN_WAIT_HINT();
@@ -206,7 +197,7 @@ void SchedulerContext::complete_slot_task(
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
-            if (completed_.load(std::memory_order_acquire)) return;
+            if (completed_.load(std::memory_order_acquire)) return LoopAction::BREAK_LOOP;
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
             SPIN_WAIT_HINT();
         }
@@ -313,6 +304,7 @@ void SchedulerContext::complete_slot_task(
         );
     }
 #endif
+    return LoopAction::NONE;
 }
 
 // Promote pending slot data to running slot. Clears pending fields.
@@ -333,7 +325,7 @@ void SchedulerContext::clear_running_slot(CoreExecState &core) {
     core.running_reg_task_id = AICPU_TASK_INVALID;
 }
 
-void SchedulerContext::check_running_cores_for_completion(
+LoopAction SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
     bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 ) {
@@ -451,7 +443,7 @@ void SchedulerContext::check_running_cores_for_completion(
             if (core.pending_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.pending_slot_state->task_attrs.timing_slot(), thread_idx);
             }
-            complete_slot_task(
+            const LoopAction action = complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
                 completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if SIMPLER_DFX
@@ -460,12 +452,13 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+            if (action == LoopAction::BREAK_LOOP) return action;
         }
         if (t.running_done) {
             if (core.running_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.running_slot_state->task_attrs.timing_slot(), thread_idx);
             }
-            complete_slot_task(
+            const LoopAction action = complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
                 completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if SIMPLER_DFX
@@ -474,6 +467,7 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+            if (action == LoopAction::BREAK_LOOP) return action;
         }
 
         // 2. Update slot data
@@ -521,6 +515,7 @@ void SchedulerContext::check_running_cores_for_completion(
             made_progress = true;
         }
     }
+    return LoopAction::NONE;
 }
 
 // =============================================================================

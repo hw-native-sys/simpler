@@ -30,6 +30,7 @@ a2a3_runtime_case(test_scheduler_retirement.cpp NO_OBJS
     LINK_OPTIONS ${_retirement_gc_link_option}
     TIMEOUT 20)
 target_sources(test_a2a3_tmr_scheduler_retirement PRIVATE
+    ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
     ${A2A3_RUNTIME_DIR}/shared/runtime.cpp)
 target_sources(test_a2a3_hbg_scheduler_retirement PRIVATE
     ${HBG_COMMON_SHARED_DIR}/runtime.cpp)

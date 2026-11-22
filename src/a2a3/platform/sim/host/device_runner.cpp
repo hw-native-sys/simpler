@@ -835,21 +835,25 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         LOG_ERROR("drain_execution called without a launched simulated run");
         return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     }
-    const DfxRunConfig &dfx = active.prepared->dfx;
-    auto run_cleanup = RAIIScopeGuard([this]() {
-        cleanup_active_run();
-    });
-    // The simulated device stopping. Each of these threads calls its execute
-    // function synchronously in its own body, so none outlives this join and no
-    // producer can still be recording after it — which is the whole of what the
-    // settlements below act on, and why the join is taken through the seam that
-    // holds it rather than beside one.
-    stop_run_producers(active.prepared->identity.run_epoch, [this]() {
-        active_run_->join();
-    });
+    return drain_simulated_run(
+        active.prepared->identity.run_epoch, run_completion_,
+        [this] {
+            active_run_->join();
+        },
+        [&](int device_rc) {
+            auto cleanup = RAIIScopeGuard([this] {
+                cleanup_active_run();
+            });
+            return collect_run_diagnostics(*active.prepared, device_rc);
+        }
+    );
+}
+
+int DeviceRunner::collect_run_diagnostics(const PreparedExecution &prepared, int runtime_rc) {
+    const DfxRunConfig &dfx = prepared.dfx;
     LOG_INFO("All threads completed");
     auto *result_storage =
-        reinterpret_cast<NativeInvocationResultStorage *>(run_result_region_base(active.prepared->pipeline_slot));
+        reinterpret_cast<NativeInvocationResultStorage *>(run_result_region_base(prepared.pipeline_slot));
     if (result_storage != nullptr) {
         const auto evidence = result_storage->evidence.read_after_exit();
         if (evidence.kind != NativeInvocationEvidence::Kind::None) {
@@ -903,7 +907,6 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         );
     }
 
-    int runtime_rc = run_completion_.first_error();
     if (runtime_rc != 0) {
         LOG_ERROR("AICPU execution failed with rc=%d", runtime_rc);
         // `active_run_->join()` above joined this run's AICPU *and* AICore
@@ -918,20 +921,19 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         // terminal snapshot, which this run never reached — its bank goes back
         // unread rather than being withdrawn, because the producer-stop proof
         // is what a withdrawal is for.
-        // The runtime error that brought this path here stays authoritative, so
-        // a diagnostics ownership failure only logs on it.
+        // Keep diagnostics teardown status alongside the original execution error.
         const int error_teardown_rc = settle_run_after_producer_stop(
-            dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch,
+            dfx, prepared.pipeline_slot, prepared.identity.run_epoch,
             /*device_execution_complete=*/false
         );
         if (error_teardown_rc != 0) {
             LOG_ERROR("Diagnostics teardown reported %d on the error path; the run error is kept", error_teardown_rc);
         }
         emit_device_dep_gen_graph(
-            dfx, active.prepared->identity.run_epoch, /*device_execution_complete=*/false,
+            dfx, prepared.identity.run_epoch, /*device_execution_complete=*/false,
             /*device_producers_stopped=*/true
         );
-        return DrainOutcome::device_error(runtime_rc, true);
+        return error_teardown_rc;
     }
 
     // A retained diagnostics close that could not prove it owns this run's
@@ -939,10 +941,10 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // told the run succeeded would read files whose completeness nothing
     // established.
     const int teardown_rc = settle_run_after_producer_stop(
-        dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, /*device_execution_complete=*/true
+        dfx, prepared.pipeline_slot, prepared.identity.run_epoch, /*device_execution_complete=*/true
     );
     emit_device_dep_gen_graph(
-        dfx, active.prepared->identity.run_epoch, /*device_execution_complete=*/true, /*device_producers_stopped=*/true
+        dfx, prepared.identity.run_epoch, /*device_execution_complete=*/true, /*device_producers_stopped=*/true
     );
 
     print_handshake_results();
@@ -960,7 +962,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         aicore_so_path_.clear();
     }
 
-    return DrainOutcome::device_complete(teardown_rc);
+    return teardown_rc;
 }
 
 void DeviceRunner::emit_device_dep_gen_graph(

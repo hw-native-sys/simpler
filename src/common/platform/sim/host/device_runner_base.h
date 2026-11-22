@@ -60,6 +60,7 @@
 #include "common/dma_workspace.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "sim_run_completion.h"
 #include "platform_comm/comm.h"
 #include "host/execution_mode_latch.h"
 #include "host/caller_device_buffers.h"
@@ -672,6 +673,9 @@ public:
      * `simpler::dfx::runs::settle_failed_run_terminal_bank`. Only a caller that
      * joined its producers may pass it.
      */
+    void close_chip_swimlane_run_boundary(
+        uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+    );
     void close_pmu_run_boundary(
         const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
     );
@@ -865,6 +869,28 @@ public:
     /** Whether *this* run's producers were stopped by the call above. */
     bool run_producers_stopped(uint64_t run_epoch) const {
         return run_epoch != 0 && producers_stopped_epoch_ == run_epoch;
+    }
+
+    // Join the producers before reading their execution result or collecting diagnostics.
+    template <typename Join, typename Diagnostics>
+    DrainOutcome drain_simulated_run(
+        uint64_t epoch, const simpler::common::sim_host::SimRunCompletion &completion, Join &&join,
+        Diagnostics &&diagnostics
+    ) {
+        stop_run_producers(epoch, join);
+        if (!run_producers_stopped(epoch)) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
+        const int device_rc = completion.first_error();
+        // Producer exit belongs to this epoch even if exporting diagnostics fails.
+        int diagnostics_rc = PTO_RUNTIME_ERR_INTERNAL;
+        try {
+            diagnostics_rc = diagnostics(device_rc);
+        } catch (...) {
+            LOG_ERROR(
+                "Sim diagnostics threw after joining run %llu (device_rc=%d)", static_cast<unsigned long long>(epoch),
+                device_rc
+            );
+        }
+        return {device_rc, diagnostics_rc, true};
     }
 
     /**

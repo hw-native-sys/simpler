@@ -17,6 +17,7 @@
 #include "kernel_platform_ops.h"
 #include "platform_comm/comm.h"
 #include "run_retention_probe.h"
+#include <utility>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -126,7 +127,12 @@ int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMe
     std::memcpy(dst, src, bytes);
     return 0;
 }
-int rtSetDevice(int32_t) { return native_admission_transport::control().attach_rc; }
+int rtSetDevice(int32_t) {
+    auto &c = native_admission_transport::control();
+    ++c.attach_calls;
+    if (c.next_attach_rc != 0) return std::exchange(c.next_attach_rc, 0);
+    return c.attach_rc;
+}
 int rtDeviceReset(int32_t) {
     auto &c = native_admission_transport::control();
     c.retired = true;

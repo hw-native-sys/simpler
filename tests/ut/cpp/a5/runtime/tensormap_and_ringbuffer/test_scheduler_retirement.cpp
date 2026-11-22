@@ -13,12 +13,15 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
 
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "runtime.h"
+#include "runtime_core.h"
 #include "scheduler/scheduler_context.h"
 
 namespace {
@@ -30,10 +33,17 @@ bool silent_core = false;
 std::atomic<int> nonce_batches{0};
 bool diagnostic_registers = false;
 uint64_t diagnostic_cond = 0;
+struct PausedDoorbell {
+    std::promise<void> entered;
+    std::promise<void> resume;
+};
+PausedDoorbell *paused_doorbell = nullptr;
+uint64_t data_main = 0;
 uint64_t diagnostic_dmb = 0;
 int diagnostic_reads = 0;
 }  // namespace
 
+extern "C" uint64_t get_platform_phase_base() { return 0; }
 uint64_t platform_aicore_exit_deadline() { return ++deadlines; }
 uint64_t read_reg(uint64_t address, RegId reg) {
     if (!diagnostic_registers) return AICORE_EXITED_VALUE;
@@ -43,10 +53,19 @@ uint64_t read_reg(uint64_t address, RegId reg) {
     EXPECT_EQ(reg, RegId::DATA_MAIN_BASE);
     return diagnostic_dmb;
 }
+volatile uint32_t *get_reg_ptr(uint64_t, RegId) {
+    if (paused_doorbell != nullptr) {
+        paused_doorbell->entered.set_value();
+        paused_doorbell->resume.get_future().wait();
+    }
+    return reinterpret_cast<volatile uint32_t *>(&data_main);
+}
+void write_reg(uint64_t, RegId, uint64_t value) { data_main = value; }
 int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t count, uint64_t, bool *released) {
     ++nonce_batches;
     ++retirement_batches;
     for (size_t i = 0; i < count; ++i) {
+        if (targets[i].reg_addr == 1) data_main = AICORE_EXIT_SIGNAL;
         EXPECT_GE(targets[i].reg_addr, 1U);
         EXPECT_LE(targets[i].reg_addr, kCores);
         if (targets[i].reg_addr >= 1 && targets[i].reg_addr <= kCores) ++retirements[targets[i].reg_addr - 1];
@@ -61,6 +80,10 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
 
 class SchedulerRetirementTestPeer {
 public:
+    static auto prepare_token() { return SchedulerContext::PublishHandle{1, 17, 0, nullptr, TASK_TIMING_SLOT_NONE}; }
+    static void publish(SchedulerContext &ctx, const SchedulerContext::PublishHandle &handle) {
+        ctx.publish_subtask_to_core(handle, 0, 0);
+    }
     static void publish_orchestration(SchedulerContext &context, int total, int completed, bool done) {
         context.total_tasks_ = total;
         context.completed_tasks_.store(completed, std::memory_order_relaxed);
@@ -207,6 +230,49 @@ TEST_F(SchedulerRetirement, IdleStallSnapshotDoesNotReadRegisters) {
     EXPECT_EQ(diagnostic_reads, 0);
 }
 
+TEST_F(SchedulerRetirement, RetirementRejectsPreparedTaskAndPreviouslyClaimedDoorbell) {
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    auto rt = std::make_unique<RuntimeContext>();
+    context->bind_runtime(rt.get());
+    const auto prepared = SchedulerRetirementTestPeer::prepare_token();
+    data_main = 0;
+    SchedulerRetirementTestPeer::publish(*context, prepared);
+    EXPECT_EQ(data_main, 17u);
+    EXPECT_TRUE(rt->scheduler.ring_claimed_local_doorbell(1, 0, 1, 17));
+    EXPECT_EQ(data_main, (17ULL << 32) | 17);
+    ASSERT_EQ(context->retire_all_cores(), 0);
+    SchedulerRetirementTestPeer::publish(*context, prepared);
+    EXPECT_EQ(data_main, AICORE_EXIT_SIGNAL);
+    EXPECT_FALSE(rt->scheduler.ring_claimed_local_doorbell(1, 0, 1, 17));
+    EXPECT_EQ(data_main, AICORE_EXIT_SIGNAL);
+}
+
+TEST_F(SchedulerRetirement, RetirementDrainsDoorbellAlreadyWritingTheRegister) {
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    auto rt = std::make_unique<RuntimeContext>();
+    context->bind_runtime(rt.get());
+    PausedDoorbell paused;
+    paused_doorbell = &paused;
+    auto entered = paused.entered.get_future();
+    auto writer = std::async(std::launch::async, [&] {
+        return rt->scheduler.ring_claimed_local_doorbell(1, 0, 1, 17);
+    });
+    EXPECT_EQ(entered.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto retire = std::async(std::launch::async, [&] {
+        return context->retire_all_cores();
+    });
+    EXPECT_EQ(retire.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
+    paused.resume.set_value();
+    EXPECT_TRUE(writer.get());
+    EXPECT_EQ(retire.get(), 0);
+    paused_doorbell = nullptr;
+    EXPECT_EQ(data_main, AICORE_EXIT_SIGNAL);
+}
+
 TEST_F(SchedulerRetirement, EmergencyUsesOneBatchAndDeadlineAcrossOwners) {
     SchedulerRetirementTestPeer::open_cores(*context);
     context->assign_own_clusters(0);
@@ -216,6 +282,18 @@ TEST_F(SchedulerRetirement, EmergencyUsesOneBatchAndDeadlineAcrossOwners) {
     expect_once();
     EXPECT_EQ(retirement_batches.load(), 1);
     EXPECT_EQ(deadlines.load(), 1);
+}
+
+TEST_F(SchedulerRetirement, EmergencyRetirementErrorSurvivesLaterEmptySweepUntilNextRun) {
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    silent_core = true;
+    context->abort_and_shutdown(runtime.get());
+    EXPECT_EQ(context->retire_all_cores(), 0);
+    EXPECT_EQ(context->retirement_error(), -1);
+    ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, 0), 0);
+    EXPECT_EQ(context->retirement_error(), 0);
 }
 
 TEST_F(SchedulerRetirement, OverlappingCoreSetsAreClaimedIndependently) {
@@ -240,6 +318,38 @@ TEST_F(SchedulerRetirement, NewGenerationClearsEveryReturnGateBeforePublication)
     ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, 0), 0);
     for (int i = 0; i < kCores; ++i)
         EXPECT_EQ(runtime->get_teardown_gates()[i].post_close_release, 0U);
+}
+
+TEST_F(SchedulerRetirement, OrchestrationSetupFailureReleasesPeersForPerThreadRetirement) {
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    std::atomic<bool> ready{false};
+    context->handle_failure(runtime.get(), 2, simpler::tmr::OrchestrationSetupFailure{ready});
+    EXPECT_TRUE(ready.load(std::memory_order_acquire));
+    EXPECT_FALSE(context->is_completed());
+    EXPECT_FALSE(SchedulerRetirementTestPeer::fatal(*context));
+    EXPECT_EQ(retirement_batches.load(), 0);
+    EXPECT_EQ(context->shutdown(0), 0);
+    EXPECT_EQ(context->shutdown(1), 0);
+    expect_once();
+}
+
+TEST_F(SchedulerRetirement, SharedOrchestratorErrorRetiresOnceAndSurvivesParticipantShutdown) {
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    auto header = std::make_unique<SharedMemoryHeader>();
+    header->orch_error_code.store(SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(SchedulerRetirementTestPeer::check_exit(*context, *header, runtime.get()), LoopAction::BREAK_LOOP);
+    EXPECT_TRUE(SchedulerRetirementTestPeer::fatal(*context));
+    EXPECT_EQ(retirement_batches.load(), 1);
+    EXPECT_EQ(context->shutdown(0), 0);
+    EXPECT_EQ(context->shutdown(1), 0);
+    EXPECT_EQ(retirement_batches.load(), 1);
+    expect_once();
+    EXPECT_EQ(header->orch_error_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(header->sched_error_code.load(), SIMPLER_ERROR_NONE);
 }
 
 TEST_F(SchedulerRetirement, EmergencyBeforeInitializationRetiresLateCores) {

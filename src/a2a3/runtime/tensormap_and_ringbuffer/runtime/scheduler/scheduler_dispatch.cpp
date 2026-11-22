@@ -308,8 +308,9 @@ bool SchedulerContext::requeue_ready_tasks(
     const bool pushed =
         count == 1 ? queue.push_shaped(entries[0], shape) : queue.push_shaped_batch(entries, nullptr, count, shape);
     if (pushed) return true;
-    latch_scheduler_error(sched_->sm_header, thread_idx, SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
-    completed_.store(true, std::memory_order_release);
+    handle_failure(
+        thread_idx, simpler::tmr::LocalSchedulerFailure{sched_->sm_header, SIMPLER_ERROR_READY_QUEUE_OVERFLOW}
+    );
     return false;
 }
 
@@ -728,9 +729,7 @@ int32_t SchedulerContext::stage_consumer_blocks(
         }
         for (int i = 0; i < n; i++) {
             int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
-            SchedulerState::ring_claimed_local_doorbell(
-                owned[cid >> 6], cid, handles[i].reg_addr, handles[i].reg_task_id
-            );
+            sched_->ring_claimed_local_doorbell(owned[cid >> 6], cid, handles[i].reg_addr, handles[i].reg_task_id);
         }
         wmb();
     }
@@ -1092,8 +1091,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
+        LoopAction completion_action = LoopAction::NONE;
         if (try_completed) {
-            check_running_cores_for_completion(
+            completion_action = check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
                 deferred_release_slot_states, deferred_release_count
             );
@@ -1150,6 +1150,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
+        if (completion_action == LoopAction::BREAK_LOOP) break;
+
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             sched_->async_wait_list.needs_poll(*rt_->aicore_mailbox)) {
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
@@ -1160,11 +1162,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
             );
             if (poll_result.error_code != SIMPLER_ERROR_NONE) {
-                int32_t expected = SIMPLER_ERROR_NONE;
-                header->sched_error_code.compare_exchange_strong(
-                    expected, poll_result.error_code, std::memory_order_acq_rel, std::memory_order_acquire
-                );
-                completed_.store(true, std::memory_order_release);
+                handle_failure(thread_idx, simpler::tmr::LocalSchedulerFailure{header, poll_result.error_code});
                 break;
             }
             if (poll_result.completed > 0) {

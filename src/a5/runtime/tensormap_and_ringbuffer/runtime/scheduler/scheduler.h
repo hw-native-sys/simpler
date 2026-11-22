@@ -41,6 +41,7 @@
 #include "shared_memory.h"
 #include "aicpu/platform_regs.h"
 #include "common/memory_barrier.h"
+#include "tensormap_and_ringbuffer/core_publication.h"
 
 #if SIMPLER_SCHED_PROFILING
 #include "aicpu/device_time.h"
@@ -893,10 +894,17 @@ struct SchedulerState {
     // cohort and falls back to the generation-tagged global drain otherwise.
     ChipReadyQueue early_sync_start_queue;
 
-    static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
-        volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
-        uint64_t tk = static_cast<uint64_t>(token);
-        *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
+    // Bound before the orchestrator can submit work. Retirement can already have closed a core during handshake.
+    simpler::tmr::CorePublication *core_publications{nullptr};
+
+    inline bool ring_one_doorbell(int core_id, uint64_t reg_addr, uint32_t token) {
+        if (core_publications == nullptr) return false;
+        return core_publications[core_id].publish([&] {
+            volatile uint64_t *dmb =
+                reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
+            uint64_t tk = static_cast<uint64_t>(token);
+            *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
+        });
     }
 
     inline void ring_staged_doorbell_bits(int word, uint64_t bits) {
@@ -904,7 +912,7 @@ struct SchedulerState {
             int core_id = word * 64 + __builtin_ctzll(bits);
             bits &= bits - 1;
             ring_one_doorbell(
-                early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+                core_id, early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
             );
         }
     }
@@ -921,11 +929,9 @@ struct SchedulerState {
         return force_gate || early_dispatch_state == EARLY_DISPATCH_STAGING;
     }
 
-    static inline bool
-    ring_claimed_local_doorbell(uint64_t claimed_word, int core_id, uint64_t reg_addr, uint32_t token) {
+    inline bool ring_claimed_local_doorbell(uint64_t claimed_word, int core_id, uint64_t reg_addr, uint32_t token) {
         if ((claimed_word & (1ULL << (core_id & 63))) == 0) return false;
-        ring_one_doorbell(reg_addr, token);
-        return true;
+        return ring_one_doorbell(core_id, reg_addr, token);
     }
 
     static inline bool try_claim_early_dispatch_launch(TaskPayload &payload) {
@@ -947,7 +953,7 @@ struct SchedulerState {
                 int core_id = w * 64 + __builtin_ctzll(bits);
                 bits &= bits - 1;
                 ring_one_doorbell(
-                    early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+                    core_id, early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
                 );
             }
         }

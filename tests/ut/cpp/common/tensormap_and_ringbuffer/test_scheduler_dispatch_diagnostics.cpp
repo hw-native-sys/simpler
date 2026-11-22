@@ -378,6 +378,23 @@ TEST_F(SchedulerDispatchDiagnostics, TimeoutWinnerPublishesOwnerRecordsAndLatche
     orch->end_scope();
 }
 
+TEST_F(SchedulerDispatchDiagnostics, TimeoutPublishesItsSnapshotAfterOrchestrationClaimsShutdown) {
+    orch->begin_scope();
+    TaskId waiter, producer;
+    make_counterexample(waiter, producer);
+    auto *header = shared->header;
+    header->orch_error_code.store(SIMPLER_ERROR_INVALID_ARGS);
+    MixAdmissionTestPeer::fatal_dump(*context, header, true);
+    const std::string later = MixAdmissionTestPeer::timeout_dump(*context, header);
+    EXPECT_EQ(header->orch_error_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(header->sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(header->sched_stall_detail.load(), SIMPLER_STALL_DETAIL_RUNNING_STALLED);
+    EXPECT_EQ(header->sched_stall_task_id.load(), waiter);
+    EXPECT_EQ(header->sched_stall_core.load(), 0);
+    EXPECT_EQ(later.find("Emergency shutdown:"), std::string::npos);
+    orch->end_scope();
+}
+
 class TensorWaitTimeoutDiagnostics : public SchedulerDispatchDiagnostics,
                                      public testing::WithParamInterface<bool> {};
 

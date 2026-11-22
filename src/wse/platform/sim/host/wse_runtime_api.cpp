@@ -1416,7 +1416,11 @@ int simpler_run(
     int rc = simpler_prepare_run(ctx, runtime, callable_id, args, config, descriptor);
     if (rc != 0) return rc;
     rc = simpler_launch_run(ctx, runtime);
-    if (rc == 0) rc = simpler_wait_run(ctx, runtime);
+    if (rc == 0) {
+        rc = simpler_wait_run(ctx, runtime);
+        // Finalize observes the run itself when the earlier wait could not attach.
+        if (rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) return simpler_finalize_run(ctx, runtime);
+    }
     int finalize_rc = simpler_finalize_run(ctx, runtime);
     return finalize_rc != 0 ? finalize_rc : rc;
 }

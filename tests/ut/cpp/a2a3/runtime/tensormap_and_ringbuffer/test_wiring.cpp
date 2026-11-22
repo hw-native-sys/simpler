@@ -65,7 +65,9 @@ protected:
     TaskDescriptor slot_task_pool_[kSlotPayloadPoolSize];
     int slot_payload_pool_idx_ = 0;
 
+    simpler::tmr::CorePublication publications[PLATFORM_MAX_CORES]{};
     void SetUp() override {
+        sched.core_publications = publications;
         sm_handle = SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
         auto layout = SchedulerState::reserve_layout(sched_arena);
@@ -813,7 +815,7 @@ TEST_F(WiringTest, LateStagerRingsCapturedDoorbellAfterTableReuse) {
     sched.early_dispatch_doorbell_table[core_id].token = reused_token;
 
     uint64_t claimed = 1ULL << core_id;
-    EXPECT_TRUE(SchedulerState::ring_claimed_local_doorbell(claimed, core_id, captured_addr, captured_token));
+    EXPECT_TRUE(sched.ring_claimed_local_doorbell(claimed, core_id, captured_addr, captured_token));
     EXPECT_EQ(get_test_reg_stub_base_addr(), captured_addr);
     EXPECT_EQ(get_test_reg_stub_value(), (static_cast<uint64_t>(captured_token) << 32) | captured_token);
 }

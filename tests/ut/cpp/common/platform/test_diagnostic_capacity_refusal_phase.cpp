@@ -67,6 +67,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <cstdlib>
 #include <new>
 #include <stdexcept>
@@ -362,21 +363,22 @@ CallConfig diagnostic_config() {
     return config;
 }
 
-struct PreparedRun {
-    RetryRunner runner;
+template <typename Backend>
+struct PreparedRunWith {
+    Backend runner;
     RuntimeStorage storage;
     /** The caller's acceptance sink, which only a matching receipt may write. */
     volatile int32_t accepted{kUnaccepted};
 
     /** Drive the real `simpler_prepare_run` to a real PREPARED carrier. */
-    int prepare(const CallConfig &config = diagnostic_config()) {
+    int prepare(const CallConfig &config = diagnostic_config(), uint64_t epoch = 9100) {
         NativeRunDescriptor descriptor{};
         descriptor.pipeline_slot = 0;
         descriptor.arena_bank = 0;
         descriptor.run_id = 4100;
         descriptor.generation = 1;
         descriptor.dispatch_id = 2;
-        descriptor.run_epoch = 9100;
+        descriptor.run_epoch = epoch;
         descriptor.accepted_state = &accepted;
         descriptor.accepted_value = kAccepted;
         return simpler_prepare_run(
@@ -398,6 +400,98 @@ struct PreparedRun {
     /** What the caller's sink holds, read as a value rather than as storage. */
     int32_t acceptance() const { return accepted; }
 };
+
+using PreparedRun = PreparedRunWith<RetryRunner>;
+
+class DiagnosticDrainRunner : public RetryRunner {
+public:
+    simpler::common::sim_host::SimRunCompletion completion;
+    std::thread producer;
+    DrainOutcome last_drain{};
+    bool refuse_join = false;
+    bool fail_diagnostics = true;
+    int diagnostics_calls = 0;
+
+    ~DiagnosticDrainRunner() override {
+        if (producer.joinable()) producer.join();
+    }
+    void start_producer(int rc) {
+        completion.reset(1);
+        producer = std::thread([this, rc] {
+            completion.task_finished(rc);
+        });
+    }
+
+    DrainOutcome drain_execution(ActiveExecution &active) override {
+        last_drain = drain_simulated_run(
+            active.prepared->identity.run_epoch, completion,
+            [&] {
+                if (refuse_join) throw std::runtime_error("join refused");
+                producer.join();
+            },
+            [&](int device_rc) {
+                EXPECT_FALSE(producer.joinable());
+                EXPECT_EQ(device_rc, completion.first_error());
+                ++diagnostics_calls;
+                if (fail_diagnostics) throw std::runtime_error("diagnostics export failed");
+                return 0;
+            }
+        );
+        return last_drain;
+    }
+};
+
+TEST(SimDrainDiagnostics, PostJoinExceptionKeepsDeviceErrorAndReleasesSlot) {
+    for (int device_rc : {0, -73}) {
+        SCOPED_TRACE(device_rc);
+        PreparedRunWith<DiagnosticDrainRunner> run;
+        ASSERT_TRUE(run.runner.stand_up());
+        run.runner.refuse_for_capacity = false;
+        ASSERT_EQ(run.prepare(), 0);
+        ASSERT_EQ(run.launch(), 0);
+        run.runner.start_producer(device_rc);
+
+        const int expected = device_rc == 0 ? PTO_RUNTIME_ERR_INTERNAL : device_rc;
+        EXPECT_EQ(simpler_wait_run(&run.runner, run.storage.handle()), expected);
+        ASSERT_TRUE(run.state()->physical_complete);
+        EXPECT_EQ(run.runner.last_drain.device_rc, device_rc);
+        EXPECT_EQ(run.runner.last_drain.diagnostics_rc, PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(run.finalize(), expected);
+        EXPECT_EQ(run.runner.diagnostics_calls, 1);
+        EXPECT_FALSE(run.runner.native_run_active());
+
+        ASSERT_EQ(run.prepare(diagnostic_config(), 9101), 0);
+        ASSERT_EQ(run.launch(), 0);
+        run.runner.fail_diagnostics = false;
+        run.runner.start_producer(0);
+        EXPECT_EQ(run.finalize(), 0);
+    }
+}
+
+TEST(SimDrainDiagnostics, UnprovedJoinKeepsSlotUntilSameRunIsStopped) {
+    PreparedRunWith<DiagnosticDrainRunner> run;
+    ASSERT_TRUE(run.runner.stand_up());
+    run.runner.refuse_for_capacity = false;
+    ASSERT_EQ(run.prepare(), 0);
+    ASSERT_EQ(run.launch(), 0);
+    run.runner.start_producer(0);
+    run.runner.refuse_join = true;
+    EXPECT_EQ(run.finalize(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_FALSE(run.state()->physical_complete);
+    EXPECT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+    EXPECT_EQ(run.runner.diagnostics_calls, 0);
+    RuntimeStorage next;
+    auto descriptor = run.state()->descriptor;
+    ++descriptor.run_epoch;
+    CallConfig config = diagnostic_config();
+    EXPECT_NE(simpler_prepare_run(&run.runner, next.handle(), kCallableId, nullptr, &config, &descriptor), 0);
+
+    run.runner.refuse_join = false;
+    run.runner.fail_diagnostics = false;
+    EXPECT_EQ(run.finalize(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(run.runner.diagnostics_calls, 1);
+    EXPECT_FALSE(run.runner.native_run_active());
+}
 
 /**
  * The value `completion_rc` carries before any phase writes one.

@@ -626,18 +626,24 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 | `init(runtime, aicpu_thread_num, sched_thread_num, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
 | `bind_runtime(rt)` | device-orch only | Wire `sched_` to `rt->scheduler` once the orchestrator thread creates `rt` |
 | `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
-| `shutdown(thread_idx, runtime)` | per thread on exit, before the completion count | EXIT / ACK / CLOSE / post-close release for this thread's own cores; PMU finalize when enabled. Orchestrator threads own none and no-op. Claims per core, so cores an emergency retirement already took are skipped. See [worker retirement](../../../../../docs/troubleshooting/a2a3-worker-retirement.md) |
-| `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_` (or `emergency_shutdown` on fatal) |
+| `shutdown(thread_idx, runtime)` | per thread on exit, before the completion count | EXIT / ACK / CLOSE / post-close release for this thread's own cores; PMU finalize when enabled. Threads with no assigned cores skip retirement. Claims per core, so cores an emergency retirement already took are skipped. See [worker retirement](../../../../../docs/troubleshooting/a2a3-worker-retirement.md) |
+| `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, publish `orchestrator_done_` and report a latched orchestration error to `handle_failure` |
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
 | Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
 
-Private internals are split across three .cpp files by responsibility:
+The scheduler implementation is split by responsibility:
 
 - `scheduler_completion.cpp` — completion polling, drain protocol
 - `scheduler_dispatch.cpp` — task dispatch loop and helpers
-- `scheduler_cold_path.cpp` — exit checks, stall diagnostics, profiling, lifecycle (`pre_handshake_init` / `handshake_partition` / `post_handshake_init` / `deinit`), core management (`assign_cores_to_threads` / `emergency_shutdown`), and `on_orchestration_done`
+- `scheduler_failure.cpp` (shared TMR AICPU source) — failure policy, exit checks, timeout reporting
+- `scheduler_cold_path.cpp` — stall diagnostics, profiling, lifecycle (`pre_handshake_init` / `handshake_partition` / `post_handshake_init` / `deinit`), core management (`assign_cores_to_threads` / `signal_emergency_shutdown`), and `on_orchestration_done`
 
-`AicpuExecutor` calls neither `handshake_*`, `assign_*`, `reassign_*`, nor `emergency_shutdown` directly — they are private, invoked only by `init` and `on_orchestration_done`.
+**AICPU failure handling.** Once AICores have launched, the action depends on how far orchestration has progressed:
+
+- If `run_orchestration` rejects the callable, arguments, or runtime setup, `AicpuExecutor::run` passes the failure to `SchedulerContext::handle_failure`. It releases `runtime_init_ready_` while `rt` is null. Each scheduler skips dispatch, retires its own cores, and reaches the completion gate. The orchestrator contributes its execution return to the terminal record.
+- With a bound runtime, `on_orchestration_done` or a scheduler's idle check can observe a shared fatal code. The handler preserves that code. A scheduler that detects a progress timeout enters through `handle_timeout_exit`; the handler attempts to latch code 100 and the winning reporter publishes the stall classification and task/core information.
+- For a shared fatal, progress timeout, or explicit abort, `begin_emergency_shutdown` elects one thread to request retirement of all cores via `signal_emergency_shutdown`. The timeout reporter and the retirement owner can be different threads. All participants still run their own teardown and contribute to the terminal result. An exit request alone does not establish that a core acknowledged it.
+- When FIN reports a completion error or the asynchronous wait list fails during polling, the detecting scheduler calls `handle_failure` with `LocalSchedulerFailure`. It preserves the first scheduler code and reporter, adds its reporter bit and stops dispatch before the next ready task in that iteration. A ready queue that cannot accept a requeued task reports error 104 through the same handler. Participants retire their own assigned cores on exit. A concurrent emergency request can claim those cores first.
 
 ### 8.6 Dispatch model — two sources, sync tiers, occupancy order
 

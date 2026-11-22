@@ -183,4 +183,13 @@ TEST_F(ResidentFinalizer, LateDiagnosticIdentityIsLoggedByTheActualFinalizer) {
     EXPECT_NE(output.find("identity_fields=0x3f"), std::string::npos);
 }
 
+TEST_F(ResidentFinalizer, LateFailureIsReportedWhenCoreRetirementIsUnproved) {
+    ASSERT_TRUE(exit_wait_watchdog_fires());
+    const DeviceRunTerminal result = finalize_and_publish(/*cores_retired=*/false);
+    EXPECT_EQ(result.state, DeviceRunTerminalState::Failed);
+    EXPECT_EQ(result.code, -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(result.source, DeviceRunCodeSource::Header);
+    EXPECT_EQ(run_control.error_site, static_cast<uint64_t>(SchedulerErrorSite::EXIT_WAIT_TIMEOUT));
+}
+
 }  // namespace

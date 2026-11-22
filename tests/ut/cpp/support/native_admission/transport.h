@@ -45,6 +45,8 @@ struct Control {
     bool retired{false};
     size_t calls_after_retire{0};
     int attach_rc{0};
+    int next_attach_rc{0};
+    size_t attach_calls{0};
     int pmu_start_rc{0};
     size_t pmu_start_calls{0};
     size_t pmu_stop_calls{0};

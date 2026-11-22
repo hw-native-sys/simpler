@@ -15,7 +15,7 @@
     {
       "source": "src/common/platform/sim/host/c_api_shared.cpp",
       "destination": "src/wse/platform/sim/host/wse_runtime_api.cpp",
-      "sha256": "06bf4349c2667cec4bf0def928517753045ff0c3122b705fcdd76868a87431d4"
+      "sha256": "336952483269778333a841c5029455ee8149d02acc083f0cda9e6c33e08fa399"
     },
     {
       "source": "src/common/worker/native_run_execution.h",

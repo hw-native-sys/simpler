@@ -17,6 +17,8 @@
 #include "scheduler_types.h"
 
 #include "scheduler/scheduler.h"
+#include "tensormap_and_ringbuffer/scheduler_failure.h"
+#include "tensormap_and_ringbuffer/scheduler_timeout.h"
 
 #include "aicore_completion_mailbox.h"
 
@@ -47,9 +49,10 @@ struct RuntimeContext;
  * point is resolve_and_dispatch(), called once per scheduler thread.
  *
  * All dispatch/completion/drain/cold-path logic is implemented as private
- * member methods, split across three .cpp files by responsibility:
+ * member methods, split across the following files:
  *   - scheduler_completion.cpp  (completion polling, drain protocol)
- *   - scheduler_cold_path.cpp   (exit checks, stall diagnostics, profiling)
+ *   - scheduler_cold_path.cpp   (core retirement, stall diagnostics, profiling)
+ *   - scheduler_failure.cpp     (shared TMR failure handling and exit checks)
  *   - scheduler_dispatch.cpp    (task dispatch loop and helpers)
  */
 class SchedulerContext {
@@ -94,6 +97,7 @@ public:
     // Leader-only profiling-subsystem init (DFX builds); called behind a barrier
     // in the barrier-free path since pmu_aicpu_init needs all physical_core_ids_.
     void post_handshake_profiling_init(Runtime *runtime);
+    int32_t retirement_error() const { return retirement_error_.load(std::memory_order_acquire); }
     bool handshake_failed() const { return handshake_failed_.load(std::memory_order_acquire); }
     // Leader-only, after the handshake barrier: build worker-id lists, assign
     // cores, init profiling subsystems, read task counts, init payloads.
@@ -106,6 +110,13 @@ public:
     // =========================================================================
     // Per-thread execution entry points (called by AicpuExecutor::run)
     // =========================================================================
+
+    // Setup releases waiting schedulers. Local failures stop dispatch and use per-thread retirement.
+    // Shared failures, progress timeouts and explicit aborts elect one emergency retirement owner.
+    __attribute__((noinline, cold)) void
+    handle_failure(Runtime *runtime, int32_t thread_idx, const simpler::tmr::Failure &failure);
+    __attribute__((noinline, cold)) void
+    handle_failure(int32_t thread_idx, simpler::tmr::LocalSchedulerFailure failure);
 
     // Main scheduler thread entry: poll completion + dispatch ready tasks.
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
@@ -210,6 +221,8 @@ private:
     // REQUESTED can arrive before initialization without consuming an empty set.
     static constexpr uint8_t RETIREMENT_READY = 1;
     static constexpr uint8_t RETIREMENT_REQUESTED = 2;
+    simpler::tmr::CorePublication core_publications_[PLATFORM_MAX_CORES]{};
+    std::atomic<int32_t> retirement_error_{0};
     uint8_t retirement_state_[PLATFORM_MAX_CORES]{};
     AicoreTeardownControl *teardown_gates_{nullptr};
     bool retirement_blocked_layout_{false};
@@ -265,6 +278,8 @@ private:
 
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
     // deinit their AICore register blocks. Idempotent.
+    void log_fatal_shutdown(int32_t thread_idx, const simpler::tmr::SharedFailure *shared);
+
     void emergency_shutdown(Runtime *runtime);
 
     // Elect exactly one thread to drive the emergency retirement. Returns true
@@ -331,16 +346,19 @@ private:
     // `thread_idx` is the publishing Scheduler thread's index, used to select the
     // per-thread task-timing record; every call site already has it in scope.
     inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts, int32_t thread_idx) {
-        if (h.dispatch_timestamp_slot != nullptr) {
-            *h.dispatch_timestamp_slot = dispatch_ts;
-        }
-        // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
-        // task, folded as min. Untagged tasks pay only this cache-hot compare and
-        // never read the sys counter. Independent of chip swimlane level.
-        if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
-            aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
-        }
-        write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
+        const int core_id = core_trackers_[thread_idx].get_core_id_by_offset(h.core_offset);
+        core_publications_[core_id].publish([&] {
+            if (h.dispatch_timestamp_slot != nullptr) {
+                *h.dispatch_timestamp_slot = dispatch_ts;
+            }
+            // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
+            // task, folded as min. Untagged tasks pay only this cache-hot compare and
+            // never read the sys counter. Independent of chip swimlane level.
+            if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
+                aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
+            }
+            write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
+        });
     }
 
     // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the
@@ -417,7 +435,7 @@ private:
         int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated = false
     );
 
-    void complete_slot_task(
+    LoopAction complete_slot_task(
         ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, SubtaskSlot subslot, int32_t thread_idx,
         int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
         ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
@@ -430,7 +448,7 @@ private:
     static void promote_pending_to_running(CoreExecState &core);
     static void clear_running_slot(CoreExecState &core);
 
-    void check_running_cores_for_completion(
+    LoopAction check_running_cores_for_completion(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
         bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
     );
@@ -449,7 +467,7 @@ private:
     );
 
     // =========================================================================
-    // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)
+    // Cold path: exit checks, stall diagnostics, profiling
     // =========================================================================
 
     __attribute__((noinline, cold)) LoopAction
@@ -457,10 +475,10 @@ private:
 
     // idle_iterations / last_progress_count feed the post-mortem this emits
     // when it is the one to latch the run's end; the pre-dispatch caller has
-    // no idle counters of its own and passes zeroes.
+    // no idle counters of its own and samples the current completion count.
     __attribute__((noinline, cold)) LoopAction check_idle_fatal_error(
         int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations = 0,
-        int32_t last_progress_count = 0
+        int32_t last_progress_count = -1
     );
 
     __attribute__((noinline, cold)) void
@@ -497,28 +515,12 @@ private:
     // ownerless idle threads are the only observers — let one of them latch.
     bool no_thread_owns_running_task() const;
 
-    // One-glance classification of a no-progress timeout, derived from state the
-    // scheduler already holds at the stall. Reduces the multi-state snapshot to a
-    // dominant SIMPLER_STALL_DETAIL_* sub-class plus a few locator fields, which
-    // handle_timeout_exit propagates to host alongside the unchanged code 100.
-    struct StallClassification {
-        int32_t detail;          // SIMPLER_STALL_DETAIL_*
-        int32_t cnt_running;     // tasks observed RUNNING (on a core)
-        int32_t cnt_ready;       // fanin-satisfied but not dispatched
-        int32_t cnt_waiting;     // still waiting on fanin
-        int32_t cnt_async_wait;  // all AICore subtasks finished, deferred completion pending
-        int32_t completed;       // completed_tasks_ snapshot
-        int32_t total;           // total_tasks_ snapshot
-        int32_t orch_done;       // orchestrator_done flag (0/1)
-        TaskId stuck_task_id;    // S1/S6: first task in the dominant class, invalid() if none
-        int32_t stuck_core;      // S1: core hosting it (-1 if none)
-    };
-
     // Scan the rings once (same ground truth as log_global_stall_diagnostics: a slot is
     // RUNNING iff a core holds it as running_slot_state) and reduce to a
     // StallClassification. Pure reads — safe to call from any scheduler thread.
     __attribute__((noinline, cold)) StallClassification classify_stall_reason() const;
 
+    void record_progress_timeout(int32_t thread_idx, SharedMemoryHeader *header, int32_t idle_iterations);
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
         int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
         int32_t last_progress_count

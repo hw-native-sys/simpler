@@ -35,6 +35,7 @@ set(_entry_cache_sources
 a2a3_tmr_case(test_entry_cache_deinit.cpp NO_OBJS
     SOURCES ${_entry_cache_sources}
         ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp
     INCLUDES ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer
     DEFINES SIMPLER_DFX=0
@@ -71,6 +72,7 @@ endif()
 a2a3_tmr_case(test_entry_args_preparation.cpp NO_OBJS
     SOURCES
         ${A2A3_RUNTIME_DIR}/shared/runtime.cpp
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${A2A3_RUNTIME_DIR}/scheduler/scheduler_cold_path.cpp
         ${A2A3_RUNTIME_DIR}/scheduler/scheduler.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/aicpu_device_config.cpp
@@ -86,6 +88,10 @@ get_target_property(_kernel_error_sources a2a3_tmr_objs SOURCES)
 list(FILTER _kernel_error_sources EXCLUDE REGEX "device_time_stub.cpp$")
 a2a3_tmr_case(test_kernel_error.cpp NO_OBJS
     SOURCES ${_kernel_error_sources}
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler_cold_path.cpp
+        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/a2a3/platform/shared/aicpu/platform_regs.cpp
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${A2A3_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
         ${A2A3_RUNTIME_DIR}/runtime_core.cpp
     LINK a2a3_ut_support

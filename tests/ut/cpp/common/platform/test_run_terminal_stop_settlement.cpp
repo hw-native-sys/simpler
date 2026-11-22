@@ -49,7 +49,10 @@
 
 #include <gtest/gtest.h>
 
+#include "aicpu/args_dump_aicpu.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "device_runner_base.h"
+#include "support/test_task_id.h"
 #include "host/args_dump_collector.h"
 #include "host/dep_gen_collector.h"
 #include "host/pmu_collector.h"
@@ -62,6 +65,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <fstream>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -546,11 +551,28 @@ public:
         return true;
     }
 
+    ArgsDumpCollector &dump() { return dump_collector_; }
+    std::promise<void> swimlane_publishing;
+    bool enable_throwing_swimlane() {
+        return chip_swimlane_collector_.initialize(
+                   1, 1, kSimDeviceId, ChipSwimlaneLevel::TASK_TIMING, settle_alloc, nullptr, settle_free
+               ) == 0;
+    }
+    void publish_chip_swimlane_runtime_extensions() override {
+        swimlane_publishing.set_value();
+        throw std::runtime_error("swimlane extension export failed");
+    }
+
     uint64_t dump_bank_of(uint64_t run_epoch) const { return dump_collector_.run_terminal_bank_address(run_epoch); }
     size_t dump_banks_in_use() const { return dump_collector_.run_terminal_banks_in_use(); }
     bool dump_host_state_released() const { return dump_collector_.retained_runs_idle(); }
 
     void shut_down() {
+        if (chip_swimlane_collector_.is_initialized()) {
+            chip_swimlane_collector_.finish_retained_runs();
+            chip_swimlane_collector_.stop();
+            chip_swimlane_collector_.finalize(nullptr, settle_free);
+        }
         dump_collector_.hold_retained_writer_for_test(false);
         dump_collector_.finish_retained_runs();
         dump_collector_.stop();
@@ -609,6 +631,78 @@ TEST(RunTerminalStopSettlementThroughTheRunner, AFailedTeardownThatProvedTheStop
     EXPECT_FALSE(runner.dump_host_state_released()) << "the failed run's host state went with the device storage";
 
     runner.shut_down();
+}
+
+TEST(RunTerminalStopSettlementThroughTheRunner, ThrowingSwimlanePublisherStillClosesArgsDump) {
+    OutputRoot root("runner-throwing-swimlane");
+    SettlementRunner runner;
+    ASSERT_TRUE(runner.stand_up());
+    ASSERT_TRUE(runner.enable_throwing_swimlane());
+    auto dfx = args_dump_only(root.prefix(kFirstRun));
+    dfx.chip_swimlane_level = ChipSwimlaneLevel::TASK_TIMING;
+    ASSERT_EQ(runner.start_shared_collectors_for_run(dfx, kFirstRun, {}), 0);
+    ASSERT_NE(runner.dump_bank_of(kFirstRun), 0u);
+    // Admission needs a live reader to acknowledge its initial cut. Pause the shards after that cut,
+    // before the device publishes, to keep a real payload unread until the close reaches it.
+    runner.dump().stop();
+    std::promise<void> release_readers;
+    auto readers = release_readers.get_future().share();
+    runner.dump().start([&](std::function<void()> fn) {
+        return std::thread([readers, fn = std::move(fn)] {
+            readers.wait();
+            fn();
+        });
+    });
+    set_platform_run_result(0, kFirstRun);
+    set_platform_dump_base(reinterpret_cast<uint64_t>(runner.dump().get_dump_shm_device_ptr()));
+    set_dump_args_enabled(true);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    uint32_t value = 0x1234abcd;
+    ArgsDumpInfo info{};
+    info.task_id = simpler::ut::test_task_id(1);
+    info.role = ArgsDumpRole::INPUT;
+    info.stage = ArgsDumpStage::BEFORE_DISPATCH;
+    info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+    info.dtype = static_cast<uint8_t>(DataType::UINT32);
+    info.capture_payload = 1;
+    info.buffer_addr = reinterpret_cast<uint64_t>(&value);
+    info.ndims = 1;
+    info.shapes[0] = info.strides[0] = 1;
+    EXPECT_EQ(dump_arg_record(0, info), 0);
+    dump_args_flush(0);
+    EXPECT_EQ(runner.dump().retained_run_stats_for_test().open_collected_records, 0u);
+
+    runner.stop_run_producers(kFirstRun, [] {});
+    auto publishing = runner.swimlane_publishing.get_future();
+    auto closing = std::async(std::launch::async, [&] {
+        return runner.settle_run_after_producer_stop(dfx, 0, kFirstRun, false);
+    });
+    EXPECT_EQ(publishing.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(closing.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
+    release_readers.set_value();
+    EXPECT_EQ(closing.get(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(runner.dump_bank_of(kFirstRun), 0u);
+    EXPECT_EQ(runner.dump().retained_run_stats_for_test().open_collected_records, 1u);
+
+    const auto next = args_dump_only(root.prefix(kSecondRun));
+    EXPECT_EQ(runner.start_shared_collectors_for_run(next, kSecondRun, {}), 0);
+    runner.stop_run_producers(kSecondRun, [] {});
+    EXPECT_EQ(runner.settle_run_after_producer_stop(next, 0, kSecondRun, false), 0);
+    set_dump_args_enabled(false);
+    set_platform_dump_base(0);
+    set_platform_run_result(0, 0);
+    runner.shut_down();
+    int files = 0;
+    for (const auto &entry :
+         std::filesystem::directory_iterator(std::filesystem::path(dfx.output_prefix) / "args_dump")) {
+        if (entry.path().extension() != ".bin") continue;
+        ++files;
+        std::ifstream payload(entry.path(), std::ios::binary);
+        uint32_t saved = 0;
+        ASSERT_TRUE(payload.read(reinterpret_cast<char *>(&saved), sizeof(saved)));
+        EXPECT_EQ(saved, value);
+    }
+    EXPECT_EQ(files, 1);
 }
 
 // --- The stop itself: what performs it, and in what order -----------------

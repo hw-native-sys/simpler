@@ -104,6 +104,7 @@ tmr_case(test_mix_admission.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/aicpu/inner_platform_regs.cpp
@@ -123,6 +124,7 @@ tmr_case(test_scheduler_dispatch_diagnostics.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
@@ -141,6 +143,7 @@ tmr_case(test_async_wait_poll_hint.cpp TIMEOUT 30)
 tmr_case(test_early_dispatch_deferred_completion.cpp
     NO_OBJS
     SOURCES
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/shared_memory.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
@@ -148,6 +151,7 @@ tmr_case(test_early_dispatch_deferred_completion.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp

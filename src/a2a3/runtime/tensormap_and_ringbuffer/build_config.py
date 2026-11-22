@@ -19,7 +19,7 @@
 # by the Tensor constructor's validation logic).
 #
 # src/common/tensormap_and_ringbuffer holds the sources shared with the other
-# architecture. Its .cpp files sit under a "host" subdirectory naming the target
+# architecture. Its .cpp files sit under subdirectories naming the target
 # that compiles them; headers stay flat there. Those sources still include this
 # runtime's headers by bare name (dep_gen_replay.cpp takes dep_compute.h,
 # tensormap.h and tensor.h) and resolve them to whichever architecture's
@@ -37,7 +37,7 @@ BUILD_CONFIG = {
     "aicore": {"include_dirs": ["runtime", "common", "..", SHARED], "source_dirs": ["aicore", "orchestration"]},
     "aicpu": {
         "include_dirs": ["runtime", "common", "..", SHARED],
-        "source_dirs": ["aicpu", "runtime", "orchestration"],
+        "source_dirs": ["aicpu", "runtime", "orchestration", f"{SHARED}/aicpu"],
     },
     "host": {
         "include_dirs": ["runtime", "common", "..", SHARED],

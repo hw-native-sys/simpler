@@ -43,6 +43,7 @@ a5_tmr_case(test_mix_spare_lane.cpp
         ${A5_RUNTIME_DIR}/shared/runtime_init.cpp
         ${A5_RUNTIME_DIR}/scheduler/scheduler.cpp
         ${A5_RUNTIME_DIR}/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
     DEFINES SIMPLER_DFX=0
@@ -56,11 +57,14 @@ else()
 endif()
 
 # Exercise the production cold path with an observable platform retirement sink.
-a5_tmr_case(test_scheduler_retirement.cpp
+a5_tmr_case(test_scheduler_retirement.cpp NO_OBJS LINK a5_ut_support
     SOURCES
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${A5_RUNTIME_DIR}/scheduler/scheduler_cold_path.cpp
         ${A5_RUNTIME_DIR}/shared/runtime.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/aicpu_device_config.cpp
+        ${A5_RUNTIME_DIR}/scheduler/scheduler.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
     DEFINES SIMPLER_DFX=0
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     TIMEOUT 20)
@@ -73,6 +77,10 @@ endif()
 # Exercise the failed submission slab through the real FIN completion path.
 a5_tmr_case(test_urma_completion_kernel.cpp
     SOURCES
+        ${A5_RUNTIME_DIR}/scheduler/scheduler_cold_path.cpp
+        ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp

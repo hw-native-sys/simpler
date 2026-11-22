@@ -35,120 +35,6 @@
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
 
-// Returns true iff this call won the first-writer CAS for sched_error_code — the
-// caller may then write companion fields (e.g. the stall detail) knowing they
-// describe the same observation that owns the latched code.
-static bool latch_scheduler_error(SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
-    if (header == nullptr || error_code == SIMPLER_ERROR_NONE) {
-        return false;
-    }
-    // The first error code/thread pair wins; the bitmap cumulatively records all reporting threads.
-    int32_t expected = SIMPLER_ERROR_NONE;
-    bool won = header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel);
-    if (won) {
-        header->sched_error_thread.store(thread_idx, std::memory_order_release);
-    }
-    if (thread_idx >= 0 && thread_idx < 32) {
-        header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
-    }
-    return won;
-}
-
-static const char *orchestrator_fatal_reason(int32_t error_code) {
-    return error_code == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT ? "tensor_data_timeout" : "orchestrator_fatal";
-}
-
-LoopAction SchedulerContext::handle_orchestrator_exit(
-    int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count
-) {
-    if (completed_.load(std::memory_order_acquire)) {
-        return LoopAction::BREAK_LOOP;
-    }
-    int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
-    if (orch_err != SIMPLER_ERROR_NONE) {
-        LOG_ERROR(
-            "Thread %d: Fatal error (code=%d), sending EXIT_SIGNAL to all cores. "
-            "completed_tasks=%d, total_tasks=%d",
-            thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
-        );
-        if (orch_err == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT) {
-            log_owned_dispatch_records(thread_idx, StallDumpReport::Shutdown);
-        }
-        if (begin_emergency_shutdown()) {
-            log_shutdown_stall_snapshot(
-                thread_idx, 0, completed_tasks_.load(std::memory_order_relaxed), orchestrator_fatal_reason(orch_err)
-            );
-            signal_emergency_shutdown(runtime);
-        }
-        return LoopAction::BREAK_LOOP;
-    }
-    int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
-    if (sched_err != SIMPLER_ERROR_NONE) {
-        LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
-        if (begin_emergency_shutdown()) {
-            log_shutdown_stall_snapshot(
-                thread_idx, 0, completed_tasks_.load(std::memory_order_relaxed), "scheduler_fatal"
-            );
-            signal_emergency_shutdown(runtime);
-        }
-        return LoopAction::BREAK_LOOP;
-    }
-
-    bool orch_done = orchestrator_done_.load(std::memory_order_acquire);
-    if (!orch_done) return LoopAction::NONE;
-
-    // orchestrator_done_ publishes the final task count, including zero.
-    task_count = total_tasks_;
-    if (completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
-        completed_.store(true, std::memory_order_release);
-        LOG_INFO(
-            "Thread %d: completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed), task_count
-        );
-        return LoopAction::BREAK_LOOP;
-    }
-    return LoopAction::NONE;
-}
-
-LoopAction SchedulerContext::check_idle_fatal_error(
-    int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
-    int32_t last_progress_count
-) {
-    if (completed_.load(std::memory_order_acquire)) {
-        return LoopAction::BREAK_LOOP;
-    }
-    int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
-    if (orch_err != SIMPLER_ERROR_NONE) {
-        LOG_ERROR("Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores", thread_idx, orch_err);
-        if (orch_err == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT) {
-            log_owned_dispatch_records(thread_idx, StallDumpReport::Shutdown);
-        }
-        if (begin_emergency_shutdown()) {
-            // An orchestrator fatal that lands here while tasks are still in
-            // flight is a hang in the same sense the wall-clock budget catches
-            // -- SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT is raised by an orchestrator
-            // wait on a producer that never completed. Only the route to the
-            // shutdown differs, so the post-mortem should not: without this the
-            // caller gets one FATAL line and none of the AICore, fanin or
-            // wait-list state that says which dependency stalled.
-            log_shutdown_stall_snapshot(
-                thread_idx, idle_iterations, last_progress_count, orchestrator_fatal_reason(orch_err)
-            );
-            signal_emergency_shutdown(runtime);
-        }
-        return LoopAction::BREAK_LOOP;
-    }
-    int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
-    if (sched_err != SIMPLER_ERROR_NONE) {
-        LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
-        if (begin_emergency_shutdown()) {
-            log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count, "scheduler_fatal");
-            signal_emergency_shutdown(runtime);
-        }
-        return LoopAction::BREAK_LOOP;
-    }
-    return LoopAction::NONE;
-}
-
 // =============================================================================
 // Stall diagnostic log format.
 //
@@ -451,7 +337,7 @@ void SchedulerContext::log_shutdown_stall_snapshot(
     }
 }
 
-SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() const {
+StallClassification SchedulerContext::classify_stall_reason() const {
     StallClassification cls{};
     cls.stuck_task_id = TaskId::invalid();
     cls.stuck_core = -1;
@@ -516,80 +402,6 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
     cls.detail = classify_stall_detail(cnt_running, cnt_ready, cnt_waiting, cnt_async_wait, cls.orch_done);
     if (cls.detail == SIMPLER_STALL_DETAIL_ASYNC_WAIT) cls.stuck_task_id = async_task_id;
     return cls;
-}
-
-int32_t SchedulerContext::handle_timeout_exit(
-    int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
-    int32_t last_progress_count
-#if SIMPLER_DFX
-    ,
-    uint64_t sched_start_ts
-#endif
-) {
-    StallClassification cls = classify_stall_reason();
-    LOG_ERROR(
-        "[STALL thread=%d idle_iterations=%d] TIMEOUT_EXIT after_idle_iterations=%d sub_class=%s "
-        "completed=%d/%d running=%d ready=%d waiting=%d async_wait=%d orch_done=%d stuck_task_id=0x%" PRIx64
-        " stuck_core=%d",
-        thread_idx, idle_iterations, idle_iterations, stall_detail_name(cls.detail), cls.completed, cls.total,
-        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.cnt_async_wait, cls.orch_done,
-        TaskId::to_uint64(cls.stuck_task_id), cls.stuck_core
-    );
-    // Only the thread that wins the code-100 latch publishes the detail/locators,
-    // keeping the host-visible sub-class consistent with the latched code.
-    if (latch_scheduler_error(header, thread_idx, SIMPLER_ERROR_SCHEDULER_TIMEOUT) && header != nullptr) {
-        header->sched_stall_completed.store(cls.completed, std::memory_order_relaxed);
-        header->sched_stall_total.store(cls.total, std::memory_order_relaxed);
-        header->sched_stall_cnt_running.store(cls.cnt_running, std::memory_order_relaxed);
-        header->sched_stall_cnt_ready.store(cls.cnt_ready, std::memory_order_relaxed);
-        header->sched_stall_cnt_waiting.store(cls.cnt_waiting, std::memory_order_relaxed);
-        header->sched_stall_cnt_async_wait.store(cls.cnt_async_wait, std::memory_order_relaxed);
-        header->sched_stall_orch_done.store(cls.orch_done, std::memory_order_relaxed);
-        header->sched_stall_task_id.store(cls.stuck_task_id, std::memory_order_relaxed);
-        header->sched_stall_core.store(cls.stuck_core, std::memory_order_relaxed);
-        // detail published last (release) so a host reading a non-NONE detail
-        // sees the locators above already settled.
-        header->sched_stall_detail.store(cls.detail, std::memory_order_release);
-    }
-    if (begin_emergency_shutdown()) {
-        log_owned_dispatch_records(thread_idx, StallDumpReport::Shutdown);
-        log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count, "scheduler_timeout");
-#if SIMPLER_DFX
-        // Capture the in-flight kernels' partial output before signalling the
-        // cores to exit, so the dump reflects the live stuck state.
-        if (is_dump_args_enabled()) {
-            dump_running_task_outputs(
-                cores_total_num_,
-                [this](int32_t cid) {
-                    return core_exec_states_[cid].running_slot_state;
-                },
-                [this, thread_idx](const ChipTaskSlotState &slot_state) {
-                    dump_args_for_task<SUBTASK_SLOT_COUNT>(
-                        thread_idx, *slot_state.task, *slot_state.payload, slot_state.active_mask,
-                        ArgsDumpStage::AFTER_COMPLETION, [this](int32_t func_id) {
-                            return get_function_bin_addr(func_id);
-                        }
-                    );
-                }
-            );
-        }
-#endif
-        signal_emergency_shutdown(runtime);
-    }
-#if SIMPLER_DFX
-    uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
-    aicpu_phase_set_window(
-        AicpuPhase::SchedWindow, static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts)
-    );
-#if SIMPLER_SCHED_PROFILING
-    LOG_INFO(
-        "Thread %d: sched_start=%" PRIu64 " sched_end(timeout)=%" PRIu64 " sched_cost=%.3fus", thread_idx,
-        static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts),
-        cycles_to_us(sched_timeout_ts - sched_start_ts)
-    );
-#endif
-#endif
-    return -SIMPLER_ERROR_SCHEDULER_TIMEOUT;
 }
 
 #if SIMPLER_DFX
@@ -813,6 +625,7 @@ int32_t SchedulerContext::retire_claimed_cores(const int32_t *core_ids, int32_t 
         const int32_t core_id = core_ids[i];
         if (core_id < 0 || core_id >= cores_total_num_) continue;
         if (core_exec_states_[core_id].reg_addr == 0) continue;
+        core_publications_[core_id].close();
         claimed_ids[count] = core_id;
         targets[count] = {core_exec_states_[core_id].reg_addr, &teardown_gates_[core_id]};
         ++count;
@@ -825,6 +638,8 @@ int32_t SchedulerContext::retire_claimed_cores(const int32_t *core_ids, int32_t 
     const uint64_t deadline = platform_aicore_exit_deadline();
     const int32_t rc = platform_retire_aicore_group(targets, count, deadline, released);
     if (rc != 0) {
+        int32_t expected = 0;
+        retirement_error_.compare_exchange_strong(expected, rc, std::memory_order_release, std::memory_order_relaxed);
         // Naming the cores is the only signal an unretired core leaves: the host
         // sees just a stream timeout.
         for (size_t i = 0; i < count; ++i) {
@@ -1250,6 +1065,17 @@ bool SchedulerContext::assign_cores_to_threads() {
 // Emergency shutdown: broadcast exit signal to every handshake'd core and
 // deinit their AICore register blocks. Idempotent.
 // =============================================================================
+void SchedulerContext::log_fatal_shutdown(int32_t thread_idx, const simpler::tmr::SharedFailure *shared) {
+    if (shared == nullptr) return;
+    const char *reason = "scheduler_fatal";
+    if (shared->source == simpler::tmr::SharedFailure::Source::Orchestrator) {
+        reason = shared->code == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT ? "tensor_data_timeout" : "orchestrator_fatal";
+    }
+    const int32_t progress = shared->last_progress_count < 0 ? completed_tasks_.load(std::memory_order_relaxed) :
+                                                               shared->last_progress_count;
+    log_shutdown_stall_snapshot(thread_idx, shared->idle_iterations, progress, reason);
+}
+
 bool SchedulerContext::begin_emergency_shutdown() {
     return publish_fatal_shutdown(fatal_shutdown_started_, completed_);
 }
@@ -1266,12 +1092,6 @@ void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
     (void)retire_all_cores();
 }
 
-void SchedulerContext::emergency_shutdown(Runtime *runtime) {
-    if (begin_emergency_shutdown()) {
-        signal_emergency_shutdown(runtime);
-    }
-}
-
 // =============================================================================
 // Lifecycle: init / deinit
 // =============================================================================
@@ -1283,7 +1103,10 @@ int32_t SchedulerContext::pre_handshake_init(
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
     // Reset before hs_setup_done_ releases any initializer or emergency caller.
+    for (auto &publication : core_publications_)
+        publication.reset();
     memset(retirement_state_, 0, sizeof(retirement_state_));
+    retirement_error_.store(0, std::memory_order_relaxed);
     retirement_blocked_layout_ = aicpu_thread_num > 1 && !runtime->dev.serial_orch_sched;
     retirement_unassigned_ = false;
 
@@ -1567,6 +1390,7 @@ void SchedulerContext::deinit() {
 void SchedulerContext::bind_runtime(RuntimeContext *rt) {
     rt_ = rt;
     sched_ = &rt->scheduler;
+    sched_->core_publications = core_publications_;
 }
 
 void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx) {
@@ -1612,12 +1436,10 @@ void SchedulerContext::on_orchestration_done(
         orch_err = sched_->sm_header->orch_error_code.load(std::memory_order_relaxed);
     }
     if (orch_err != SIMPLER_ERROR_NONE) {
-        if (begin_emergency_shutdown()) {
-            log_shutdown_stall_snapshot(
-                thread_idx, 0, completed_tasks_.load(std::memory_order_relaxed), orchestrator_fatal_reason(orch_err)
-            );
-            signal_emergency_shutdown(runtime);
-        }
+        handle_failure(
+            runtime, thread_idx,
+            simpler::tmr::SharedFailure{simpler::tmr::SharedFailure::Source::Orchestrator, orch_err}
+        );
     }
 
 #if SIMPLER_DFX

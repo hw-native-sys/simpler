@@ -643,7 +643,6 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             LOG_ERROR(
                 "Thread %d: invalid callable_id %d (limit=%d)", thread_idx, callable_id, MAX_REGISTERED_CALLABLE_IDS
             );
-            runtime_init_ready_.store(true, std::memory_order_release);
             return -1;
         }
         if (orch_so_table_[callable_id].handle == nullptr || orch_so_table_[callable_id].func == nullptr) {
@@ -651,7 +650,6 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
                 "Thread %d: callable_id=%d not registered (no orch SO loaded); register before run", thread_idx,
                 callable_id
             );
-            runtime_init_ready_.store(true, std::memory_order_release);
             return -1;
         }
         // graph_build front-matter phases (orch thread only); the scheduler
@@ -688,29 +686,7 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
                                                            ) :
                                                            adopt_launch_entry_args(runtime, thread_idx);
             if (!args_admitted) {
-                // Pre-runtime failure, reported by the thread's own return: rt
-                // and the SM header do not exist yet, so there is no shared
-                // error state to latch. The two statements below are the same
-                // pair the arg-count rejection a few lines down already uses,
-                // and what follows them is that path's, not new code:
-                //
-                //   `run` sees a non-zero run_orchestration and withholds this
-                //   thread's `normal_path` claim -> the release below frees the
-                //   scheduler threads from their runtime_init_ready_ spin ->
-                //   each sees `rt` null (file-scope, nulled by every run's gate
-                //   cleanup), skips dispatch and withholds its own claim ->
-                //   every thread still calls sched_ctx_.shutdown to retire the
-                //   cores it owns, then terminal_.record_participant, then
-                //   arrives at completion_gate_ -> the last arrival runs
-                //   snapshot_run_terminal, where run_terminal_select turns an
-                //   incomplete normal path carrying a participant failure into
-                //   an Error terminal rather than a success or an undecided
-                //   read.
-                //
-                // Returning out of the entry instead would leave the AICore
-                // workers waiting on gates nobody releases until the
-                // op-execute timeout.
-                runtime_init_ready_.store(true, std::memory_order_release);
+                // run() releases the waiting schedulers and records this participant failure.
                 return -1;
             }
 
@@ -734,9 +710,7 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
                         // The registered SO is fine — these run args are
                         // incompatible with it. Run only consumes the slot
                         // (no reload), so leave the table intact and just
-                        // fail this run; unblock scheduler threads first so
-                        // they don't spin forever.
-                        runtime_init_ready_.store(true, std::memory_order_release);
+                        // fail this run. The caller releases the scheduler threads.
                         return -1;
                     }
                 }
@@ -757,7 +731,6 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             size_t off_runtime = runtime->get_prebuilt_runtime_offset();
             if (prebuilt_arena == nullptr) {
                 LOG_ERROR("Thread %d: prebuilt_arena_base is null", thread_idx);
-                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
             runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
@@ -779,13 +752,11 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
                 )) {
                 LOG_ERROR("Thread %d: sm_handle->init_per_ring failed", thread_idx);
                 rt = nullptr;
-                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
             if (!runtime_reset_for_reuse(runtime_arena_, rt->prebuilt_layout, rt)) {
                 LOG_ERROR("Thread %d: runtime_reset_for_reuse failed", thread_idx);
                 rt = nullptr;
-                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
@@ -1031,7 +1002,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // Reachable before the orchestrator split: this thread may be the
         // would-be orchestrator, so release the scheduler threads waiting on
         // runtime_init_ready_ (run_orchestration is the only other publisher).
-        runtime_init_ready_.store(true, std::memory_order_release);
+        sched_ctx_.handle_failure(runtime, thread_idx, simpler::tmr::OrchestrationSetupFailure{runtime_init_ready_});
         return -1;
     }
     int32_t run_rc = 0;
@@ -1047,8 +1018,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     if (thread_idx >= sched_thread_num_) {
         run_rc = run_orchestration(runtime, thread_idx);
         if (run_rc != 0) {
-            // This thread submitted nothing the scheduler could run, so it has
-            // no normal path to vouch for; its return carries the failure.
+            sched_ctx_.handle_failure(
+                runtime, thread_idx, simpler::tmr::OrchestrationSetupFailure{runtime_init_ready_}
+            );
             normal_path = false;
         }
     }
@@ -1067,7 +1039,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // one that reports the failure.
             normal_path = false;
         } else {
-            sched_ctx_.bind_runtime(rt);
             if (serial_orch_sched_) {
                 sched_ctx_.wait_for_orchestration_done_before_dispatch(runtime, thread_idx);
             }
@@ -1133,6 +1104,7 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     // The shared header outranks a participant's own return: a thread can
     // finish with a zero return while the state it wrote — a scheduler timeout
     // latched beside a non-negative completed count — is the run's failure.
+    terminal_.record_participant(0, sched_ctx_.retirement_error());
     const int32_t header_status = read_runtime_status(runtime);
     const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
     const RunTerminalSelection selection = run_terminal_select(normal_path, header_status, terminal_);

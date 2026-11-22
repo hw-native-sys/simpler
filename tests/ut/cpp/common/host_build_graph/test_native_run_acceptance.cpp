@@ -14,6 +14,7 @@
 #include <cstdint>
 
 #include "native_run_context.h"
+#include "host_build_graph/runtime_status.h"
 #include "common/support/native_run_execution_peer.h"
 
 namespace {
@@ -89,4 +90,25 @@ TEST(NativeRunAcceptanceTest, AbsentAcceptedStateIsAccepted) {
     FakeRunContext context(&runner, config, 0, make_descriptor(nullptr), nullptr);
 
     EXPECT_TRUE(context.publish_acceptance(complete_receipt(context.identity())));
+}
+
+TEST(NativeRunDrainTest, UnconfirmedExecutionRetainsItsCarrierAndPreservesTheFirstFailure) {
+    FakeRunner runner;
+    FakeRunContext context(&runner, CallConfig{}, 0, make_descriptor(nullptr), nullptr);
+    context.completion_rc = 0;
+
+    EXPECT_EQ(context.check_finalize_drain(/*launched=*/false), 0);
+    EXPECT_EQ(context.check_finalize_drain(/*launched=*/true), PTO_RUNTIME_ERR_INTERNAL);
+    context.record_drain_outcome(DrainOutcome::device_error(-SIMPLER_ERROR_SCHEDULER_TIMEOUT));
+    EXPECT_EQ(context.check_finalize_drain(true), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_FALSE(context.physical_complete);
+
+    context.record_drain_outcome(DrainOutcome::device_complete(/*diagnostics_rc=*/PTO_RUNTIME_ERR_INTERNAL));
+    EXPECT_EQ(context.check_finalize_drain(true), 0);
+    EXPECT_EQ(context.completion_rc, -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_TRUE(context.physical_complete);
+
+    context.record_drain_outcome(DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL));
+    EXPECT_TRUE(context.physical_complete);
+    EXPECT_EQ(context.completion_rc, -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
 }

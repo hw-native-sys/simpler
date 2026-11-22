@@ -31,6 +31,7 @@ constexpr int kCores = 6;
 std::array<std::atomic<int>, kCores> opened{};
 std::array<std::atomic<int>, kCores> retired{};
 std::array<uint32_t, kCores> conditions{};
+uint64_t data_main = 0;
 std::atomic<int> batches{0};
 std::atomic<int> deadlines{0};
 std::mutex init_mutex;
@@ -92,9 +93,14 @@ uint32_t platform_get_physical_cores_count() { return kCores; }
 static uint64_t test_report_epoch = 0;
 static std::atomic<int> nonce_batches{0};
 extern "C" uint64_t get_platform_run_result_epoch() { return test_report_epoch; }
+extern "C" uint64_t get_platform_phase_base() { return 0; }
+void reg_store_release(volatile uint32_t *p, uint32_t value) { __atomic_store_n(p, value, __ATOMIC_RELEASE); }
 uint64_t platform_aicore_exit_deadline() { return ++deadlines; }
 uint64_t read_reg(uint64_t, RegId) { return AICORE_IDLE_VALUE; }
-volatile uint32_t *get_reg_ptr(uint64_t address, RegId) { return &conditions.at(address - 1); }
+volatile uint32_t *get_reg_ptr(uint64_t address, RegId reg) {
+    if (reg == RegId::DATA_MAIN_BASE) return reinterpret_cast<volatile uint32_t *>(&data_main);
+    return &conditions.at(address - 1);
+}
 
 #ifdef PTO_ASYNC_WAIT_H
 void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *, const char *) {}
@@ -122,6 +128,7 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
         if (core >= kCores) continue;
         EXPECT_EQ(opened[core].load(), 1);
         EXPECT_NE(targets[i].teardown, nullptr);
+        if (core == 0) data_main = AICORE_EXIT_SIGNAL;
         ++retired[core];
         const bool success = !(silent_first_core && core == 0);
         if (released != nullptr) released[i] = success;
@@ -136,6 +143,15 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
 class SchedulerContextTestPeer {
 public:
 #ifdef PTO_ASYNC_WAIT_H
+    static auto prepare_token() {
+        return SchedulerContext::PublishHandle{
+            reinterpret_cast<uint64_t>(&data_main) - reg_offset(RegId::DATA_MAIN_BASE), 17, 0, nullptr,
+            TASK_TIMING_SLOT_NONE
+        };
+    }
+    static void publish(SchedulerContext &ctx, const SchedulerContext::PublishHandle &handle) {
+        ctx.publish_subtask_to_core(handle, 0, 0);
+    }
     static void bind_async(SchedulerContext &context, RuntimeContext &runtime) {
         context.rt_ = &runtime;
         context.sched_ = &runtime.scheduler;
@@ -429,6 +445,35 @@ TEST_F(SchedulerRetirement, NewRunClearsRetirementFailure) {
     EXPECT_EQ(context->retirement_error(), -1);
     ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
     EXPECT_EQ(context->retirement_error(), 0);
+}
+
+TEST_F(SchedulerRetirement, OrchestrationSetupFailureReleasesPeersForPerThreadRetirement) {
+    handshake();
+    std::atomic<bool> ready{false};
+    context->handle_failure(runtime.get(), 2, simpler::tmr::OrchestrationSetupFailure{ready});
+    EXPECT_TRUE(ready.load(std::memory_order_acquire));
+    EXPECT_FALSE(context->is_completed());
+    EXPECT_EQ(batches.load(), 0);
+    EXPECT_EQ(context->shutdown(0, runtime.get()), 0);
+    EXPECT_EQ(context->shutdown(1, runtime.get()), 0);
+    expect_once();
+}
+
+TEST_F(SchedulerRetirement, RetirementRejectsPreparedTaskAndPreviouslyClaimedDoorbell) {
+    handshake();
+    auto rt = std::make_unique<RuntimeContext>();
+    context->bind_runtime(rt.get());
+    const auto prepared = SchedulerContextTestPeer::prepare_token();
+    data_main = 0;
+    SchedulerContextTestPeer::publish(*context, prepared);
+    EXPECT_EQ(data_main, 17u);
+    EXPECT_TRUE(rt->scheduler.ring_claimed_local_doorbell(1, 0, 1, 17));
+    EXPECT_EQ(data_main, (17ULL << 32) | 17);
+    ASSERT_EQ(request_all(), 0);
+    SchedulerContextTestPeer::publish(*context, prepared);
+    EXPECT_EQ(data_main, AICORE_EXIT_SIGNAL);
+    EXPECT_FALSE(rt->scheduler.ring_claimed_local_doorbell(1, 0, 1, 17));
+    EXPECT_EQ(data_main, AICORE_EXIT_SIGNAL);
 }
 
 TEST_F(SchedulerRetirement, CancelledDrainCoversAllOwnersWithoutCompletingTasks) {
