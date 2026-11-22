@@ -10,6 +10,8 @@
  */
 
 #include <gtest/gtest.h>
+
+#include <thread>
 #include "scheduler/scheduler.h"
 #include "graph_execution.h"
 #include "hbg_graph_image_test_support.h"
@@ -48,14 +50,14 @@ TEST(GraphExecutionReplay, PublishedTaskCompletesBeforeRemainingTasksMaterialize
     queue.slots = queue_slots;
     queue.capacity = 2;
     queue.mask = 1;
-    EXPECT_EQ(scheduler.signal_graph_external_ready(outer.slot), 0);
+    EXPECT_EQ(scheduler.signal_graph_external_ready(outer.slot, 0), 0);
 
     execution->materialize_busy.store(1);
     EXPECT_EQ(graph_execution_materialize_slice(outer.slot, *execution, heap.image(), 1), GraphMaterializeResult::BUSY);
     EXPECT_EQ(execution->materialized_tasks, 0);
     execution->materialize_busy.store(0);
 
-    ASSERT_EQ(scheduler.prepare_graph_task(outer.slot, heap.image(), 1), GraphMaterializeResult::PENDING);
+    ASSERT_EQ(scheduler.prepare_graph_task(outer.slot, heap.image(), 0, 1), GraphMaterializeResult::PENDING);
     EXPECT_EQ(graph_execution_phase(*execution), GraphExecutionPhase::SUBMITTED);
     EXPECT_EQ(execution->materialized_tasks, 1);
     EXPECT_EQ(execution->constructed_tasks, 1);
@@ -63,7 +65,7 @@ TEST(GraphExecutionReplay, PublishedTaskCompletesBeforeRemainingTasksMaterialize
     ChipTaskSlotState *ready[2]{};
     ASSERT_EQ(queue.pop_batch(ready, 2), 1);
     ASSERT_EQ(ready[0], &tasks[0].slot);
-    const auto first = scheduler.complete_task(*ready[0]);
+    const auto first = scheduler.complete_task(*ready[0], 0);
     EXPECT_EQ(first.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(first.stream_tasks_completed, 0);
     EXPECT_EQ(graph_execution_phase(*execution), GraphExecutionPhase::SUBMITTED);
@@ -72,7 +74,7 @@ TEST(GraphExecutionReplay, PublishedTaskCompletesBeforeRemainingTasksMaterialize
     EXPECT_TRUE(execution->is_completed(0));
     EXPECT_FALSE(header.tasks.is_completed(7));
 
-    ASSERT_EQ(scheduler.prepare_graph_task(outer.slot, heap.image(), 1), GraphMaterializeResult::MATERIALIZED);
+    ASSERT_EQ(scheduler.prepare_graph_task(outer.slot, heap.image(), 0, 1), GraphMaterializeResult::MATERIALIZED);
     EXPECT_EQ(graph_execution_phase(*execution), GraphExecutionPhase::MATERIALIZED);
     EXPECT_TRUE(graph_execution_external_ready(*execution));
     EXPECT_EQ(execution->task_storage, tasks);
@@ -89,7 +91,7 @@ TEST(GraphExecutionReplay, PublishedTaskCompletesBeforeRemainingTasksMaterialize
 
     ASSERT_EQ(queue.pop_batch(ready, 2), 1);
     ASSERT_EQ(ready[0], &tasks[1].slot);
-    const auto last = scheduler.complete_task(*ready[0]);
+    const auto last = scheduler.complete_task(*ready[0], 0);
     EXPECT_EQ(last.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(last.stream_tasks_completed, 1);
     EXPECT_EQ(graph_execution_phase(*execution), GraphExecutionPhase::COMPLETED);
@@ -121,9 +123,9 @@ TEST(GraphExecutionPhase, ShellReadinessOpensTheGateInsteadOfQueueing) {
         executions[i].outer_slot = &graph_slots[i];
     }
 
-    scheduler.push_ready_routed(&graph_slots[0]);
-    scheduler.push_ready_routed(&graph_slots[1]);
-    scheduler.push_ready_routed(&graph_slots[2]);
+    scheduler.push_ready_routed(&graph_slots[0], 0);
+    scheduler.push_ready_routed(&graph_slots[1], 0);
+    scheduler.push_ready_routed(&graph_slots[2], 0);
 
     for (const GraphExecution &execution : executions) {
         EXPECT_TRUE(graph_execution_external_ready(execution));
@@ -153,6 +155,16 @@ TEST(GraphExecutionErrors, GraphPrepareQueueOverflowIsReported) {
     EXPECT_EQ(header.sched_error_code.load(std::memory_order_acquire), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
     EXPECT_EQ(header.sched_error_thread.load(std::memory_order_acquire), 3);
     EXPECT_EQ(header.sched_error_bitmap.load(std::memory_order_acquire), 1U << 3);
+
+    // Later reporters contribute their thread bits without replacing the cause.
+    std::thread timeout([&] {
+        report_scheduler_error(header, 2, SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    });
+    scheduler.latch_ready_queue_overflow(4);
+    timeout.join();
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    EXPECT_EQ(header.sched_error_thread.load(), 3);
+    EXPECT_EQ(header.sched_error_bitmap.load(), (1U << 2) | (1U << 3) | (1U << 4));
 }
 
 TEST(GraphExecutionErrors, InvalidSubTaskCompletionIsReported) {
@@ -163,7 +175,7 @@ TEST(GraphExecutionErrors, InvalidSubTaskCompletionIsReported) {
     GraphExecution execution{};
     slot.graph_context = &execution;
 
-    const SchedulerState::TaskCompletionOutcome outcome = scheduler.complete_task(slot);
+    const SchedulerState::TaskCompletionOutcome outcome = scheduler.complete_task(slot, 0);
 
     EXPECT_EQ(outcome.error_code, SIMPLER_ERROR_INVALID_ARGS);
     EXPECT_EQ(outcome.stream_tasks_completed, 0);
@@ -191,7 +203,7 @@ TEST(GraphExecutionProgress, SubTaskResolutionIsNotAHostCompletion) {
     wait_list.entries[0].normal_done = true;
     wait_list.count = 1;
 
-    const AsyncPollResult result = wait_list.poll_and_complete<false>(nullptr, &scheduler);
+    const AsyncPollResult result = wait_list.poll_and_complete<false>(nullptr, &scheduler, 0);
 
     EXPECT_EQ(result.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(result.resolved, 1);

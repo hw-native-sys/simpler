@@ -31,8 +31,19 @@ a2a3_runtime_case(test_scheduler_retirement.cpp NO_OBJS
     TIMEOUT 20)
 target_sources(test_a2a3_tmr_scheduler_retirement PRIVATE
     ${A2A3_RUNTIME_DIR}/shared/runtime.cpp)
+target_include_directories(test_a2a3_hbg_scheduler_retirement PRIVATE
+    ${SIMPLER_SRC}/a2a3/runtime/host_build_graph)
 target_sources(test_a2a3_hbg_scheduler_retirement PRIVATE
-    ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
+    ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    ${HBG_RUNTIME_DIR}/scheduler/scheduler_dispatch.cpp
+    ${HBG_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+    ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp
+    ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+    ${SIMPLER_SRC}/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+    ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp
+    ${SIMPLER_SRC}/common/platform/shared/aicpu/platform_entry_args.cpp
+    ${SIMPLER_SRC}/common/platform/sim/aicpu/platform_aicpu_affinity.cpp
+    ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp)
 
 # NO_OBJS: this case compiles platform/shared/aicpu/platform_regs.cpp, and the
 # runtime object libraries carry support/platform_regs_stub.cpp, which defines the

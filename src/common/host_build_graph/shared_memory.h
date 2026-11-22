@@ -176,8 +176,8 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     // copy of this header. The orchestrator runs on the host and latches its own
     // fatal code in OrchestratorState, so no orchestrator error crosses here.
     std::atomic<uint32_t> sched_error_bitmap;  // Bit X set = thread X had error
-    std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
-    std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
+    std::atomic<int32_t> sched_error_code;     // Scheduler error selected for this run
+    std::atomic<int32_t> sched_error_thread;   // Reporting thread, or -1 when unavailable
 
     // Exclusive invocation initialization, before publishing readiness to schedulers.
     // Historical fault evidence belongs to NativeInvocationEvidence, not this header.
@@ -188,6 +188,19 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
         sched_error_thread.store(-1, std::memory_order_relaxed);
     }
 };
+
+// During execution the detector publishes the failure for all scheduler threads.
+// A thread observing an existing failure must not report itself as its source.
+inline void report_scheduler_error(SharedMemoryHeader &header, int32_t thread_idx, int32_t code) {
+    if (code == SIMPLER_ERROR_NONE) return;
+    int32_t expected = SIMPLER_ERROR_NONE;
+    if (header.sched_error_code.compare_exchange_strong(expected, code, std::memory_order_acq_rel) && thread_idx >= 0) {
+        header.sched_error_thread.store(thread_idx, std::memory_order_release);
+    }
+    if (thread_idx >= 0 && thread_idx < 32) {
+        header.sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
+    }
+}
 
 static_assert(sizeof(SharedMemoryHeader) == 128, "SharedMemoryHeader layout drift");
 static_assert(

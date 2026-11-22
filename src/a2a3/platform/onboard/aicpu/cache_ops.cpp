@@ -31,18 +31,31 @@ namespace aicpu_cache_maintenance __attribute__((visibility("hidden"))) {
         __asm__ __volatile__("isb" ::: "memory");
     }
 
-    void flush_range_impl(const void *addr, size_t size) {
-        if (size == 0) {
-            return;
-        }
+    static inline void clean_cache_lines(const void *addr, size_t size) {
         const size_t kCacheLineSize = 64;
         uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~(kCacheLineSize - 1);
         uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + size + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
         for (uintptr_t p = start; p < end; p += kCacheLineSize) {
             __asm__ __volatile__("dc cvac, %0" ::"r"(p) : "memory");
         }
+    }
+
+    static inline void complete_writeback() {
         __asm__ __volatile__("dsb sy" ::: "memory");
         __asm__ __volatile__("isb" ::: "memory");
+    }
+
+    void flush_range_impl(const void *addr, size_t size) {
+        if (size == 0) return;
+        clean_cache_lines(addr, size);
+        complete_writeback();
+    }
+
+    void flush_ranges_impl(const void *const *ranges, size_t count, size_t bytes_per_range) {
+        if (count == 0 || bytes_per_range == 0) return;
+        for (size_t i = 0; i < count; ++i)
+            clean_cache_lines(ranges[i], bytes_per_range);
+        complete_writeback();
     }
 
 #else
@@ -54,6 +67,8 @@ namespace aicpu_cache_maintenance __attribute__((visibility("hidden"))) {
     void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
 
     void flush_range_impl(const void * /* addr */, size_t /* size */) {}
+
+    void flush_ranges_impl(const void *const *, size_t, size_t) {}
 
 #endif
 

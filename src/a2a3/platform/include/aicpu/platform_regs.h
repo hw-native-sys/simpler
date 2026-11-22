@@ -150,6 +150,13 @@ uint64_t platform_aicore_exit_deadline();
 
 struct AicoreTeardownControl;
 
+// The optional predicate uses the target's array index. Once true it must
+// stay true: that target is closed to future register writes.
+struct AicoreExitReadiness {
+    const void *context;
+    bool (*ready)(const void *, size_t);
+};
+
 struct AicoreExitTarget {
     uint64_t reg_addr;
     AicoreTeardownControl *teardown;
@@ -163,8 +170,9 @@ void platform_open_aicore_exit_window(uint64_t reg_addr);
 // launches use the same reserved COND nonce protocol. Each core echoes its
 // current request once after quiescence and makes no subsequent SPR writes.
 //
-// Publish requests, broadcast EXIT to the group, and collect matching COND
-// values against one shared deadline. Close/read back every acknowledged
+// Publish requests, signal each ready target, and collect matching COND
+// values against one shared deadline. A pending writer on one target leaves
+// other targets free to signal and acknowledge. Close/read back every acknowledged
 // window, drain the closes, then release only those cores. An unacknowledged
 // core is neither closed nor released; it remains owned by host recovery.
 // ACK arriving after return does not run another close/release pass. A failed
@@ -176,7 +184,8 @@ void platform_open_aicore_exit_window(uint64_t reg_addr);
 // PLATFORM_MAX_CORES entries are filled. Return 0 if all targets were released,
 // otherwise -1. Concurrent callers must never claim the same core.
 int32_t platform_retire_aicore_group(
-    const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released = nullptr
+    const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released = nullptr,
+    AicoreExitReadiness readiness = {}
 );
 
 /**

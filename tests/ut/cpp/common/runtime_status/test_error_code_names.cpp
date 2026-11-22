@@ -52,6 +52,7 @@ constexpr int32_t kAllRuntimeCodes[] = {
     SIMPLER_ERROR_ASYNC_COMPLETION_INVALID,
     SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW,
     SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED,
+    SIMPLER_ERROR_READY_QUEUE_OVERFLOW,
 #ifdef SIMPLER_ERROR_KERNEL_INVALID_OUTPUT
     SIMPLER_ERROR_KERNEL_INVALID_OUTPUT,
     SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE,
@@ -91,8 +92,7 @@ TEST(RuntimeErrorNames, UnknownCodeFallsBack) {
     }
 }
 
-// The orchestrator and the scheduler each latch into their own field, and at most one is
-// ever non-zero. The annotation has to name the field the code actually came from.
+// The status and its log annotation must select the same field, even when both are set.
 TEST(RuntimeErrorNames, LatchedCodePicksTheNonZeroField) {
     EXPECT_EQ(latched_error_code(SIMPLER_ERROR_SCOPE_DEADLOCK, SIMPLER_ERROR_NONE), SIMPLER_ERROR_SCOPE_DEADLOCK);
     EXPECT_STREQ(latched_error_field(SIMPLER_ERROR_SCOPE_DEADLOCK, SIMPLER_ERROR_NONE), "orch_error_code");
@@ -101,6 +101,16 @@ TEST(RuntimeErrorNames, LatchedCodePicksTheNonZeroField) {
     EXPECT_STREQ(latched_error_field(SIMPLER_ERROR_NONE, SIMPLER_ERROR_SCHEDULER_TIMEOUT), "sched_error_code");
 
     EXPECT_EQ(latched_error_code(SIMPLER_ERROR_NONE, SIMPLER_ERROR_NONE), SIMPLER_ERROR_NONE);
+}
+
+TEST(RuntimeErrorNames, StatusAndLogAgreeWhenBothFieldsAreSet) {
+    EXPECT_EQ(
+        latched_error_code(SIMPLER_ERROR_INVALID_ARGS, SIMPLER_ERROR_SCHEDULER_TIMEOUT), SIMPLER_ERROR_INVALID_ARGS
+    );
+    EXPECT_STREQ(latched_error_field(SIMPLER_ERROR_INVALID_ARGS, SIMPLER_ERROR_SCHEDULER_TIMEOUT), "orch_error_code");
+    EXPECT_EQ(runtime_status_from_error_codes(SIMPLER_ERROR_INVALID_ARGS, SIMPLER_ERROR_SCHEDULER_TIMEOUT), -5);
+    EXPECT_EQ(runtime_status_from_error_codes(0, SIMPLER_ERROR_READY_QUEUE_OVERFLOW), -104);
+    EXPECT_EQ(runtime_status_from_error_code(-104), -104);
 }
 
 // The stall sub-class already had a name table; keep it and the error table consistent so a

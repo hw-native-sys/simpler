@@ -17,7 +17,7 @@
  * that stall_detail_name() already plays for the stall sub-class.
  *
  * The switches key off the SIMPLER_ERROR_* macros rather than literals, so the code values
- * live in exactly one place (the per-runtime runtime_status.h). Include this header
+ * live in runtime_status/error_codes.h. Include this header
  * *after* that one; the #error below enforces it.
  *
  * Full triage steps per code: docs/troubleshooting/device-error-codes.md
@@ -68,10 +68,8 @@ static inline const char *error_name(int32_t code) {
         return "ASYNC_WAIT_OVERFLOW";
     case SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED:
         return "ASYNC_REGISTRATION_FAILED";
-#ifdef SIMPLER_ERROR_READY_QUEUE_OVERFLOW
     case SIMPLER_ERROR_READY_QUEUE_OVERFLOW:
         return "READY_QUEUE_OVERFLOW";
-#endif
 #ifdef SIMPLER_ERROR_KERNEL_INVALID_OUTPUT
     case SIMPLER_ERROR_KERNEL_INVALID_OUTPUT:
         return "KERNEL_INVALID_OUTPUT";
@@ -141,10 +139,9 @@ static inline const char *error_desc(int32_t code) {
     case SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED:
         return "the scheduler received an async completion message of an illegal kind (runtime-internal; "
                "ASYNC_WAIT_OVERFLOW normally intercepts this first)";
-#ifdef SIMPLER_ERROR_READY_QUEUE_OVERFLOW
     case SIMPLER_ERROR_READY_QUEUE_OVERFLOW:
-        return "a scheduler ready queue rejected a task because it had no free slot";
-#endif
+        return "the graph requires more ready queue capacity than allowed at bind time, or a scheduler enqueue found "
+               "no free slot";
     default:
         return "";
     }
@@ -212,24 +209,15 @@ static inline const char *error_hint(int32_t code) {
     case SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW:
         return "cut the number of in-flight async completions per task, and confirm the consumer side "
                "actually polls and retires them";
-#ifdef SIMPLER_ERROR_READY_QUEUE_OVERFLOW
     case SIMPLER_ERROR_READY_QUEUE_OVERFLOW:
-        return "ensure runtime_env.ring_task_window does not exceed the ready-queue capacity; otherwise keep the "
-               "device "
-               "log and report the scheduler queue-accounting bug";
-#endif
+        return "for a host bind failure, inspect the queue population against its capacity limit; "
+               "for a device enqueue failure, keep the scheduler queue and task diagnostics";
     default:
         return "";
     }
 }
 
-// At most one of the two codes is ever non-zero (orchestrator and scheduler each latch
-// their own, first-writer-wins). These two pick the latched one and name the field it
-// came from, so every failure site annotates the same way without repeating the choice.
-static inline int32_t latched_error_code(int32_t orch_error_code, int32_t sched_error_code) {
-    return orch_error_code != SIMPLER_ERROR_NONE ? orch_error_code : sched_error_code;
-}
-
+// Report the field selected by latched_error_code(), including when both carry a failure.
 static inline const char *latched_error_field(int32_t orch_error_code, int32_t sched_error_code) {
     return orch_error_code != SIMPLER_ERROR_NONE ? "orch_error_code" : "sched_error_code";
 }

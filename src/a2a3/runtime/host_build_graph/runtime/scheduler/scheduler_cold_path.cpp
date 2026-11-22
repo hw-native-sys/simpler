@@ -13,6 +13,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <new>
 
 #include "assert_compat.h"
 #include "common/unified_log.h"
@@ -37,25 +38,17 @@
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
 
-static void latch_scheduler_error(SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
-    if (header == nullptr || error_code == SIMPLER_ERROR_NONE) {
-        return;
-    }
-    // The first error code/thread pair wins; the bitmap cumulatively records all reporting threads.
-    int32_t expected = SIMPLER_ERROR_NONE;
-    if (header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel)) {
-        header->sched_error_thread.store(thread_idx, std::memory_order_release);
-    }
-    if (thread_idx >= 0 && thread_idx < 32) {
-        header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
+void SchedulerContext::stop_failed_scheduler(Runtime *runtime) {
+    if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+        emergency_shutdown(runtime);
     }
 }
 
 void SchedulerContext::fail_scheduler(Runtime *runtime, int32_t thread_idx, int32_t error_code) {
-    latch_scheduler_error(sched_ == nullptr ? nullptr : sched_->sm_header, thread_idx, error_code);
-    if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-        emergency_shutdown(runtime);
+    if (sched_ != nullptr && sched_->sm_header != nullptr) {
+        report_scheduler_error(*sched_->sm_header, thread_idx, error_code);
     }
+    stop_failed_scheduler(runtime);
 }
 
 LoopAction
@@ -70,9 +63,7 @@ SchedulerContext::check_latched_sched_error(int32_t thread_idx, SharedMemoryHead
             "completed_tasks=%d, total_tasks=%d",
             thread_idx, sched_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
         );
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
+        stop_failed_scheduler(runtime);
         return LoopAction::BREAK_LOOP;
     }
     return LoopAction::NONE;
@@ -424,7 +415,9 @@ int32_t SchedulerContext::handle_timeout_exit(
         "[STALL thread=%d idle_iterations=%d] TIMEOUT_EXIT after_idle_iterations=%d", thread_idx, idle_iterations,
         idle_iterations
     );
-    latch_scheduler_error(header, thread_idx, SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    if (header != nullptr) {
+        report_scheduler_error(*header, thread_idx, SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    }
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
 #if SIMPLER_DFX
@@ -656,6 +649,7 @@ void SchedulerContext::publish_all_retirement_cores(Runtime *runtime) {
 int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num) {
     AicoreExitTarget targets[PLATFORM_MAX_CORES];
     int32_t claimed_ids[PLATFORM_MAX_CORES];
+    RegisterPublications::CoreMask closed{};
     size_t count = 0;
     for (int32_t i = 0; i < core_num; ++i) {
         const int32_t core_id = core_ids[i];
@@ -663,6 +657,7 @@ int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *
         const uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
         if (reg_addr == 0) continue;
         claimed_ids[count] = core_id;
+        closed[core_id / 64] |= 1ULL << (core_id % 64);
         targets[count] = {reg_addr, &runtime->get_teardown_gates()[core_id]};
         ++count;
     }
@@ -674,18 +669,35 @@ int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *
     // READY commits the current report, reset gate/request, and register
     // metadata before a unique retirement claimant can enter this helper.
     const uint64_t deadline = platform_aicore_exit_deadline();
-    const int32_t rc = platform_retire_aicore_group(targets, count, deadline, released);
+    struct Writers {
+        const RegisterPublications *publications;
+        const int32_t *ids;
+    } writers{nullptr, claimed_ids};
+    AicoreExitReadiness readiness{};
+    if (sched_ != nullptr && sched_->register_publications.close_and_check_writers(closed)) {
+        writers.publications = &sched_->register_publications;
+        readiness = {&writers, [](const void *ctx, size_t i) {
+                         const auto &w = *static_cast<const Writers *>(ctx);
+                         return w.publications->idle(w.ids[i]);
+                     }};
+    }
+    const int32_t rc = platform_retire_aicore_group(targets, count, deadline, released, readiness);
+    const void *reports[PLATFORM_MAX_CORES];
+    size_t report_count = 0;
     for (size_t i = 0; i < count; ++i) {
         if (!released[i]) continue;
         Handshake *report = &runtime->get_workers()[claimed_ids[i]];
         aicore_invalidate_retired_report(report);
-        cache_flush_range(report, sizeof(*report));
+        reports[report_count++] = report;
     }
+    // No successor can reuse these reports until the group returns. Complete
+    // their writebacks together, touching only workers that were released.
+    cache_flush_ranges(reports, report_count, sizeof(Handshake));
     wmb();
     if (rc != 0) {
-        // Naming the cores is the only signal an unreleased worker leaves: it
-        // spins on a gate it cannot log about, and the host sees just a stream
-        // timeout. See docs/troubleshooting/a2a3-worker-retirement.md.
+        int32_t expected = 0;
+        retirement_error_.compare_exchange_strong(expected, rc, std::memory_order_release);
+        // The per-run result preserves the failure; the device log names each unreleased core.
         for (size_t i = 0; i < count; ++i) {
             if (!released[i]) {
                 LOG_ERROR(
@@ -950,6 +962,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
     memset(retirement_state_, 0, sizeof(retirement_state_));
+    retirement_error_.store(0, std::memory_order_relaxed);
 
     // Wire thread configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
@@ -1185,6 +1198,8 @@ void SchedulerContext::deinit() {
 void SchedulerContext::bind_runtime(RuntimeContext *rt) {
     rt_ = rt;
     sched_ = rt->scheduler;
+    // The device-only arena can retain closed bits from its previous run.
+    new (&sched_->register_publications) RegisterPublications{};
 }
 
 // =============================================================================
@@ -1199,11 +1214,8 @@ void SchedulerContext::on_graph_attached(RuntimeContext *rt, [[maybe_unused]] in
 
     // Allocate the per-S CompletedTaskQueues here on the boot leader, before it
     // releases runtime_init_ready_ — no scheduler thread can push until then.
-    // Completed-but-unresolved tasks in flight are bounded by the run's task count
-    // (a task must have been submitted to run and complete), so size to that,
-    // rounded up to a power of two and floored at 256. That bound is exact, so
-    // there is no artificial ceiling and a producer never has to spin on a full
-    // queue.
+    // Size to outer tasks, rounded up to a power of two and floored at 256.
+    // An expanded Graph can produce more completions, so a full queue applies backpressure.
     uint64_t sp_bound = static_cast<uint64_t>(total_tasks);
     uint64_t sp_cap = 256;
     while (sp_cap < sp_bound) {
@@ -1269,10 +1281,10 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads, 
         }
         int32_t state = sched_->classify_fanin_state(&slot);
         if (state < 0) {
-            sched_->push_ready_routed(&slot);
+            if (!sched_->push_ready_routed(&slot, thread_idx)) return;
         } else {
             int32_t prod_local = slot.to_payload().fanin_data()[state];
-            sched_->register_wake(&tasks.get_slot_state_by_task_id(prod_local), &slot);
+            if (!sched_->register_wake(&tasks.get_slot_state_by_task_id(prod_local), &slot, thread_idx)) return;
             // A not-yet-ready candidate also enters the publish list, hung on
             // its latest-submitted unpublished producer — or, when every
             // producer is already published at intake (pre-completed fanin),

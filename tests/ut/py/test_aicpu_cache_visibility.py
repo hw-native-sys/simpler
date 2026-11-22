@@ -30,6 +30,7 @@ def test_onboard_cache_helpers_bind_to_each_shared_object(tmp_path: Path, arch: 
         '#include "aicpu/cache_maintenance.h"\n'
         'extern "C" void exercise() {\n'
         "  cache_flush_range(nullptr, 0);\n"
+        "  cache_flush_ranges(nullptr, 0, 64);\n"
         "  cache_invalidate_range(nullptr, 0);\n"
         "}\n"
     )
@@ -39,6 +40,7 @@ def test_onboard_cache_helpers_bind_to_each_shared_object(tmp_path: Path, arch: 
         "static int calls;\n"
         "namespace aicpu_cache_maintenance {\n"
         "void flush_range_impl(const void *, size_t) { ++calls; }\n"
+        "void flush_ranges_impl(const void *const *, size_t, size_t) { ++calls; }\n"
         "void invalidate_range_impl(const void *, size_t) { ++calls; }\n"
         "}\n"
         'extern "C" int count_calls() { return calls; }\n'

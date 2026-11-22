@@ -72,7 +72,9 @@ void platform_signal_aicore_exit(uint64_t reg_addr) { write_reg(reg_addr, RegId:
 
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + inner_get_deinit_timeout_ticks(); }
 
-int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released) {
+int32_t platform_retire_aicore_group(
+    const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released, AicoreExitReadiness readiness
+) {
     // `released` is filled before anything can return, rejection included, so a
     // caller may read it without initializing the buffer. An over-large `count`
     // says nothing about how big that buffer is, so the fill stops at the one
@@ -105,28 +107,33 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     // Broadcast to the whole group before waiting on any member, so the cores
     // drain concurrently and a dead core's wait does not serialize behind the
     // cores ahead of it.
+    enum class ExitState : uint8_t { WaitingForAck, Acknowledged, WaitingForWriter };
+    ExitState state[PLATFORM_MAX_CORES];
     for (size_t i = 0; i < count; ++i) {
-        platform_signal_aicore_exit(targets[i].reg_addr);
+        if (readiness.ready && !readiness.ready(readiness.context, i)) {
+            state[i] = ExitState::WaitingForWriter;
+        } else {
+            platform_signal_aicore_exit(targets[i].reg_addr);
+            state[i] = ExitState::WaitingForAck;
+        }
     }
     wmb();
 
-    // Round-robin rather than blocking on one core at a time. Blocking spends
-    // the shared deadline on whichever core happens to come first, and every
-    // core behind it is then judged on a peer's timeout instead of its own.
-    // Sweeping non-blockingly gives each core the whole budget: a core is only
-    // abandoned once the deadline passes with it still silent.
-    // The sweep below reads an entry before it writes it, so the first `count`
-    // must start false. Entries past `count` are never read.
-    bool acknowledged[PLATFORM_MAX_CORES];
-    for (size_t i = 0; i < count; ++i)
-        acknowledged[i] = false;
+    // Poll all targets against the same deadline. A suspended register writer
+    // delays EXIT only for its own targets. Its retained COND cannot count as an ACK.
     size_t remaining = count;
     while (remaining != 0) {
         for (size_t i = 0; i < count; ++i) {
-            if (acknowledged[i]) continue;
+            if (state[i] != ExitState::WaitingForAck) {
+                if (state[i] == ExitState::Acknowledged) continue;
+                if (get_sys_cnt_aicpu() > deadline || !readiness.ready(readiness.context, i)) continue;
+                platform_signal_aicore_exit(targets[i].reg_addr);
+                wmb();
+                state[i] = ExitState::WaitingForAck;
+            }
             const uint32_t cond = static_cast<uint32_t>(read_reg(targets[i].reg_addr, RegId::COND));
             if (cond == exit_requests[i]) {
-                acknowledged[i] = true;
+                state[i] = ExitState::Acknowledged;
                 --remaining;
             }
         }
@@ -138,7 +145,7 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     // passes above already established it.
     int32_t rc = 0;
     for (size_t i = 0; i < count; ++i) {
-        if (acknowledged[i]) {
+        if (state[i] == ExitState::Acknowledged) {
             write_reg(targets[i].reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
             write_reg(targets[i].reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
         } else {
@@ -148,7 +155,7 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     // Each acknowledged window retains its own completion readback before
     // the common drain and release pass. Unacknowledged windows stay open.
     for (size_t i = 0; i < count; ++i) {
-        if (acknowledged[i]) {
+        if (state[i] == ExitState::Acknowledged) {
             (void)read_reg(targets[i].reg_addr, RegId::FAST_PATH_ENABLE);
         }
     }
@@ -162,10 +169,10 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     // exists to prevent. Unreleased cores are reported through `released` so
     // the caller can name them; the host recovery path owns them from here.
     for (size_t i = 0; i < count; ++i) {
-        if (acknowledged[i]) {
+        if (state[i] == ExitState::Acknowledged) {
             __atomic_store_n(&targets[i].teardown->post_close_release, AICORE_POST_CLOSE_RELEASE, __ATOMIC_RELAXED);
         }
-        if (released != nullptr) released[i] = acknowledged[i];
+        if (released != nullptr) released[i] = state[i] == ExitState::Acknowledged;
     }
     return rc;
 }

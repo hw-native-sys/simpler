@@ -17,6 +17,7 @@ namespace aicpu_cache_maintenance {
 
 void invalidate_range_impl(const void *addr, size_t size);
 void flush_range_impl(const void *addr, size_t size);
+void flush_ranges_impl(const void *const *ranges, size_t count, size_t bytes_per_range);
 
 }  // namespace aicpu_cache_maintenance
 
@@ -27,3 +28,8 @@ inline void cache_invalidate_range(const void *addr, size_t size) {
 }
 
 inline void cache_flush_range(const void *addr, size_t size) { aicpu_cache_maintenance::flush_range_impl(addr, size); }
+
+// Disjoint ranges with the same size. All writebacks complete before return.
+inline void cache_flush_ranges(const void *const *ranges, size_t count, size_t bytes_per_range) {
+    aicpu_cache_maintenance::flush_ranges_impl(ranges, count, bytes_per_range);
+}

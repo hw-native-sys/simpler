@@ -61,4 +61,14 @@
         }                                                                                                              \
     } while (0)
 
+// A bind failure has no running scheduler. Publish the diagnostic locally and
+// return the signed status directly to the caller.
+static inline int32_t report_scheduler_error(int32_t code) {
+    const int32_t status = runtime_status_from_error_code(code);
+    if (code != SIMPLER_ERROR_NONE) {
+        LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, code, status);
+    }
+    return status;
+}
+
 #endif  // SRC_COMMON_RUNTIME_STATUS_ERROR_LOG_H_

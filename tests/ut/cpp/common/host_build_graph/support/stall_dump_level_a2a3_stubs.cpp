@@ -16,7 +16,7 @@
 
 // Stall-dump tests do not execute retirement; these stubs satisfy the link.
 int32_t __attribute__((weak))
-platform_retire_aicore_group(const AicoreExitTarget *, size_t count, uint64_t, bool *released) {
+platform_retire_aicore_group(const AicoreExitTarget *, size_t count, uint64_t, bool *released, AicoreExitReadiness) {
     if (released != nullptr) {
         for (size_t i = 0; i < count; i++)
             released[i] = true;

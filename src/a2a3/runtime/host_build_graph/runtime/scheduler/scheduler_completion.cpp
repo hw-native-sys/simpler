@@ -78,9 +78,9 @@ SlotTransition SchedulerContext::decide_slot_transition(
 }
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
-void SchedulerContext::complete_slot_task(
+bool SchedulerContext::complete_slot_task(
     ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] SubtaskSlot subslot,
-    int32_t thread_idx, int32_t core_id, Handshake *hank, [[maybe_unused]] int32_t &completed_this_turn
+    int32_t thread_idx, int32_t core_id, [[maybe_unused]] Handshake *hank, [[maybe_unused]] int32_t &completed_this_turn
 #if SIMPLER_DFX
     ,
     uint64_t dispatch_ts, uint64_t finish_ts
@@ -88,8 +88,6 @@ void SchedulerContext::complete_slot_task(
 ) {
 #if SIMPLER_DFX
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
-#else
-    (void)hank;
 #endif
     // MPSC fast-path is opt-in per task: only tasks with at least one subtask
     // that registered a deferred condition route through the mailbox. Pure
@@ -105,24 +103,14 @@ void SchedulerContext::complete_slot_task(
     // Scoped so the slab reference does not outlive the drain below it.
     {
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
-        int32_t slab_err = deferred_slab->error_code;
-        if (slab_err != SIMPLER_ERROR_NONE) {
-            int32_t expected = SIMPLER_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
+        const int32_t slab_err = deferred_slab->error_code;
+        const uint32_t cond_count = deferred_slab->count;
+        if (slab_err != SIMPLER_ERROR_NONE || cond_count > MAX_COMPLETIONS_PER_TASK) {
+            report_scheduler_error(
+                *sched_->sm_header, thread_idx,
+                slab_err != SIMPLER_ERROR_NONE ? slab_err : SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED
             );
-            completed_.store(true, std::memory_order_release);
-            return;
-        }
-
-        uint32_t cond_count = deferred_slab->count;
-        if (cond_count > MAX_COMPLETIONS_PER_TASK) {
-            int32_t expected = SIMPLER_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
-            );
-            completed_.store(true, std::memory_order_release);
-            return;
+            return false;
         }
 
         if (cond_count > 0) {
@@ -138,6 +126,7 @@ void SchedulerContext::complete_slot_task(
                 while (!mailbox->try_push_condition(
                     token, e->addr, e->backend_cookie, e->expected_value, e->engine, e->completion_type
                 )) {
+                    if (is_completed()) return false;
                     sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
                     SPIN_WAIT_HINT();
                 }
@@ -166,6 +155,7 @@ void SchedulerContext::complete_slot_task(
         while (
             !mailbox->try_push_normal_done(slot_state.to_descriptor().task_id, reinterpret_cast<uint64_t>(&slot_state))
         ) {
+            if (is_completed()) return false;
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
             SPIN_WAIT_HINT();
         }
@@ -190,7 +180,7 @@ void SchedulerContext::complete_slot_task(
         // completed_tasks_, so this scheduler thread neither
         // resolves nor bumps completed_this_turn. (The Resolve swimlane bar is
         // emitted by P, not here.)
-        sp_queues_[thread_idx].push(&slot_state);
+        if (!sp_queues_[thread_idx].push(&slot_state, completed_)) return false;
 #if SIMPLER_DFX
         chip_swimlane.phase_complete_count++;
 #endif
@@ -229,6 +219,7 @@ void SchedulerContext::complete_slot_task(
         );
     }
 #endif
+    return true;
 }
 
 // Promote pending slot data to running slot. Clears pending fields.
@@ -249,7 +240,7 @@ void SchedulerContext::clear_running_slot(CoreExecState &core) {
     core.running_reg_task_id = AICPU_TASK_INVALID;
 }
 
-void SchedulerContext::check_running_cores_for_completion(
+LoopAction SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
     bool &made_progress
 ) {
@@ -354,28 +345,32 @@ void SchedulerContext::check_running_cores_for_completion(
             if (core.pending_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.pending_slot_state->task_attrs.timing_slot(), thread_idx);
             }
-            complete_slot_task(
-                *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
-                completed_this_turn
+            if (!complete_slot_task(
+                    *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
+                    completed_this_turn
 #if SIMPLER_DFX
-                ,
-                core.pending_dispatch_timestamp, finish_ts
+                    ,
+                    core.pending_dispatch_timestamp, finish_ts
 #endif
-            );
+                )) {
+                return LoopAction::BREAK_LOOP;
+            }
             cur_thread_completed++;
         }
         if (t.running_done) {
             if (core.running_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.running_slot_state->task_attrs.timing_slot(), thread_idx);
             }
-            complete_slot_task(
-                *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
-                completed_this_turn
+            if (!complete_slot_task(
+                    *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
+                    completed_this_turn
 #if SIMPLER_DFX
-                ,
-                core.running_dispatch_timestamp, finish_ts
+                    ,
+                    core.running_dispatch_timestamp, finish_ts
 #endif
-            );
+                )) {
+                return LoopAction::BREAK_LOOP;
+            }
             cur_thread_completed++;
         }
 
@@ -391,7 +386,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
                 if (sync_start_promote) {
                     promoted->to_payload().running_slot_count.fetch_add(1, std::memory_order_seq_cst);
-                    sched_->try_launch_sync_start_cohort(*promoted);
+                    sched_->try_launch_sync_start_cohort(*promoted, thread_idx);
                 }
             } else {
                 clear_running_slot(core);  // Case 1 or Case 3 (no pending)
@@ -422,6 +417,7 @@ void SchedulerContext::check_running_cores_for_completion(
             made_progress = true;
         }
     }
+    return LoopAction::NONE;
 }
 
 // =============================================================================
@@ -527,55 +523,57 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                 );
             }
             // Account before the tokens, seal after them (see account_published_blocks).
-            const bool owns_seal = sched_->account_published_blocks(*slot_state, claim);
-            wmb();
-            uint64_t dispatch_ts = 0;
+            bool owns_seal = false;
+            RegisterPublications::CoreMask my_mask{};
+            if (!publish_task_batch(thread_idx, handles, handle_count, my_mask, [&] {
+                    owns_seal = sched_->account_published_blocks(*slot_state, claim);
+                    wmb();
+                    uint64_t dispatch_ts = 0;
 #if SIMPLER_DFX
-            uint64_t pub_t0 = 0;
-            if (sub_prof) {
-                pub_t0 = get_sys_cnt_aicpu();
-                // DrainPrepare bar: cluster scan happened before this lambda, so this covers the
-                // build_payload work for `claim` blocks (handle_count subtasks).
-                chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, SchedPhaseKind::DrainPrepare, prep_t0, pub_t0,
-                    sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
-                );
-            }
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
-                dispatch_ts = pub_t0 != 0 ? pub_t0 : get_sys_cnt_aicpu();
-            }
-#endif
-            // Accumulate this batch's gated cores into a LOCAL mask and OR it into the shared
-            // staged_core_mask ONCE below, instead of a seq_cst fetch_or per subtask — that
-            // per-write atomic contends across all drain threads on the same 2 words and was
-            // ~half the publish cost. The doorbell-table writes stay per-core (unique cid, no
-            // contention).
-            uint64_t my_mask[EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
-            for (int i = 0; i < handle_count; i++) {
-                publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
-                if (gated) {
-                    int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
-                    sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
-                    sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
-                    my_mask[cid >> 6] |= 1ULL << (cid & 63);
-                }
-            }
-            if (gated) {
-                for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
-                    if (my_mask[w] != 0) {
-                        slot_state->to_payload().staged_core_mask[w].fetch_or(my_mask[w], std::memory_order_seq_cst);
+                    uint64_t pub_t0 = 0;
+                    if (sub_prof) {
+                        pub_t0 = get_sys_cnt_aicpu();
+                        // DrainPrepare bar: cluster scan happened before this lambda, so this covers the
+                        // build_payload work for `claim` blocks (handle_count subtasks).
+                        chip_swimlane_aicpu_record_sched_phase(
+                            thread_idx, SchedPhaseKind::DrainPrepare, prep_t0, pub_t0,
+                            sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
+                        );
                     }
-                }
-            }
-#if SIMPLER_DFX
-            if (sub_prof) {
-                // DrainPublish bar: the MMIO write_reg per subtask (+ gated doorbell/mask record).
-                chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, SchedPhaseKind::DrainPublish, pub_t0, get_sys_cnt_aicpu(),
-                    sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
-                );
-            }
+                    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+                        dispatch_ts = pub_t0 != 0 ? pub_t0 : get_sys_cnt_aicpu();
+                    }
 #endif
+                    // Publish the already registered batch mask once per word. Each
+                    // doorbell-table entry has a unique core writer in this stage.
+                    for (int i = 0; i < handle_count; i++) {
+                        publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
+                        if (gated) {
+                            int32_t cid = handles[i].core_id;
+                            sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
+                            sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
+                        }
+                    }
+                    if (gated) {
+                        for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                            if (my_mask[w] != 0) {
+                                slot_state->to_payload().staged_core_mask[w].fetch_or(
+                                    my_mask[w], std::memory_order_seq_cst
+                                );
+                            }
+                        }
+                    }
+#if SIMPLER_DFX
+                    if (sub_prof) {
+                        // DrainPublish bar: the MMIO write_reg per subtask (+ gated doorbell/mask record).
+                        chip_swimlane_aicpu_record_sched_phase(
+                            thread_idx, SchedPhaseKind::DrainPublish, pub_t0, get_sys_cnt_aicpu(),
+                            sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
+                        );
+                    }
+#endif
+                }))
+                return;
             if (owns_seal) sched_->seal_ed_publish_list(*slot_state);
             // AIC/AIV running placement (whole block on idle cores); MIX running cores are
             // counted per-cluster above (mix_cluster_idle_core_count).
@@ -757,7 +755,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     // ahead of drain completion and fail while running_slot_count is still incomplete. When
     // every block landed directly in a running slot, no pending promotion remains to retry it.
     if (gated) {
-        sched_->try_launch_sync_start_cohort(*slot_state);
+        sched_->try_launch_sync_start_cohort(*slot_state, thread_idx);
     }
     SchedulerState::finish_early_sync_drain(slot_state->to_payload());
 }

@@ -181,6 +181,70 @@ TEST(AicoreRetirement, GroupWaitsForEveryAckBeforeClosingAnyWindow) {
     }
 }
 
+TEST(AicoreRetirement, DelayedRegisterWriterDoesNotDeferPeerExit) {
+    alignas(64) std::array<uint32_t, 0x500 / sizeof(uint32_t)> peer_registers{};
+    AicoreTeardownControl controls[2]{};
+    const AicoreExitTarget targets[] = {
+        {reinterpret_cast<uint64_t>(registers.data()), &controls[0]},
+        {reinterpret_cast<uint64_t>(peer_registers.data()), &controls[1]},
+    };
+    registers.fill(0);
+    for (const auto &target : targets)
+        platform_init_aicore_regs(target.reg_addr);
+    std::atomic<bool> idle{false};
+    AicoreExitReadiness readiness{&idle, [](const void *ctx, size_t i) {
+                                      return i == 1 || static_cast<const std::atomic<bool> *>(ctx)->load();
+                                  }};
+    AicoreExitResponder first(targets[0]), peer(targets[1]);
+    bool released[2]{};
+    int rc = -1;
+    std::thread retire([&] {
+        rc = platform_retire_aicore_group(targets, 2, platform_aicore_exit_deadline(), released, readiness);
+    });
+    EXPECT_TRUE(wait_until(
+        [&] {
+            return read_reg(targets[1].reg_addr, RegId::COND) == AICORE_EXIT_NONCE_0;
+        },
+        std::chrono::seconds(2)
+    ));
+    EXPECT_EQ(load_register(RegId::DATA_MAIN_BASE), AICPU_IDLE_TASK_ID);
+    EXPECT_EQ(__atomic_load_n(&controls[0].post_close_release, __ATOMIC_ACQUIRE), 0u);
+    idle.store(true);
+    retire.join();
+    EXPECT_EQ(rc, 0);
+    EXPECT_TRUE(released[0]);
+    EXPECT_TRUE(released[1]);
+}
+
+TEST(AicoreRetirement, WriterPastDeadlineLeavesOnlyItsTargetOpen) {
+    alignas(64) std::array<uint32_t, 0x500 / sizeof(uint32_t)> peer_registers{};
+    AicoreTeardownControl controls[2]{};
+    const AicoreExitTarget targets[] = {
+        {reinterpret_cast<uint64_t>(registers.data()), &controls[0]},
+        {reinterpret_cast<uint64_t>(peer_registers.data()), &controls[1]},
+    };
+    registers.fill(0);
+    for (const auto &target : targets)
+        platform_init_aicore_regs(target.reg_addr);
+    AicoreExitResponder responsive_target(targets[0]), responsive_peer(targets[1]);
+    bool released[2]{};
+    AicoreExitReadiness readiness{nullptr, [](const void *, size_t i) {
+                                      return i == 1;
+                                  }};
+    EXPECT_EQ(
+        platform_retire_aicore_group(
+            targets, 2, get_sys_cnt_aicpu() + PLATFORM_PROF_SYS_CNT_FREQ / 10, released, readiness
+        ),
+        -1
+    );
+    EXPECT_EQ(load_register(RegId::DATA_MAIN_BASE), AICPU_IDLE_TASK_ID);
+    EXPECT_EQ(load_register(RegId::FAST_PATH_ENABLE), REG_SPR_FAST_PATH_OPEN);
+    EXPECT_EQ(controls[0].post_close_release, 0u);
+    EXPECT_FALSE(released[0]);
+    EXPECT_EQ(controls[1].post_close_release, AICORE_POST_CLOSE_RELEASE);
+    EXPECT_TRUE(released[1]);
+}
+
 TEST(AicoreRetirement, MissingAckDoesNotCloseOrReleaseThatCore) {
     alignas(64) std::array<uint32_t, 0x500 / sizeof(uint32_t)> peer_registers{};
     AicoreTeardownControl controls[2]{};
