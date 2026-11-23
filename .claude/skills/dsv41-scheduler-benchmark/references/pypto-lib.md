@@ -18,6 +18,8 @@ The A5 decode set in the verified dev manifest contains six 1-card attention cas
 
 For HBG no-graph, verify per-task submission in the generated orchestration, such as `rt_submit_task`, and compare the same submission mode on both arms. A configuration selecting HBG alone leaves graph submission mode ambiguous. If a dev-branch harness selects no-graph with a PyPTO pass context, record the harness and keep it identical across arms.
 
+For full-network DSpark decode on the same stack, use the [separate 8K fixture](dspark-8k.md).
+
 ## Run
 
 From the pypto-lib root in the prepared environment, use the daily entry point for a CI reproduction. It manages reservations and uses the manifest sampling.
