@@ -39,11 +39,12 @@ task-submit --device auto --device-num 2 --timeout 1200 --max-time 1200 \
 - `--prepare` compiles without initializing hardware. `--output-prefix` enables
   dependency and chip-swimlane diagnostics for each round.
 
-The runtime supports one or more local children; these examples require two for
-qualification. L3 HBG, A3, remote/cross-node MAP, borrowed contexts and capture are
-unsupported. First-time mapping and cache reuse both permit earlier accepted
-calls to remain active. A child preparation failure is reported like H2D failure;
-other dispatched tasks may already have executed. CPU updates and overlapping Device writers require application ordering.
+These examples target two local A5 TMR children. The runtime supports one or more
+local TMR children on A3 and A5. L3 HBG, remote/cross-node MAP, borrowed contexts
+and capture are unsupported. First-time mapping and cache reuse both permit
+earlier accepted calls to remain active. A child preparation failure follows the
+same error handling as H2D. Other dispatched tasks may already have executed.
+CPU updates and overlapping Device writers require application ordering.
 
 See [Host DDR design](../../../../docs/design/a5-host-ddr.md) for failure retention
 and cleanup retry. Historical URMA measurements are not MAP qualification.

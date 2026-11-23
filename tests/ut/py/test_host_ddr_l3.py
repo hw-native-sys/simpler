@@ -458,8 +458,20 @@ def test_failed_import_retains_cleanup_record_without_native_unmap(group, monkey
     group.chips[0]._unmap_host_ddr.assert_not_called()
 
 
-@pytest.mark.parametrize("outcome", ["accepted", "refused", "unknown", "materialization-failed"])
-def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(group, outcome):
+@pytest.mark.parametrize(
+    ("outcome", "activation"),
+    [
+        ("accepted", None),
+        ("refused", None),
+        ("unknown", None),
+        ("materialization-failed", None),
+        ("activation-safe", "immediate"),
+        ("activation-safe", "delayed"),
+        ("activation-unproven", "immediate"),
+        ("activation-unproven", "delayed"),
+    ],
+)
+def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(group, outcome, activation):
     import ast  # noqa: PLC0415
     import inspect  # noqa: PLC0415
 
@@ -467,6 +479,9 @@ def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(g
 
     tree = ast.parse(inspect.getsource(worker_module._run_chip_main_loop))
     helper = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "submit_run")
+    activate = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "activate_run"
+    )
     child = group.children[0]
     args = args_for(group.native)
     group.parent.acquire(1, args, 0)
@@ -479,7 +494,9 @@ def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(g
         provenance=SimpleNamespace(_asdict=lambda: {}),
         entry_addr=0,
         entry_buf=None,
-        activated=False,
+        activated=activation == "immediate",
+        ccu_binding=None,
+        native_activated=False,
     )
 
     def submit(_cid, chip_args, *_args, **_kwargs):
@@ -490,6 +507,12 @@ def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(g
             raise worker_module.RunPreparationRefused("refused safely")
         if outcome == "unknown":
             raise RuntimeError("native admission unknown")
+        if activation is not None:
+            return SimpleNamespace(
+                preparation_disposition=worker_module._VALIDATED_ONLY,
+                activate=Mock(side_effect=MemoryError("device borrow failed")),
+                _owner_recovery_required=outcome == "activation-unproven",
+            )
         return SimpleNamespace(preparation_disposition=worker_module._NATIVE_PREPARED)
 
     native = Mock(side_effect=submit)
@@ -501,16 +524,19 @@ def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(g
         cw=SimpleNamespace(_submit_chip_run_materialized=native),
         _mailbox_store_i32=Mock(),
         _write_entry_error=Mock(),
+        staged_runs={},
     )
     if outcome == "materialization-failed":
         namespace["_materialize_chip_task_args"] = Mock(side_effect=ValueError("materialization failed"))
-    exec(compile(ast.Module(body=[helper], type_ignores=[]), "<actual-child-submit>", "exec"), namespace)
+    exec(compile(ast.Module(body=[helper, activate], type_ignores=[]), "<actual-child-submit>", "exec"), namespace)
     if outcome == "accepted":
         namespace["submit_run"](staged)
     else:
-        with pytest.raises((RuntimeError, ValueError)):
+        with pytest.raises((RuntimeError, ValueError, MemoryError)):
             namespace["submit_run"](staged)
-    assert (key in child._uses) == (outcome in ("accepted", "unknown"))
+            if activation == "delayed":
+                namespace["activate_run"](staged)
+    assert (key in child._uses) == (outcome in ("accepted", "unknown", "activation-unproven"))
     assert child.holds_resources
     if outcome == "materialization-failed":
         native.assert_not_called()
@@ -524,3 +550,12 @@ def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(g
         group.parent.close_all(terminal=True)
         group.chips[0]._quiesce_host_uses.assert_called_once()
         assert not child._uses
+    if activation is not None:
+        group.parent.release(1)
+        if outcome == "activation-safe":
+            group.table.close()
+            assert group.table.closed
+        else:
+            with pytest.raises(RuntimeError, match="failed on children") as error:
+                group.table.close()
+            assert "in-flight or unproven uses" in str(error.value.__cause__)

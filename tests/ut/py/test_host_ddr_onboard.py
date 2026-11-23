@@ -53,29 +53,73 @@ def test_a3_map_reads_and_writes_shared_host_backing(request, runtime, tmp_path)
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     env = os.environ.copy()
     if runtime == "tensormap_and_ringbuffer":
-        faults = tmp_path / "host_map_faults.so"
-        cann = Path(env["ASCEND_HOME_PATH"])
-        includes = ("include", "pkg_inc", "pkg_inc/runtime", "pkg_inc/profiling")
-        subprocess.run(
-            [
-                "c++",
-                "-shared",
-                "-fPIC",
-                *(f"-I{cann / directory}" for directory in includes),
-                str(Path(__file__).with_name("support") / "a3_host_map_faults.cpp"),
-                "-ldl",
-                "-o",
-                str(faults),
-            ],
-            check=True,
-        )
-        env["LD_PRELOAD"] = str(faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+        _preload_host_map_faults(env, tmp_path)
     # Release process-scoped ACL state before the next hardware test uses this device.
     subprocess.run([sys.executable, __file__, device, runtime], env=env, check=True, timeout=180)
 
 
-def _check_a3_context_switch(worker, device, buffer, acl):
-    fail_next = ctypes.CDLL(None).simpler_test_a3_host_map_fail_next
+def _preload_host_map_faults(env, tmp_path):
+    faults = tmp_path / "host_map_faults.so"
+    cann = Path(env["ASCEND_HOME_PATH"])
+    includes = ("include", "pkg_inc", "pkg_inc/runtime", "pkg_inc/profiling")
+    subprocess.run(
+        [
+            "c++",
+            "-shared",
+            "-fPIC",
+            *(f"-I{cann / directory}" for directory in includes),
+            str(Path(__file__).with_name("support") / "host_map_faults.cpp"),
+            "-ldl",
+            "-o",
+            str(faults),
+        ],
+        check=True,
+    )
+    env["LD_PRELOAD"] = str(faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+
+
+@pytest.mark.requires_hardware
+@pytest.mark.platforms(["a5"])
+def test_a5_host_map_caller_context(request, tmp_path):
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    env = os.environ.copy()
+    _preload_host_map_faults(env, tmp_path)
+    subprocess.run([sys.executable, __file__, device, "a5-context"], env=env, check=True, timeout=180)
+
+
+def _run_a5_host_context(device):
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=device)
+    try:
+        worker.init()
+        chip = worker._chip_worker
+        assert chip is not None
+        buffer = worker.create_buffer(4096)
+        acl = ctypes.CDLL("libascendcl.so")
+        get_context = acl.aclrtGetCurrentContext
+        get_context.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        primary = ctypes.c_void_p()
+        assert get_context(ctypes.byref(primary)) == 0 and primary.value is not None
+
+        def map_on_unbound_thread():
+            current = ctypes.c_void_p()
+            assert get_context(ctypes.byref(current)) != 0 and current.value is None
+            assert chip._map_host_ddr(buffer.base, buffer.nbytes)
+            assert get_context(ctypes.byref(current)) == 0 and current.value == primary.value
+            chip._unmap_host_ddr(buffer.base)
+            assert get_context(ctypes.byref(current)) == 0 and current.value == primary.value
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(map_on_unbound_thread).result()
+        _check_host_context_switch(worker, device, buffer, acl)
+        worker.release_buffer(buffer)
+    finally:
+        worker.close()
+
+
+def _check_host_context_switch(worker, device, buffer, acl):
+    fail_next = ctypes.CDLL(None).simpler_test_host_map_fail_next
     fail_next.argtypes = [ctypes.c_int]
     fail_next.restype = None
     get_context = acl.aclrtGetCurrentContext
@@ -98,6 +142,10 @@ def _check_a3_context_switch(worker, device, buffer, acl):
                 chip._map_host_ddr(buffer.base, buffer.nbytes)
             assert get_context(ctypes.byref(current)) == 0 and current.value == alternate.value
         assert chip._map_host_ddr(buffer.base, buffer.nbytes)
+        assert get_context(ctypes.byref(current)) == 0 and current.value == alternate.value
+        fail_next(-774)
+        with pytest.raises(RuntimeError, match="Host DDR unmapping failed: -774$"):
+            chip._unmap_host_ddr(buffer.base)
         assert get_context(ctypes.byref(current)) == 0 and current.value == alternate.value
         chip._unmap_host_ddr(buffer.base)
         assert get_context(ctypes.byref(current)) == 0 and current.value == alternate.value
@@ -125,10 +173,8 @@ def _check_a3_context_switch(worker, device, buffer, acl):
             assert destroy_context(alternate) == 0
 
 
-def _run_a3_host_map(device: int, runtime: str) -> None:
-    import numpy as np  # noqa: PLC0415
-    from simpler.task_interface import ArgDirection, DataType, TaskArgs, TensorArgType, TensorTransfer  # noqa: PLC0415
-    from simpler.worker import Worker  # noqa: PLC0415
+def _build_a3_map_vector_add(runtime):
+    from simpler.task_interface import ArgDirection  # noqa: PLC0415
 
     from simpler_setup.scene_test import compile_chip_callable_spec  # noqa: PLC0415
 
@@ -137,11 +183,11 @@ def _run_a3_host_map(device: int, runtime: str) -> None:
     if hbg:
         kernels = root / "tests/st/task_timing/task_timing_slots/kernels/host_build_graph"
         orch, function = "task_timing_orch.cpp", "task_timing_orchestration"
-        kernel, shape, multiplier = "vector_add_a2a3.cpp", (128, 128), 3
+        kernel = "vector_add_a2a3.cpp"
     else:
         kernels = root / "examples/workers/l3/multi_chip_dispatch/kernels"
         orch, function = "orchestration/vector_add_orch.cpp", "vector_add_orchestration"
-        kernel, shape, multiplier = "vector_add_kernel.cpp", (128 * 128,), 2
+        kernel = "vector_add_kernel.cpp"
     signature = [ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT]
     spec = {
         "orchestration": {
@@ -158,7 +204,17 @@ def _run_a3_host_map(device: int, runtime: str) -> None:
             }
         ],
     }
-    entry = compile_chip_callable_spec(spec, "a2a3", runtime, ("a3_host_map", runtime))
+    return compile_chip_callable_spec(spec, "a2a3", runtime, ("a3_host_map", runtime))
+
+
+def _run_a3_host_map(device: int, runtime: str) -> None:
+    import numpy as np  # noqa: PLC0415
+    from simpler.task_interface import DataType, TaskArgs, TensorArgType, TensorTransfer  # noqa: PLC0415
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    hbg = runtime == "host_build_graph"
+    shape, multiplier = ((128, 128), 3) if hbg else ((128 * 128,), 2)
+    entry = _build_a3_map_vector_add(runtime)
     worker = Worker(level=2, platform="a2a3", runtime=runtime, device_id=device)
     try:
         worker.init()
@@ -202,11 +258,55 @@ def _run_a3_host_map(device: int, runtime: str) -> None:
         with ThreadPoolExecutor(max_workers=1) as pool:
             pool.submit(release_on_unbound_thread).result()
         scratch = worker.create_buffer(4096)
-        _check_a3_context_switch(worker, device, scratch, acl)
+        _check_host_context_switch(worker, device, scratch, acl)
         worker.release_buffer(scratch)
     finally:
         worker.close()
 
 
+@pytest.mark.requires_hardware
+@pytest.mark.platforms(["a2a3"])
+@pytest.mark.device_count(2)
+def test_same_host_table_maps_to_two_a3_chips(st_device_ids):
+    import numpy as np  # noqa: PLC0415
+    from simpler.task_interface import DataType, TaskArgs, TensorArgType, TensorTransfer  # noqa: PLC0415
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    runtime = "tensormap_and_ringbuffer"
+    shape = (128 * 128,)
+    nbytes = shape[0] * np.dtype(np.float32).itemsize
+    worker = Worker(level=3, platform="a2a3", runtime=runtime, device_ids=st_device_ids)
+    entry = worker.register(_build_a3_map_vector_add(runtime))
+    try:
+        worker.init()
+        table = worker.create_buffer(nbytes)
+        result = worker.create_buffer(2 * nbytes)
+        table_view = table.tensor(shape, DataType.FLOAT32)
+        outputs = [result.tensor(shape, DataType.FLOAT32, byte_offset=i * nbytes) for i in range(2)]
+
+        def dispatch(orch, _args, cfg):
+            for i, output in enumerate(outputs):
+                args = TaskArgs()
+                args.add_tensor(table_view, TensorArgType.INPUT, transfer=TensorTransfer.MAP)
+                args.add_tensor(table_view, TensorArgType.INPUT, transfer=TensorTransfer.H2D)
+                args.add_tensor(output, TensorArgType.OUTPUT_EXISTING, transfer=TensorTransfer.MAP)
+                orch.submit_next_level(entry, args, cfg, worker=i)
+
+        for value in (2.0, 3.0):
+            with table.host_view() as host:
+                host[:] = np.full(shape, value, dtype=np.float32).tobytes()
+            worker.run(dispatch)
+            with result.host_view() as host:
+                np.testing.assert_array_equal(np.frombuffer(host, dtype=np.float32), 2 * value)
+        worker.release_buffer(table)
+        worker.release_buffer(result)
+        assert table.closed and result.closed
+    finally:
+        worker.close()
+
+
 if __name__ == "__main__":
-    _run_a3_host_map(int(sys.argv[1]), sys.argv[2])
+    if sys.argv[2] == "a5-context":
+        _run_a5_host_context(int(sys.argv[1]))
+    else:
+        _run_a3_host_map(int(sys.argv[1]), sys.argv[2])

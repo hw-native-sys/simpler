@@ -155,15 +155,7 @@ std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     return thread;
 }
 
-int DeviceRunner::ensure_acl_ready(int device_id) {
-    std::lock_guard<std::mutex> lock(acl_init_mutex_);
-    if (device_id < 0 || (device_id_ >= 0 && device_id_ != device_id)) return PTO_RUNTIME_ERR_INVALID_STATE;
-
-    // This entry can run before simpler_init, so claim program mode before ACL.
-    const int mode_rc = execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
-    if (mode_rc != 0) return mode_rc;
-    if ((rts_device_ref_ || acl_device_ref_) && owned_context_ == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
-
+int DeviceRunner::acquire_acl_init_reference() {
     if (!acl_init_ref_) {
         constexpr int kAclRepeatInit = 100002;
         const int rc = aclInit(nullptr);
@@ -175,6 +167,25 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
         // Both results acquire a process-wide ACL reference.
         acl_init_ref_ = true;
     }
+    return 0;
+}
+
+int DeviceRunner::ensure_host_mapping_acl() {
+    std::lock_guard<std::mutex> lock(acl_init_mutex_);
+    return acquire_acl_init_reference();
+}
+
+int DeviceRunner::ensure_acl_ready(int device_id) {
+    std::lock_guard<std::mutex> lock(acl_init_mutex_);
+    if (device_id < 0 || (device_id_ >= 0 && device_id_ != device_id)) return PTO_RUNTIME_ERR_INVALID_STATE;
+
+    // This entry can run before simpler_init, so claim program mode before ACL.
+    const int mode_rc = execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
+    if (mode_rc != 0) return mode_rc;
+    if ((rts_device_ref_ || acl_device_ref_) && owned_context_ == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+
+    const int init_rc = acquire_acl_init_reference();
+    if (init_rc != 0) return init_rc;
     if (acl_device_ref_) return aclrtSetCurrentContext(owned_context_);
 
     const int rc = aclrtSetDevice(device_id);

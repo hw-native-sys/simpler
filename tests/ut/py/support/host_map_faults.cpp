@@ -21,6 +21,7 @@ namespace {
 constexpr int kSwitchFailure = -771;
 constexpr int kRegisterFailure = -772;
 constexpr int kRestoreFailure = -773;
+constexpr int kUnregisterFailure = -774;
 thread_local int pending_failure = 0;
 thread_local unsigned switches_before_failure = 0;
 
@@ -36,7 +37,7 @@ Function resolve(const char *library, const char *symbol) {
 
 }  // namespace
 
-extern "C" void simpler_test_a3_host_map_fail_next(int failure) {
+extern "C" void simpler_test_host_map_fail_next(int failure) {
     pending_failure = failure;
     switches_before_failure = failure == kRestoreFailure ? 2 : 1;
 }
@@ -58,4 +59,22 @@ extern "C" aclError aclrtHostRegister(void *host, uint64_t bytes, aclrtHostRegis
     }
     static auto real = resolve<decltype(&aclrtHostRegister)>("libascendcl.so", "aclrtHostRegister");
     return real(host, bytes, type, mapped);
+}
+
+extern "C" aclError aclrtHostRegisterV2(void *host, uint64_t bytes, uint32_t flags) {
+    if (pending_failure == kRegisterFailure) {
+        pending_failure = 0;
+        return kRegisterFailure;
+    }
+    static auto real = resolve<decltype(&aclrtHostRegisterV2)>("libascendcl.so", "aclrtHostRegisterV2");
+    return real(host, bytes, flags);
+}
+
+extern "C" aclError aclrtHostUnregister(void *host) {
+    if (pending_failure == kUnregisterFailure) {
+        pending_failure = 0;
+        return kUnregisterFailure;
+    }
+    static auto real = resolve<decltype(&aclrtHostUnregister)>("libascendcl.so", "aclrtHostUnregister");
+    return real(host);
 }

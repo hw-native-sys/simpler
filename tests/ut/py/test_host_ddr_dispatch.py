@@ -165,8 +165,9 @@ def dispatch_both(l3):
     return callback
 
 
-@pytest.mark.parametrize("outer_none", [False, True])
-def test_child_map_does_not_require_outer_map(l3, outer_none):
+@pytest.mark.parametrize(("platform", "outer_none"), [("a5", False), ("a5", True), ("a2a3", False)])
+def test_child_map_does_not_require_outer_map(l3, platform, outer_none):
+    l3.worker._config["platform"] = platform
     outer = TaskArgs()
     if outer_none:
         outer.add_tensor(l3.native, transfer=TensorTransfer.NONE)
@@ -386,7 +387,7 @@ def test_raw_close_in_callback_refuses_without_poisoning_mapping(l3):
 
 @pytest.mark.parametrize(
     "platform,runtime",
-    [("a5", "host_build_graph"), ("a5sim", "tensormap_and_ringbuffer"), ("a2a3", "tensormap_and_ringbuffer")],
+    [("a5", "host_build_graph"), ("a5sim", "tensormap_and_ringbuffer"), ("a2a3sim", "tensormap_and_ringbuffer")],
 )
 def test_unsupported_l3_child_map_is_refused_before_dispatch(l3, platform, runtime):
     l3.worker._config["platform"] = platform

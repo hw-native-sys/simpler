@@ -102,7 +102,7 @@ def test_host_ddr_refuses_unsupported_hierarchical_workers(level, worker):
     tensor = worker.create_buffer(64).tensor((4,), DataType.INT32)
     hierarchical = Worker(level=level)
     try:
-        with pytest.raises(RuntimeError, match="L3 MAP requires local A5"):
+        with pytest.raises(RuntimeError, match="L3 MAP requires local onboard A3 or A5"):
             hierarchical._submit_l3_locked(None, map_args(tensor), CallConfig())
     finally:
         hierarchical.close()

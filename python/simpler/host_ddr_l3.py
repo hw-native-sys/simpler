@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""L3-owned Host backing with endpoint-local A5 mappings."""
+"""L3-owned Host backing with endpoint-local device mappings."""
 
 from __future__ import annotations
 
@@ -352,7 +352,7 @@ class ChildHostMappings:
                 raise RuntimeError("Host mapping retains setup debt")
             return
         if not getattr(self._chip, "_host_ddr_mapping_supported", False):
-            raise RuntimeError("MAP requires an A5 onboard runtime with Host mapping support")
+            raise RuntimeError("MAP requires an onboard runtime with Host mapping support")
         record = _ChildRecord(descriptor)
         self._records[identity] = record
         try:

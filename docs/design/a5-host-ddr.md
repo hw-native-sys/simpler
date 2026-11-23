@@ -1,9 +1,10 @@
-# A5 local Host DDR access
+# Local Host DDR access
 
-A direct L2 Worker can use `TensorTransfer.MAP` to let its A5 device access owned
-Host DDR through MTE. This supports large Host tables without a full Device
-replica and supports Device writes to Host backing. TMR and HBG share the API and
-registration implementation. No communication domain or URMA workspace is needed.
+A direct L2 Worker can use `TensorTransfer.MAP` to let its A3 or A5 device
+access owned Host DDR through MTE. This supports large Host tables without a full
+Device replica and supports Device writes to Host backing. TMR and HBG share the
+API and use the registration backend for the device. Host MAP requires no
+communication domain or URMA workspace.
 
 ## Scope and API
 
@@ -30,9 +31,9 @@ MAP supports IN, OUT and INOUT, with the usual INPUT, OUTPUT_EXISTING and INOUT
 argument tags. Buffer grants remain authoritative. Directions describe kernel use
 and dependencies; IN is not hardware write protection.
 
-Direct L2 supports owned POSIX_SHM on A5 TMR and HBG. Same-machine L3 supports
-A5 TMR through the coordinated preparation below. Remote access, Host compute
-leaves, borrowed L2 contexts, L3 HBG, A3 and capture paths reject MAP.
+Direct L2 supports owned POSIX_SHM on A3 and A5 with TMR or HBG. Same-machine
+L3 supports A3 and A5 TMR children. Remote access, Host compute leaves, borrowed
+L2 contexts, L3 HBG and capture paths reject MAP.
 
 ## Usage
 
@@ -154,7 +155,7 @@ retain their own allocation and unlink ownership rules.
 
 ## L3 shared tables
 
-An L3 Worker owns complete ordinary Host Buffers. Each local A5 TMR child imports
+An L3 Worker owns complete ordinary Host Buffers. Each local A3 or A5 TMR child imports
 that same backing and registers its own Device mapping when preparing a child
 call with `TensorTransfer.MAP`. This is the same parameter-preparation boundary
 at which H2D requests are handled. Outer arguments need no MAP declaration: they
@@ -172,10 +173,8 @@ L3 Host Buffer -> callback submits child args (MAP)
 
 Only children receiving the backing prepare it. Mapping sends no preparation
 control messages and creates no peer relationship, rank communication, MR, URMA
-channel or communication workspace. One child is supported; qualification uses
-at least two distinct A5 devices and processes. Multiple backings and views
-coexist. There is no table-sized HBM replica or payload copy in the control
-transport.
+channel or communication workspace. One child is supported. Multiple backings
+and views coexist. MAP uses the existing Host storage directly.
 
 Registrations are cached across calls. First use of a new backing does not
 require earlier calls to drain; each child establishes its mapping before its
@@ -211,7 +210,10 @@ Python run handle. If carrier destruction remains unknown, the owned A5 runtime
 stops background collectors and requires a successful bounded device synchronize
 before releasing Host uses. This does not prove device health, unregister memory,
 or reset the context. Failed synchronization keeps the uses, mappings and backing.
-Live communication resources or external native references block this recovery.
+A3 has no terminal device drain hook for Host MAP. If native cleanup cannot prove
+last use, close reports a failure and retains uses, mappings, backing and child
+transport. Live communication resources or external native references can block
+terminal recovery.
 
 A poisoned child keeps serving cleanup commands while refusing new tasks. Once
 every Host registration has been explicitly unregistered and every CPU import
@@ -231,5 +233,7 @@ or establish that any Device access to Host backing has stopped.
 
 Use the [shared-table examples](../../examples/a5/tensormap_and_ringbuffer/host_ddr_map/README.md)
 for BF16 gathers and MXFP8 payloads with Device scales and dependent consumers,
-in serial and staged L3 execution. Historical URMA qualification does not qualify
-this MAP path.
+in serial and staged L3 execution on A5. The A3 hardware test
+`test_same_host_table_maps_to_two_a3_chips` in
+`tests/ut/py/test_host_ddr_onboard.py` uses two local TMR devices to check shared
+table reads, disjoint writes and CPU readback, followed by Buffer release.
