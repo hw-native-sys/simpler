@@ -610,16 +610,15 @@ TEST(HbgSpmdTaskRecords, DispatchMetadataAlwaysCopiesLogicalBlockCountAndTimingS
     local.config.task_metadata_offset = layout.task_metadata_offset;
     for (int16_t timing_slot : {-1, 0, 15}) {
         source->timing_slot = timing_slot;
-        for (uint64_t profiling : {0u, 1u, 3u}) {
-            SCOPED_TRACE(timing_slot);
-            SCOPED_TRACE(profiling);
-            const auto loaded = scheduler_load_dispatch_metadata(storage.base(), &local, 0, profiling);
-            EXPECT_EQ(loaded.logical_block_num, INT16_MAX);
-            EXPECT_EQ(loaded.timing_slot, timing_slot);
-            EXPECT_EQ(loaded.active_mask, source->active_mask);
-            EXPECT_EQ(loaded.flags, source->flags);
-            EXPECT_EQ(loaded.trace_index_base, profiling == 0 ? 0u : UINT32_MAX);
-        }
+        SCOPED_TRACE(timing_slot);
+        const auto loaded = scheduler_load_dispatch_metadata(storage.base(), &local, 0);
+        EXPECT_EQ(loaded.logical_block_num, INT16_MAX);
+        EXPECT_EQ(loaded.timing_slot, timing_slot);
+        EXPECT_EQ(loaded.active_mask, source->active_mask);
+        EXPECT_EQ(loaded.flags, source->flags);
+        EXPECT_EQ(loaded.trace_index_base, source->trace_index_base);
+        for (unsigned lane = 0; lane < 3; ++lane)
+            EXPECT_EQ(loaded.kernel_ids[lane], source->kernel_ids[lane]);
     }
 }
 

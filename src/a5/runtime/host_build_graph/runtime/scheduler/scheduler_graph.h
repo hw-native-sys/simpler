@@ -370,6 +370,7 @@ struct SchedulerFaninView {
     uint32_t source_limit{0};
 };
 
+template <bool WithNativeGraph = true>
 inline __aicore__ SchedulerGraphResult scheduler_node_fanin_view(
     const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerFaninView *view,
     SchedulerNativeNode *resolved = nullptr
@@ -379,7 +380,7 @@ inline __aicore__ SchedulerGraphResult scheduler_node_fanin_view(
         return SchedulerGraphResult::INVALID_TASK_COUNT;
     *view = {};
     __gm__ uint8_t *payload = nullptr;
-    if (graph.native_header_offset != 0) {
+    if (WithNativeGraph && graph.native_header_offset != 0) {
         SchedulerNativeNode node{};
         if (!scheduler_native_node_checked(graph, task_ref, &node)) return SchedulerGraphResult::INVALID_ARGUMENTS;
         if (resolved != nullptr) *resolved = node;

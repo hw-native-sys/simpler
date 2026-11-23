@@ -18,7 +18,7 @@ struct SchedulerScalarCompilation<void> {
 };
 }  // namespace
 
-#include "resident_scheduler_impl.h"
+#include "resident_ordinary_impl.h"
 
 namespace simpler::hbg::resident {
 

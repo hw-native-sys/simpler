@@ -204,6 +204,7 @@ class TestSchedulerPhases(SceneTestCase):
                 if not filtered:
                     required_kinds |= {
                         "scalar_execution_token_refill",
+                        "scalar_prepared_claim",
                         "scalar_prepared_receive",
                         "scalar_execution_token_fanin",
                         "scalar_select_owned_execution",

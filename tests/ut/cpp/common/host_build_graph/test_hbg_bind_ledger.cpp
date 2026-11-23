@@ -3079,10 +3079,10 @@ TEST_F(HbgResidentSchedulerStorageTest, KernelCapabilitiesSelectTheWaveOrderOnEa
         const auto *header = scheduler_state_at<SchedulerTaskCatalogHeader>(source, summary->task_catalog_offset);
         const auto vector = scheduler_task_catalog(source, *header, 1);
         ASSERT_EQ(vector.count, 4u);
-        EXPECT_EQ(
-            std::vector<int64_t>(vector.refs, vector.refs + vector.count),
-            synchronous ? (std::vector<int64_t>{1, 2, 0, 3}) : (std::vector<int64_t>{1, 0, 2, 3})
-        );
+        std::vector<int64_t> refs;
+        for (uint32_t index = 0; index < vector.count; ++index)
+            refs.push_back(vector.entries[index].ref);
+        EXPECT_EQ(refs, synchronous ? (std::vector<int64_t>{1, 2, 0, 3}) : (std::vector<int64_t>{1, 0, 2, 3}));
         ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
     }
 }
@@ -3137,10 +3137,10 @@ TEST_F(HbgResidentSchedulerStorageTest, IndependentAsyncSinksUseAvailableChainAn
     EXPECT_EQ(chains[0].read_address, 0x1000u);
     EXPECT_EQ(chains[0].add_address, 0x1008u);
     EXPECT_EQ(chains[0].threshold, 34u);
-    EXPECT_EQ(chains[1].read_address, 0u);
-    const auto *done = reinterpret_cast<const uint64_t *>(base + ctx.done_notifications_offset);
-    EXPECT_EQ(done[0], 0u);
-    EXPECT_EQ(done[1], 0x2004u);
+    EXPECT_EQ(chains[1].read_address, 0x2004u);
+    EXPECT_EQ(chains[1].add_address, 0u);
+    EXPECT_EQ(chains[1].threshold, 1u);
+    EXPECT_EQ(chains[1].limit, 1u);
     const auto &summary = *reinterpret_cast<const SchedulerGraphSummary *>(base + ctx.graph_summary_offset);
     ASSERT_NE(summary.async_layout_offset, 0u);
     const auto &layout = *reinterpret_cast<const SchedulerAsyncLayout *>(base + summary.async_layout_offset);

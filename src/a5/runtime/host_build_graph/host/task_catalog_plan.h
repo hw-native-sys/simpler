@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -29,6 +30,8 @@ struct SchedulerTaskCatalogPlan {
     uint64_t total_size{0};
     SchedulerTaskCatalogHeader header{};
     std::vector<SchedulerTaskCatalogOrder> order_rows;
+    std::vector<int32_t> supply_inputs;
+    std::vector<uint16_t> third_task_blocks;
     std::vector<SchedulerTaskCatalogDescriptor> descriptors;
     std::vector<std::vector<int64_t>> catalogs;
     std::vector<int64_t> task_order;
@@ -126,6 +129,8 @@ struct SchedulerCatalogOrderBuilder {
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             if (!lanes.has(static_cast<SubtaskSlot>(lane))) continue;
             row.required_floor[lane] = mix ? previous_sync_floor[lane] : previous_mix_floor[lane];
+            if (mix && task.active_mask.has(static_cast<SubtaskSlot>(lane)) && row.required_floor[lane] != 0)
+                row.requires_peer_order = 1;
             if (mix) previous_mix_floor[lane] = rank + 1;
             else if (scheduler_task_requires_sync_start(task.flags)) previous_sync_floor[lane] = rank + 1;
         }
@@ -344,6 +349,75 @@ inline bool scheduler_order_task_catalog(
     return scheduler_apply_task_order(std::move(ordered), metadata, plan, error);
 }
 
+// A cursor has passed every earlier entry on the same engine. Fixed owners on the other engine
+// are known at launch. Neither fact proves data completion.
+inline int32_t scheduler_catalog_supply_input(
+    const SchedulerDependencyPlan &deps, const std::vector<SchedulerTaskMetadata> &metadata, int64_t ref,
+    uint32_t engine
+) {
+    int32_t input = SCHEDULER_SUPPLY_STATIC;
+    for (int64_t producer : deps.fanin[ref]) {
+        const auto &task = metadata[producer];
+        if (deps.host_done[producer] || scheduler_task_has_fixed_owners(task.flags) ||
+            (scheduler_task_is_executable(task.flags) && !scheduler_task_is_inline(task.flags) &&
+             scheduler_task_execution_engine(task.flags, task.active_mask) == engine))
+            continue;
+        if (input != SCHEDULER_SUPPLY_STATIC) return SCHEDULER_SUPPLY_SCAN;
+        input = static_cast<int32_t>(producer);
+    }
+    return input;
+}
+
+inline void scheduler_plan_static_supply(
+    const SchedulerDependencyPlan &deps, const std::vector<SchedulerTaskMetadata> &metadata,
+    SchedulerTaskCatalogPlan &catalog
+) {
+    catalog.supply_inputs.assign(metadata.size(), SCHEDULER_SUPPLY_SCAN);
+    catalog.third_task_blocks.assign(metadata.size(), 0);
+    for (uint32_t engine = 0; engine < catalog.catalogs.size(); ++engine) {
+        const auto &entries = catalog.catalogs[engine];
+        uint32_t ordinary = 0;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto ref = entries[i];
+            catalog.supply_inputs[ref] = scheduler_catalog_supply_input(deps, metadata, ref, engine);
+            const auto flags = metadata[ref].flags;
+            if (scheduler_task_has_fixed_owners(flags) || scheduler_task_is_mix(flags) ||
+                scheduler_task_requires_sync_start(flags) || scheduler_task_has_predicate(flags)) {
+                ordinary = 0;
+            } else if (++ordinary == 3) {
+                // Every issuer of this dynamic ordinary task already passed the two preceding seals.
+                catalog.third_task_blocks[entries[i - 2]] = metadata[ref].logical_block_num;
+                ordinary = 0;
+            }
+        }
+    }
+}
+
+// Fixed MIX entries in this suffix have no unresolved supply checks: their AIV
+// predecessors precede the proxy cursor, and any AIC predecessor has a static owner.
+// The members still acquire every predecessor's logical completion before entry.
+inline uint32_t scheduler_terminal_mix_begin(
+    const SchedulerDependencyPlan &deps, const std::vector<SchedulerTaskMetadata> &metadata,
+    const SchedulerTaskCatalogPlan &catalog
+) {
+    constexpr auto aiv = static_cast<uint32_t>(SchedulerExecutionEngine::AIV);
+    const auto &refs = catalog.catalogs[aiv];
+    if (deps.sinks.size() != 1 || refs.empty() || refs.back() != deps.sinks.front()) return UINT32_MAX;
+    auto begin = refs.size();
+    while (begin != 0) {
+        const auto ref = refs[begin - 1];
+        const auto flags = metadata[ref].flags;
+        if (!scheduler_task_is_mix(flags) || !scheduler_task_has_fixed_owners(flags)) break;
+        if (begin < refs.size()) {
+            const auto &successor_fanin = deps.fanin[refs[begin]];
+            if (std::find(successor_fanin.begin(), successor_fanin.end(), ref) == successor_fanin.end()) break;
+        }
+        if (scheduler_catalog_supply_input(deps, metadata, ref, aiv) != SCHEDULER_SUPPLY_STATIC) break;
+        --begin;
+    }
+    return refs.size() - begin >= 2 ? static_cast<uint32_t>(begin) : UINT32_MAX;
+}
+
 // The two terminal MIX Calls have one immutable identity per physical lane. Additional inputs
 // into either MIX are allowed: their completion is still checked on the execution path.
 inline void scheduler_plan_terminal_mix_calls(
@@ -405,7 +479,10 @@ inline void scheduler_elide_proven_mix_floors(
             bool all_clear = known;
             for (size_t lane = 0; lane < proof.size(); ++lane)
                 if (lanes.has(static_cast<SubtaskSlot>(lane)) && proof[lane] < last_ordinary[lane]) all_clear = false;
-            if (all_clear) std::fill_n(row.required_floor, proof.size(), 0u);
+            if (all_clear) {
+                std::fill_n(row.required_floor, proof.size(), 0u);
+                row.requires_peer_order = 0;
+            }
         } else {
             for (size_t lane = 0; lane < proof.size(); ++lane) {
                 if (!lanes.has(static_cast<SubtaskSlot>(lane))) continue;
@@ -485,7 +562,8 @@ inline bool scheduler_prepare_ordinary_fanin(
         }
         std::sort(completed.begin(), completed.end());
     }
-    std::vector<uint64_t> ancestors(rows.size(), 0);
+    using Ancestors = std::bitset<128>;
+    std::vector<Ancestors> ancestors(rows.size());
     uint64_t cursor = 0;
     for (size_t ref = 0; ref < rows.size(); ++ref) {
         auto &row = rows[ref];
@@ -496,16 +574,16 @@ inline bool scheduler_prepare_ordinary_fanin(
             if (row.empty()) payload.fanin_count = 0;
         }
         if (row.empty()) continue;
-        uint64_t direct = 0, implied = 0;
+        Ancestors direct, implied;
         for (const auto producer : row) {
             const size_t distance = ref - producer;
-            if (distance <= 64) direct |= uint64_t{1} << (distance - 1);
-            if (distance < 64) implied |= ancestors[producer] << distance;
+            if (distance <= direct.size()) direct.set(distance - 1);
+            if (distance < implied.size()) implied |= ancestors[producer] << distance;
         }
         ancestors[ref] = direct | implied;
         auto end = std::remove_if(row.begin(), row.end(), [&](int64_t producer) {
             const size_t distance = ref - producer;
-            return distance <= 64 && (implied & (uint64_t{1} << (distance - 1))) != 0;
+            return dependencies.host_done[producer] || (distance <= implied.size() && implied.test(distance - 1));
         });
         std::stable_sort(row.begin(), end, [&](int64_t left, int64_t right) {
             return catalog.task_ranks[left] < catalog.task_ranks[right];
@@ -561,7 +639,8 @@ inline bool scheduler_size_task_catalog(
         return false;
     for (auto &descriptor : next.descriptors)
         if (!scheduler_layout_reserve(
-                &cursor, descriptor.capacity * sizeof(int64_t), SCHEDULER_STATE_ALIGNMENT, &descriptor.entries_offset
+                &cursor, descriptor.capacity * sizeof(SchedulerCatalogEntry), SCHEDULER_STATE_ALIGNMENT,
+                &descriptor.entries_offset
             ))
             return false;
     if (!scheduler_layout_reserve(
@@ -595,7 +674,11 @@ inline void scheduler_init_task_catalog(void *base, const SchedulerTaskCatalogPl
     auto *descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(base, plan.header.descriptors_offset);
     std::copy(plan.descriptors.begin(), plan.descriptors.end(), descriptors);
     for (uint32_t type = 0; type < plan.descriptors.size(); ++type) {
-        auto *entries = scheduler_state_at<int64_t>(base, plan.descriptors[type].entries_offset);
-        std::copy(plan.catalogs[type].begin(), plan.catalogs[type].end(), entries);
+        auto *entries = scheduler_state_at<SchedulerCatalogEntry>(base, plan.descriptors[type].entries_offset);
+        for (const auto ref : plan.catalogs[type])
+            *entries++ = {
+                static_cast<int32_t>(ref), plan.supply_inputs.empty() ? SCHEDULER_SUPPLY_SCAN : plan.supply_inputs[ref],
+                plan.third_task_blocks.empty() ? uint16_t{0} : plan.third_task_blocks[ref]
+            };
     }
 }

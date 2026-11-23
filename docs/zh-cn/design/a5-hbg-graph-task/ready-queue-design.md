@@ -48,3 +48,5 @@ MIX 和纯核 `sync_start` 共用 Host 的排名约束。MIX 的发布者、活�
 每核有一份自取记录，以及对应本簇 SSBUF bank 的一份 MIX 成员记录。取得 block 或收到本代描述符后可以提前准备 Call。最终 payload、执行、完成与退休沿用同一条来源记录。等待 fanin 或组内伙伴时保留已取得的责任，未满足条件的记录不授予执行许可。一次只有一个 kernel 在本核执行。
 
 供给、依赖和协作成员的进度各有证明。私有游标只在前项供给关闭后继续分发；原子有效票授予唯一 owner；真正的数据后继还须等逻辑 DONE。异步 CHECK、控制节点和簇内已有责任继续按有界服务推进。窗口深度的实测见[调度设计](build-execute-separation.md)，运行全流程见[协议](protocol.md)。
+
+Device 通过 `scheduler_find_issuable_task` 查询可分发的目录项，由 `scheduler_find_local_execution` 推进本核领取与选择，Graph 控制节点由 `scheduler_progress_graph_controls` 推进。

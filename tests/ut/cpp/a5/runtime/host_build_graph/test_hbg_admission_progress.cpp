@@ -68,7 +68,7 @@ public:
     void *base() { return store.scheduler_state->base(); }
     SchedulerRunControl *run() { return store.run_control; }
     SchedulerTaskControl *ctrl(uint32_t ref) { return scheduler_task_control_at(base(), locals[0], ref); }
-    const SchedulerTaskCatalogOrder &order(int64_t ref) { return scheduler_order_for(base(), locals[0], ref); }
+    const SchedulerTaskCatalogOrder &order(int64_t ref) { return scheduler_order_for(locals[0], ref); }
 
     bool next(uint32_t worker, uint32_t *selected) {
         bool failed = false;
@@ -81,7 +81,7 @@ public:
     bool finish(uint32_t worker, uint32_t selected) {
         bool allow = false;
         auto *local = locals[worker];
-        return scheduler_check_entry_permit(graph.graph(), base(), local, run(), selected, &allow) && allow &&
+        return hbg_test_check_ready_order(graph.graph(), base(), local, run(), selected, &allow) && allow &&
                hbg_test_begin_execution(local, selected) &&
                scheduler_complete_lane_execution(graph.graph(), base(), local, run(), selected, 0);
     }
@@ -142,6 +142,23 @@ TEST(HbgResourceOrder, PureSyncMemberCanReturnBeforeAnotherCoreClaimsAndNeverTak
     EXPECT_EQ(f.store.completed_gm_records(), 2u);
 }
 
+TEST(HbgResourceOrder, SectorReportersPublishOneCanonicalSeal) {
+    Ranked f({{LaneMask::aic(), 2, true}});
+    uint32_t word = 1;
+    auto *control = f.ctrl(0);
+    control->supply_address = reinterpret_cast<uint64_t>(&word);
+    control->supply_mask = 6;
+    uint32_t slot = UINT32_MAX;
+    ASSERT_TRUE(f.next(0, &slot));
+    ASSERT_LT(slot, SCHEDULER_EXECUTION_TOKEN_COUNT);
+    EXPECT_EQ(word, 3U);
+    ASSERT_TRUE(f.next(3, &slot));
+    ASSERT_LT(slot, SCHEDULER_EXECUTION_TOKEN_COUNT);
+    EXPECT_EQ(word, 7U);
+    EXPECT_EQ(control->next_block, 2U);
+    EXPECT_EQ(control->claim_seal, 2U);
+}
+
 TEST(HbgResourceOrder, OrdinaryBlockOwnerCanRefillAfterItsOwnReturn) {
     Ranked f({{LaneMask::aic(), 3, false}});
     std::set<uint32_t> seen;
@@ -165,7 +182,7 @@ TEST(HbgResourceOrder, PureCohortWaitsForBothPublicationFloorAndItsOwnEarlierLan
     ASSERT_EQ(required, 1u);
     bool ready = true;
     const auto allowed = [&] {
-        return scheduler_self_order_ready(f.graph.graph(), f.base(), lane, f.run(), self.rank, required, true, &ready);
+        return scheduler_self_order_ready(f.graph.graph(), lane, f.run(), self.rank, required, &ready);
     };
     ASSERT_TRUE(allowed());
     EXPECT_FALSE(ready);
@@ -207,7 +224,7 @@ TEST(HbgResourceOrder, EarlierSelfClaimRemainsAnObligationWhenItsDirectoryAdvanc
     group.rank = later.rank;
     group.required_floor = later.required_floor[lane->config.self_lane];
     const auto check = [&] {
-        return scheduler_mix_lane_order_ready(f.graph.graph(), f.base(), lane, f.run(), group, &ready);
+        return scheduler_mix_lane_order_ready(f.graph.graph(), lane, f.run(), group, &ready);
     };
     ASSERT_TRUE(check());
     EXPECT_FALSE(ready);
@@ -227,23 +244,6 @@ TEST(HbgResourceOrder, EarlierSelfClaimRemainsAnObligationWhenItsDirectoryAdvanc
     ASSERT_TRUE(f.finish(2, first));
     ASSERT_TRUE(check());
     EXPECT_TRUE(ready);
-}
-
-TEST(HbgResourceOrder, AClosedSupplyCannotAdvancePastTheProxysUnpublishedGroup) {
-    Ranked f({{LaneMask::all(), 1, false}, {LaneMask::aiv0(), 2, true}});
-    auto *proxy = f.locals[1];
-    ASSERT_TRUE(proxy->is_mix_coordinator());
-    ASSERT_EQ(proxy->next_mix_ref, 0u);
-    scheduler_gm_store(f.ctrl(0)->claim_seal, UINT64_C(1));
-    proxy->cluster_pending.task_ref = 0;
-    bool progress = false;
-    ASSERT_TRUE(scheduler_advance_mix_floor(f.graph.graph(), f.base(), proxy, f.run(), &progress));
-    EXPECT_EQ(scheduler_cluster_load_acquire(&f.signals[0].mix_floor), 0u);
-    EXPECT_FALSE(progress);
-    proxy->cluster_pending.task_ref = SCHEDULER_TASK_REF_INVALID;
-    ASSERT_TRUE(scheduler_advance_mix_floor(f.graph.graph(), f.base(), proxy, f.run(), &progress));
-    EXPECT_TRUE(progress);
-    EXPECT_EQ(scheduler_cluster_load_acquire(&f.signals[0].mix_floor), 2u);
 }
 
 }  // namespace

@@ -20,7 +20,9 @@ enum class SchedulerNotificationPurpose : uint32_t {
     MIX_ACK,
     COMPLETION_COUNTER,
     HBG_REQUIRED_TASK_STATE,
-    HBG_REQUIRED_COMPLETION_COUNTER
+    HBG_REQUIRED_COMPLETION_COUNTER,
+    CLAIM_SUPPLY,
+    BOOTSTRAP_ARRIVAL
 };
 
 inline constexpr bool scheduler_notification_is_required(SchedulerNotificationPurpose purpose) {

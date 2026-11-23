@@ -77,6 +77,23 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     const bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
     uint64_t aicore_entry_cycles = __builtin_expect(chip_swimlane_enabled, false) ? get_sys_cnt_aicore() : 0;
     const uint64_t report_epoch = get_aicore_report_epoch();
+    const uint64_t context_base = runtime->dev.scheduler_bootstrap.worker_context_base;
+    const int32_t worker_count = runtime->dev.worker_count;
+    const bool valid_bootstrap =
+        (runtime_mode == SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING ||
+         runtime_mode == SCHEDULER_RUNTIME_MODE_RESIDENT_READY) &&
+        worker_count > 0 && worker_count <= static_cast<int32_t>(SCHEDULER_WORKER_CAPACITY) && block_idx >= 0 &&
+        block_idx < worker_count && context_base != 0 && context_base % alignof(SchedulerWorkerContext) == 0 &&
+        context_base <= UINT64_MAX - static_cast<uint64_t>(worker_count) * sizeof(SchedulerWorkerContext);
+    auto *ready_word = reinterpret_cast<__gm__ volatile uint32_t *>(
+        valid_bootstrap ? runtime->dev.scheduler_bootstrap.context_ready_address : 0
+    );
+    uint32_t ready_before = 0;
+    if (ready_word != nullptr) {
+        // AICPU changes this word only after accepting every report from this invocation.
+        ready_before = scheduler_notify_query(*ready_word);
+        scheduler_cache_barrier();
+    }
     handshake->work_start_cycle = 0;
     handshake->work_end_cycle = 0;
     if (report_epoch != 0) {
@@ -108,14 +125,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
 
-    const uint64_t context_base = runtime->dev.scheduler_bootstrap.worker_context_base;
-    const int32_t worker_count = runtime->dev.worker_count;
-    const bool valid_bootstrap =
-        (runtime_mode == SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING ||
-         runtime_mode == SCHEDULER_RUNTIME_MODE_RESIDENT_READY) &&
-        worker_count > 0 && worker_count <= static_cast<int32_t>(SCHEDULER_WORKER_CAPACITY) && block_idx >= 0 &&
-        block_idx < worker_count && context_base != 0 && context_base % alignof(SchedulerWorkerContext) == 0 &&
-        context_base <= UINT64_MAX - static_cast<uint64_t>(worker_count) * sizeof(SchedulerWorkerContext);
     if (!valid_bootstrap) {
         // Discovery and retirement use the report and teardown gate only;
         // an invalid bootstrap grants no access to scheduler backing.
@@ -130,10 +139,20 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // EXIT registers are accessible, including when configuration fails.
     uint32_t startup_signal = 0;
     const uint64_t context_wait_start = get_sys_cnt_aicore();
-    while (handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_READY && startup_signal != AICORE_EXIT_SIGNAL) {
+    if (ready_word != nullptr) {
+        while (scheduler_notify_query(*ready_word) == ready_before && startup_signal != AICORE_EXIT_SIGNAL) {
+            startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+            SPIN_WAIT_HINT();
+        }
+        scheduler_cache_barrier();
+    } else {
+        while (handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_READY &&
+               startup_signal != AICORE_EXIT_SIGNAL) {
+            scheduler_observe_cache_line(handshake);
+            startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+            SPIN_WAIT_HINT();
+        }
         scheduler_observe_cache_line(handshake);
-        startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
-        SPIN_WAIT_HINT();
     }
     if (startup_signal == AICORE_EXIT_SIGNAL) {
         // Failed initialization owns its error reporting. EXIT permits retirement,
@@ -146,8 +165,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     // READY publishes AICPU's topology-dependent context updates. Re-observe
     // them after the acquire point instead of using the pre-publish cache view.
-    scheduler_observe_cache_line(handshake);
-    __gm__ SchedulerWorkerContext *context = reinterpret_cast<__gm__ SchedulerWorkerContext *>(handshake->task);
+    __gm__ SchedulerWorkerContext *context =
+        ready_word != nullptr ? reinterpret_cast<__gm__ SchedulerWorkerContext *>(context_base) + block_idx :
+                                reinterpret_cast<__gm__ SchedulerWorkerContext *>(handshake->task);
     scheduler_observe_cache_line(context);
     scheduler_observe_cache_line(&context->task_metadata_offset);
     __gm__ void *scheduler_state_base = reinterpret_cast<__gm__ void *>(context->scheduler_state_base_address);

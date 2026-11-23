@@ -99,6 +99,9 @@ TEST(SchedulerTokenDispatch, AddChainReleasesSuccessorsBeforeAccountingAndKeepsO
             ASSERT_EQ(f.local()->execution_at(slot).task_ref, task);
             auto stale = f.local()->execution_at(slot).prepared;
             ASSERT_TRUE(f.complete(slot));
+            EXPECT_EQ(
+                f.local()->continuation_task_ref, block == 0 ? static_cast<int64_t>(task) : SCHEDULER_TASK_REF_INVALID
+            );
             EXPECT_FALSE(scheduler_return_prepared_execution(f.base(), f.local()->config.prepared, &stale));
             EXPECT_EQ(value, task * 2 + block + 1);
         }
@@ -111,6 +114,22 @@ TEST(SchedulerTokenDispatch, AddChainReleasesSuccessorsBeforeAccountingAndKeepsO
     EXPECT_EQ(f.storage.completed_gm_records(), 1u);
     value = 5;
     EXPECT_EQ(scheduler_observe_task_completion(first), SchedulerCompletionObservation::INVALID);
+}
+
+TEST(SchedulerTokenDispatch, FixedOwnerReturnDoesNotContinueWhileAnotherOwnerOwesABlock) {
+    DispatchFixture f(1, 2, 6);
+    auto &metadata = f.storage.metadata[0];
+    metadata.flags |= SCHEDULER_TASK_SPMD | SCHEDULER_TASK_FIXED_OWNER;
+    metadata.logical_block_num = 2;
+    ASSERT_TRUE(f.prepare());
+    uint32_t value = 0;
+    bind_counter(f, 0, value, 2, 2);
+    uint32_t slot = UINT32_MAX;
+    ASSERT_TRUE(f.take(slot));
+    ASSERT_EQ(f.local()->execution_at(slot).block_idx, 0u);
+    ASSERT_TRUE(f.complete(slot));
+    EXPECT_EQ(value, 1u);
+    EXPECT_EQ(f.local()->continuation_task_ref, SCHEDULER_TASK_REF_INVALID);
 }
 
 TEST(SchedulerTokenDispatch, AddMixMembersContributeBeforeGroupRetirement) {
@@ -143,10 +162,10 @@ TEST(SchedulerTokenDispatch, AddMixMembersContributeBeforeGroupRetirement) {
                 member.block_idx = block;
                 member.subtask_slot = static_cast<uint8_t>(lane);
                 member.cluster_mix = true;
-                member.completion_credits = 1 + static_cast<uint8_t>(async_lane && lane == 2);
                 EXPECT_EQ(
                     scheduler_publish_fanout<false>(
-                        f.graph.graph(), f.base(), f.local(), f.storage.run_control, member, 0
+                        f.graph.graph(), f.base(), f.local(), f.storage.run_control, member, 0, nullptr,
+                        async_lane && lane == 2
                     ),
                     SchedulerSubtaskFinishResult::PARTIAL
                 );
@@ -169,8 +188,10 @@ TEST(SchedulerTokenDispatch, CntNotifyCompletionReleasesAllReadersWithoutConsumi
     f.graph.executable(1, 0, {0});
     ASSERT_TRUE(f.prepare());
     uint32_t notification = 0;
-    auto *addresses = scheduler_state_at<uint64_t>(f.base(), f.storage.layout.done_notifications_offset);
-    addresses[0] = reinterpret_cast<uint64_t>(&notification);
+    f.local()->config.completion_counters_offset = f.storage.layout.completion_counters_offset;
+    auto *sources =
+        scheduler_state_at<SchedulerTaskCompletionCounter>(f.base(), f.storage.layout.completion_counters_offset);
+    sources[0] = scheduler_set_completion_source(reinterpret_cast<uint64_t>(&notification));
     const auto source = scheduler_completion_source(f.base(), f.local(), 0);
     ASSERT_EQ(scheduler_observe_task_completion(source), SchedulerCompletionObservation::PENDING);
     uint32_t slot = UINT32_MAX;
@@ -190,9 +211,11 @@ TEST(SchedulerTokenDispatch, CntNotifyWaitKeepsItsAddressAndDoesNotConfirmCanoni
     f.graph.executable(2, 0, {0, 1});
     ASSERT_TRUE(f.prepare());
     uint32_t notification = 0, next_notification = 0;
-    auto *addresses = scheduler_state_at<uint64_t>(f.base(), f.storage.layout.done_notifications_offset);
-    addresses[0] = reinterpret_cast<uint64_t>(&notification);
-    addresses[1] = reinterpret_cast<uint64_t>(&next_notification);
+    f.local()->config.completion_counters_offset = f.storage.layout.completion_counters_offset;
+    auto *sources =
+        scheduler_state_at<SchedulerTaskCompletionCounter>(f.base(), f.storage.layout.completion_counters_offset);
+    sources[0] = scheduler_set_completion_source(reinterpret_cast<uint64_t>(&notification));
+    sources[1] = scheduler_set_completion_source(reinterpret_cast<uint64_t>(&next_notification));
     SchedulerFaninView fanin{};
     ASSERT_EQ(scheduler_node_fanin_view(f.graph.graph(), 2, &fanin), SchedulerGraphResult::OK);
     SchedulerFaninWait wait{};
@@ -204,7 +227,7 @@ TEST(SchedulerTokenDispatch, CntNotifyWaitKeepsItsAddressAndDoesNotConfirmCanoni
     EXPECT_EQ(wait.source.notification, &notification);
     // Poison unrelated proof storage after binding: the saved SRAM source
     // alone authorizes this wait, and the address table is not read twice.
-    addresses[0] = 0;
+    sources[0] = {};
     f.control(0)->completion_state = 0;
     scheduler_notify_done(notification);
     ASSERT_TRUE(scheduler_observe_fanin_prefix(
@@ -213,7 +236,7 @@ TEST(SchedulerTokenDispatch, CntNotifyWaitKeepsItsAddressAndDoesNotConfirmCanoni
     EXPECT_EQ(next, 1u);
     EXPECT_EQ(wait.predecessor, 1);
     EXPECT_EQ(wait.source.notification, &next_notification);
-    addresses[1] = 0;
+    sources[1] = {};
     scheduler_notify_done(next_notification);
     ASSERT_TRUE(scheduler_observe_fanin_prefix(
         f.graph.graph(), f.base(), f.local(), f.storage.run_control, 2, fanin, next, &wait
@@ -221,6 +244,66 @@ TEST(SchedulerTokenDispatch, CntNotifyWaitKeepsItsAddressAndDoesNotConfirmCanoni
     EXPECT_EQ(next, fanin.count);
     EXPECT_EQ(wait.predecessor, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(f.storage.run_control->scheduler_error, 0u);
+}
+
+TEST(SchedulerTokenDispatch, CachedDonePreservesAnOwedMemberAndTheRemainingInput) {
+    DispatchFixture f(3);
+    f.graph.executable(2, 0, {0, 1});
+    ASSERT_TRUE(f.prepare());
+    uint32_t first = 1, second = 0;
+    bind_counter(f, 0, first, 1, 1);
+    bind_counter(f, 1, second, 1, 1);
+    auto *local = f.local();
+    ASSERT_EQ(scheduler_observe_cached_completion(f.base(), local, 0), SchedulerCompletionObservation::DONE);
+    scheduler_remember_task_proof(local, 1, SchedulerTaskProof::SUPPLY_CLOSED);
+    SchedulerFaninView fanin{};
+    ASSERT_EQ(scheduler_node_fanin_view(f.graph.graph(), 2, &fanin), SchedulerGraphResult::OK);
+    SchedulerFaninWait wait{};
+    uint32_t next = 0;
+    const auto poll = [&](int64_t owed) {
+        return scheduler_observe_fanin_prefix(
+            f.graph.graph(), f.base(), local, f.storage.run_control, 2, fanin, next, &wait, owed
+        );
+    };
+    ASSERT_TRUE(poll(0));
+    EXPECT_EQ(next, 0u);
+    EXPECT_EQ(wait.predecessor, 0);
+    ASSERT_TRUE(poll(SCHEDULER_TASK_REF_INVALID));
+    EXPECT_EQ(next, 1u);
+    EXPECT_EQ(wait.predecessor, 1);
+    scheduler_notify_done(second);
+    ASSERT_TRUE(poll(SCHEDULER_TASK_REF_INVALID));
+    EXPECT_EQ(next, fanin.count);
+    EXPECT_EQ(wait.predecessor, SCHEDULER_TASK_REF_INVALID);
+}
+
+TEST(SchedulerTokenDispatch, PendingFaninRetainsTheCounterAddressAndBothBounds) {
+    for (uint32_t value_after_retry : {3u, 5u}) {
+        DispatchFixture f(2);
+        f.graph.executable(1, 0, {0});
+        ASSERT_TRUE(f.prepare());
+        uint32_t value = 1, alternate = 0;
+        bind_counter(f, 0, value, 3, 4);
+        SchedulerFaninView fanin{};
+        ASSERT_EQ(scheduler_node_fanin_view(f.graph.graph(), 1, &fanin), SchedulerGraphResult::OK);
+        SchedulerFaninWait wait{};
+        uint32_t next = 0;
+        auto poll = [&]() {
+            return scheduler_observe_fanin_prefix(
+                f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1, fanin, next, &wait
+            );
+        };
+        ASSERT_TRUE(poll());
+        ASSERT_EQ(next, 0u);
+        // Poison the original descriptor to catch any re-resolution of the pending edge.
+        bind_counter(f, 0, alternate, 1, 8);
+        value = 2;
+        ASSERT_TRUE(poll());
+        EXPECT_EQ(next, 0u);
+        value = value_after_retry;
+        EXPECT_EQ(poll(), value_after_retry == 3);
+        EXPECT_EQ(next, value_after_retry == 3 ? 1u : 0u);
+    }
 }
 
 TEST(SchedulerTokenDispatch, FreshReadyRefillSelectsOneExecutionWithoutAnotherScan) {
@@ -385,9 +468,9 @@ TEST(SchedulerTokenDispatch, ACorruptLaterCallCannotRewriteAnExistingExecution) 
     ASSERT_EQ(block, 0u);
     token.task_ref = 0;
     token.block_idx = static_cast<uint32_t>(block);
+    token.metadata = f.storage.metadata[token.task_ref];
     token.subtask_slot = 0;
-    token.phase = SchedulerExecutionTokenPhase::TICKETED;
-    token.state = SchedulerDispatchSlotState::FILLING;
+    token.state = SchedulerDispatchSlotState::TICKETED;
     ASSERT_EQ(scheduler_node_fanin_view(f.graph.graph(), 0, &token.fanin), SchedulerGraphResult::OK);
     ASSERT_TRUE(
         scheduler_bind_ticketed_execution(f.graph.graph(), f.base(), f.local(), f.storage.run_control, token, 0)
@@ -547,6 +630,22 @@ TEST(SchedulerTokenDispatch, InvalidFaninCannotGrantExecutionPermission) {
     EXPECT_NE(f.storage.run_control->scheduler_error, 0u);
 }
 
+TEST(SchedulerTokenDispatch, AnEmptySlotObservesWorkerErrorBeforeIssuingOrDraining) {
+    for (bool drained : {false, true}) {
+        DispatchFixture f;
+        ASSERT_TRUE(f.prepare());
+        auto *local = f.local();
+        if (drained) local->issue_cursor = local->config.engine_catalog.count;
+        scheduler_publish_error(f.storage.run_control, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
+        bool failed = false;
+        uint32_t selected = UINT32_MAX;
+        scheduler_find_local_execution(f.graph.graph(), f.base(), local, f.storage.run_control, 0, &failed, &selected);
+        EXPECT_TRUE(failed);
+        EXPECT_EQ(selected, UINT32_MAX);
+        EXPECT_EQ(f.control(0)->next_block, 0u);
+    }
+}
+
 TEST(SchedulerTokenDispatch, PredicateFailureSkipsAndMalformedPredicateStopsExecution) {
     for (bool malformed : {false, true}) {
         DispatchFixture f;
@@ -565,7 +664,7 @@ TEST(SchedulerTokenDispatch, PredicateFailureSkipsAndMalformedPredicateStopsExec
             EXPECT_NE(f.storage.run_control->scheduler_error, 0u);
         } else {
             ASSERT_NE(slot, UINT32_MAX);
-            EXPECT_EQ(f.local()->execution_at(slot).predicate, SchedulerPredicateState::FAIL);
+            EXPECT_TRUE(f.local()->execution_at(slot).skip_kernel);
             ASSERT_TRUE(f.complete(slot));
             EXPECT_TRUE(scheduler_completion_done(f.control(0)->completion_state));
             EXPECT_EQ(f.storage.completed_gm_records(), 1u);
@@ -738,25 +837,22 @@ TEST(SchedulerPredicate, DistinguishesFailedAndMalformedPredicates) {
 using namespace scheduler_test::gm_mix;
 class SchedulerMix : public ::testing::TestWithParam<LaneMask> {};
 
-void arm_ordinary_mix(GmMixFixture &fixture, uint64_t profiling = 0) {
-    bool armed = false;
-    ASSERT_TRUE(fixture.ordinary_arm(0, 0, &armed));
-    ASSERT_TRUE(armed);
-    for (uint32_t pass = 0; pass < 2; ++pass) {
-        for (uint32_t worker = 0; worker < 3; ++worker) {
-            bool progress = false;
-            ASSERT_TRUE(fixture.ordinary_service(worker, &progress, profiling));
-        }
-    }
-}
-
 TEST_P(SchedulerMix, PayloadAndCompletionTraceFollowEachLogicalSubtask) {
     const auto mask = GetParam();
     GmMixFixture fixture({{1, mask}}, true, 1);
     ASSERT_TRUE(fixture.prepare_calls());
     for (auto *local : fixture.locals)
         local->observed_self_floor = 1;
-    ASSERT_NO_FATAL_FAILURE(arm_ordinary_mix(fixture, 3));
+    bool published = false;
+    ASSERT_TRUE(scheduler_claim_for_execute(
+        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &published
+    ));
+    ASSERT_TRUE(published);
+    for (uint32_t pass = 0; pass < 2; ++pass)
+        for (uint32_t worker = 0; worker < 3; ++worker) {
+            bool advanced = false;
+            ASSERT_TRUE(fixture.ordinary_service(worker, &advanced, 3));
+        }
     auto *block =
         scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
     auto *records = scheduler_state_at<SchedulerProtocolExecutionTrace>(
@@ -808,7 +904,9 @@ TEST_P(SchedulerMix, InvalidPreparedCallPublishesNoPayloadOrCompletion) {
     GmMixFixture fixture({{1, GetParam()}}, true, 1);
     ASSERT_TRUE(fixture.prepare_calls());
     bool armed = false;
-    ASSERT_TRUE(fixture.ordinary_arm(0, 0, &armed));
+    ASSERT_TRUE(
+        scheduler_claim_for_execute(fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &armed)
+    );
     ASSERT_TRUE(armed);
     const auto *prepared = fixture.locals[0]->config.prepared;
     for (uint64_t index = 0; index < prepared->execution_count; ++index)

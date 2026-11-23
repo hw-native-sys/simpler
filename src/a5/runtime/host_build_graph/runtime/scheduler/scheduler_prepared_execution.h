@@ -18,6 +18,7 @@
 struct SchedulerPreparedHandle {
     uint64_t execution_index{UINT64_MAX};
     uint64_t claimed_state{0};
+    uint64_t function_address{0};
 };
 
 inline __aicore__ bool scheduler_prepared_region_end(
@@ -93,13 +94,14 @@ scheduler_prepared_call_at(__gm__ void *base, __gm__ const SchedulerPreparedLayo
 
 // Ticket ownership comes from the successful task FAA, not this diagnostic.
 // Its fixed writer owns the entire isolated line through return or cancellation.
+template <bool FenceWriteback = true>
 static inline __aicore__ bool
 scheduler_transition_prepared_state(__gm__ SchedulerPreparedControl *control, uint64_t expected, uint64_t desired) {
     if (((expected | desired) & SCHEDULER_PREPARED_TICKET_OWNED) != 0) {
         if (control->state != expected) return false;
         control->state = desired;
         scheduler_writeback_cache_line(control);
-        scheduler_cache_barrier();
+        if constexpr (FenceWriteback) scheduler_cache_barrier();
         return true;
     }
     return scheduler_gm_compare_exchange(control->state, expected, desired) == expected;
@@ -138,16 +140,17 @@ inline __aicore__ bool scheduler_prepared_execution_index(
     return true;
 }
 
-static inline __aicore__ bool scheduler_prepared_call_valid(
+static inline __aicore__ uint64_t scheduler_prepared_function_address(
     __gm__ const SchedulerPreparedCall *call, __gm__ const SchedulerExecutionBinding *binding, uint64_t run_epoch,
     uint64_t index, int64_t task_ref, uint32_t block, uint8_t lane
 ) {
     SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedValidate, task_ref);
-    return call->run_epoch == run_epoch && call->execution_index == index && call->task_ref == task_ref &&
-           call->block_idx == block && call->subtask_slot == lane && call->num_args <= SPMD_LOCAL_CONTEXT_INDEX &&
-           call->function_bin_addr != 0 &&
-           call->args[SPMD_LOCAL_CONTEXT_INDEX] == reinterpret_cast<uint64_t>(&binding->local_context) &&
-           call->args[SPMD_GLOBAL_CONTEXT_INDEX] == reinterpret_cast<uint64_t>(&binding->global_context);
+    if (call->run_epoch != run_epoch || call->execution_index != index || call->task_ref != task_ref ||
+        call->block_idx != block || call->subtask_slot != lane || call->num_args > SPMD_LOCAL_CONTEXT_INDEX ||
+        call->args[SPMD_LOCAL_CONTEXT_INDEX] != reinterpret_cast<uint64_t>(&binding->local_context) ||
+        call->args[SPMD_GLOBAL_CONTEXT_INDEX] != reinterpret_cast<uint64_t>(&binding->global_context))
+        return 0;
+    return call->function_bin_addr;
 }
 
 static inline __aicore__ bool scheduler_prepared_already_returned(
@@ -176,7 +179,8 @@ scheduler_mark_mix_kernel_entered(SchedulerPreparedHandle &handle, __gm__ Schedu
     if (diagnostic != nullptr) scheduler_store_signal(diagnostic->state, handle.claimed_state);
 }
 
-// The executor owns the returned call. FIN or the exit fence publishes its return state.
+// The executor owns the return state. Counted completion may drain its writeback at credit publication.
+template <bool FenceWriteback = true>
 inline __aicore__ bool scheduler_return_prepared_execution(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, SchedulerPreparedHandle *handle
 ) {
@@ -192,7 +196,8 @@ inline __aicore__ bool scheduler_return_prepared_execution(
     if (mix_owned) {
         scheduler_store_signal(control->state, returned);
     } else if ((handle->claimed_state & SCHEDULER_PREPARED_TICKET_OWNED) != 0) {
-        if (!scheduler_transition_prepared_state(control, handle->claimed_state, returned)) return false;
+        if (!scheduler_transition_prepared_state<FenceWriteback>(control, handle->claimed_state, returned))
+            return false;
     } else {
         scheduler_gm_store(control->state, returned);
     }
@@ -220,13 +225,19 @@ static inline __aicore__ bool scheduler_receive_payload(
 ) {
     SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedReceive, task_ref);
     const auto index = handle->execution_index;
-    const auto *call = scheduler_prepared_call_at(base, prepared, index);
+    auto *call = scheduler_prepared_call_at(base, prepared, index);
+#if defined(__CCE_AICORE__)
+    // Host publishes the arguments before launch. They occupy separate cache lines from the writable contexts.
+    dc_preload(call->args, 0);
+#endif
     auto *binding = scheduler_execution_binding_at(base, prepared, index);
     scheduler_invalidate_cache_line(&binding->local_context);
     scheduler_invalidate_cache_line(&binding->global_context);
     scheduler_cache_barrier();
     asm volatile("" ::: "memory");
-    if (!scheduler_prepared_call_valid(call, binding, prepared->run_epoch, index, task_ref, block, lane)) {
+    handle->function_address =
+        scheduler_prepared_function_address(call, binding, prepared->run_epoch, index, task_ref, block, lane);
+    if (handle->function_address == 0) {
         const uint64_t failed =
             (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::FAILED);
         if ((handle->claimed_state & SCHEDULER_PREPARED_MIX_OWNED) != 0 ||
@@ -243,17 +254,25 @@ static inline __aicore__ bool scheduler_receive_payload(
 // payload before using the claimed handle for execution.
 static inline __aicore__ bool scheduler_claim_for_execution(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id, int64_t task_ref,
-    uint32_t block, uint8_t lane, SchedulerPreparedHandle *handle
+    uint32_t block, uint8_t lane, SchedulerPreparedHandle *handle, const SchedulerTaskMetadata *flat_task = nullptr
 ) {
     SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedClaim, task_ref);
     SchedulerExecutionClaimLoads claim_loads;
+    if (base == nullptr || prepared == nullptr || handle == nullptr || worker_id >= PLATFORM_MAX_CORES) return false;
     uint64_t index = 0;
-    if (base == nullptr || handle == nullptr || worker_id >= PLATFORM_MAX_CORES ||
-        !scheduler_prepared_execution_index(base, prepared, task_ref, block, lane, &index) ||
-        (handle->execution_index != UINT64_MAX && handle->execution_index != index))
-        return false;
-    if (const auto &plan = scheduler_state_at<SchedulerExecutionPlan>(base, prepared->plans_offset)[task_ref];
-        plan.active_lane_count != 1 ||
+    if (flat_task != nullptr && prepared->execution_count <= UINT64_C(1) + UINT32_MAX) {
+        // A flat task's trace rows and Calls have identical block order. Host verifies the prefix at preparation.
+        if (task_ref < 0 || static_cast<uint64_t>(task_ref) >= prepared->task_count || lane >= SUBTASK_SLOT_COUNT ||
+            flat_task->active_mask.raw() != (1U << lane) || block >= flat_task->logical_block_num)
+            return false;
+        index = uint64_t{flat_task->trace_index_base} + block;
+        if (index >= prepared->execution_count) return false;
+    } else {
+        if (!scheduler_prepared_execution_index(base, prepared, task_ref, block, lane, &index) ||
+            scheduler_state_at<SchedulerExecutionPlan>(base, prepared->plans_offset)[task_ref].active_lane_count != 1)
+            return false;
+    }
+    if ((handle->execution_index != UINT64_MAX && handle->execution_index != index) ||
         (handle->claimed_state != 0 && (handle->claimed_state & SCHEDULER_PREPARED_TICKET_OWNED) == 0))
         return false;
     if (handle->claimed_state != 0)
@@ -283,5 +302,16 @@ static inline __aicore__ bool scheduler_acquire_group_lane(
         scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker) | SCHEDULER_PREPARED_MIX_OWNED;
     handle->execution_index = index;
     handle->claimed_state = claimed;
-    return scheduler_receive_payload(base, prepared, task_ref, block, lane, handle);
+    if (!scheduler_receive_payload(base, prepared, task_ref, block, lane, handle)) return false;
+#if defined(__CCE_AICORE__)
+    const auto *call = scheduler_prepared_call_at(base, prepared, index);
+    if (call->tensor_count != 0 && call->tensor_count <= call->num_args) {
+        // Only the argument prefix contains tensor descriptor addresses. The remaining arguments are scalars.
+        auto *descriptors = reinterpret_cast<__gm__ uint64_t *>(call->args[0]);
+        const uint32_t bytes = static_cast<uint32_t>(call->tensor_count) * TASK_IMAGE_TENSOR_STRIDE;
+        for (uint32_t offset = 0; offset < bytes; offset += SCHEDULER_SCALAR_CACHE_LINE_BYTES)
+            dc_preload(descriptors, static_cast<int64_t>(offset));
+    }
+#endif
+    return true;
 }

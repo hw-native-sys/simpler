@@ -130,7 +130,7 @@ struct InlineFixture {
     bool complete(uint32_t worker, uint32_t slot) {
         auto *local = locals[worker];
         bool permit = false;
-        if (!scheduler_check_entry_permit(graph.graph(), base(), local, run(), slot, &permit) || !permit) return false;
+        if (!hbg_test_check_ready_order(graph.graph(), base(), local, run(), slot, &permit) || !permit) return false;
         if (!hbg_test_begin_execution(local, slot)) return false;
         return scheduler_complete_lane_execution(graph.graph(), base(), local, run(), slot, 4);
     }
@@ -379,7 +379,7 @@ TEST(HbgInlineProtocol, RecordsTheLogicalCompletionAndRankWithoutKernelEntry) {
         EXPECT_EQ(done.task_ref, 1);
         EXPECT_EQ(done.run_epoch, 61u);
         EXPECT_EQ(done.worker_index, 1u);
-        EXPECT_EQ(done.order_key, scheduler_order_for(fixture.base(), fixture.locals[1], 1).rank);
+        EXPECT_EQ(done.order_key, scheduler_order_for(fixture.locals[1], 1).rank);
         EXPECT_NE(done.flags & SCHEDULER_TASK_INLINE, 0u);
         EXPECT_EQ(tasks[0].completion.before.sequence, 0u);
         const auto *executions = scheduler_state_at<SchedulerProtocolExecutionTrace>(

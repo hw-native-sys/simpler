@@ -252,9 +252,15 @@ def _milestones(rows, ideal_ready, include_kernel_execution):
     return min(ticks + starts), max(ticks), spans, ideal_ready
 
 
-def _block_events(rows, pid, tid, name, spans, ideal_ready):
+def _block_events(rows, pid, tid, name, spans, ideal_ready, prefix):
     block = rows[0]
     args = {key: block[key] for key in ("run_epoch", "task_id", "block_index", "block_count")}
+
+    def stage_name(stage):
+        return f"{prefix}-{stage}" if prefix is not None else f"{stage} · {name}"
+
+    if prefix is not None:
+        args["kernel_slice_label"] = name
     location = {"pid": pid, "tid": tid, "cat": "percounter_task_timing"}
     if ideal_ready is not None:
         args["ideal_ready_us"] = ideal_ready
@@ -266,7 +272,7 @@ def _block_events(rows, pid, tid, name, spans, ideal_ready):
                 "ph": "X",
                 "ts": start,
                 "dur": end - start,
-                "name": f"{label} · {name}",
+                "name": stage_name(label),
                 "cname": color,
                 "args": args,
             }
@@ -276,7 +282,7 @@ def _block_events(rows, pid, tid, name, spans, ideal_ready):
             "ph": "i",
             "s": "t",
             "ts": ideal_ready,
-            "name": f"Ideal ready (estimated) · {name}",
+            "name": stage_name("Ideal ready (estimated)"),
             "args": {**args, "kind": "ideal_ready"},
         }
     for row in rows:
@@ -290,13 +296,15 @@ def _block_events(rows, pid, tid, name, spans, ideal_ready):
             key: value for key, value in row.items() if key not in ("time_us", "claim_start_us", "kernel_start_us")
         }
         row_args["worker_role"] = role
+        if prefix is not None:
+            row_args["kernel_slice_label"] = name
         if row["kind"] == "claim":
             yield {
                 **location,
                 "ph": "i",
                 "s": "t",
                 "ts": row["claim_start_us"],
-                "name": f"Claim start · {name}",
+                "name": stage_name("Claim start"),
                 "args": {**row_args, "kind": "claim_start", "cycles": row["claim_start_cycles"]},
             }
         yield {
@@ -304,7 +312,7 @@ def _block_events(rows, pid, tid, name, spans, ideal_ready):
             "ph": "i",
             "s": "t",
             "ts": row["time_us"],
-            "name": f"{label} · {name}",
+            "name": stage_name(label),
             "args": row_args,
         }
 
@@ -341,6 +349,7 @@ def trace_events(
     task_name,
     *,
     include_kernel_execution=True,
+    l2_task_display=None,
     deps_edges=None,
     deps_kernel_map=None,
     deps_block_map=None,
@@ -389,7 +398,8 @@ def trace_events(
                 yield _meta(pid, "thread_sort_index", {"sort_index": tid}, tid)
             heappush(lanes, (end, tid))
             name = f"{task_name(task_id)} [block {block}/{rows[0]['block_count']}]"
-            yield from _block_events(rows, pid, tid, name, spans, ideal_ready)
+            prefix = f"{l2_task_display(task_id)}-b{block}" if l2_task_display is not None else None
+            yield from _block_events(rows, pid, tid, name, spans, ideal_ready, prefix)
     yield from capture_status(capture, pid)
 
 

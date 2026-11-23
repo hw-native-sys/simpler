@@ -70,6 +70,6 @@ EXIT 等待全部 sink 的逻辑 DONE，不能用记录顺序最后一个 child 
 CntNotify 路径的 P 可以先于整组 FIN 到齐。常规上板运行中，AIV0 在复用 bank 或退出时检查参与核的本代 FIN。CPU/sim 的 GM 路径由记账成员收齐本代活动成员的成功 FIN 后批量扣减物理贡献。清退还须确认 bank 退休及整个 run 的 EXIT/ACK。
 Host 必须取得本轮的清退证明后才能回收 backing。
 
-实现入口为 `scheduler_observe_task_completion`、`scheduler_execution_token_observe_fanin`、
-`scheduler_service_controls`、`scheduler_contribute_returns` 和 GM 内联 FINISH。
+实现入口为 `scheduler_observe_task_completion`、`scheduler_observe_fanin_prefix`、
+`scheduler_progress_graph_controls`、`scheduler_publish_fanout` 和 GM 内联 FINISH。
 相关测试覆盖非法 gate、重复贡献、控制 CAS 唯一性、跨核依赖、async waiter 进展及 run 复用。

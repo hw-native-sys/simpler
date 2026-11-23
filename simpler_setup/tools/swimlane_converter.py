@@ -1438,10 +1438,21 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             data.get("aicore_tasks", []),
             data.get("aicore_execution_identities"),
         )
+        idle_by_worker_epoch = defaultdict(list)
+        if runtime_name == "host_build_graph" and level == 3:
+            for records, stream in zip(sched_phases_raw, scheduler_stream_metadata):
+                if stream["producer"] == "aicore":
+                    for record in records:
+                        if record["kind"] == "idle":
+                            key = stream["worker_id"], record["run_epoch"]
+                            idle_by_worker_epoch[key].append((record["start_cycles"], record["end_cycles"]))
         for profile in profiles:
             if runtime_name == "host_build_graph" and level == 3:
                 scalar_profile.apply_l3_detail_policy(profile)
             profile["clock_freq_hz"] = clock_freq_hz
+            if idle_by_worker_epoch and profile.get("complete"):
+                key = profile["worker_id"], profile["run_epoch"]
+                profile["no_progress_intervals"] = idle_by_worker_epoch.get(key, [])
             for key in ("rows", "exclusive"):
                 for row in profile[key]:
                     row["start_time_us"] = _to_us(row["start_cycles"])
@@ -1757,7 +1768,9 @@ def _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams, *, c
         lane_workers[(3, tid + 1)] = worker
     for index, stream in enumerate(scheduler_streams or []):
         if stream.get("producer") == "aicore" and type(stream.get("worker_id")) is int:
-            lane_workers[(2, 30000 + index * 10)] = stream["worker_id"]
+            tid = 30000 + index * 10
+            lane_workers[(2, tid)] = stream["worker_id"]
+            lane_workers[(2, tid + 2)] = stream["worker_id"]
     workers = sorted(set(lane_workers.values()), key=lambda w: (w not in positions, positions.get(w, (w, 0)), w))
     order = {worker: index for index, worker in enumerate(workers)}
     desired, present = {}, set()
@@ -1768,7 +1781,7 @@ def _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams, *, c
         worker = lane_workers.get(key)
         if worker is None:
             continue
-        sort_index = order[worker] * 10 + (key[1] - core_to_tid[worker] if key[0] == 3 else 0)
+        sort_index = order[worker] * 10 + key[1] % 10
         if event["name"] == "thread_name":
             event["args"]["name"] = _cluster_track_label(
                 positions.get(worker), event["args"]["name"], compact_workers and key[0] == 4
@@ -2715,6 +2728,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 pid=3,
                 task_name=lambda task_id: _marker_event_name(task_id, task_display(task_id)),
                 include_kernel_execution=pc_l2_events is None,
+                l2_task_display=task_display if pc_l2_events is not None else None,
                 deps_edges=deps_edges if chip_swimlane_level == 2 else None,
                 deps_kernel_map=deps_kernel_map,
                 deps_block_map=deps_block_map,
@@ -2828,7 +2842,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "cat": "Percounter L2 control",
                     "ts": ts,
                     "id": marker_id,
-                    "name": f"Control completion · {task_display(ref)}",
+                    "name": f"{task_display(ref)}-Control completion",
                     "args": {
                         "task_id": ref,
                         "run_epoch": epoch,
@@ -2868,7 +2882,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         for event in events:
             if event.get("cat") not in ("Percounter L2", "HBG L2", "percounter_task_timing"):
                 continue
-            if event.get("ph") not in ("b", "X") or not event["name"].startswith(
+            if event.get("ph") not in ("b", "X") or not event["name"].split("-", 2)[-1].startswith(
                 ("Bound", "Predecessor pending", "Claim →", "Ideal ready →")
             ):
                 continue
@@ -3392,6 +3406,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 kernel_labels=hbg_kernel_labels,
             )
         )
+        if runtime_name == "host_build_graph" and chip_swimlane_level == 3:
+            from simpler_setup.tools.hbg.kernel_gaps import kernel_gap_events  # noqa: PLC0415
+
+            events.extend(kernel_gap_events(scalar_profiles, scheduler_streams, tasks, fanin_map))
 
     # AICPU Orchestrator lane (chip_swimlane_level >= 4)
     #

@@ -46,11 +46,11 @@ public:
             notifications_.emplace_back();
             auto &notification = notifications_.back();
             const auto rc = aclrtCntNotifyCreate(&notification.handle, 0);
-            if (!required_ && (rc == ACL_ERROR_RT_NO_NOTIFY_RESOURCE || rc == ACL_ERROR_RT_RESOURCE_ALLOC_FAIL)) {
+            if (rc == ACL_ERROR_RT_NO_NOTIFY_RESOURCE || rc == ACL_ERROR_RT_RESOURCE_ALLOC_FAIL) {
                 notifications_.pop_back();
+                if (required_) throw SchedulerNotificationQuotaExceeded("CntNotify create: " + std::to_string(rc));
                 LOG_WARN(
-                    "A5 HBG: CntNotify capacity exhausted at %zu/%zu; remaining nodes use GM", notifications_.size(),
-                    count
+                    "A5 scheduler: optional CntNotify capacity exhausted at %zu/%zu", notifications_.size(), count
                 );
                 break;
             }

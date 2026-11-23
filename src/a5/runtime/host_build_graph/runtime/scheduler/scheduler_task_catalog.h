@@ -23,6 +23,7 @@ struct alignas(64) SchedulerTaskCatalogHeader {
     uint64_t order_offset{0};
     uint32_t first_mix_ref{UINT32_MAX};
     uint32_t terminal_mix_refs[2]{UINT32_MAX, UINT32_MAX};
+    uint32_t terminal_mix_begin{UINT32_MAX};  // Index in the vector engine catalog.
 };
 
 // Indexed by expanded node ref. A threshold is one past the last earlier
@@ -33,8 +34,9 @@ struct SchedulerTaskCatalogOrder {
     uint32_t cooperative_index{UINT32_MAX};
     uint32_t required_floor[PLATFORM_CORES_PER_BLOCKDIM]{};
     uint32_t next_mix_ref{UINT32_MAX};
+    uint32_t requires_peer_order{0};
 };
-static_assert(sizeof(SchedulerTaskCatalogOrder) == 24);
+static_assert(sizeof(SchedulerTaskCatalogOrder) == 28);
 static_assert(
     std::is_standard_layout_v<SchedulerTaskCatalogOrder> && std::is_trivially_copyable_v<SchedulerTaskCatalogOrder>
 );
@@ -62,9 +64,22 @@ static_assert(
     std::is_trivially_copyable_v<SchedulerTaskCatalogDescriptor>
 );
 
+// A nonnegative supply_input names the only predecessor whose supply must be checked.
+inline constexpr int32_t SCHEDULER_SUPPLY_SCAN = -2;
+inline constexpr int32_t SCHEDULER_SUPPLY_STATIC = -1;
+struct alignas(8) SchedulerCatalogEntry {
+    int32_t ref;
+    int32_t supply_input;
+    // Nonzero at the start of three dynamic ordinary entries. It selects the third task's ticket word.
+    uint16_t third_task_blocks{};
+};
+static_assert(sizeof(SchedulerCatalogEntry) == 16);
+
 struct SchedulerTaskCatalog {
-    __gm__ const int64_t *refs{nullptr};
-    uint64_t count{UINT64_MAX};
+    __gm__ const SchedulerCatalogEntry *entries{nullptr};
+    uint32_t count{UINT32_MAX};
+    uint32_t terminal_mix_begin{UINT32_MAX};
+    __gm__ const SchedulerTaskCatalogOrder *orders{nullptr};
 };
 
 inline __aicore__ SchedulerTaskCatalog
@@ -73,11 +88,18 @@ scheduler_task_catalog(__gm__ void *base, const __gm__ SchedulerTaskCatalogHeade
     const auto *descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(base, pool.descriptors_offset);
     const auto &descriptor = descriptors[engine];
     if (descriptor.capacity > pool.task_count) return {};
-    return {scheduler_state_at<int64_t>(base, descriptor.entries_offset), descriptor.capacity};
+    const auto terminal =
+        engine == static_cast<uint32_t>(SchedulerExecutionEngine::AIV) ? pool.terminal_mix_begin : UINT32_MAX;
+    if (terminal != UINT32_MAX && terminal >= descriptor.capacity) return {};
+    return {
+        scheduler_state_at<SchedulerCatalogEntry>(base, descriptor.entries_offset),
+        static_cast<uint32_t>(descriptor.capacity), terminal,
+        scheduler_state_at<SchedulerTaskCatalogOrder>(base, pool.order_offset)
+    };
 }
 
 inline __aicore__ bool scheduler_task_catalog_valid(const SchedulerTaskCatalog &catalog) {
-    return catalog.refs != nullptr;
+    return catalog.entries != nullptr;
 }
 
 // Called once after READY acquire. All subsequent descriptor reads are of
@@ -112,9 +134,10 @@ static inline __aicore__ bool scheduler_task_catalog_validate(
         entries += descriptor.capacity;
         if (descriptor.entries_offset < cursor || descriptor.entries_offset % SCHEDULER_STATE_ALIGNMENT != 0 ||
             descriptor.entries_offset > pool->storage_end_offset ||
-            descriptor.capacity > (pool->storage_end_offset - descriptor.entries_offset) / sizeof(int64_t))
+            descriptor.capacity >
+                (pool->storage_end_offset - descriptor.entries_offset) / sizeof(SchedulerCatalogEntry))
             return false;
-        cursor = descriptor.entries_offset + descriptor.capacity * sizeof(int64_t);
+        cursor = descriptor.entries_offset + descriptor.capacity * sizeof(SchedulerCatalogEntry);
     }
     return entries == pool->entry_count && (pool->first_mix_ref == UINT32_MAX || pool->first_mix_ref < task_count) &&
            pool->order_offset >= cursor && pool->order_offset % SCHEDULER_STATE_ALIGNMENT == 0 &&

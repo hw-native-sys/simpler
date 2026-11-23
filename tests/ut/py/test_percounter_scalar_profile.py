@@ -146,12 +146,13 @@ def test_scheduler_view_keeps_block_identity_and_deferred_publisher(tmp_path, le
     assert {e["tid"] for e in block_0} == {block_0[0]["tid"]}
     assert block_0[0]["ts"] == pytest.approx(0)
     assert block_0[1]["ts"] == pytest.approx(4 * cycle_us)
-    acquisition = next(e for e in view if e["ph"] == "X" and e["name"].startswith("Claim start → claim"))
+    prefix = "t7-b0-" if level == 2 else ""
+    acquisition = next(e for e in view if e["ph"] == "X" and e["name"].startswith(prefix + "Claim start → claim"))
     assert acquisition["tid"] == block_0[0]["tid"]
     assert acquisition["dur"] == pytest.approx(4 * cycle_us)
-    assert block_0[3]["name"].startswith("Ready (V0)")
-    assert block_0[5]["name"].startswith("Kernel end (V0)")
-    assert block_0[7]["name"].startswith("Completion issued +1")
+    assert block_0[3]["name"].startswith(prefix + "Ready (V0)")
+    assert block_0[5]["name"].startswith(prefix + "Kernel end (V0)")
+    assert block_0[7]["name"].startswith(prefix + "Completion issued +1")
     assert block_0[-1]["args"]["worker_id"] == 1
     assert block_0[-1]["args"]["cluster_index"] == 1
     assert block_0[-1]["ts"] == pytest.approx((90 - 6) * cycle_us)
@@ -294,21 +295,19 @@ def test_l2_physical_slots_keep_mix_members_and_deferred_settlement_separate():
     ]
     ev = list(schedule_events({"records": rows}, 7, lambda t: f"t{t}"))
     names = {e["id2"]["local"]: e["name"] for e in ev if e["ph"] == "n"}
-    bars = [
-        (names[e["id2"]["local"]], e["name"].partition(" · ")[0], e["ts"], ev[i + 1]["ts"])
-        for i, e in enumerate(ev)
-        if e["ph"] == "b"
-    ]
-    assert ("C02 / MIX0 (AIV0 proxy)", "Prepare MIX descriptor → SSBUF publish", 2, 3) in bars
-    assert ("C02 / MIX0/AIC", "Predecessor pending → inputs observed", 4, 8) in bars
-    assert all(name != "Kernel execution" for _, name, _, _ in bars)
-    assert ("C02 / MIX0/AIV0", "Inputs proven → entry commitment", 8, 12) in bars
-    assert ("C02 / MIX0/AIC", "MIX rendezvous → selection", 10, 13) in bars
-    assert ("C02 / MIX0/AIC", "Output fence → completion issue", 22, 23) in bars
-    assert ("C02 / MIX0/AIV0", "Output fence → completion issue", 24, 28) in bars
-    assert ("C02 / deferred 0", "Defer registration → settlement issue", 27, 40) in bars
+    bars = [(names[e["id2"]["local"]], e["name"], e["ts"], ev[i + 1]["ts"]) for i, e in enumerate(ev) if e["ph"] == "b"]
+    assert ("C02 / MIX0 (AIV0 proxy)", "t5-b0-Prepare MIX descriptor → SSBUF publish", 2, 3) in bars
+    assert ("C02 / MIX0/AIC", "t5-b0-Predecessor pending → inputs observed", 4, 8) in bars
+    assert all("Kernel execution" not in name for _, name, _, _ in bars)
+    assert ("C02 / MIX0/AIV0", "t5-b0-Inputs proven → entry commitment", 8, 12) in bars
+    assert ("C02 / MIX0/AIC", "t5-b0-MIX rendezvous → selection", 10, 13) in bars
+    assert ("C02 / MIX0/AIC", "t5-b0-Output fence → completion issue", 22, 23) in bars
+    assert ("C02 / MIX0/AIV0", "t5-b0-Output fence → completion issue", 24, 28) in bars
+    assert ("C02 / deferred 0", "t5-b0-Defer registration → settlement issue", 27, 40) in bars
     partial = [r for r in rows if not (r["kind"] == "kernel_end" and r["cluster_lane"] == 0)]
     partial_issues = [
-        e for e in schedule_events({"records": partial}, 7, str) if e.get("name", "").startswith("Output fence →")
+        e
+        for e in schedule_events({"records": partial}, 7, str)
+        if e.get("name") == "5-b0-Output fence → completion issue"
     ]
     assert [(e["ts"], e["args"]["worker_id"]) for e in partial_issues] == [(24, 11)]

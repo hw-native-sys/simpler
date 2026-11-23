@@ -19,7 +19,7 @@
 #include "aicpu/device_time.h"
 #endif
 
-static_assert(static_cast<uint32_t>(SchedPhaseKind::ScalarRetireExecution) < SCHEDULER_SCALAR_STORAGE_EXTENDED);
+static_assert(static_cast<uint32_t>(SchedPhaseKind::ScalarMixNotifyMembers) < SCHEDULER_SCALAR_STORAGE_EXTENDED);
 
 inline __aicore__ uint64_t scheduler_scalar_clock() {
 #if defined(__CCE_AICORE__)
@@ -204,12 +204,11 @@ struct SchedulerScalarTrace {
             kind == SchedPhaseKind::ScalarTraceBeforeExecution || kind == SchedPhaseKind::ScalarTraceBeforeCompletion;
         // Retain measured handoff and ordinary execution boundaries even below the usual L3 duration threshold.
         const bool business_step =
-            kind == SchedPhaseKind::ScalarBuildPayload || kind == SchedPhaseKind::ScalarPublishBuilt ||
+            kind == SchedPhaseKind::ScalarMixClaimForExecution || kind == SchedPhaseKind::ScalarMixNotifyMembers ||
             kind == SchedPhaseKind::ScalarPreparedClaim || kind == SchedPhaseKind::ScalarGroupAcquire ||
             kind == SchedPhaseKind::ScalarSelectOwnedExecution || kind == SchedPhaseKind::ScalarRetireExecution ||
-            kind == SchedPhaseKind::ScalarClusterMixDiscoverTask || kind == SchedPhaseKind::ScalarExecutionTokenFanin ||
-            kind == SchedPhaseKind::ScalarClusterMixDependencies || kind == SchedPhaseKind::ScalarSubtaskContribute ||
-            kind == SchedPhaseKind::ScalarMixGroupContribute;
+            kind == SchedPhaseKind::ScalarExecutionTokenFanin || kind == SchedPhaseKind::ScalarClusterMixDependencies ||
+            kind == SchedPhaseKind::ScalarSubtaskContribute || kind == SchedPhaseKind::ScalarMixGroupContribute;
         if (!business_step && !trace_stage && end >= begin && end - begin < function_min_cycles) {
             ++short_intervals;
             return;

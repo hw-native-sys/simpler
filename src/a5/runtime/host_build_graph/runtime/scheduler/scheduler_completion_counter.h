@@ -39,8 +39,11 @@ inline __aicore__ int scheduler_completion_counter_observe(const __gm__ Schedule
 }
 
 inline __aicore__ void
-scheduler_completion_counter_add(const __gm__ SchedulerTaskCompletionCounter &counter, uint32_t credits) {
-    scheduler_notify_add(*reinterpret_cast<__gm__ volatile uint32_t *>(counter.add_address), credits);
+scheduler_publish_counter_credit(const __gm__ SchedulerTaskCompletionCounter &counter, bool extra_credit = false) {
+    auto &address = *reinterpret_cast<__gm__ volatile uint32_t *>(counter.add_address);
+    scheduler_cache_barrier();
+    scheduler_notify_increment(address);
+    if (extra_credit) scheduler_notify_increment(address);
 }
 
 struct SchedulerCounterProtocolActor {
@@ -88,8 +91,7 @@ static inline __aicore__ bool scheduler_counter_publish_condition(
         event->source = acquired ? 1 : 0;
         event->credits = 1;
     }
-    scheduler_cache_barrier();
-    scheduler_completion_counter_add(counter, 1);
+    scheduler_publish_counter_credit(counter);
     if (event != nullptr) {
         if (!scheduler_protocol_stamp(base, &actor, layout, &event->after)) return false;
         scheduler_protocol_publish_record(event);

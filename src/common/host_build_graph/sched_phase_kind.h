@@ -93,7 +93,6 @@ enum class SchedPhaseKind : uint8_t {
     ScalarLaunchWait = 36,
     ScalarExitDrain = 37,
     ScalarCacheObserve = 39,
-    ScalarCachePublish = 40,
     ScalarAdvanceMixFloor = 42,
     ScalarFlushCompletions = 43,
     ScalarLoopControl = 44,
@@ -129,9 +128,7 @@ enum class SchedPhaseKind : uint8_t {
     ScalarFaninObserve = 101,
     ScalarFillOwnSlots = 103,
     ScalarClusterMixService = 105,
-    ScalarClusterMixDiscoverTask = 106,
     ScalarClusterMixDiscoverNext = 107,
-    ScalarClusterMixPending = 108,
     ScalarClusterMixObserve = 110,
     ScalarClusterMixEnter = 112,
     ScalarClusterMixRelease = 113,
@@ -139,7 +136,6 @@ enum class SchedPhaseKind : uint8_t {
     ScalarClusterMixAll = 117,
     ScalarPreparedReceive = 118,
     ScalarPreparedReturn = 123,
-    ScalarPreparedObserve = 124,
     ScalarPreparedIndex = 125,
     ScalarPreparedValidate = 126,
     ScalarGroupAcquire = 131,
@@ -175,10 +171,10 @@ enum class SchedPhaseKind : uint8_t {
     ScalarCanEnterExecution = 179,
     ScalarTraceAppend = 180,
     ScalarEndIteration = 181,
-    ScalarBuildPayload = 182,
-    ScalarPublishBuilt = 183,
     ScalarSelectOwnedExecution = 185,
     ScalarRetireExecution = 186,
+    ScalarMixClaimForExecution = 187,
+    ScalarMixNotifyMembers = 188,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -245,8 +241,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_exit_drain";
     case SchedPhaseKind::ScalarCacheObserve:
         return "scalar_cache_observe";
-    case SchedPhaseKind::ScalarCachePublish:
-        return "scalar_cache_publish";
     case SchedPhaseKind::ScalarAdvanceMixFloor:
         return "scalar_advance_mix_floor";
     case SchedPhaseKind::ScalarFlushCompletions:
@@ -317,12 +311,8 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_fill_own_slots";
     case SchedPhaseKind::ScalarClusterMixService:
         return "scalar_cluster_mix_service";
-    case SchedPhaseKind::ScalarClusterMixDiscoverTask:
-        return "scalar_cluster_mix_discover_task";
     case SchedPhaseKind::ScalarClusterMixDiscoverNext:
         return "scalar_cluster_mix_discover_next";
-    case SchedPhaseKind::ScalarClusterMixPending:
-        return "scalar_cluster_mix_pending";
     case SchedPhaseKind::ScalarClusterMixObserve:
         return "scalar_cluster_mix_observe";
     case SchedPhaseKind::ScalarClusterMixEnter:
@@ -377,12 +367,12 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_can_enter_execution";
     case SchedPhaseKind::ScalarTraceAppend:
         return "scalar_trace_append";
-    case SchedPhaseKind::ScalarBuildPayload:
-        return "scalar_build_payload";
-    case SchedPhaseKind::ScalarPublishBuilt:
-        return "scalar_publish_built";
     case SchedPhaseKind::ScalarSelectOwnedExecution:
         return "scalar_select_owned_execution";
+    case SchedPhaseKind::ScalarMixClaimForExecution:
+        return "scalar_mix_claim_for_execution";
+    case SchedPhaseKind::ScalarMixNotifyMembers:
+        return "scalar_mix_notify_members";
     case SchedPhaseKind::ScalarRetireExecution:
         return "scalar_retire_execution";
     case SchedPhaseKind::ScalarEndIteration:
@@ -391,8 +381,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_trace_before_completion";
     case SchedPhaseKind::ScalarPreparedReturn:
         return "scalar_prepared_return";
-    case SchedPhaseKind::ScalarPreparedObserve:
-        return "scalar_prepared_observe";
     case SchedPhaseKind::ScalarPreparedIndex:
         return "scalar_prepared_index";
     case SchedPhaseKind::ScalarPreparedValidate:

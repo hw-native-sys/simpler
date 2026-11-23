@@ -264,10 +264,10 @@ TEST(HbgErrorIdentity, PreparationFailureNamesTheSelfBlockWithoutBorrowingTheOth
     metadata.active_mask = LaneMask::aiv0();
     auto &token = local->execution_tokens[0];
     token.task_ref = 0;
+    token.metadata = fixture.storage.metadata[0];
     token.block_idx = 2;
     token.subtask_slot = 1;
-    token.state = SchedulerDispatchSlotState::FILLING;
-    token.phase = SchedulerExecutionTokenPhase::TICKETED;
+    token.state = SchedulerDispatchSlotState::TICKETED;
     EXPECT_FALSE(
         scheduler_bind_ticketed_execution(fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0)
     );
@@ -305,12 +305,9 @@ TEST(HbgErrorIdentity, InactiveCoordinatorObservesTheGenerationWithoutReportingM
     coordinator->mix_groups[0] = {};
     bool progress = false;
     ASSERT_TRUE(
-        scheduler_claim_for_build(fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), 0, &progress)
+        scheduler_claim_for_execute(fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), 0, &progress)
     );
     ASSERT_TRUE(progress);
-    ASSERT_TRUE(
-        scheduler_progress_mix_publication(fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress)
-    );
     ASSERT_TRUE(scheduler_cluster_mix_armed(fixture.signal.groups[0].armed_generation));
     ASSERT_TRUE(
         scheduler_cluster_mix_observe(fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress, 0)
@@ -430,10 +427,10 @@ TEST(HbgErrorIdentity, MalformedSelfClaimRetainsItsBlockAndBoundEpoch) {
     auto *local = fixture.locals[1];
     local->mix_groups[0] = {};
     auto &token = local->execution_tokens[0];
-    token.state = SchedulerDispatchSlotState::FILLING;
     token.task_ref = 0;
+    token.metadata = fixture.storage.metadata[0];
     token.subtask_slot = UINT8_MAX;
-    token.phase = SchedulerExecutionTokenPhase::TICKETED;
+    token.state = SchedulerDispatchSlotState::TICKETED;
     EXPECT_FALSE(
         scheduler_bind_ticketed_execution(fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0)
     );
@@ -452,10 +449,10 @@ TEST(HbgErrorIdentity, InvalidTicketNamesTheSelfBlockWhileMixHasAnotherBlock) {
     decoy.state = SchedulerDispatchSlotState::FILLING;
     auto &token = local->execution_tokens[0];
     token.task_ref = 0;
+    token.metadata = fixture.storage.metadata[0];
     token.rank = 0;
     token.block_idx = 2;
-    token.phase = SchedulerExecutionTokenPhase::TICKETED;
-    token.state = SchedulerDispatchSlotState::FILLING;
+    token.state = SchedulerDispatchSlotState::TICKETED;
     EXPECT_FALSE(
         scheduler_bind_ticketed_execution(fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0)
     );

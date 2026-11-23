@@ -20,6 +20,7 @@ struct Counters {
     int released{0};
     int abandoned{0};
     bool fail_release{false};
+    size_t allocated{0};
     size_t capacity_limit{SIZE_MAX};
 };
 class FakePool final : public SchedulerNotificationStorage {
@@ -33,9 +34,13 @@ public:
     size_t capacity() const override { return capacity_; }
     SchedulerDoneNotifications prepare(size_t count) override {
         ++counts_.prepared;
-        if (count > counts_.capacity_limit && scheduler_notification_is_required(purpose_))
-            throw std::runtime_error("CntNotify exhausted");
-        capacity_ = std::min(std::max(capacity_, count), counts_.capacity_limit);
+        if (count > capacity_) {
+            const auto growth = std::min(count - capacity_, counts_.capacity_limit - counts_.allocated);
+            capacity_ += growth;
+            counts_.allocated += growth;
+        }
+        if (count > capacity_ && scheduler_notification_is_required(purpose_))
+            throw SchedulerNotificationQuotaExceeded("CntNotify exhausted");
         SchedulerDoneNotifications result{std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
         std::fill_n(result.addresses.begin(), std::min(capacity_, count), 32);
         if (scheduler_notification_uses_counter(purpose_))
@@ -44,7 +49,10 @@ public:
     }
     int release() override {
         ++counts_.released;
-        return counts_.fail_release ? -7 : 0;
+        if (counts_.fail_release) return -7;
+        counts_.allocated -= capacity_;
+        capacity_ = 0;
+        return 0;
     }
     void abandon() noexcept override { ++counts_.abandoned; }
 
@@ -184,6 +192,55 @@ TEST(SchedulerNotificationCache, FailedHbgAllocationRetiresThePartialPoolAndCanB
         lease = {};
         EXPECT_EQ(f.cache.release(), 0);
     }
+}
+
+TEST(SchedulerNotificationCache, LargerGraphReclaimsIdleOptionalPoolsButPreservesCapturedLease) {
+    Fixture f;
+    f.counts.capacity_limit = 8;
+    SchedulerDoneNotifications supply, bootstrap, captured, required;
+    ASSERT_EQ(f.acquire(supply, 3, SchedulerNotificationPurpose::CLAIM_SUPPLY), 0);
+    ASSERT_EQ(f.acquire(bootstrap, 2, SchedulerNotificationPurpose::BOOTSTRAP_ARRIVAL), 0);
+    ASSERT_EQ(f.acquire(captured, 2, SchedulerNotificationPurpose::BOOTSTRAP_ARRIVAL), 0);
+    auto replay = captured.owner;
+    supply = bootstrap = captured = {};
+    ASSERT_EQ(f.acquire(required, 6, SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER), 0);
+    EXPECT_EQ(required.add_addresses.back(), 40u);
+    EXPECT_EQ(f.counts.prepared, 5);
+    EXPECT_EQ(f.counts.released, 2);
+    EXPECT_EQ(f.counts.allocated, 8u);
+    required = {};
+    EXPECT_THROW(
+        f.acquire(required, 7, SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER),
+        SchedulerNotificationQuotaExceeded
+    );
+    EXPECT_EQ(required.owner, nullptr);
+    EXPECT_EQ(f.counts.released, 2);
+    replay.reset();
+    ASSERT_EQ(f.acquire(required, 7, SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER), 0);
+    required = {};
+    EXPECT_EQ(f.cache.release(), 0);
+    EXPECT_EQ(f.counts.allocated, 0u);
+}
+
+TEST(SchedulerNotificationCache, FailedOptionalReclaimRetainsResourcesForRetry) {
+    Fixture f;
+    f.counts.capacity_limit = 4;
+    SchedulerDoneNotifications lease;
+    ASSERT_EQ(f.acquire(lease, 2, SchedulerNotificationPurpose::CLAIM_SUPPLY), 0);
+    lease = {};
+    ASSERT_EQ(f.acquire(lease, 2, SchedulerNotificationPurpose::HBG_REQUIRED_TASK_STATE), 0);
+    EXPECT_EQ(f.counts.released, 0);
+    lease = {};
+    f.counts.fail_release = true;
+    EXPECT_EQ(f.acquire(lease, 4, SchedulerNotificationPurpose::HBG_REQUIRED_TASK_STATE), -7);
+    EXPECT_EQ(lease.owner, nullptr);
+    EXPECT_EQ(f.counts.allocated, 4u);
+    f.counts.fail_release = false;
+    ASSERT_EQ(f.acquire(lease, 4, SchedulerNotificationPurpose::HBG_REQUIRED_TASK_STATE), 0);
+    EXPECT_NE(lease.addresses.back(), 0u);
+    lease = {};
+    EXPECT_EQ(f.cache.release(), 0);
+    EXPECT_EQ(f.counts.allocated, 0u);
 }
 
 TEST(SchedulerNotificationCache, CapacityFallbackKeepsWholeCounterPairsAndLease) {

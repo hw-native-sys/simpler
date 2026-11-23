@@ -30,6 +30,12 @@ TEST(AicoreGraphView, OrdinaryNodesKeepTheirOriginalDependencyReferences) {
     SchedulerFaninView fanin{};
     ASSERT_EQ(scheduler_node_fanin_view(graph, 4, &fanin), SchedulerGraphResult::OK);
     ASSERT_EQ(fanin.count, 3u);
+    SchedulerFaninView flat{};
+    ASSERT_EQ(scheduler_node_fanin_view<false>(graph, 4, &flat), SchedulerGraphResult::OK);
+    EXPECT_EQ(flat.global_refs, fanin.global_refs);
+    EXPECT_EQ(flat.count, fanin.count);
+    EXPECT_EQ(flat.source_limit, fanin.source_limit);
+
     for (uint32_t index = 0; index < fanin.count; ++index) {
         int64_t producer = -1;
         ASSERT_EQ(scheduler_fanin_ref(fanin, 4, index, &producer), SchedulerGraphResult::OK);

@@ -199,9 +199,8 @@ inline void log_aicore_mix_proxy(
     const uint32_t block = scheduler_mix_proxy_block_idx(snapshot);
     LOG_ERROR(
         "A5 HBG MIX proxy: epoch=%" PRIu64 " worker=%" PRIu64 " physical_core_id=%" PRId32 " cluster=%" PRIu64
-        " bank=%" PRId32 " task=%" PRIu32 " block=%" PRIu32 " phase=%s",
-        layout.run_epoch, worker, context.physical_core_id, context.cluster_index, bank, ref, block,
-        scheduler_mix_proxy_phase_name(scheduler_mix_proxy_phase(snapshot))
+        " bank=%" PRId32 " task=%" PRIu32 " block=%" PRIu32 " phase=published",
+        layout.run_epoch, worker, context.physical_core_id, context.cluster_index, bank, ref, block
     );
     if (ref >= layout.task_count) return;
     const auto *shared_plan = reinterpret_cast<const SchedulerExecutionPlan *>(base + layout.plans_offset) + ref;
@@ -291,8 +290,8 @@ inline void log_aicore_prepared_error(const SchedulerWorkerContext *context, Sch
         for (uint64_t worker = 0; worker < workers; ++worker) {
             const auto &entry = contexts[worker];
             cache_invalidate_range(
-                reinterpret_cast<const uint8_t *>(&entry) + offsetof(SchedulerWorkerContext, mix_proxy_acquired),
-                sizeof(SchedulerWorkerContext) - offsetof(SchedulerWorkerContext, mix_proxy_acquired)
+                reinterpret_cast<const uint8_t *>(&entry) + offsetof(SchedulerWorkerContext, mix_proxy_published),
+                sizeof(entry.mix_proxy_published)
             );
             scheduler_visit_mix_proxy_records(entry, [&](int32_t bank, uint64_t state) {
                 log_aicore_mix_proxy(base, layout, worker, entry, bank, state);

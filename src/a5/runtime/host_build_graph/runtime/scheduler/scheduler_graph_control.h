@@ -34,7 +34,7 @@ static inline __aicore__ bool scheduler_progress_graph_controls(
         const auto &metadata = *scheduler_task_metadata_at(base, local, ref);
         const bool inline_task = scheduler_task_is_inline(metadata.flags);
         if (!inline_task) {
-            if (graph.native_header_offset == 0) continue;
+            if (!scheduler_resident_graph_is_native(graph)) continue;
             SchedulerNodeKind kind{};
             if (scheduler_node_kind(graph, ref, &kind) != SchedulerGraphResult::OK) return false;
             if (!scheduler_node_is_control(kind)) continue;
@@ -71,8 +71,16 @@ static inline __aicore__ bool scheduler_progress_graph_controls(
             }
         }
         scheduler_cache_barrier();
-        if (notification != nullptr) scheduler_notify_done(*notification);
-        // Publish the canonical GM state in the same step as the notification.
+        if (notification != nullptr) {
+            scheduler_notify_done(*notification);
+            // Every observer consumes SET. Only protocol capture needs a unique accounting actor.
+            if (!record) {
+                scheduler_remember_task_proof(local, ref, SchedulerTaskProof::DONE);
+                *progress = true;
+                continue;
+            }
+        }
+        // A GM-backed completion or a protocol actor still needs a unique transition.
         // Only the winning CAS records the control-node completion actor.
         const uint64_t before = record ? scheduler_protocol_cycles(local) : 0;
         const uint64_t previous = scheduler_gm_compare_exchange(

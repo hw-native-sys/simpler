@@ -11,7 +11,21 @@
 
 #pragma once
 
-#include "scheduler/scheduler_ready.h"
+#include "scheduler/scheduler_dispatch.h"
+
+// Tests which pick READY slots directly must perform the order check done by resident selection.
+inline bool hbg_test_check_ready_order(
+    const SchedulerGraphAccess &graph, void *base, SchedulerLocalState *local, SchedulerRunControl *run, uint32_t index,
+    bool *permit
+) {
+    const auto &owner = local->execution_at(index);
+    if (!owner.cluster_mix) {
+        if (!scheduler_self_order_ready(graph, local, run, owner.rank, owner.required_floor, permit)) return false;
+        if (!*permit) return true;
+    }
+    *permit = scheduler_validate_selected_entry(graph, base, local, run, index);
+    return *permit;
+}
 
 inline uint32_t hbg_test_eligible_mask(const SchedulerLocalState *local) {
     uint32_t mask = 0;
