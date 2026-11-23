@@ -1507,7 +1507,11 @@ struct SchedulerState {
             }
         }
         execution.published_tasks.store(last, std::memory_order_release);
-        graph_route_ready_roots(execution);
+        // The later RMW acquires the earlier one: either this publisher sees READY,
+        // or the readiness caller sees the new range before claiming roots.
+        if (execution.control.fetch_or(0, std::memory_order_acq_rel) & GRAPH_EXECUTION_EXTERNAL_READY) {
+            graph_route_ready_roots(execution);
+        }
     }
 
     // `image` is the calling thread's own view of this run's Definition section;

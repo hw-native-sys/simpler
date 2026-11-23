@@ -57,6 +57,16 @@ bool fail_rollback_free = false;
 int rollback_free_attempts = 0;
 int rollback_free_engine = -1;
 bool throw_hccl_destroy = false;
+aclrtContext barrier_context = reinterpret_cast<aclrtContext>(0x101);
+const aclrtContext barrier_caller_context = barrier_context;
+bool barrier_pending = false;
+bool barrier_switch_context = true;
+int barrier_get_context_rc = 0;
+int barrier_restore_context_rc = 0;
+int barrier_submit_rc = 0;
+int barrier_sync_rc = 0;
+int barrier_sync_calls = 0;
+int barrier_submit_calls = 0;
 bool fail_context_upload = false;
 bool fail_dbcos_read = false;
 bool fail_host_register = false;
@@ -143,6 +153,29 @@ extern "C" aclError aclrtHostMemMapCapabilities(uint32_t, aclrtHacType engine, a
 extern "C" aclError aclrtGetDevice(int32_t *id) {
     *id = 0;
     return ACL_SUCCESS;
+}
+extern "C" aclError aclrtGetCurrentContext(aclrtContext *context) {
+    if (barrier_get_context_rc != 0) return barrier_get_context_rc;
+    *context = barrier_context;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtSetCurrentContext(aclrtContext context) {
+    if (barrier_restore_context_rc != 0) return barrier_restore_context_rc;
+    barrier_context = context;
+    return ACL_SUCCESS;
+}
+extern "C" HcclResult HcclBarrier(HcclComm, aclrtStream) {
+    ++barrier_submit_calls;
+    if (barrier_switch_context) barrier_context = reinterpret_cast<aclrtContext>(0x202);
+    barrier_pending = barrier_submit_rc == 0;
+    return static_cast<HcclResult>(barrier_submit_rc);
+}
+extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t timeout) {
+    assert(stream == reinterpret_cast<aclrtStream>(0x303));
+    assert(timeout > 0 && barrier_context == barrier_caller_context);
+    ++barrier_sync_calls;
+    if (barrier_sync_rc == 0) barrier_pending = false;
+    return barrier_sync_rc;
 }
 extern "C" aclError aclrtMalloc(void **out, size_t bytes, aclrtMemMallocPolicy) { return map_buffer(out, bytes); }
 extern "C" aclError aclrtFree(void *p) {
@@ -927,6 +960,41 @@ static void test_basic_window() {
 #include "comm_ccu_failure.h"
 #endif
 
+static void test_barrier_completion(const std::string &scenario) {
+    CommHandle_ handle{};
+    handle.hccl_comm = reinterpret_cast<HcclComm>(0x404);
+    handle.stream = reinterpret_cast<aclrtStream>(0x303);
+    barrier_switch_context = scenario != "barrier_same_context";
+    barrier_get_context_rc = scenario == "barrier_context_error" ? ACL_ERROR_FAILURE : 0;
+    barrier_restore_context_rc = scenario == "barrier_restore_error" ? ACL_ERROR_FAILURE : 0;
+    barrier_submit_rc = scenario == "barrier_submit_error" ? HCCL_E_INTERNAL : 0;
+    barrier_sync_rc = scenario == "barrier_sync_error" ? ACL_ERROR_FAILURE : 0;
+    const int rc = comm_barrier(&handle);
+    if (barrier_get_context_rc != 0) {
+        assert(rc == barrier_get_context_rc && barrier_submit_calls == 0 && barrier_sync_calls == 0);
+        assert(!handle.cleanup_failed);
+        return;
+    }
+    if (barrier_restore_context_rc != 0) {
+        assert(rc == barrier_restore_context_rc && barrier_sync_calls == 0 && handle.cleanup_failed);
+        assert(comm_destroy(&handle) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(comm_barrier(&handle) == COMM_RECLAMATION_UNCONFIRMED && barrier_submit_calls == 1);
+        return;
+    }
+    assert(barrier_context == barrier_caller_context);
+    if (barrier_submit_rc != 0) {
+        assert(rc == barrier_submit_rc && barrier_sync_calls == 0);
+    } else if (barrier_sync_rc != 0) {
+        assert(rc == barrier_sync_rc && barrier_pending && barrier_sync_calls == 1);
+        assert(handle.cleanup_failed);
+        assert(comm_destroy(&handle) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(comm_barrier(&handle) == COMM_RECLAMATION_UNCONFIRMED && barrier_submit_calls == 1);
+    } else {
+        assert(rc == 0 && !barrier_pending && barrier_sync_calls == 1);
+        assert(!handle.cleanup_failed);
+    }
+}
+
 int main(int argc, char **argv) {
 #ifdef SIMPLER_TEST_CCU_BACKEND
     assert(argc == 3);
@@ -938,6 +1006,10 @@ int main(int argc, char **argv) {
     return 0;
 #endif
     if (argc == 2) {
+        if (std::string(argv[1]).find("barrier_") == 0) {
+            test_barrier_completion(argv[1]);
+            return 0;
+        }
         if (std::string(argv[1]).find("host_mte") == 0) {
             test_host_mte_domain(argv[1]);
             return 0;

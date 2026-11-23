@@ -125,7 +125,7 @@ def test_l2_checkpoints_render_one_proxy_and_separate_member_slots(tmp_path):
     assert not any(e["name"].startswith(("EXECUTE", "Kernel execution")) for e in starts)
     workers = [e for e in events if e["pid"] == 4 and e["ph"] == "X"]
     assert len(workers) == 2
-    assert {e["name"] for e in workers} == {"EXECUTE · proj(t7)"}
+    assert {e["name"] for e in workers} == {"t7-proj"}
     assert {e["args"]["correlation_id"] for e in workers} == {"spmd/7"}
     assert {e["args"]["kernel_slice_label"] for e in workers} == {"proj_aic(t7)", "proj_aiv(t7)"}
     binds = [e for e in starts if e["name"].startswith("MIX member bind")]
@@ -464,11 +464,11 @@ def test_ranked_protocol_rejects_unversioned_null_rank(tmp_path):
         read(tmp_path, raw)
 
 
-def test_native_l2_spmd_slice_preserves_execute_label_and_task_color():
+def test_native_l2_spmd_slice_preserves_worker_label_and_task_color():
     from simpler_setup.tools.l2_pftrace import encode_l2_trace  # noqa: PLC0415
 
     proto = pytest.importorskip("perfetto.protos.perfetto.trace.perfetto_trace_pb2")
-    name = "EXECUTE · proj_spmd(t7)"
+    name = "t7-proj_spmd"
     events = [{"ph": "M", "pid": 4, "name": "process_name", "args": {"name": "Worker View"}}]
     for tid, member in enumerate(("proj_aic", "proj_aiv")):
         events.append({"ph": "M", "pid": 4, "tid": tid, "name": "thread_name", "args": {"name": member}})

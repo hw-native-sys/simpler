@@ -22,6 +22,7 @@ struct alignas(64) SchedulerTaskCatalogHeader {
     uint64_t entry_count{0};
     uint64_t order_offset{0};
     uint32_t first_mix_ref{UINT32_MAX};
+    uint32_t terminal_mix_refs[2]{UINT32_MAX, UINT32_MAX};
 };
 
 // Indexed by expanded node ref. A threshold is one past the last earlier

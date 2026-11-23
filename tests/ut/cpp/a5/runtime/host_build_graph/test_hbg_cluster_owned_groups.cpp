@@ -19,6 +19,24 @@ namespace {
 using namespace scheduler_test::gm_mix;
 class HbgClusterOwnedGroups : public ::testing::TestWithParam<std::tuple<LaneMask, bool>> {};
 
+TEST(HbgFixedOwnerWave, FullMixPlacementIsABijectionWithinEachBlockStripe) {
+    for (uint32_t clusters : {2u, 8u, 16u, 24u, 32u}) {
+        uint32_t same_half = 0;
+        for (uint32_t cluster = 0; cluster < clusters; ++cluster) {
+            const auto block = scheduler_fixed_mix_block(cluster, clusters, LaneMask::all());
+            ASSERT_LT(block, clusters);
+            EXPECT_EQ(block % 4, cluster % 4);
+            EXPECT_EQ(scheduler_fixed_mix_block(block, clusters, LaneMask::all()), cluster);
+            EXPECT_EQ(scheduler_fixed_mix_block(cluster, clusters, LaneMask::aic()), cluster);
+            EXPECT_EQ(scheduler_fixed_mix_block(cluster, clusters, kAicAiv0), block);
+            EXPECT_EQ(scheduler_fixed_mix_block(cluster, clusters, kAicAiv1), block);
+            EXPECT_EQ(scheduler_fixed_mix_block(cluster, clusters, LaneMask::both_aiv()), cluster);
+            same_half += (block < clusters / 2) == (cluster < clusters / 2);
+        }
+        EXPECT_EQ(same_half, clusters == 2 || clusters == 24 ? clusters : clusters / 2);
+    }
+}
+
 TEST(HbgFixedOwnerWave, EachPositionExecutesItsOwnBlockEvenWhenAnotherClusterArrivesLate) {
     for (auto mask : {LaneMask::aic(), LaneMask::aiv0(), LaneMask::aiv1(), kAicAiv0, kAicAiv1, LaneMask::all()}) {
         for (bool sync : {false, true}) {
@@ -127,8 +145,9 @@ TEST_P(HbgClusterOwnedGroups, ActualMembersCompleteWithoutASecondProxyVisit) {
             const auto &handle = local->execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION).prepared;
             const auto *cell = scheduler_prepared_control_at(base, local->config.prepared, handle.execution_index);
             const auto worker = local->worker_id();
+            EXPECT_EQ(cell->state, scheduler_prepared_state(SchedulerPreparedPhase::BUILT));
             EXPECT_EQ(
-                cell->state,
+                handle.claimed_state,
                 scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker) | SCHEDULER_PREPARED_MIX_OWNED
             );
             auto unentered = handle;
@@ -136,10 +155,13 @@ TEST_P(HbgClusterOwnedGroups, ActualMembersCompleteWithoutASecondProxyVisit) {
             GmExecution unit{};
             ASSERT_TRUE(fixture.begin(first + lane, &unit));
             ASSERT_EQ(unit.slot, SCHEDULER_CLUSTER_MIX_EXECUTION);
+            EXPECT_EQ(cell->state, scheduler_prepared_state(SchedulerPreparedPhase::BUILT));
             EXPECT_EQ(
-                cell->state,
+                handle.claimed_state,
                 scheduler_prepared_state(SchedulerPreparedPhase::ENTERED, worker) | SCHEDULER_PREPARED_MIX_OWNED
             );
+            EXPECT_FALSE(scheduler_cancel_unstarted_handle(base, local, &unentered));
+            EXPECT_FALSE(scheduler_cancel_unstarted_slot<true>(base, local, unit.slot));
         }
         auto finish = [&](uint32_t lane) {
             auto *local = locals[first + lane];
@@ -188,6 +210,51 @@ TEST_P(HbgClusterOwnedGroups, ActualMembersCompleteWithoutASecondProxyVisit) {
     EXPECT_EQ(storage.completed_gm_records(), 1u);
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);
 }
+TEST(HbgClusterOwnedGroups, ProxyReusesCountedBankOnlyAfterEveryNamedLaneReturns) {
+    GmMixFixture fixture({{2, kAicAiv1}}, false, 1);
+    ASSERT_TRUE(fixture.prepare_calls());
+    uint32_t credits = 0;
+    const auto counters = fixture.storage.layout.completion_counters_offset;
+    *scheduler_state_at<SchedulerTaskCompletionCounter>(fixture.base(), counters) = {
+        reinterpret_cast<uint64_t>(&credits), reinterpret_cast<uint64_t>(&credits), 4, 4
+    };
+    for (auto *local : fixture.locals)
+        local->config.completion_counters_offset = counters;
+    auto *proxy = fixture.locals[1];
+    auto &bank = fixture.signal(0)->groups[0];
+    for (uint32_t block = 0; block < 2; ++block) {
+        bool published = false;
+        ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
+        ASSERT_TRUE(published);
+        const uint32_t generation = bank.armed_generation;
+        ASSERT_TRUE(fixture.service_cooperative(0));
+        ASSERT_TRUE(fixture.service_cooperative(2));
+        GmExecution first{}, last{};
+        ASSERT_TRUE(fixture.begin(0, &first));
+        ASSERT_TRUE(fixture.begin(2, &last));
+        ASSERT_TRUE(fixture.complete(first));
+        EXPECT_EQ(credits, block * 2 + 1);
+        EXPECT_FALSE(scheduler_cluster_owes_before(fixture.locals[0], UINT32_MAX));
+        EXPECT_TRUE(scheduler_cluster_owes_before(fixture.locals[2], UINT32_MAX));
+        ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
+        EXPECT_FALSE(published);
+        EXPECT_EQ(bank.armed_generation, generation);
+        ASSERT_TRUE(fixture.complete(last));
+        EXPECT_EQ(credits, block * 2 + 2);
+        bool advanced = true;
+        ASSERT_TRUE(
+            scheduler_progress_mix_publication(fixture.graph.graph(), fixture.base(), proxy, fixture.run(), &advanced)
+        );
+        EXPECT_FALSE(advanced);
+        EXPECT_EQ(bank.armed_generation, generation);
+        EXPECT_EQ(bank.accounted_generation, 0u);
+    }
+    bool done = false;
+    ASSERT_TRUE(scheduler_cluster_mix_drain(fixture.graph.graph(), fixture.base(), proxy, fixture.run(), &done));
+    EXPECT_TRUE(done);
+    EXPECT_FALSE(scheduler_cluster_mix_armed(bank.armed_generation));
+}
+
 TEST(HbgClusterOwnedGroups, CompetingProxiesCanOnlyDistributeOneCopyOfTheSameMixBlock) {
     const auto lanes = LaneMask::both_aiv();
     GmMixFixture fixture({{1, lanes}}, true, 2);
@@ -230,7 +297,8 @@ TEST(HbgClusterOwnedGroups, CompetingProxiesCanOnlyDistributeOneCopyOfTheSameMix
     ASSERT_TRUE(scheduler_cluster_mix_armed(descriptor.armed_generation));
     ASSERT_EQ(descriptor.task_ref, 0);
     ASSERT_EQ(descriptor.block_idx, 0u);
-    ASSERT_FALSE(scheduler_cluster_mix_armed(fixture.signal(winner)->groups[1].armed_generation));
+    for (uint32_t bank = 1; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank)
+        ASSERT_FALSE(scheduler_cluster_mix_armed(fixture.signal(winner)->groups[bank].armed_generation));
     for (const auto &unused : fixture.signal(other)->groups)
         ASSERT_FALSE(scheduler_cluster_mix_armed(unused.armed_generation));
 
@@ -399,7 +467,7 @@ TEST(HbgClusterOrder, PureAiv1SyncStartUsesBothVectorWorkersWithLogicalSubtaskTw
     EXPECT_EQ(fixture.run()->scheduler_error, 0u);
 }
 
-TEST_P(HbgClusterOwnedGroups, MembersClaimBothDependentMixExecutionsBeforeTheProducerReturns) {
+TEST_P(HbgClusterOwnedGroups, MembersClaimTheFirstDependentMixBeforeTheProducerReturns) {
     const auto [mask, sync] = GetParam();
     const uint16_t blocks = sync ? 2 : 1;
     const uint32_t workers = 3 * blocks;
@@ -412,23 +480,19 @@ TEST_P(HbgClusterOwnedGroups, MembersClaimBothDependentMixExecutionsBeforeThePro
     GmExecution producer{};
     ASSERT_TRUE(fixture.begin(workers, &producer));
 
-    // The producer occupies another cluster. This cluster can claim two MIX groups while the first awaits data.
+    // The producer occupies another cluster. The first MIX can claim its slot while it waits for data.
     for (int pass = 0; pass < 12; ++pass)
         for (uint32_t worker = 0; worker < workers; ++worker)
             ASSERT_TRUE(fixture.fill(worker));
     for (uint32_t worker = 0; worker < workers; ++worker) {
         if (!mask.has(static_cast<SubtaskSlot>(worker % 3))) continue;
-        std::set<int64_t> claimed;
-        for (uint32_t slot = SCHEDULER_CLUSTER_MIX_EXECUTION; slot < SCHEDULER_LOCAL_EXECUTION_COUNT; ++slot) {
-            const auto &owner = fixture.locals[worker]->execution_at(slot);
-            EXPECT_EQ(
-                owner.prepared.claimed_state,
-                scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker) | SCHEDULER_PREPARED_MIX_OWNED
-            );
-            EXPECT_EQ(owner.state, SchedulerDispatchSlotState::FILLING);
-            EXPECT_TRUE(claimed.insert(owner.task_ref).second);
-        }
-        EXPECT_EQ(claimed, (std::set<int64_t>{1, 2}));
+        const auto &owner = fixture.locals[worker]->execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION);
+        EXPECT_EQ(
+            owner.prepared.claimed_state,
+            scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker) | SCHEDULER_PREPARED_MIX_OWNED
+        );
+        EXPECT_EQ(owner.state, SchedulerDispatchSlotState::FILLING);
+        EXPECT_EQ(owner.task_ref, 1);
         GmExecution premature{};
         EXPECT_FALSE(fixture.begin(worker, &premature));
     }
@@ -456,7 +520,7 @@ TEST_P(HbgClusterOwnedGroups, MembersClaimBothDependentMixExecutionsBeforeThePro
 
 class HbgEarlierProducer : public ::testing::TestWithParam<bool> {};
 
-TEST_P(HbgEarlierProducer, LaterMixAllowsOrdinaryProducerToReleaseTheEarlierTask) {
+TEST_P(HbgEarlierProducer, OrdinaryProducerReleasesEarlierWorkWhileLaterMixWaits) {
     const bool earlier_sync = GetParam();
     constexpr int64_t remote = 0, ready = 1, producer = 2, relay = 3, first = 4, later = 5;
     GmMixFixture f(
@@ -507,12 +571,15 @@ TEST_P(HbgEarlierProducer, LaterMixAllowsOrdinaryProducerToReleaseTheEarlierTask
             ASSERT_TRUE(f.complete(execution));
         }
     };
-    const auto &newer = f.locals[0]->mix_groups[earlier_sync ? 0 : 1];
-    for (unsigned pass = 0; pass < 12 && (newer.task_ref != later || newer.next_fanin != newer.fanin.count); ++pass)
+    const auto &group = f.locals[0]->mix_groups[0];
+    const auto published = earlier_sync ? later : first;
+    const uint32_t completed_fanin = earlier_sync ? 1 : 0;
+    for (unsigned pass = 0; pass < 12 && (group.task_ref != published || group.next_fanin != completed_fanin); ++pass)
         service(false);
-    ASSERT_EQ(newer.task_ref, later);
-    ASSERT_EQ(newer.fanin.count, 1u);
-    ASSERT_EQ(newer.next_fanin, newer.fanin.count);
+    ASSERT_EQ(group.task_ref, published);
+    ASSERT_EQ(group.fanin.count, 1u);
+    ASSERT_EQ(group.next_fanin, completed_fanin);
+    EXPECT_FALSE(f.task_done(later));
 
     // Both groups need the AIC. AIV1 must run the producer before the earlier group can release the AIC to the later
     // group.
@@ -527,7 +594,39 @@ TEST_P(HbgEarlierProducer, LaterMixAllowsOrdinaryProducerToReleaseTheEarlierTask
 
 INSTANTIATE_TEST_SUITE_P(EarlierMixOrPureSync, HbgEarlierProducer, ::testing::Bool());
 
-TEST(HbgClusterGroupOwnership, InvalidMemberCallPublishesFailedWithoutArriving) {
+TEST(HbgClusterGroupOwnership, CancellingAnUnstartedMixMemberUsesOnlyTheCurrentLocalGrant) {
+    GmMixFixture f({{1, kAicAiv1}}, false, 1);
+    ASSERT_TRUE(f.prepare_calls());
+    bool published = false;
+    ASSERT_TRUE(f.ordinary_arm(0, 0, &published));
+    ASSERT_TRUE(published);
+    ASSERT_TRUE(f.service_cooperative(2));
+    auto *local = f.locals[2];
+    auto &group = local->mix_groups[0];
+    auto &handle = group.prepared;
+    const auto index = handle.execution_index;
+    ASSERT_EQ(index, 1U);
+    auto *cell = scheduler_prepared_control_at(f.base(), local->config.prepared, index);
+    const auto built = scheduler_prepared_state(SchedulerPreparedPhase::BUILT);
+
+    auto stale = handle;
+    EXPECT_FALSE(scheduler_cancel_unstarted_handle(f.base(), local, &stale));
+    handle.execution_index = 0;
+    EXPECT_FALSE(scheduler_cancel_unstarted_handle(f.base(), local, &handle));
+    EXPECT_EQ(scheduler_prepared_control_at(f.base(), local->config.prepared, 0)->state, built);
+    handle.execution_index = index;
+    group.generation += 2;
+    EXPECT_FALSE(scheduler_cancel_unstarted_handle(f.base(), local, &handle));
+    group.generation -= 2;
+    ASSERT_TRUE(scheduler_cancel_unstarted_slot(f.base(), local, SCHEDULER_CLUSTER_MIX_EXECUTION));
+    EXPECT_EQ(cell->state, built);
+    EXPECT_EQ(handle.claimed_state, 0U);
+    EXPECT_FALSE(scheduler_cancel_unstarted_handle(f.base(), local, &stale));
+    EXPECT_EQ(f.signal(0)->groups[0].finished[2], 0U);
+    EXPECT_FALSE(f.task_done(0));
+}
+
+TEST(HbgClusterGroupOwnership, InvalidMemberCallFailsLocallyWithoutArriving) {
     const struct {
         const char *field;
         void (*corrupt)(SchedulerPreparedCall &);
@@ -584,10 +683,12 @@ TEST(HbgClusterGroupOwnership, InvalidMemberCallPublishesFailedWithoutArriving) 
             scheduler_cluster_mix_service(fixture.graph.graph(), fixture.base(), member, fixture.run(), 0, &progress)
         );
         const auto state = scheduler_prepared_control_at(fixture.base(), member->config.prepared, index)->state;
+        EXPECT_EQ(state, scheduler_prepared_state(SchedulerPreparedPhase::BUILT));
         EXPECT_EQ(
-            state,
+            member->mix_groups[0].prepared.claimed_state,
             scheduler_prepared_state(SchedulerPreparedPhase::FAILED, member->worker_id()) | SCHEDULER_PREPARED_MIX_OWNED
         );
+        EXPECT_NE(scheduler_read_worker_error(fixture.run(), member->worker_id()), 0U);
         EXPECT_EQ(fixture.signal(0)->groups[0].arrived[2], 0u);
         EXPECT_EQ(fixture.signal(0)->groups[0].finished[2], 0u);
         EXPECT_FALSE(fixture.task_done(0));

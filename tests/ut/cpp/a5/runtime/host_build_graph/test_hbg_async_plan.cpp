@@ -235,9 +235,9 @@ TEST(HbgAsyncPlan, ExpandedTasksBlocksAndLanesHaveIndependentStableRecords) {
             }
         }
     }
-    const auto *leases = scheduler_state_at<SchedulerAsyncLease>(image.base, plan.layout.group_leases_offset);
+    const auto *queued = scheduler_state_at<SchedulerAsyncGroupProgress>(image.base, plan.layout.group_progress_offset);
     for (uint32_t index = 0; index < plan.layout.group_count; ++index)
-        EXPECT_EQ(leases[index].word, UINT64_C(0xa5a5a5a5a5a5a5a5));
+        EXPECT_EQ(queued[index].pending_mask, UINT64_C(0xa5a5a5a5a5a5a5a5));
     const auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(image.base, plan.layout.joins_offset);
     EXPECT_EQ(joins[1].word, 0u);
     EXPECT_EQ(joins[2].word, 0u);
@@ -375,7 +375,7 @@ TEST(HbgAsyncPlan, RelocationPreservesIndependentExecutionRecords) {
     EXPECT_TRUE(seal_conditions(writer));
 }
 
-TEST(HbgAsyncPlan, DirectoriesHideUninitializedLeasesAcrossWordBoundaries) {
+TEST(HbgAsyncPlan, UninitializedOverflowStorageSupportsMoreThan64Groups) {
     AsyncCompletionHostPlan plan;
     std::vector<AsyncTaskPlanInput> inputs;
     for (int64_t ref = 0; ref < 65; ++ref)
@@ -384,14 +384,9 @@ TEST(HbgAsyncPlan, DirectoriesHideUninitializedLeasesAcrossWordBoundaries) {
     ASSERT_TRUE(plan_async_completion(kPrefix, 7, 65, inputs, &plan, &error)) << error;
     Image image(plan.total_bytes);
     ASSERT_TRUE(initialize_async_completion(image.base, plan.total_bytes, plan));
-    const auto *checks =
-        scheduler_state_at<SchedulerAsyncDirectoryWord>(image.base, plan.layout.check_directory_offset);
-    for (uint32_t word = 0; word < 2; ++word) {
-        EXPECT_EQ(checks[word].bits, 0u);
-    }
-    auto *leases = scheduler_state_at<SchedulerAsyncLease>(image.base, plan.layout.group_leases_offset);
+    const auto *queued = scheduler_state_at<SchedulerAsyncGroupProgress>(image.base, plan.layout.group_progress_offset);
     for (uint32_t index = 0; index < 65; ++index)
-        EXPECT_EQ(leases[index].word, UINT64_C(0xa5a5a5a5a5a5a5a5));
+        EXPECT_EQ(queued[index].pending_mask, UINT64_C(0xa5a5a5a5a5a5a5a5));
     EXPECT_EQ(scheduler_async_condition_mask(0), 0u);
     EXPECT_EQ(scheduler_async_condition_mask(1), 1u);
     EXPECT_EQ(scheduler_async_condition_mask(63), UINT64_MAX >> 1);

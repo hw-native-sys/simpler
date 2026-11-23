@@ -119,5 +119,17 @@ static inline __aicore__ bool scheduler_initialize_order(__gm__ void *base, Sche
     local->run_epoch = summary.run_epoch;
     local->run_epoch_known = true;
     local->next_mix_ref = catalog.first_mix_ref;
+    if (catalog.terminal_mix_refs[0] != UINT32_MAX) {
+        const uint32_t block = scheduler_fixed_mix_block(local->config.cluster_index, clusters, LaneMask::all());
+        for (unsigned stage = 0; stage < 2; ++stage) {
+            const uint32_t ref = catalog.terminal_mix_refs[stage];
+            if (ref >= catalog.task_count || !scheduler_acquire_group_lane(
+                                                 base, local->config.prepared, local->worker_id(), ref, block,
+                                                 local->config.self_lane, 7, &local->terminal_mix_calls[stage]
+                                             ))
+                return false;
+            local->terminal_mix_refs[stage] = ref;
+        }
+    }
     return true;
 }

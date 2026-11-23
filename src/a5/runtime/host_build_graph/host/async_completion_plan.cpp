@@ -92,10 +92,7 @@ bool plan_async_completion(
         !reserve_array<SchedulerAsyncActivity>(&cursor, 1, &layout.activity_offset) ||
         !reserve_array<uint32_t>(&cursor, task_count, &layout.task_map_offset) ||
         !reserve_array<SchedulerAsyncTaskData>(&cursor, layout.async_task_count, &layout.task_data_offset) ||
-        !reserve_array<SchedulerAsyncTaskJoin>(&cursor, layout.async_task_count, &layout.joins_offset) ||
-        !reserve_array<SchedulerAsyncDirectoryWord>(
-            &cursor, (static_cast<uint64_t>(layout.group_count) + 63) / 64, &layout.check_directory_offset
-        ))
+        !reserve_array<SchedulerAsyncTaskJoin>(&cursor, layout.async_task_count, &layout.joins_offset))
         return reject(error, "async control storage overflows");
     if (sdma_guard_count != 0 &&
         !reserve_array<AsyncSdmaSubmissionGuard>(&cursor, sdma_guard_count, &layout.sdma_guards_offset))
@@ -104,8 +101,7 @@ bool plan_async_completion(
         !scheduler_layout_checked_align(cursor, ASYNC_RECORD_ALIGNMENT, &next.initialized_bytes))
         return reject(error, "header storage overflows");
     cursor = next.initialized_bytes;
-    if (!reserve_array<SchedulerAsyncLease>(&cursor, layout.group_count, &layout.group_leases_offset) ||
-        !reserve_array<SchedulerAsyncGroupProgress>(&cursor, layout.group_count, &layout.group_progress_offset))
+    if (!reserve_array<SchedulerAsyncGroupProgress>(&cursor, layout.group_count, &layout.group_progress_offset))
         return reject(error, "deferred control storage overflows");
     for (auto &task : next.tasks) {
         uint32_t block_entry_bytes = 0;
@@ -161,12 +157,6 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
         tasks[index] = task;
         map[task.task_ref] = index;
         joins[index].word = 0;
-    }
-    auto *checks = scheduler_state_at<SchedulerAsyncDirectoryWord>(image, plan.layout.check_directory_offset);
-    for (uint64_t word = 0; word < (static_cast<uint64_t>(plan.layout.group_count) + 63) / 64; ++word) {
-        checks[word].bits = 0;
-        checks[word].notification_addresses[0] = 0;
-        checks[word].notification_addresses[1] = 0;
     }
     AsyncGroupData header{};
     header.run_epoch = plan.layout.run_epoch;

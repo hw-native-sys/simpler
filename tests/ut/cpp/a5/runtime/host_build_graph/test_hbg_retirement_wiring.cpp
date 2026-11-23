@@ -936,8 +936,9 @@ TEST_F(HbgRetirementWiring, ResidentSwimlaneAccumulatesInterleavedEpochsAndKeeps
     const std::string prefix = R"({"nested":{"streams":[]},"streams": [)";
     const std::string suffix =
         R"(],"prepared_calls":{"schema":"hbg-prepared-calls","run_epoch":41,"source":"host",)"
-        R"("columns":["execution_index","node_ref","task_id","block_idx","subtask_slot","owner","phase"],)"
-        R"("records":[[0,0,0,0,0,2,3]]}})";
+        R"("columns":["execution_index","node_ref","task_id","block_idx","subtask_slot","owner","phase",)"
+        R"("raw_phase","return_inferred","completion_state","mix_owned","mix_kernel_entered"],)"
+        R"("records":[[0,0,0,0,0,2,3,3,false,1,true,true],[1,0,0,0,1,null,1,1,false,0,null,null]]}})";
     for (const bool populated : {false, true}) {
         SCOPED_TRACE(populated);
         auto body = populated ? json.substr(body_start, json.rfind(']') - body_start) : " \n ";

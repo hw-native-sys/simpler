@@ -168,14 +168,14 @@ inline void log_aicore_prepared_cell(uint64_t base, const SchedulerPreparedLayou
     LOG_ERROR(
         "A5 HBG prepared cell: index=%" PRIu64 " state=0x%" PRIx64 " phase=%" PRIu64 " raw_phase=%" PRIu64
         " return_inferred=%u completion=0x%" PRIx64 " source=host owner=%" PRId64 " execute_owner=%" PRId64
-        " mix_owned=%u mix_kernel_entered=%u call_epoch=%" PRIu64 " call_index=%" PRIu64 " call_task=%" PRId64
+        " mix_owner_recorded=%u mix_kernel_entered=%s call_epoch=%" PRIu64 " call_index=%" PRIu64 " call_task=%" PRId64
         " call_block=%" PRIu32 " call_lane=%u num_args=%u function=0x%" PRIx64,
         index, state, static_cast<uint64_t>(phase), state & UINT64_C(255), static_cast<unsigned>(inferred), completion,
         owner == UINT32_MAX ? INT64_C(-1) : static_cast<int64_t>(owner),
         executor == UINT32_MAX ? INT64_C(-1) : static_cast<int64_t>(executor),
         static_cast<unsigned>((state & SCHEDULER_PREPARED_MIX_OWNED) != 0),
-        static_cast<unsigned>(scheduler_prepared_mix_kernel_entered(state)), call.run_epoch, call.execution_index,
-        call.task_ref, call.block_idx, static_cast<unsigned>(call.subtask_slot), static_cast<unsigned>(call.num_args),
+        scheduler_prepared_mix_entry(state, "unknown"), call.run_epoch, call.execution_index, call.task_ref,
+        call.block_idx, static_cast<unsigned>(call.subtask_slot), static_cast<unsigned>(call.num_args),
         call.function_bin_addr
     );
     LOG_ERROR(
@@ -300,7 +300,7 @@ inline void log_aicore_prepared_error(const SchedulerWorkerContext *context, Sch
         }
     }
     if (run->error_task_ref >= layout.task_count || (run->error_identity_fields & SCHEDULER_ERROR_HAS_BLOCK) == 0) {
-        // Each phase has its own budget so cancelled peers cannot hide a trapped kernel.
+        // Keep a separate diagnostic budget for each shared phase.
         uint32_t reported[static_cast<uint32_t>(SchedulerPreparedPhase::ENTERED) + 1]{};
         const auto *controls = reinterpret_cast<const SchedulerPreparedControl *>(base + layout.controls_offset);
         for (uint64_t index = 0; index < layout.execution_count; ++index) {

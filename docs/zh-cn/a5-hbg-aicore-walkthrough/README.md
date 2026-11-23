@@ -8,7 +8,7 @@ Graph view/native image 不携带内部版本号；普通与 native Graph 共用
 
 1. [结构与生命周期](00-data-structure-scopes.md)：输入、GM backing、核内状态及各自所有者。
 2. [初始化](01-initialization.md)：设备入口、物理报告、READY、bootstrap 和 DMB。
-3. [发现与执行](02-ready-execution.md)：fanin、两个自取位置、两个 MIX 成员位置与函数调用。
+3. [发现与执行](02-ready-execution.md)：fanin、自取位置、MIX 成员位置与函数调用。
 4. [协作、完成与退出](03-cooperative-completion.md)：MIX/sync_start、canonical debt、trace 和退休。
 5. [Graph 与 async](04-native-async.md)：实例展开、边界参数和延迟逻辑完成。
 

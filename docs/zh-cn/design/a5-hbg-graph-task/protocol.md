@@ -63,7 +63,9 @@ predicate 在支持的单 block/lane 形状下按依赖顺序求值；false 跳�
 
 ## MIX 与 sync_start
 
-每簇 AIV0 代领 MIX 并发布本代 SSBUF 描述符。活动 lane 确认 fanin 与较早冲突责任后发布自己的 ARRIVED。若任一活动 lane 有更早纯核 sync-start 的排序门槛，或本次运行有异步等待布局，成员须等本代所有活动 lane 的 ARRIVED 到齐；其余组在本核发布 ARRIVED 后即可发布 payload。CntNotify 路径由每个成功成员在自己的返回路径发布一个 P。记账成员收齐本代全部活动成员的成功 FIN 后退役 bank；在 GM 路径，它也在此时聚合整组物理贡献。失败进入错误清退。
+每簇 AIV0 代领 MIX 并发布本代 SSBUF 描述符。活动 lane 先确认 fanin 和本核的早序任务。若任一活动 lane 有更早纯核 sync-start 的排序门槛，成员须发布并观察本代所有活动 lane 的 ARRIVED，随后发布 payload。其余组在本核到达后即可发布 payload。CntNotify 路径由每个成功成员在自己的返回路径发布一个 P。
+
+需要记账回执时（GM 组信用或协议采集），记账成员收齐本代全部活动成员的成功 FIN，完成所需记账并发布 `accounted_generation`。AIV0 观察到本代回执后推进 `armed_generation`，复用 bank。常规无回执路径由 AIV0 在复用或退出时直接检查活动成员的本代 FIN，全部成功即可推进 `armed_generation`。失败 FIN 进入错误清退。
 
 `sync_start` 的每个 block 使用不同执行位置。不可撤销的承诺检查 Host 生成的每 lane 排序阈值和未退休的冲突责任；较早返回的成员可先服务独立工作。实际依赖仍等 TaskDone，描述符复用仍等前代退休。
 
@@ -80,7 +82,7 @@ trace 和 MIX/group retirement 仍由拥有者完成后，slot 才可复用。
 核内 staged trace 为三个时间戳、共 24 B。没有 completion inbox ID、旧 refill 或未写入的 resolver timing 行。
 有效计时行写回并完成 barrier 后才原子发布 valid；atomic valid 所在行不能被后续 cached 整行回写。
 
-L4 因果诊断使用 `schema: "hbg-native-protocol"` 和整数 `version: 2`。native Graph 额外携带独立的 graph source/node map；
+L4 因果诊断使用 `schema: "hbg-native-protocol"` 和整数 `version: 3`。native Graph 额外携带独立的 graph source/node map；
 共同记录 worker 身份、真实贡献、Call publication、最终 permit 和 trace retirement。
 ready_source 只接受目录发现 0 和 cooperative/group 3，不接受已无生产者的 direct-resolve/refill 事实。
 解析器只接受当前格式；历史 JSON 不能用默认值伪装成一份当前协议证明。

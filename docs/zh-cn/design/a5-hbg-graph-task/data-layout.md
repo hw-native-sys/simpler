@@ -102,7 +102,7 @@ backing 基址满足 128 B 对齐。标量缓存维护仍按 64 B 行，不能�
 bindings_offset、completion_refs_offset、templates_offset、instances_offset、readonly_end_offset、run_epoch。
 Header 的大小由当前类型定义，不另存大小字段；没有 control inbox 区。
 
-只读区域按 header、binding、completion refs、template、instance、child plan、fanin CSR、sink 排列。
+只读区域按 header、binding、completion refs、template、instance、child plan、fanin indices、sink 排列。
 Host 将该区域按 64 B 对齐追加到紧凑 task image，并随同一个执行镜像发布。板端 HBG
 Program 和 Kernel 都由 RTS 按 `argsSize` 交付整包。AICPU 按包内偏移和长度定位镜像，
 在发布 READY 前恢复可写前缀，并将引用字段指向 RTS 镜像内的对应位置。
@@ -115,11 +115,12 @@ AICPU 与 AICore 以 `SchedulerWorkerContext.native_graph_address` 和
 原始录制 Graph 及其 fanout、root、参数重定位记录、scalar inheritance 不复制进 native GM 镜像。
 
 每个唯一 Graph 对应一份 64 B `SchedulerGraphTemplate`：
-child plans、fanin rows/indices、sinks 的四个 offset，以及 task/edge/sink 数和 args_bytes。
+child plans、fanin indices、sinks 的 offset，以及 task/edge/sink 数和 args_bytes。
 fanin CSR 只拷贝实际运行使用的前驱边，sink 由 Host 验证后的拓扑推导。
 它表达 child fanin，不是运行时后继通知表。
 
-每 child 有一份 48 B plan：16 B metadata、三个参数 offset、tensor/scalar 数。
+每个 child 有一份 56 B plan，包含 16 B metadata、三个参数 offset、tensor/scalar 数，
+以及该 child 在共享 fanin indices 中的起点和前驱数（各 4 B）。
 每 instance 有一份 32 B 记录：Graph index、原始 shell ID、ENTER/child/EXIT ref 和 args_base。
 boundary 参数、heap_base 和完整 Graph 由 Host 绑定器持有；设备不读取它们。
 同一 Graph 的拓扑和 child plan 可共享；每个 instance 的参数和控制责任独立。
@@ -169,7 +170,7 @@ Host 在 orchestration 返回前取得自有 Graph 字节与索引，不能保�
 | SchedulerPreparedControl | 128 B | phase、固定 owner 与 TICKET_OWNED 状态；普通票由 owner 维护，协作转换使用 atomic |
 | SchedulerExecutionBinding | 128 B | 各占一行的 LocalContext/GlobalContext |
 
-args[48]/args[49] 指向本次 execution 的 Binding。每核可持有两个自取 block（W=2），另有两份 MIX 成员记录，分别对应两个 SSBUF bank。
+args[48]/args[49] 指向本次 execution 的 Binding。每核可持有一个自取 block（W=1），另有一份 MIX 成员记录，对应本簇的 SSBUF bank。
 两种来源都由领取它的核从原记录执行，同一时刻每核只运行一个 kernel。
 
 统计 backing 必须分别计入 metadata/control、Call/control/Binding、native readonly、两类目录的 refs、每个 node 的排序行、

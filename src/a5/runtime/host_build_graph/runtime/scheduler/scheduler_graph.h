@@ -347,13 +347,15 @@ inline __aicore__ bool scheduler_native_child_fanin_row(
     if (node.definition == nullptr || node.instance == nullptr ||
         node.binding->source_index >= node.definition->task_count)
         return false;
-    auto *rows =
-        reinterpret_cast<__gm__ const int32_t *>(graph.native_graph_address + node.definition->fanin_offsets_offset);
-    const auto start = rows[node.binding->source_index];
-    const auto stop = rows[node.binding->source_index + 1];
-    if (start < 0 || stop < start || static_cast<uint64_t>(stop) > node.definition->edge_count) return false;
-    *begin = static_cast<uint32_t>(start);
-    *end = static_cast<uint32_t>(stop);
+    const auto *plans = reinterpret_cast<__gm__ const SchedulerGraphChildPlan *>(
+        graph.native_graph_address + node.definition->child_plans_offset
+    );
+    const auto &child = plans[node.binding->source_index];
+    const uint32_t start = child.fanin_begin;
+    const uint32_t count = child.fanin_count;
+    if (start > node.definition->edge_count || count > node.definition->edge_count - start) return false;
+    *begin = start;
+    *end = start + count;
     return true;
 }
 
@@ -368,8 +370,10 @@ struct SchedulerFaninView {
     uint32_t source_limit{0};
 };
 
-inline __aicore__ SchedulerGraphResult
-scheduler_node_fanin_view(const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerFaninView *view) {
+inline __aicore__ SchedulerGraphResult scheduler_node_fanin_view(
+    const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerFaninView *view,
+    SchedulerNativeNode *resolved = nullptr
+) {
     if (view == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
     if (graph.storage_address == 0 || !scheduler_task_ref_valid(graph, task_ref))
         return SchedulerGraphResult::INVALID_TASK_COUNT;
@@ -378,6 +382,7 @@ scheduler_node_fanin_view(const SchedulerGraphAccess &graph, int64_t task_ref, S
     if (graph.native_header_offset != 0) {
         SchedulerNativeNode node{};
         if (!scheduler_native_node_checked(graph, task_ref, &node)) return SchedulerGraphResult::INVALID_ARGUMENTS;
+        if (resolved != nullptr) *resolved = node;
         const uint64_t base = graph.native_graph_address;
         const auto kind = node.binding->kind;
         if (kind == SchedulerNodeKind::GRAPH_EXIT) {

@@ -60,7 +60,7 @@ TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFab
     tasks[0].topological_level = 0;
     tasks[0].bottom_level = 2;
     const auto json = dump();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\",\"version\":2"), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\",\"version\":3"), std::string::npos);
     EXPECT_EQ(json.find("\"close_seal_stride\""), std::string::npos);
     EXPECT_NE(json.find("\"claim_seal\":0"), std::string::npos);
     EXPECT_NE(json.find("\"block_num\":2"), std::string::npos);
@@ -132,7 +132,7 @@ TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSou
     const auto json = scheduler_export_protocol(
         storage->base(), layout.total_size, layout, 0, tasks, "{\"tasks\":[],\"definitions\":[]}"
     );
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\",\"version\":2"), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\",\"version\":3"), std::string::npos);
     EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }

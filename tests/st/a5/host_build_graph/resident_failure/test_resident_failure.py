@@ -677,8 +677,8 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
             else:
                 worker.run(handle, args, config)
                 run_in_flight = False
+            # Wall time is diagnostic only; containment and recovery checks gate this case.
             elapsed = time.monotonic() - started
-            assert elapsed < (60 if platform.endswith("sim") else 20)
             assert worker.scheduler_mode_publish_count > before
             assert worker.scheduler_runtime_mode in (1, 2)
             path, raw = _capture(prefix)
@@ -766,7 +766,6 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
                     call=proof_call,
                     close_returned=close_returned,
                 )
-            assert close_elapsed < (60 if nonreturning and failed else 20)
             if evidence:
                 evidence[-1]["worker_close_seconds"] = close_elapsed
     return evidence

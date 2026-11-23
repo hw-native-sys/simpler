@@ -102,9 +102,9 @@ describes the rendezvous itself and what the cohort is scoped to.
 
 ## Dispatch and Completion
 
-Resident workers prepare their own two slots and participate in cooperative
-admission when the task shape requires it. Pure AIC and MIX tasks share the
-immutable AIC catalog; pure AIV tasks use the AIV catalog. These catalogs have no
+Resident workers use one ordinary slot and one MIX member slot each. They
+participate in cooperative admission when the task shape requires it. Pure AIC tasks use the
+immutable AIC catalog. MIX and pure AIV tasks use the AIV catalog. These catalogs have no
 enqueue operation or shared queue head. Ready execution tokens transfer into a
 worker's private slots; its local ready mask/head orders those slots. The
 [resident walkthrough](../../../../../docs/zh-cn/a5-hbg-aicore-walkthrough/README.md)

@@ -656,11 +656,14 @@ TEST(HbgNativeGraphPlan, ReadersRejectForgedHeaderRegionsAndInstanceBindings) {
     EXPECT_FALSE(scheduler_graph_view_valid(view.graph));
     header.bindings_offset = bindings_offset;
     auto &definition = view.definition();
-    const auto rows_offset = definition.fanin_offsets_offset;
-    definition.fanin_offsets_offset = header.readonly_end_offset;
+    auto *children = reinterpret_cast<SchedulerGraphChildPlan *>(
+        static_cast<std::byte *>(view.native_backing.get()) + definition.child_plans_offset
+    );
+    const auto initial_count = children[0].fanin_count;
+    children[0].fanin_count = UINT32_MAX;
     SchedulerFaninView fanin{};
     EXPECT_NE(scheduler_node_fanin_view(view.graph, 1, &fanin), SchedulerGraphResult::OK);
-    definition.fanin_offsets_offset = rows_offset;
+    children[0].fanin_count = initial_count;
     auto *bindings = reinterpret_cast<SchedulerNodeBinding *>(
         static_cast<std::byte *>(view.native_backing.get()) + header.bindings_offset
     );
@@ -694,6 +697,7 @@ SchedulerLocalState ready_worker(NativeViewFixture &view, uint32_t type, uint64_
     config.task_catalog_offset = view.catalog_plan.header_offset;
     config.prepared =
         scheduler_state_at<SchedulerPreparedLayout>(view.backing.get(), view.layout.prepared_layout_offset);
+    if (config.prepared != nullptr) local.run_epoch = config.prepared->run_epoch;
     config.runtime_worker_count = 30;
     config.cluster_count = 10;
     config.self_lane = type == 0 ? 0 : 1 + rank % 2;
@@ -753,20 +757,16 @@ TEST(HbgNativeGraphPlan, ZeroFlagLiveControlRemainsACanonicalDependency) {
     SchedulerFaninView fanin{};
     ASSERT_EQ(scheduler_node_fanin_view(view.graph, 2, &fanin), SchedulerGraphResult::OK);
     uint32_t next = 0;
-    bool ready = false;
-    ASSERT_TRUE(scheduler_observe_fanin_prefix(view.graph, view.backing.get(), &local, run, 2, fanin, next, &ready));
-    EXPECT_FALSE(ready);
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(view.graph, view.backing.get(), &local, run, 2, fanin, next));
     EXPECT_EQ(next, 0u);
     EXPECT_FALSE(scheduler_completion_done(control->completion_state));
     // Zero-shape metadata does not make a native live CONTROL_DUMMY Host-done.
     metadata[1].logical_block_num = 0;
-    ASSERT_TRUE(scheduler_observe_fanin_prefix(view.graph, view.backing.get(), &local, run, 2, fanin, next, &ready));
-    EXPECT_FALSE(ready);
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(view.graph, view.backing.get(), &local, run, 2, fanin, next));
     EXPECT_EQ(next, 0u);
     metadata[1].logical_block_num = 1;
     scheduler_gm_store(control->completion_state, scheduler_completion_completed_state(1));
-    ASSERT_TRUE(scheduler_observe_fanin_prefix(view.graph, view.backing.get(), &local, run, 2, fanin, next, &ready));
-    EXPECT_TRUE(ready);
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(view.graph, view.backing.get(), &local, run, 2, fanin, next));
     EXPECT_EQ(next, fanin.count);
     EXPECT_EQ(scheduler_read_error(run), 0u);
 }
@@ -1326,6 +1326,7 @@ struct NativeMixFixture : NativeViewFixture {
             auto &config = locals[worker].config;
             config.graph = &graph;
             config.prepared = scheduler_state_at<SchedulerPreparedLayout>(backing.get(), layout.prepared_layout_offset);
+            if (config.prepared != nullptr) locals[worker].run_epoch = config.prepared->run_epoch;
             config.shared_context = contexts + worker;
             config.graph_summary_offset = layout.graph_summary_offset;
             config.worker_contexts_offset = layout.worker_contexts_offset;
@@ -1415,12 +1416,10 @@ TEST(HbgNativeGraphPlan, NativeMixDistributesOnlyTheActualChildLanes) {
             const auto &owned = view.locals[lane].execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION);
             const bool participates = mask.has(static_cast<SubtaskSlot>(lane));
             EXPECT_EQ(owned.state, participates ? SchedulerDispatchSlotState::READY : SchedulerDispatchSlotState::FREE);
+            EXPECT_EQ(view.signals[0].groups[0].arrived[lane], 0u);
             if (participates) {
                 EXPECT_EQ(owned.task_ref, view.child());
                 EXPECT_EQ(owned.subtask_slot, lane);
-                EXPECT_EQ(view.signals[0].groups[0].arrived[lane], view.signals[0].groups[0].armed_generation);
-            } else {
-                EXPECT_EQ(view.signals[0].groups[0].arrived[lane], 0u);
             }
         }
         EXPECT_EQ(view.run->scheduler_error, 0u);

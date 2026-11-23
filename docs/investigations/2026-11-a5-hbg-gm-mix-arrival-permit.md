@@ -6,15 +6,15 @@ AIV0 takes its assigned cluster block for a fixed-owner wave or claims a
 dynamic ticket, then publishes the block identity and active lane mask in a
 cluster SSBUF bank. Each active member accepts the same odd generation,
 observes the task's fan-in with its own prefix cursor, satisfies its local
-ordering obligations and publishes its own ARRIVED. A descriptor or an
+ordering obligations and records its local arrival. A descriptor or an
 arrival on one lane does not certify another lane's fan-in. The additional
 fan-in observations can increase GM reads relative to the coordinator trial.
 
 When any active lane has a nonzero Host-planned order floor from an earlier
 pure sync-start cohort, the members exchange ORDER_READY before publishing
-ARRIVED. In that case, or when the run has an async layout, each member must
+ARRIVED. In that case each member must
 observe the complete active ARRIVED set for its generation before entry.
-Otherwise a member may publish its payload after its own ARRIVED. Its peer
+Otherwise a member may publish its payload after its local arrival. Its peer
 may still be executing unrelated ordinary work. A kernel that waits for that
 peer on an in-kernel event occupies its core until the peer reaches the event.
 The order floor constrains earlier conflicting duties; it neither bounds this
