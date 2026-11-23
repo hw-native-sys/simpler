@@ -114,42 +114,89 @@ TEST(HbgEarlyDispatchGate, WideFanoutBoundedOccupancyProducerProgressAndExactDra
     EXPECT_EQ(scheduler_gm_query(fixture.run()->scheduler_error), 0u);
 }
 
-// Independent ready work is never starved by a full window of waiting
-// consumers: roots and producers drain first, consumers follow their
-// producers, and every block still executes exactly once.
-TEST(HbgEarlyDispatchGate, ReadyWorkProgressesWhileConsumersHoldFullWaitingWindows) {
-    constexpr uint64_t kGates = 8;
-    std::vector<Shape> shapes;
-    for (uint64_t i = 0; i < kGates; ++i)
-        shapes.push_back({1, LaneMask::aic()});
-    for (uint64_t i = 0; i < kGates; ++i)
-        shapes.push_back({1, LaneMask::aiv0()});
-    for (uint64_t i = 0; i < 2; ++i)
-        shapes.push_back({1, LaneMask::aiv0()});
-    Fixture fixture(shapes);
-    for (uint64_t gate = 0; gate < kGates; ++gate)
-        fixture.dependency(kGates + gate, {static_cast<int32_t>(gate)});
-    ASSERT_TRUE(fixture.prepare());
-    std::set<uint64_t> completed;
-    const uint64_t total = fixture.expected_entries();
-    ASSERT_EQ(total, 2 * kGates + 2);
-    uint64_t drained = 0;
-    for (uint64_t turn = 0; turn < total * 8 && drained < total; ++turn) {
-        for (uint32_t worker = 0; worker < 6 && drained < total; ++worker) {
-            ASSERT_TRUE(fixture.fill(worker));
-            Execution execution{};
-            if (!fixture.begin(worker, &execution)) continue;
-            const auto task = static_cast<uint64_t>(execution.task);
-            if (task >= kGates && task < 2 * kGates) EXPECT_TRUE(completed.count(task - kGates) != 0);
-            ASSERT_TRUE(fixture.complete(execution));
-            EXPECT_TRUE(completed.insert(task).second);
-            ++drained;
-        }
-        EXPECT_EQ(scheduler_gm_query(fixture.run()->scheduler_error), 0u);
+// Independent ready work enters its kernel while a peer worker's execution
+// window is completely full of consumers waiting on an unfinished producer.
+// Worker 1 is the target window: both of its execution tokens are WAIT_FANIN
+// claims on B behind A. Worker 2 holds the independent ready task C and still
+// has a free execution token. Advancing the normal scheduling path enters C's
+// kernel while A is still incomplete and worker 1's window stays entirely held
+// by the waiting consumers; the graph then drains exactly once.
+TEST(HbgEarlyDispatchGate, ReadyWorkEntersKernelWhilePeerWindowIsFullOfWaitingConsumers) {
+    Fixture fixture({
+        {1, LaneMask::aic()},   // 0: producer A
+        {1, LaneMask::aiv0()},  // 1: consumer B, waits on A
+        {1, LaneMask::aiv0()},  // 2: consumer B, waits on A
+        {1, LaneMask::aiv0()},  // 3: independent ready task C
+    });
+    fixture.dependency(1, {0});
+    fixture.dependency(2, {0});
+    ASSERT_TRUE(fixture.prefetch(0, 0));
+    ASSERT_TRUE(fixture.prefetch(1, 1));
+    ASSERT_TRUE(fixture.prefetch(2, 1));
+    // The target window is exactly full, and every token in it is a WAIT_FANIN
+    // consumer behind the unfinished producer.
+    ASSERT_EQ(fixture.held_tokens(1), SCHEDULER_EXECUTION_TOKEN_COUNT);
+    ASSERT_EQ(fixture.waiting_tokens(1), SCHEDULER_EXECUTION_TOKEN_COUNT);
+    for (const auto &token : fixture.locals[1]->execution_tokens) {
+        EXPECT_GE(token.task_ref, 1);
+        EXPECT_LE(token.task_ref, 2);
+        EXPECT_EQ(token.phase, SchedulerExecutionTokenPhase::WAIT_FANIN);
     }
-    ASSERT_EQ(drained, total);
-    for (uint64_t task = 0; task < shapes.size(); ++task)
+
+    // C claims on worker 2, which still has a free execution token, and the
+    // normal path enters C's kernel within a bounded number of passes.
+    ASSERT_TRUE(fixture.prefetch(3, 2));
+    uint32_t selected = UINT32_MAX;
+    bool entered = false;
+    Execution independent{};
+    for (uint32_t pass = 0; pass < 4 && !entered; ++pass) {
+        ASSERT_TRUE(fixture.progress_tokens(2, &selected));
+        if (selected == UINT32_MAX) continue;
+        const uint64_t runs_before = scheduler_test::early_dispatch::kernel_run_count();
+        ASSERT_TRUE(fixture.begin(2, &independent));
+        ASSERT_EQ(independent.task, 3);
+        EXPECT_NE(independent.function, 0u);
+        EXPECT_EQ(scheduler_test::early_dispatch::kernel_run_count(), runs_before + 1);
+        entered = true;
+    }
+    ASSERT_TRUE(entered) << "independent ready task never entered its kernel";
+    // At the moment C entered: A has not completed and worker 1's window is
+    // still entirely WAIT_FANIN consumers.
+    EXPECT_FALSE(fixture.done(0));
+    EXPECT_EQ(fixture.waiting_tokens(1), SCHEDULER_EXECUTION_TOKEN_COUNT);
+    EXPECT_EQ(fixture.held_tokens(1), SCHEDULER_EXECUTION_TOKEN_COUNT);
+    ASSERT_TRUE(fixture.complete(independent));
+    EXPECT_TRUE(fixture.done(3));
+
+    // The waiting consumers stay gated until the producer completes, then each
+    // enters exactly once.
+    selected = UINT32_MAX;
+    ASSERT_TRUE(fixture.progress_tokens(1, &selected));
+    EXPECT_EQ(selected, UINT32_MAX);
+    ASSERT_TRUE(fixture.progress_tokens(0, &selected));
+    ASSERT_NE(selected, UINT32_MAX);
+    Execution producer{};
+    ASSERT_TRUE(fixture.begin(0, &producer));
+    ASSERT_EQ(producer.task, 0);
+    ASSERT_TRUE(fixture.complete(producer));
+
+    std::set<uint64_t> consumer_entries;
+    for (uint32_t count = 0; count < 2; ++count) {
+        selected = UINT32_MAX;
+        ASSERT_TRUE(fixture.progress_tokens(1, &selected));
+        ASSERT_NE(selected, UINT32_MAX);
+        Execution consumer{};
+        ASSERT_TRUE(fixture.begin(1, &consumer));
+        ASSERT_GE(consumer.task, 1);
+        ASSERT_LE(consumer.task, 2);
+        EXPECT_TRUE(consumer_entries.insert(static_cast<uint64_t>(consumer.task)).second);
+        ASSERT_TRUE(fixture.complete(consumer));
+    }
+    for (uint64_t task = 0; task < 4; ++task) {
         EXPECT_TRUE(fixture.done(task));
+        EXPECT_EQ(fixture.completions(task), 1u);
+    }
+    EXPECT_EQ(scheduler_gm_query(fixture.run()->scheduler_error), 0u);
 }
 
 // Over-claims, forged supply seals, foreign-owner cancellation and double

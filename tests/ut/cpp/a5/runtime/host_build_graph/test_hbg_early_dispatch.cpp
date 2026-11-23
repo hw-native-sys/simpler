@@ -247,10 +247,13 @@ TEST(HbgEarlyDispatch, PredicateIsEvaluatedOnlyAfterDependenciesComplete) {
     }
 }
 
-// A drained run's handles and completions cannot release work in the next run
-// on the same allocation: reinitialization resets claims, and the new epoch
-// reissues and drains the graph cleanly.
-TEST(HbgEarlyDispatch, ReinitializedRunRejectsStaleHandlesAndSignals) {
+// Cross-run safety relies on the previous run's workers having fully exited
+// before the same allocation is re-initialized (the retirement fence in
+// RUNTIME_LOGIC.md). Once the drained run is fully retired, its handles and
+// completions cannot release work in the next run: reinitialization resets
+// claims, the new epoch re-declares the same A -> B edge from the launch
+// description, and the graph repeats the full pre-dispatch lifecycle.
+TEST(HbgEarlyDispatch, ReinitializedRunRejectsStaleHandlesAfterFullRetirement) {
     Fixture fixture({{1, LaneMask::aic()}, {1, LaneMask::aiv0()}});
     fixture.dependency(1, {0});
     ASSERT_TRUE(fixture.prefetch(0, 0));
@@ -281,17 +284,52 @@ TEST(HbgEarlyDispatch, ReinitializedRunRejectsStaleHandlesAndSignals) {
         fixture.storage.layout.task_count, old_epoch + 1
     ));
     // The stale handle from the previous epoch cannot cancel or fail the fresh
-    // BUILT record: the transition requires the exact live state.
+    // BUILT record: the transition requires the exact live state. This check
+    // covers the moment before the new run re-claims the record.
     EXPECT_FALSE(scheduler_cancel_unstarted_handle(fixture.base(), fixture.locals[1], &stale));
-    ASSERT_TRUE(fixture.drain(64));
+
+    // The new run re-declares the same A -> B edge (configure() rebuilds the
+    // graph from the launch description, which drops the dependency list, so
+    // the launch restates it) and repeats the pre-dispatch lifecycle: B is
+    // claimed while A is incomplete, cannot enter its kernel, and enters
+    // exactly once after A completes.
+    fixture.dependency(1, {0});
+    ASSERT_TRUE(fixture.prefetch(0, 0));
+    ASSERT_TRUE(fixture.prefetch(1, 1));
+    ASSERT_TRUE(scheduler_execution_token_has_task(fixture.locals[1], 1));
+    uint32_t selected = UINT32_MAX;
+    ASSERT_TRUE(fixture.progress_tokens(1, &selected));
+    EXPECT_EQ(selected, UINT32_MAX);
+    EXPECT_EQ(hbg_test_eligible_mask(fixture.locals[1]), 0u);
+    Execution premature{};
+    EXPECT_FALSE(fixture.begin(1, &premature));
+    ASSERT_TRUE(fixture.progress_tokens(0, &selected));
+    ASSERT_NE(selected, UINT32_MAX);
+    Execution producer{};
+    ASSERT_TRUE(fixture.begin(0, &producer));
+    ASSERT_EQ(producer.task, 0);
+    ASSERT_TRUE(fixture.complete(producer));
+    ASSERT_TRUE(fixture.done(0));
+
+    ASSERT_TRUE(fixture.progress_tokens(1, &selected));
+    ASSERT_NE(selected, UINT32_MAX);
+    const uint64_t runs_before = scheduler_test::early_dispatch::kernel_run_count();
+    Execution consumer_execution{};
+    ASSERT_TRUE(fixture.begin(1, &consumer_execution));
+    ASSERT_EQ(consumer_execution.task, 1);
+    EXPECT_NE(consumer_execution.function, 0u);
+    EXPECT_EQ(scheduler_test::early_dispatch::kernel_run_count(), runs_before + 1);
+    ASSERT_TRUE(fixture.complete(consumer_execution));
+    EXPECT_EQ(fixture.completions(1), 1u);
     EXPECT_TRUE(fixture.done(0));
     EXPECT_TRUE(fixture.done(1));
     EXPECT_EQ(scheduler_gm_query(fixture.run()->scheduler_error), 0u);
 }
 
 // A failed run cancels its owned unstarted pre-dispatch to FAILED without
-// manufacturing a return, a completion contribution or a publication, and the
-// next epoch reuses the allocation.
+// manufacturing a return, a completion contribution or a publication. The next
+// epoch reuses the allocation, keeps the declared A -> B edge, and B still
+// gates on A in the repeated pre-dispatch lifecycle.
 TEST(HbgEarlyDispatch, FailedRunReclaimsUnstartedWorkWithoutManufacturingAReturn) {
     Fixture fixture({{1, LaneMask::aic()}, {1, LaneMask::aiv0()}});
     fixture.dependency(1, {0});
@@ -322,7 +360,37 @@ TEST(HbgEarlyDispatch, FailedRunReclaimsUnstartedWorkWithoutManufacturingAReturn
 
     fixture.configure(fixture.run_epoch + 1);
     EXPECT_EQ(scheduler_gm_query(fixture.run()->scheduler_error), 0u);
-    ASSERT_TRUE(fixture.drain(64));
+    // The reused allocation keeps the declared A -> B edge: B pre-dispatches
+    // behind A, cannot enter while A is incomplete, and enters exactly once
+    // after A completes.
+    fixture.dependency(1, {0});
+    ASSERT_TRUE(fixture.prefetch(0, 0));
+    ASSERT_TRUE(fixture.prefetch(1, 1));
+    ASSERT_TRUE(scheduler_execution_token_has_task(fixture.locals[1], 1));
+    uint32_t selected = UINT32_MAX;
+    ASSERT_TRUE(fixture.progress_tokens(1, &selected));
+    EXPECT_EQ(selected, UINT32_MAX);
+    Execution premature{};
+    EXPECT_FALSE(fixture.begin(1, &premature));
+
+    ASSERT_TRUE(fixture.progress_tokens(0, &selected));
+    ASSERT_NE(selected, UINT32_MAX);
+    Execution producer{};
+    ASSERT_TRUE(fixture.begin(0, &producer));
+    ASSERT_EQ(producer.task, 0);
+    ASSERT_TRUE(fixture.complete(producer));
+    ASSERT_TRUE(fixture.done(0));
+
+    ASSERT_TRUE(fixture.progress_tokens(1, &selected));
+    ASSERT_NE(selected, UINT32_MAX);
+    const uint64_t runs_before = scheduler_test::early_dispatch::kernel_run_count();
+    Execution consumer_execution{};
+    ASSERT_TRUE(fixture.begin(1, &consumer_execution));
+    ASSERT_EQ(consumer_execution.task, 1);
+    EXPECT_NE(consumer_execution.function, 0u);
+    EXPECT_EQ(scheduler_test::early_dispatch::kernel_run_count(), runs_before + 1);
+    ASSERT_TRUE(fixture.complete(consumer_execution));
+    EXPECT_EQ(fixture.completions(1), 1u);
     EXPECT_TRUE(fixture.done(0));
     EXPECT_TRUE(fixture.done(1));
 }
