@@ -585,7 +585,7 @@ void fake_set_retained(void *, uint32_t, void *addr, size_t size) {
     g_fake->retained_addr = addr;
     g_fake->retained_size = size;
 }
-int fake_setup_static_arena(void *, uint32_t, size_t heap, size_t, size_t arena) {
+int fake_setup_static_arena(void *, uint32_t /*pipeline_slot*/, RegionBanks, size_t heap, size_t, size_t arena) {
     if (g_fake->arena_status != 0) return g_fake->arena_status;
     g_fake->requested_arena_bytes = arena;
     g_fake->requested_heap_bytes = heap;
@@ -597,7 +597,7 @@ void *aligned_in(std::vector<uint8_t> &v) {
     auto raw = reinterpret_cast<uintptr_t>(v.data());
     return reinterpret_cast<void *>((raw + kAlign - 1) & ~static_cast<uintptr_t>(kAlign - 1));
 }
-void *fake_acquire_gm_heap(void *, uint32_t) { return aligned_in(g_fake->gm_heap); }
+void *fake_acquire_gm_heap(void *, uint32_t /*pipeline_slot*/, uint32_t) { return aligned_in(g_fake->gm_heap); }
 void *fake_acquire_runtime_arena(void *, uint32_t) { return aligned_in(g_fake->runtime_arena); }
 int fake_acquire_sm_mirror(void *, uint32_t, size_t bytes, size_t alignment, void **out) {
     g_fake->sm_mirror.assign(bytes + alignment, 0);
@@ -817,8 +817,8 @@ protected:
     static void init_runtime(Runtime &rt, int clusters = 1) {
         rt.dev.worker_count = clusters * PLATFORM_CORES_PER_BLOCKDIM;
         for (int i = 0; i < rt.dev.worker_count; ++i) {
-            rt.dev.workers[i].core_type = CoreType::AIV;
-            rt.dev.workers[i].physical_core_id = static_cast<uint32_t>(i);
+            rt.get_workers()[i].core_type = CoreType::AIV;
+            rt.get_workers()[i].physical_core_id = static_cast<uint32_t>(i);
         }
     }
 
@@ -1156,12 +1156,12 @@ TEST_F(HbgBindLedgerTest, TaskImagePublicationMatchesTheDeviceArenaContract) {
         const auto *sm = static_cast<const char *>(runtime.get_gm_sm_ptr());
         ASSERT_NE(publication.source, nullptr);
         ASSERT_NE(sm, nullptr);
+        const auto published_bytes = publication.bytes;
         const bool resident = std::strcmp(get_platform(), "a5sim") == 0;
         if (resident) {
             EXPECT_EQ(sm, arena);
             EXPECT_EQ(publication.device_target, arena);
-            EXPECT_EQ(publication.bytes, runtime.dev.sm_image_bytes);
-            EXPECT_EQ(fake_.requested_arena_bytes, runtime.dev.sm_image_bytes);
+            EXPECT_EQ(fake_.requested_arena_bytes, published_bytes);
             EXPECT_EQ(runtime.get_prebuilt_arena_base(), nullptr);
             EXPECT_EQ(runtime.get_prebuilt_runtime_offset(), 0u);
         } else {
@@ -1181,6 +1181,34 @@ TEST_F(HbgBindLedgerTest, TaskImagePublicationMatchesTheDeviceArenaContract) {
             const auto *header = static_cast<const SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
             EXPECT_EQ(header->tasks.total_tasks, runtime.dev.host_total_tasks);
         }
+#if __has_include("scheduler/scheduler_args_dump.h")
+        else {
+            const auto *context =
+                reinterpret_cast<const SchedulerWorkerContext *>(runtime.dev.scheduler_bootstrap.worker_context_base);
+            ASSERT_NE(context, nullptr);
+            if (entry != recording_orch_entry) {
+                EXPECT_EQ(published_bytes, runtime.dev.sm_image_bytes);
+                EXPECT_EQ(context->native_graph_address, 0u);
+                EXPECT_EQ(context->native_graph_bytes, 0u);
+                continue;
+            }
+            const uint64_t image_base = reinterpret_cast<uint64_t>(sm);
+            EXPECT_GE(context->native_graph_address, image_base + runtime.dev.sm_image_bytes);
+            EXPECT_EQ(context->native_graph_address + context->native_graph_bytes, image_base + published_bytes);
+            const uint64_t state_base = context->scheduler_state_base_address;
+            EXPECT_TRUE(
+                state_base + context->scheduler_state_bytes <= image_base || image_base + published_bytes <= state_base
+            );
+            const SchedulerNativeGraphHeader *header = scheduler_native_header_checked(
+                context->native_graph_address, context->native_graph_bytes, context->native_header_offset,
+                context->graph_task_count, context->original_task_count
+            );
+            ASSERT_NE(header, nullptr);
+            const auto *summary =
+                reinterpret_cast<const SchedulerGraphSummary *>(state_base + context->graph_summary_offset);
+            EXPECT_EQ(header->run_epoch, summary->run_epoch);
+        }
+#endif
     }
 }
 
@@ -1216,12 +1244,10 @@ TEST_F(HbgBindLedgerTest, TheDeviceImageCarriesNoHostOnlyBytes) {
     const size_t image_bytes = runtime_device_initialized_prefix_size(runtime);
     const size_t extent_bytes = runtime_device_extent_size(runtime);
     ASSERT_EQ(extent_bytes, sizeof(DeviceRuntimeLaunchDesc));
-    ASSERT_EQ(steady_bytes, offsetof(DeviceRuntimeLaunchDesc, workers))
-        << "a steady-state run must stop before the handshake region";
-    ASSERT_EQ(image_bytes, offsetof(DeviceRuntimeLaunchDesc, teardown_gates))
-        << "no publication may reach the device-initialized gate tail";
-    ASSERT_LT(steady_bytes, image_bytes) << "the handshake region is still in the steady upload";
-    ASSERT_LT(image_bytes, extent_bytes) << "the gate tail is still crossing to the device";
+    ASSERT_EQ(steady_bytes, sizeof(DeviceRuntimeLaunchDesc));
+    ASSERT_EQ(image_bytes, sizeof(DeviceRuntimeLaunchDesc));
+    ASSERT_EQ(steady_bytes, image_bytes);
+    ASSERT_EQ(image_bytes, extent_bytes);
     ASSERT_LT(image_bytes, sizeof(Runtime)) << "the whole object is still crossing to the device";
 
     // Search the longest thing the host ever publishes — the initializing
@@ -1495,8 +1521,8 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
             EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
             EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
             for (int i = 0; i < runtime.get_worker_count(); ++i) {
-                EXPECT_EQ(runtime.dev.workers[i].task, 0u) << "handshake state is the AICPU's to write";
-                EXPECT_EQ(runtime.dev.workers[i].aicpu_ready, 0u);
+                EXPECT_EQ(runtime.get_workers()[i].task, 0u) << "handshake state is the AICPU's to write";
+                EXPECT_EQ(runtime.get_workers()[i].aicpu_ready, 0u);
             }
         }
         destinations.push_back(pending.device_target);
@@ -2915,6 +2941,8 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
     struct Captured {
         void *target;
         std::vector<uint8_t> bytes;
+        bool execution_image;
+        size_t target_bytes;
     };
     struct Staging {
         std::vector<Captured> captured;
@@ -2922,6 +2950,8 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         int rc{0};
     } staging;
     HostApiOps ops = fake_ops();
+    const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
+    ops.launch_owns_execution_image = a5;
     ops.stage_launch_metadata = [](void *ctx, uint32_t slot, const HostMetadataRegion *regions, size_t count) {
         EXPECT_EQ(slot, 0u);
         auto &state = *static_cast<Staging *>(ctx);
@@ -2930,14 +2960,17 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         state.captured.clear();
         for (size_t i = 0; i < count; ++i) {
             const auto *source = static_cast<const uint8_t *>(regions[i].host_source);
-            state.captured.push_back({regions[i].device_target, {source, source + regions[i].bytes}});
+            const auto &region = regions[i];
+            const size_t target_bytes = std::min<uint64_t>(region.bytes, region.mutable_prefix_bytes);
+            state.captured.push_back(
+                {region.device_target, {source, source + region.bytes}, region.execution_image, target_bytes}
+            );
         }
         return 0;
     };
     api_ = HostApi(&staging, 0, 0, 1, &ops);
-    const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
-    for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, ordinary_orch_entry}) {
-        SCOPED_TRACE(entry == ordinary_orch_entry ? "resident" : "graph");
+    for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, empty_orch_entry, ordinary_orch_entry}) {
+        SCOPED_TRACE(entry == empty_orch_entry ? "empty" : entry == ordinary_orch_entry ? "resident" : "graph");
         eps_ = {entry, capture_orch_bind};
         ChipStorageTaskArgs args;
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
@@ -2947,14 +2980,18 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         std::vector<Captured> expected;
         for (const auto &region : pending.prerequisites) {
             const auto *source = static_cast<const uint8_t *>(region.source);
-            expected.push_back({region.device_target, {source, source + region.bytes}});
+            expected.push_back({region.device_target, {source, source + region.bytes}, false, region.bytes});
             std::memset(region.device_target, 0xa5, region.bytes);
         }
         void *image_target = pending.device_target;
         const auto *image_source = static_cast<const uint8_t *>(pending.source);
         const std::vector<uint8_t> image(image_source, image_source + pending.bytes);
-        expected.push_back({image_target, image});
-        std::memset(image_target, 0xa5, pending.bytes);
+        const size_t target_bytes = std::min(pending.bytes, pending.mutable_prefix_bytes);
+        ASSERT_EQ(target_bytes, pending.bytes);
+        EXPECT_TRUE(pending.image_references.empty());
+        if (a5) EXPECT_EQ(fake_.requested_arena_bytes, target_bytes);
+        expected.push_back({image_target, image, true, target_bytes});
+        std::memset(image_target, 0xa5, target_bytes);
         const int copies = fake_.copy_count;
         const int calls = staging.calls;
         ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
@@ -2964,8 +3001,10 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         for (size_t i = 0; i < expected.size(); ++i) {
             EXPECT_EQ(staging.captured[i].target, expected[i].target);
             EXPECT_EQ(staging.captured[i].bytes, expected[i].bytes);
+            EXPECT_EQ(staging.captured[i].target_bytes, expected[i].target_bytes);
+            EXPECT_EQ(staging.captured[i].execution_image, expected[i].execution_image);
             const auto *target = static_cast<const uint8_t *>(expected[i].target);
-            EXPECT_TRUE(std::all_of(target, target + expected[i].bytes.size(), [](uint8_t b) {
+            EXPECT_TRUE(std::all_of(target, target + expected[i].target_bytes, [](uint8_t b) {
                 return b == 0xa5;
             }));
         }
@@ -3137,7 +3176,9 @@ TEST_F(HbgResidentSchedulerStorageTest, GraphHeapReservationContainsArgumentsWit
         capture_orch_bind
     };
     ChipStorageTaskArgs args;
-    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    const uint64_t window[4] = {8, 0, 0, 0};
+    const uint64_t heap[4] = {CHIP_ALIGN_UP(2 * 16 * 64, DeviceArena::kDefaultBaseAlign), 0, 0, 0};
+    ASSERT_EQ(bind_callable_to_runtime_impl(&runtime, &api_, &args, &eps_, nullptr, 0, window, heap, nullptr), 0);
     EXPECT_EQ(fake_.requested_heap_bytes, CHIP_ALIGN_UP(2 * 16 * 64, DeviceArena::kDefaultBaseAlign));
     EXPECT_LT(fake_.requested_heap_bytes, 2 * 16 * sizeof(ChipTaskStorage));
     ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
@@ -3220,9 +3261,9 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
             device_context->graph_storage_address,
             device_context->graph_task_count,
             device_context->task_window_last_index,
-            device_context->scheduler_state_base_address,
+            device_context->native_graph_address,
             device_context->native_header_offset,
-            device_context->scheduler_state_bytes,
+            device_context->native_graph_bytes,
             static_cast<uint32_t>(device_context->original_task_count),
         };
         SchedulerGraphAccess graph(view);

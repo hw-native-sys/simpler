@@ -329,7 +329,8 @@ bool native_graph_plan_readonly_image(
     header.original_task_count = plan.completion_refs.size();
     header.definition_count = plan.definitions.size();
     header.instance_count = plan.instances.size();
-    uint64_t cursor = sizeof(SchedulerRunControl);
+    // Keep zero available as the graph view's absent-header sentinel.
+    uint64_t cursor = SCHEDULER_STATE_ALIGNMENT;
     auto reserve = [&](uint64_t count, uint64_t stride, uint64_t alignment, uint64_t *offset) {
         uint64_t bytes = 0;
         return scheduler_layout_checked_mul(count, stride, &bytes) &&
@@ -378,7 +379,8 @@ bool native_graph_plan_readonly_image(
     if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &header.readonly_end_offset) ||
         header.readonly_end_offset > std::numeric_limits<size_t>::max())
         return fail(error, "native readonly alignment overflow");
-    next.bytes.resize(static_cast<size_t>(header.readonly_end_offset));
+    header.image_bytes = header.readonly_end_offset;
+    next.bytes.resize(static_cast<size_t>(header.image_bytes));
     const auto copy = [&](uint64_t offset, const auto &values) {
         if (!values.empty()) std::memcpy(next.bytes.data() + offset, values.data(), values.size() * sizeof(values[0]));
     };

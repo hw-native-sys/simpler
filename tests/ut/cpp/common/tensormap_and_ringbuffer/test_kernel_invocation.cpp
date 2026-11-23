@@ -44,7 +44,7 @@ protected:
     EntryArgsStorage args{};
     EntryArgsStorage output{};
     KernelCallableIdentity identity{3, 7, 1, 1};
-    EagerKernelBinding binding{0x20000, 19};
+    EagerKernelBinding binding{512, 192, 19};
     std::vector<unsigned char> packet;
 };
 
@@ -66,10 +66,17 @@ TEST_F(KernelInvocation, ReusedCallableIdRejectsOldOccupancy) {
     EXPECT_TRUE(consume(identity, binding));
 }
 
-TEST_F(KernelInvocation, RuntimeAddressAndEpochBothBelongToThisRun) {
-    EXPECT_FALSE(consume(identity, {binding.runtime_address + 64, binding.run_epoch}));
-    EXPECT_FALSE(consume(identity, {binding.runtime_address, binding.run_epoch + 1}));
-    EXPECT_FALSE(consume(identity, {binding.runtime_address, 0}));
+TEST_F(KernelInvocation, DescriptorRangeAndEpochBelongToThisInvocation) {
+    EXPECT_FALSE(
+        consume(identity, {binding.runtime_descriptor_offset + 64, binding.runtime_descriptor_bytes, binding.run_epoch})
+    );
+    EXPECT_FALSE(
+        consume(identity, {binding.runtime_descriptor_offset, binding.runtime_descriptor_bytes, binding.run_epoch + 1})
+    );
+    EXPECT_FALSE(
+        consume(identity, {binding.runtime_descriptor_offset, binding.runtime_descriptor_bytes - 1, binding.run_epoch})
+    );
+    EXPECT_FALSE(consume(identity, {binding.runtime_descriptor_offset, binding.runtime_descriptor_bytes, 0}));
 }
 
 TEST_F(KernelInvocation, InvalidFramingDoesNotChangePreviouslyAdmittedStorage) {

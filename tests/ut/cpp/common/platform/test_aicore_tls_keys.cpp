@@ -26,7 +26,11 @@
 extern "C" int initialize_aicore_sim_tls();
 // The production wrapper is linked against a stub executor.
 // Only the wrapper and its inline worker-count accessor run in this fixture.
-Runtime::Runtime() {}
+Runtime::Runtime() :
+    dev{},
+    host_shared_state_{} {
+    dev.shared_state_addr = reinterpret_cast<uint64_t>(&host_shared_state_);
+}
 static std::atomic<int> reject_binding_after{-1};
 static std::atomic<int> executor_calls{0};
 static std::atomic<int> pthread_writes{0};

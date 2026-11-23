@@ -40,7 +40,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // The bootstrap carries the PercounterControl address every lane reads.
     __gm__ SchedulerBootstrapInputs *bootstrap = &runtime->dev.scheduler_bootstrap;
     percounter_observe_cache_line(bootstrap);
-    __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
+    __gm__ Handshake *handshake =
+        (__gm__ Handshake *)(&reinterpret_cast<__gm__ RuntimeSharedState *>(runtime->dev.shared_state_addr)
+                                  ->workers[block_idx]);
     percounter_observe_cache_line(handshake);
     if (runtime->dev.chip_swimlane_level >= 3) {
         if (core_type == CoreType::AIC) percounter_execute_profiled<CoreType::AIC>(runtime, block_idx);

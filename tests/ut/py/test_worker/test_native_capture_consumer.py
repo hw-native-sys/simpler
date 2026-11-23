@@ -136,7 +136,7 @@ def scene(prepared, consumer, monkeypatch):
             chip.state.completes = True
             return token.cancel()
 
-        token._retain_model_resources = retain_model
+        token._register_model_destroy_notice = retain_model
         token._model_destroyed = lambda: graph.notice
         token._release_model_resources = release_model
         token.capsule = export

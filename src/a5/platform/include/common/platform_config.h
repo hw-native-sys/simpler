@@ -135,6 +135,9 @@ constexpr int32_t PLATFORM_SIM_TENSOR_DATA_WAIT_TIMEOUT_MS = 30000;
  */
 constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 50000;  // 50s (> op-exec 45s)
 
+// Batch spare worker clears on the control stream to avoid synchronous H2D copies.
+constexpr bool PLATFORM_BATCH_SPARE_WORKER_CLEARS = true;
+
 // =============================================================================
 // Derived Platform Limits
 // =============================================================================

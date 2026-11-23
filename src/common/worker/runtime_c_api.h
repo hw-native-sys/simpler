@@ -164,26 +164,38 @@ enum {
 };
 
 enum {
-    PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
+    PTO_PIPELINE_CONTRACT_ABI_VERSION = 2,
     PTO_PIPELINE_MAX_RESOURCES = 8,
 };
 
 /**
- * How a resource behaves across the KernelLaunch boundary, which is what
- * decides its copy count: HOST_PER_RUN needs one instance per in-flight run
- * (`pipeline_depth`); DEVICE_SCRATCH and EXEC_HANDLE need exactly one.
+ * How a resource moves across the KernelLaunch boundary. The disposition is
+ * decided by the data flow, not by who populates the region: whether its
+ * content must arrive on every run, and whether the host must read back what
+ * the device wrote.
  */
 typedef enum PipelineResourceClass {
-    /* Carries this run's own content, so the device is still reading the
-       previous run's content while the next run is prepared. */
-    PTO_PIPELINE_HOST_PER_RUN = 0,
-    /* Not rewritten per run: whoever populates it does so once, and device ops
-       run one at a time, so a single instance is reused across runs. */
-    PTO_PIPELINE_DEVICE_SCRATCH = 1,
-    /* Execution context (stream) a run owns while its op runs and is reaped.
-       One instance serves every run: a role is declared once and the platform
-       holds that stream for the runner's lifetime. */
+    /* This run's own content must arrive, so the device may still be reading
+       the previous run's copy while the next run is prepared. One copy per
+       in-flight run, selected by the lease's slot. */
+    PTO_PIPELINE_DELIVERED = 0,
+    /* Neither delivered per run nor read back by the host: whoever populates it
+       does so once, and device ops run one at a time, so one instance is
+       reused across runs. */
+    PTO_PIPELINE_SCRATCH = 1,
+    /* Execution context (stream) a run uses while its op runs and is reaped.
+       One instance per execution role: the platform holds the stream for the
+       runner's lifetime. Not selected by a pipeline slot. */
     PTO_PIPELINE_EXEC_HANDLE = 2,
+    /* The device writes it and the host must read it back at an address it
+       knows. Keyed by run epoch rather than pipeline slot, so an unobserved
+       result is not overwritten by a successor. Declared here to reserve the
+       value; no runtime declares it yet. */
+    PTO_PIPELINE_REPORTED = 3,
+    /* Shared scratch sized by host orchestration. The platform leases the
+       GM heap from its heap pool and the writable runtime image from its
+       runtime arena. Launches sharing a backing must execute in order. */
+    PTO_PIPELINE_POOLED_SCRATCH = 4,
 } PipelineResourceClass;
 
 typedef enum PipelineResourceKind {
@@ -202,9 +214,11 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Program: must be 0. Kernel: DEVICE_SCRATCH states nonzero required
-       usable bytes per copy; HOST_PER_RUN may state 0 when host orchestration
-       determines its size at bind time. EXEC_HANDLE states 0.
+    /* Program: must be 0. Kernel: SCRATCH states nonzero required usable bytes
+       per copy; DELIVERED may state 0 when host orchestration determines its
+       size at bind time; EXEC_HANDLE states 0; REPORTED states 0 until its
+       pool decides the size at acquire time. POOLED_SCRATCH states 0 in both
+       modes; host orchestration determines its required size before acquire.
        The number is a per-copy requirement for the resource named by `kind`:
        it is neither committed HBM nor a capacity budget, and the declared
        resources are not a complete manifest of what a context commits. */
@@ -214,11 +228,11 @@ typedef struct PipelineResource {
 /**
  * Runtime-owned declaration of resources that cross KernelLaunch.
  *
- * `pipeline_depth` is the only replication count: a resource needs
- * `pipeline_depth` copies unless its class is DEVICE_SCRATCH, which needs one.
- * Per-resource copy counts stay derivable from the class, so a runtime that
- * wants a cheap resource replicated and an expensive one shared says so by
- * classifying them, not by carrying a second global count.
+ * `pipeline_depth` is the only replication count: DELIVERED needs one copy per
+ * in-flight run; SCRATCH, REPORTED and EXEC_HANDLE need one. Per-resource copy
+ * counts stay derivable from the class, so a runtime that wants a cheap
+ * resource replicated and an expensive one shared says so by classifying them,
+ * not by carrying a second global count.
  */
 typedef struct PipelineContract {
     uint32_t abi_version;
@@ -255,10 +269,11 @@ typedef struct NativeRunProvenance {
 /**
  * Ownership token for one pipeline resource slot.
  *
- * `slot_id` selects the per-run/exec-handle copies. `generation` changes every
- * time that slot is leased, so delayed completion or cleanup from an older run
- * cannot mutate resources now owned by its successor. Generation zero is
- * reserved for an invalid/uninitialised lease.
+ * `slot_id` selects the delivered copies; a scratch or reported resource is not
+ * indexed by it. `generation` changes every time that slot is leased, so
+ * delayed completion or cleanup from an older run cannot mutate resources now
+ * owned by its successor. Generation zero is reserved for an invalid or
+ * uninitialised lease.
  */
 typedef struct PipelineSlotLease {
     uint32_t slot_id;
@@ -289,8 +304,6 @@ typedef struct NativeRunArtifactIdentity {
     uint32_t group_index;
     uint32_t group_size;
 } NativeRunArtifactIdentity;
-
-typedef enum NativeRunPreparePurpose { SIMPLER_PREPARE_EAGER = 0, SIMPLER_PREPARE_CAPTURE = 1 } NativeRunPreparePurpose;
 
 /**
  * Immutable resource and trace identity copied into one prepared run.
@@ -325,10 +338,6 @@ typedef struct NativeRunDescriptor {
     uint32_t joinable_boundary;
     /** Where this dispatch came from, for diagnostic attribution only. */
     NativeRunProvenance provenance;
-    /** Host-only purpose, fixed before orchestration. Zero preserves eager.
-     * CAPTURE requires Kernel mode and rejects writable HOST/NONE arguments
-     * before user code runs. All callers must use this descriptor layout. */
-    uint32_t prepare_purpose;
     /** This execution's immutable CCU controls for AICPU READY admission. Zero without CCU. */
     uint64_t ccu_workspace_addr;
 } NativeRunDescriptor;
@@ -1099,11 +1108,9 @@ int simpler_run(
  * A successful prepare must be paired with simpler_finalize_run(), even when
  * launch is abandoned or fails. The `args` container itself is consumed during
  * prepare and need not remain alive afterward. Eager tensor backing buffers
- * must remain valid through finalize, including Program output delivery. After
- * successful capture-purpose preparation, readonly HOST/NONE control values
- * have been consumed and their source backing may be released. Borrowed device
- * tensors and the execution environment must survive all model/external uses
- * through resource-reference release, even after the Host run is finalized.
+ * must remain valid through finalize, including Program output delivery. Caller-owned
+ * preparation consumes read-only HOST/NONE controls. The caller keeps borrowed
+ * device tensors and the execution environment alive until finalizing the original run.
  * See the storage size/alignment/lifetime contract at
  * the top of this header. `descriptor` is required and copied before this
  * function returns. A non-null acceptance sink in the descriptor must remain
@@ -1132,11 +1139,16 @@ int simpler_run(
  * sequential call is permitted. This guard does not serialize different
  * threads, which remain subject to the context's native reservation rules.
  *
- * Capture callers set descriptor.prepare_purpose before preparation. HOST/NONE
- * controls must be IN: their prepare-time values determine fixed task arguments,
- * not values re-read by each replay. Eager preparation cannot later be recorded.
  */
 int simpler_prepare_run(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor
+);
+
+/** Prepare a Kernel run for caller-owned submission. Reject writable HOST controls
+ * before orchestration. The caller keeps the original handle, stream and device
+ * tensors through the final execution and retries finalization on cleanup failure. */
+int simpler_prepare_caller_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 );
@@ -1151,12 +1163,14 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
  * Launch a prepared run. Returns only after the platform has published its
  * real kernel-launch marker, or after execution terminates before that marker.
  * The acceptance sink captured by prepare is published at that marker; an
- * execution failure before the marker leaves it unchanged.
+ * execution failure before the marker leaves it unchanged. Eager Kernel runs may use a caller stream via
+ * simpler_launch_run_on_stream.
  */
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /**
- * Check the execution environment and reject capture before per-call preparation.
+ * Check the execution environment before per-call preparation. Program mode
+ * also rejects capture. Kernel mode leaves stream submission to RTS.
  * No run is admitted or published. A successful check does not reserve the stream;
  * the caller serializes capture changes and keeps it live through finalization.
  */
@@ -1171,29 +1185,23 @@ int simpler_validate_execution_context(DeviceContextHandle ctx);
 
 /**
  * Submit a prepared native run between the caller stream's preceding and
- * following work. For eager execution, the caller retains its stream and
- * external tensor storage through run finalization. For recording, the borrowed
- * execution environment, stream and device tensors remain valid through all
- * model/external uses and resource-reference release. Prepare runs outside
- * capture. An active capture requires a resource reference retained before
- * CaptureBegin and no predecessor. Supported diagnostics are ScopeStats alone
- * on A3 TMR, or one of PMU, ArgsDump and Swimlane on A3 TMR/HBG. The same task sequence is
- * recorded once; an invalidated capture is refused before publication.
- * `predecessor`, when non-null outside capture, has the joined-launch contract.
+ * following work. Kernel submission does not query RTS capture status.
+ * The caller keeps its stream, original run and external tensors alive through
+ * finalization, including all uses by a model recorded on the stream. A non-null predecessor
+ * follows the joined-launch contract.
  *
- * Both owned and borrowed contexts use the same native run. A borrowed context
- * requires this explicit stream entry. Poll/wait/finalize retain the run and
- * its event references through the caller's exit wait. A partial enqueue
- * failure in eager poisons the execution domain; it is not a rollback permission.
- * During recording, poll/wait do not report execution completion; finalize
- * ends only the Host run without synchronization or output copyback. RTS owns
- * failed/cancelled capture teardown. The external reference must survive it.
  * Host recording support does not qualify the runtime's device replay reset
  * protocol; repeated hardware replay still requires that implementation.
  */
 int simpler_launch_run_on_stream(
     DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle predecessor
 );
+
+/** Submit a run prepared by simpler_prepare_caller_run. Its caller keeps the original handle and
+ * device inputs through its last use. Success releases its submission slot.
+ * Finalize after all uses end, including work on other streams. A failed
+ * submission still requires finalization. Writable host outputs are unsupported. */
+int simpler_submit_run_on_stream(DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream);
 
 /**
  * Return nonzero when this context can order one prepared run's native
@@ -1301,51 +1309,6 @@ int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle ru
 // A prior error remains the return verdict even after all_observed becomes one.
 int simpler_transfer_completed_kernel_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 int simpler_observe_framework_submissions(DeviceContextHandle ctx, int *all_observed);
-
-/**
- * Retain preparation backing independently of the original Prepared run;
- * exactly one retention is allowed per run. Kernel capture-purpose preparations
- * allow an already ACTIVE caller stream, verified by its actual capture status.
- * Other preparations require a caller stream outside recording.
- * The output is a resource reference, not an executable RuntimeHandle. The
- * caller still finalizes the original run. Success submits no user task and
- * does not advertise capture/replay support on this backend.
- *
- * Onboard Program and Kernel retain their actual internal backing, including
- * Program input staging; Program execution remains eager-only. Kernel A3 TMR
- * additionally retains ScopeStats-only diagnostic windows; onboard A3/A5
- * retain PMU-only, ArgsDump-only or Swimlane-only windows when the runtime
- * provides the requested task-time producer. All producers sharing a
- * diagnostic pool must be caller-ordered
- * and stopped during resource-reference release. Other diagnostic combinations
- * are refused; sim returns
- * UNSUPPORTED. Borrowed context, caller stream and device tensor addresses
- * must remain valid through successful release. Internal code,
- * workspace, staging, arguments, streams and events stay protected.
- */
-int simpler_retain_run_resources(
-    DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle *out_reference
-);
-
-/**
- * The caller must first finish capture cancellation/model destruction and ALL
- * external in-flight uses, including uses on other execution streams. This
- * call cannot infer those facts from a recording stream or a reference count.
- * It additionally synchronizes the retained caller stream and respects the
- * original run's device/wait/binding completion obligations.
- *
- * On failure the reference remains valid for release retry; after close has
- * begun it must never be used for execution. After confirmed owned Program
- * reset, existing resource retirement can consume release-requested references;
- * those tokens are then invalid even if close returns an earlier device error
- * or a later cleanup error. The close return code alone proves neither reset
- * confirmation nor whether a reference remains valid. Borrowed contexts never
- * reset the caller's device. On ordinary release success the reference is consumed.
- * Backing still needed by the original run or reusable caches may remain
- * allocated. This API is not called once per replay and must not be called
- * directly from a callback that forbids synchronization/device APIs.
- */
-int simpler_release_run_resources(DeviceContextHandle ctx, RuntimeHandle reference);
 
 /**
  * Committed GM heap base of one arena bank, or 0 when that bank has never been

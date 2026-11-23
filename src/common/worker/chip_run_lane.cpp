@@ -32,9 +32,7 @@
 #include "common/strace.h"
 
 struct ChipRunState {
-    // CARRIER_RETIRED closes only the original Host carrier; external graph
-    // uses still own immutable backing and caller spans through the original resource reference.
-    enum class Phase : uint8_t { QUEUED, PREPARED, LAUNCHED, ENDED, CARRIER_RETIRED, TERMINAL };
+    enum class Phase : uint8_t { QUEUED, PREPARED, LAUNCHED, ENDED, CALLER_SUBMITTED, TERMINAL };
 
     int32_t callable_id{0};
     ChipStorageTaskArgs args{};
@@ -51,8 +49,6 @@ struct ChipRunState {
     void *caller_stream{nullptr};
     Phase phase{Phase::QUEUED};
     ChipRunPreparationDisposition disposition{ChipRunPreparationDisposition::VALIDATED_ONLY};
-    NativeRunPreparePurpose prepare_purpose{SIMPLER_PREPARE_EAGER};
-    size_t external_resource_obligations{0};
     bool pipeline_leased{true};
     bool activated{false};
     bool crossed_launch_fence{false};
@@ -103,7 +99,7 @@ struct ChipRunState {
     // destroys its carrier; physical END can precede carrier cleanup instead.
     bool caller_last_use_proven{false};
     bool native_context_destroyed{false};
-    bool framework_owned{false};
+    ChipRunOwner owner{ChipRunOwner::Lane};
     bool framework_transferred{false};
     std::exception_ptr error;
     std::exception_ptr poison_error;
@@ -117,8 +113,8 @@ struct ChipRunState {
  * to be one the *runtime* can also name. A host-side orchestrator asks whether
  * a device span it is about to read is held by a run other than its own, and
  * the slot is what its HostApi binding already carries. It identifies the live
- * Host carrier. Checked capture finalization detaches this active identity;
- * the original external references then hold their own facts in the same ledger.
+ * Host carrier. Caller-owned submission releases the slot identity;
+ * the original run holds the same spans under its own identity.
  */
 static uint64_t borrow_identity(const ChipRunState &run) { return static_cast<uint64_t>(run.lease.slot_id) + 1; }
 
@@ -217,11 +213,9 @@ struct ChipRunLaneState {
         worker->validate_execution_context();
     }
 
-    // Retired capture carriers remain in fifo for backing/span ownership;
-    // their external references no longer occupy an execution slot.
-    static bool external_only(const ChipRunState &run) {
-        return run.prepare_purpose == SIMPLER_PREPARE_CAPTURE && run.phase == ChipRunState::Phase::CARRIER_RETIRED;
-    }
+    // Caller-owned runs remain in fifo for lifetime tracking;
+    // a submitted run no longer occupies an execution slot.
+    static bool external_only(const ChipRunState &run) { return run.phase == ChipRunState::Phase::CALLER_SUBMITTED; }
 
     size_t execution_size() const {
         return static_cast<size_t>(std::count_if(fifo.begin(), fifo.end(), [](const auto &run) {
@@ -261,9 +255,9 @@ struct ChipRunLaneState {
     void require_eager_admission() const {
         bool retained = false;
         for (const auto &run : fifo) {
-            if (run->prepare_purpose != SIMPLER_PREPARE_CAPTURE) continue;
+            if (run->owner != ChipRunOwner::Caller) continue;
             if (!external_only(*run))
-                throw RunPreparationRefused("eager admission requires capture carrier retirement");
+                throw RunPreparationRefused("eager admission requires the pending caller-owned submission to finish");
             retained = true;
         }
         // Only live Host carriers occupy execution grants. Do not drain ordinary
@@ -289,26 +283,8 @@ struct ChipRunLaneState {
     void abandon_unlaunched() noexcept {
         for (auto it = fifo.begin(); it != fifo.end();) {
             const auto run = *it;
-            if (run->prepare_purpose == SIMPLER_PREPARE_CAPTURE) {
-                if (run->external_resource_obligations != 0 || run->crossed_launch_fence) {
-                    ++it;
-                    continue;
-                }
-                try {
-                    worker->finalize_native_run_impl(run->native_run, nullptr, false, &run->native_context_destroyed);
-                } catch (...) {
-                    if (!run->error) run->error = std::current_exception();
-                    poison_with(run, run->error);
-                }
-                if (run->native_context_destroyed) {
-                    complete_capture_if_released(run);
-                    // Completion erased this run; restart with a valid iterator.
-                    it = fifo.begin();
-                } else {
-                    release_device_spans(run, false);
-                    run->phase = ChipRunState::Phase::TERMINAL;
-                    it = fifo.erase(it);
-                }
+            if (run->owner == ChipRunOwner::Caller) {
+                ++it;
                 continue;
             }
             if (run->phase == ChipRunState::Phase::LAUNCHED) {
@@ -386,7 +362,8 @@ struct ChipRunLaneState {
     void prepare(const std::shared_ptr<ChipRunState> &run) {
         run->native_run = worker->prepare_native_run_for_lane(
             run->callable_id, &run->args, run->config, run->lease, run->run_id, run->dispatch_id, run->accepted_state,
-            run->accepted_value, run->pipeline_leased, run->provenance, run->prepare_purpose
+            run->accepted_value, run->pipeline_leased, run->provenance,
+            run->owner == ChipRunOwner::Caller ? worker->prepare_caller_run_fn_ : worker->prepare_run_fn_
         );
         run->phase = ChipRunState::Phase::PREPARED;
         run->disposition = ChipRunPreparationDisposition::NATIVE_PREPARED;
@@ -527,7 +504,8 @@ struct ChipRunLaneState {
     }
 
     bool transfer_framework(const std::shared_ptr<ChipRunState> &run) {
-        if (!run->framework_owned) throw std::logic_error("run has no framework observation owner");
+        if (run->owner != ChipRunOwner::FrameworkObserver)
+            throw std::logic_error("run has no framework observation owner");
         if (run->framework_transferred) return true;
         if (run->phase != ChipRunState::Phase::ENDED) return false;
         bool destroyed = false;
@@ -608,35 +586,6 @@ struct ChipRunLaneState {
         if (observed != completed.end()) completed.erase(observed);
     }
 
-    void complete_capture_if_released(const std::shared_ptr<ChipRunState> &run) {
-        if (!run->native_context_destroyed) return;
-        // Checked common finalization detached this carrier's active slot
-        // facts. Its external snapshots still require model last-use proof.
-        run->caller_references_live = false;
-        run->device_spans_borrowed = false;
-        if (run->external_resource_obligations != 0 || run->phase == ChipRunState::Phase::TERMINAL) return;
-        release_device_spans(run, true);
-        run->phase = ChipRunState::Phase::TERMINAL;
-        const auto it = std::find(fifo.begin(), fifo.end(), run);
-        if (it != fifo.end()) fifo.erase(it);
-        // All transitions that establish the capture last-use predicate use
-        // this path, including a failed null acquisition after Host retirement.
-        resource_changed.notify_all();
-    }
-
-    void retire_capture_carrier(const std::shared_ptr<ChipRunState> &run) {
-        try {
-            worker->finalize_native_run_impl(run->native_run, nullptr, false, &run->native_context_destroyed);
-        } catch (...) {
-            if (!run->error) run->error = std::current_exception();
-            if (!run->native_context_destroyed) rethrow_run_error(run);
-        }
-        if (run->native_context_destroyed) {
-            run->phase = ChipRunState::Phase::CARRIER_RETIRED;
-        }
-        complete_capture_if_released(run);
-    }
-
     void fail_prepare(const std::shared_ptr<ChipRunState> &run) noexcept {
         run->error = std::current_exception();
         bool inputs_released = false;
@@ -658,15 +607,15 @@ struct ChipRunLaneState {
 
     void fail_launch(const std::shared_ptr<ChipRunState> &run) noexcept {
         run->error = std::current_exception();
-        if (run->framework_owned) poison_with(run, run->error);
+        if (run->owner == ChipRunOwner::FrameworkObserver) poison_with(run, run->error);
         else finish(run);
     }
 
     void launch_front() noexcept {
         if (admission_stopped) return;
         const auto run = execution_at(0);
-        if (!run || run->prepare_purpose == SIMPLER_PREPARE_CAPTURE) return;
-        if (run->framework_owned && run->error != nullptr) return;
+        if (!run || run->owner == ChipRunOwner::Caller) return;
+        if (run->owner == ChipRunOwner::FrameworkObserver && run->error != nullptr) return;
         if (poison != nullptr) {
             if (run->phase == ChipRunState::Phase::PREPARED) {
                 run->error = poison;
@@ -935,7 +884,7 @@ struct ChipRunLaneState {
                 );
             } catch (...) {
                 successor->error = std::current_exception();
-                if (successor->framework_owned) poison_with(successor, successor->error);
+                if (successor->owner == ChipRunOwner::FrameworkObserver) poison_with(successor, successor->error);
                 else finish(successor, successor->error);
                 return;
             }
@@ -1022,7 +971,8 @@ struct ChipRunLaneState {
     }
 
     bool progress(const std::shared_ptr<ChipRunState> &target) {
-        if (target->framework_owned && target->error != nullptr) std::rethrow_exception(target->error);
+        if (target->owner == ChipRunOwner::FrameworkObserver && target->error != nullptr)
+            std::rethrow_exception(target->error);
         if (target->phase == ChipRunState::Phase::TERMINAL || target->phase == ChipRunState::Phase::ENDED) return true;
         worker->validate_execution_context();
         const auto front = execution_at(0);
@@ -1058,7 +1008,7 @@ struct ChipRunLaneState {
             if (!worker->poll_native_run(target->native_run)) return false;
         } catch (...) {
             const std::exception_ptr poll_error = std::current_exception();
-            if (target->framework_owned) {
+            if (target->owner == ChipRunOwner::FrameworkObserver) {
                 if (target->error == nullptr) target->error = poll_error;
                 poison_with(target, target->error);
                 std::rethrow_exception(target->error);
@@ -1089,7 +1039,7 @@ struct ChipRunLaneState {
     DrainOutcome drain_front(bool observe = false) {
         const auto run = execution_at(0);
         if (!run) return DrainOutcome::Progressed;
-        if (run->framework_owned && run->error != nullptr) {
+        if (run->owner == ChipRunOwner::FrameworkObserver && run->error != nullptr) {
             if (!observe) std::rethrow_exception(run->error);
             finish(run);
             return DrainOutcome::Progressed;
@@ -1129,7 +1079,7 @@ struct ChipRunLaneState {
             } catch (...) {
                 run->error = std::current_exception();
                 poison_with(run, run->error);
-                if (run->framework_owned && !observe) std::rethrow_exception(run->error);
+                if (run->owner == ChipRunOwner::FrameworkObserver && !observe) std::rethrow_exception(run->error);
                 finish(run);
             }
             return DrainOutcome::Progressed;
@@ -1138,7 +1088,7 @@ struct ChipRunLaneState {
             // Actual workspace pressure may require delivery of an old call's
             // retained host outputs. Poll/progress never takes this path.
             const auto previous = completed.front();
-            if (previous->framework_owned && !observe) {
+            if (previous->owner == ChipRunOwner::FrameworkObserver && !observe) {
                 if (!transfer_framework(previous)) throw std::runtime_error("framework transfer is busy");
             } else finish(previous);
             return DrainOutcome::Progressed;
@@ -1247,7 +1197,7 @@ struct ChipRunLaneState {
         if (!front) return false;
         if (front->resource_wait && !completed.empty()) {
             const auto previous = completed.front();
-            if (previous->framework_owned) {
+            if (previous->owner == ChipRunOwner::FrameworkObserver) {
                 if (!transfer_framework(previous)) throw std::runtime_error("framework transfer is busy");
             } else finish(previous);
             return true;
@@ -1259,7 +1209,7 @@ struct ChipRunLaneState {
             const std::exception_ptr wait_error = std::current_exception();
             if (front->error == nullptr) front->error = wait_error;
             poison_with(front, front->error);
-            if (front->framework_owned) std::rethrow_exception(front->error);
+            if (front->owner == ChipRunOwner::FrameworkObserver) std::rethrow_exception(front->error);
             finish(front);
         }
         launch_ready_prefix();
@@ -1292,8 +1242,7 @@ bool ChipRun::done() {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
-    if (run_->prepare_purpose == SIMPLER_PREPARE_CAPTURE)
-        return run_->native_context_destroyed && run_->caller_last_use_proven;
+    if (run_->owner == ChipRunOwner::Caller) return run_->native_context_destroyed && run_->caller_last_use_proven;
     return lane_->progress(run_);
 }
 
@@ -1303,7 +1252,8 @@ bool ChipRun::retire_framework(bool wait_for_own_completion, Deadline deadline) 
     while (true) {
         {
             std::lock_guard<std::mutex> lock(lane_->mu);
-            if (!run_->framework_owned) throw std::logic_error("run has no framework observation owner");
+            if (run_->owner != ChipRunOwner::FrameworkObserver)
+                throw std::logic_error("run has no framework observation owner");
             if (run_->framework_transferred) return true;
             lane_->worker->validate_execution_context();
             // Physical retirement is established already. A later cleanup request may
@@ -1357,7 +1307,7 @@ bool ChipRun::wait_until(Deadline deadline) {
     lane_->validate_process();
     {
         std::unique_lock<std::mutex> lock(lane_->mu);
-        if (run_->prepare_purpose == SIMPLER_PREPARE_CAPTURE) {
+        if (run_->owner == ChipRunOwner::Caller) {
             const auto released = [&] {
                 return run_->native_context_destroyed && run_->caller_last_use_proven;
             };
@@ -1377,7 +1327,8 @@ bool ChipRun::wait_until(Deadline deadline) {
         std::shared_ptr<ChipRunState> blocked_front;
         {
             std::unique_lock<std::mutex> lk(lane_->mu);
-            if (run_->framework_owned && run_->error != nullptr && !run_->native_context_destroyed) {
+            if (run_->owner == ChipRunOwner::FrameworkObserver && run_->error != nullptr &&
+                !run_->native_context_destroyed) {
                 // Only an explicit observer may retry known-intact carrier
                 // cleanup after a private transfer/poll failure. Admission
                 // keeps refusing it; unknown native teardown stays isolated.
@@ -1442,30 +1393,13 @@ void ChipRun::activate() {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
+    if (run_->owner == ChipRunOwner::Caller)
+        throw std::logic_error("the caller owns submission and finalization of this run");
     if (run_->phase == ChipRunState::Phase::TERMINAL) {
         lane_->rethrow_run_error(run_);
         return;
     }
     lane_->worker->validate_execution_context();
-    if (run_->prepare_purpose == SIMPLER_PREPARE_CAPTURE) {
-        if (run_->phase != ChipRunState::Phase::PREPARED || run_->external_resource_obligations == 0)
-            throw std::runtime_error("capture emission requires a retained Prepared run");
-        if (lane_->execution_at(0) != run_)
-            throw std::runtime_error("capture emission must follow lane preparation order");
-        try {
-            if (lane_->worker->launch_native_run(run_->native_run, run_->caller_stream) !=
-                ChipWorker::NativeLaunch::Launched)
-                throw RunPreparationRefused("capture emission has no diagnostic capacity");
-            run_->crossed_launch_fence = true;
-            run_->phase = ChipRunState::Phase::LAUNCHED;
-        } catch (...) {
-            run_->error = std::current_exception();
-            lane_->retire_capture_carrier(run_);
-            lane_->rethrow_run_error(run_);
-        }
-        lane_->retire_capture_carrier(run_);
-        return;
-    }
     run_->activated = true;
     lane_->launch_ready_prefix();
     // Activating a queued run is what launches it, and its launch is what lets the run behind it
@@ -1477,16 +1411,9 @@ void ChipRun::abandon() {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
+    if (run_->owner == ChipRunOwner::Caller)
+        throw std::logic_error("the caller owns submission and finalization of this run");
     if (run_->phase == ChipRunState::Phase::TERMINAL) return;
-    if (run_->prepare_purpose == SIMPLER_PREPARE_CAPTURE) {
-        // Retry only the original carrier's finalizer, never its launch. The
-        // common Worker protocol admits known-intact cleanup retries and keeps
-        // unknown/noncanonical destruction unreachable to the runtime.
-        if (!run_->native_context_destroyed) lane_->retire_capture_carrier(run_);
-        else lane_->complete_capture_if_released(run_);
-        lane_->rethrow_run_error(run_);
-        return;
-    }
     if (run_->phase == ChipRunState::Phase::LAUNCHED || run_->phase == ChipRunState::Phase::ENDED) {
         throw std::runtime_error("cannot abandon a launched ChipRun");
     }
@@ -1542,10 +1469,26 @@ bool ChipRun::owner_recovery_required() const {
     return !run_->native_context_destroyed || !run_->caller_last_use_proven;
 }
 
-std::unique_ptr<ChipRunResources> ChipRun::retain_resources() {
-    std::unique_ptr<ChipRunResources> out;
-    retain_resources_into(out);
-    return out;
+void ChipRun::finalize_after_last_use() {
+    if (!run_) return;
+    lane_->validate_process();
+    std::lock_guard<std::mutex> lock(lane_->mu);
+    if (run_->owner != ChipRunOwner::Caller) throw std::logic_error("run has no caller-owned lifetime");
+    if (run_->native_context_destroyed) return;
+    if (run_->native_run.run_epoch == 0) lane_->rethrow_run_error(run_);
+    std::exception_ptr error;
+    try {
+        lane_->worker->finalize_native_run_impl(run_->native_run, nullptr, false, &run_->native_context_destroyed);
+    } catch (...) {
+        error = std::current_exception();
+    }
+    if (run_->native_context_destroyed) {
+        lane_->release_device_spans(run_, true);
+        run_->phase = ChipRunState::Phase::TERMINAL;
+        lane_->erase_from_fifo(run_);
+        lane_->resource_changed.notify_all();
+    }
+    if (error) std::rethrow_exception(error);
 }
 
 bool ChipRun::carrier_retired_for_submission() const {
@@ -1553,45 +1496,6 @@ bool ChipRun::carrier_retired_for_submission() const {
     lane_->validate_process();
     std::lock_guard<std::mutex> lock(lane_->mu);
     return run_->native_context_destroyed;
-}
-
-void ChipRun::retain_resources_into(std::unique_ptr<ChipRunResources> &out) {
-    if (out) throw std::logic_error("native resource output slot is already occupied");
-    if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
-    lane_->validate_process();
-    std::shared_ptr<ChipWorker> owner;
-    ChipWorkerNativeRun native;
-    void *stream;
-    {
-        std::lock_guard<std::mutex> lock(lane_->mu);
-        if (run_->prepare_purpose != SIMPLER_PREPARE_CAPTURE || run_->phase != ChipRunState::Phase::PREPARED)
-            throw std::runtime_error("resource retention requires a capture Prepared run");
-        if (lane_->worker == nullptr) throw std::runtime_error("capture run has no live native owner");
-        owner = lane_->worker->shared_from_this();
-        owner->validate_execution_context();
-        ++run_->external_resource_obligations;
-        native = run_->native_run;
-        stream = run_->caller_stream;
-    }
-    owner->retain_native_run_resources_impl(native, stream, this, out);
-}
-
-void ChipRun::external_resource_acquire_failed() const {
-    std::lock_guard<std::mutex> lock(lane_->mu);
-    --run_->external_resource_obligations;
-    lane_->complete_capture_if_released(run_);
-}
-
-void ChipRun::require_carrier_retired() const {
-    std::lock_guard<std::mutex> lock(lane_->mu);
-    if (!run_->native_context_destroyed)
-        throw std::runtime_error("resource release requires original carrier retirement");
-}
-
-void ChipRun::external_resources_released() const {
-    std::lock_guard<std::mutex> lock(lane_->mu);
-    --run_->external_resource_obligations;
-    lane_->complete_capture_if_released(run_);
 }
 
 ChipRunPreparationDisposition ChipRun::preparation_disposition() const {
@@ -1696,37 +1600,25 @@ ChipRun ChipRunLane::submit(
 
 ChipRun ChipRunLane::submit(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value, void *caller_stream, NativeRunPreparePurpose purpose, ChipRun *prepared_out,
-    bool framework_owned
+    int32_t accepted_value, void *caller_stream, ChipRun *prepared_out, ChipRunOwner owner
 ) {
     state_->validate_process();
     std::unique_lock<std::mutex> lk(state_->mu);
     state_->require_usable();
-    if (caller_stream != nullptr && purpose == SIMPLER_PREPARE_EAGER)
-        state_->worker->validate_caller_stream(caller_stream);
+    if (caller_stream != nullptr) state_->worker->validate_caller_stream(caller_stream);
     if (state_->generations.empty()) throw std::runtime_error("chip run lane has no runtime slots");
 
-    if (purpose != SIMPLER_PREPARE_EAGER && purpose != SIMPLER_PREPARE_CAPTURE)
-        throw RunPreparationRefused("invalid run prepare purpose");
-    const bool capture = purpose == SIMPLER_PREPARE_CAPTURE;
-    if (capture) {
-        if (caller_stream == nullptr) throw RunPreparationRefused("capture preparation requires a caller stream");
-        if (state_->execution_size() >= state_->generations.size())
-            throw RunPreparationRefused("capture preparation has no free granted lane slot");
-        if (std::any_of(state_->fifo.begin(), state_->fifo.end(), [](const auto &candidate) {
-                return candidate->prepare_purpose != SIMPLER_PREPARE_CAPTURE;
-            }))
-            throw RunPreparationRefused("capture preparation cannot progress an eager lane");
-    } else {
-        state_->require_eager_admission();
-    }
+    const bool caller_owned = owner == ChipRunOwner::Caller;
+    if (caller_owned && (!caller_stream || !prepared_out || state_->execution_size() != 0))
+        throw RunPreparationRefused("caller-owned submission requires an available lane and a caller stream");
+    state_->require_eager_admission();
 
     // Direct admission follows the runtime contract but keeps the lane as its
     // only authority. A run whose predecessor permits a native successor may queue behind it up to
     // the lane's capacity; otherwise admission drains the front and retains depth-one behavior.
     // In particular, the submit past that capacity waits here before a slot generation is
     // minted or native preparation begins.
-    while (!capture) {
+    while (!caller_owned) {
         state_->require_eager_admission();
         const auto front = state_->execution_at(0);
         if (!front) break;
@@ -1773,10 +1665,9 @@ ChipRun ChipRunLane::submit(
     run->accepted_state = accepted_state;
     run->accepted_value = accepted_value;
     run->caller_stream = caller_stream;
-    run->framework_owned = framework_owned;
+    run->owner = owner;
     run->pipeline_leased = false;
-    run->prepare_purpose = purpose;
-    run->activated = !capture;
+    run->activated = true;
     state_->fifo.push_back(run);
     if (prepared_out != nullptr) *prepared_out = ChipRun(state_, run);
     try {
@@ -1792,13 +1683,20 @@ ChipRun ChipRunLane::submit(
         state_->fifo.pop_back();
         throw;
     }
-    if (capture) {
+    if (caller_owned) {
         try {
             state_->prepare(run);
         } catch (...) {
             state_->fail_prepare(run);
             state_->rethrow_run_error(run);
         }
+        // The original run owns its epoch's buffer references through finalization.
+        // A successful enqueue releases the slot, even before device execution.
+        state_->worker->submit_native_run_to_caller(run->native_run, caller_stream);
+        run->crossed_launch_fence = true;
+        run->caller_references_live = false;
+        run->device_spans_borrowed = false;
+        run->phase = ChipRunState::Phase::CALLER_SUBMITTED;
         return ChipRun(state_, std::move(run));
     }
     if (state_->execution_at(0) == run) {
@@ -1846,9 +1744,9 @@ void ChipRunLane::drain() {
     std::unique_lock<std::mutex> lk(state_->mu);
     if (state_->worker != nullptr) state_->worker->validate_execution_context();
     if (std::any_of(state_->fifo.begin(), state_->fifo.end(), [](const auto &run) {
-            return run->prepare_purpose == SIMPLER_PREPARE_CAPTURE;
+            return run->owner == ChipRunOwner::Caller;
         }))
-        throw std::runtime_error("lane drain requires capture resources to be retired first");
+        throw std::runtime_error("lane drain requires caller-owned runs to be finalized first");
     while (const auto front = state_->execution_at(0)) {
         if (state_->drain_front(true) == ChipRunLaneState::DrainOutcome::CreditBlocked) {
             // The run's own admission deadline bounds this: when it passes,
@@ -1882,9 +1780,9 @@ void ChipRunLane::close(bool report_run_error) {
         std::lock_guard<std::mutex> validate(state_->mu);
         if (state_->worker != nullptr) state_->worker->validate_execution_context();
         if (std::any_of(state_->fifo.begin(), state_->fifo.end(), [](const auto &run) {
-                return run->prepare_purpose == SIMPLER_PREPARE_CAPTURE;
+                return run->owner == ChipRunOwner::Caller;
             }))
-            throw std::runtime_error("lane close requires capture resources to be retired first");
+            throw std::runtime_error("lane close requires caller-owned runs to be finalized first");
     }
 
     // Now that the context is this one's: cancelling makes every parked
@@ -1936,6 +1834,16 @@ void ChipRunLane::detach_after_failed_teardown(std::exception_ptr error) noexcep
     terminalize(state_->fifo);
     terminalize(state_->completed);
     state_->worker = nullptr;
+}
+
+void ChipRunLane::stop_admission_for_close() {
+    std::lock_guard<std::mutex> lk(state_->mu);
+    if (std::any_of(state_->fifo.begin(), state_->fifo.end(), [](const auto &run) {
+            return run->owner == ChipRunOwner::Caller;
+        }))
+        throw std::runtime_error("ChipWorker::finalize: caller-owned runs still require checked release");
+    state_->admission_stopped = true;
+    state_->abandon_unlaunched();
 }
 
 void ChipRunLane::stop_admission() noexcept {

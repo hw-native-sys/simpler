@@ -196,8 +196,8 @@ private:
      * The task capacity is a configured size, so its branch is the one a real bind
      * reaches. The heap is not configured: a bind hands
      * this allocator the whole MAX_HEAP_CAPACITY span and commits the device
-     * region afterwards, so a graph that does not fit the device fails at that
-     * commit and not here. The heap branch stays because the allocator is also
+     * region afterwards, so a graph exceeding the configured physical capacity
+     * fails before that commit, not here. The heap branch stays because the allocator is also
      * constructed directly, against a small heap, by the unit tests that cover
      * this report.
      */

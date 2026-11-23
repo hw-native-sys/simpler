@@ -17,6 +17,9 @@
 
 #include "common/host_log_state.h"
 
+struct KernelArgsHelper;
+class LaunchProgressSink;
+
 namespace {
 int failure_kind = 0;
 int attempts = 0;
@@ -25,6 +28,7 @@ int failures_to_skip = 0;
 void *failed_destroy_handle = nullptr;
 int failed_destroy_attempts = 0;
 int failed_destroy_successes = 0;
+void *runtime_owner_base = nullptr;
 SimplerHostLogState test_log_state{};
 bool guard_acl = false;
 std::array<int, 8> forbidden_calls{};
@@ -37,18 +41,19 @@ void *capture_fault_stream = nullptr;
 int capture_queries_until_fault = 0;
 int capture_query_faults = 0;
 int (*real_memcpy)(void *, uint64_t, const void *, uint64_t, int) = nullptr;
-int (*real_memcpy_async)(void *, uint64_t, const void *, uint64_t, int, void *) = nullptr;
-int (*real_malloc_host)(void **, uint64_t, uint16_t) = nullptr;
-int (*real_free_host)(void *) = nullptr;
+int (*real_record_event)(void *, void *) = nullptr;
 using CoreLaunch = int (*)(void *, uint64_t, uint32_t, void *, void *, void *, void *);
 CoreLaunch real_core_launch = nullptr;
-void *latest_pinned = nullptr;
-void *watched_source = nullptr;
-bool reject_descriptor_copy = false;
-bool descriptor_rejected = false;
-int descriptor_failures = 0, watched_source_frees = 0, core_launch_calls = 0, descriptor_guard_hits = 0;
-bool fail_next_copy = false;
+void *entry_fault_stream = nullptr;
+void *watched_event = nullptr;
+bool reject_entry_record = false;
+bool entry_rejected = false;
+int entry_failures = 0, watched_event_destroys = 0, core_launch_calls = 0, entry_guard_hits = 0;
 int copies = 0;
+using PublishForLaunch = int (*)(KernelArgsHelper &, void *, LaunchProgressSink &, bool, bool);
+PublishForLaunch real_publish_for_launch = nullptr;
+bool fail_launch_publication = false;
+int launch_publication_failures = 0;
 bool fake_device_drain = false;
 int device_drain_calls = 0;
 // Targeting an allocation by identity rather than by a call index: a
@@ -74,22 +79,27 @@ int forbidden(size_t index) {
     return -4322;
 }
 
+// Count one owner request even if the SDK re-enters an interposed release.
+thread_local unsigned destroy_depth = 0;
 int destroy(const char *symbol, void *handle, int kind) {
+    const bool outermost = destroy_depth++ == 0;
     const bool retrying_handle =
-        kind == failure_kind && failed_destroy_handle != nullptr && handle == failed_destroy_handle;
+        outermost && kind == failure_kind && failed_destroy_handle != nullptr && handle == failed_destroy_handle;
     if (retrying_handle) ++failed_destroy_attempts;
-    if (failure_kind == kind) {
+    if (outermost && failure_kind == kind) {
         ++attempts;
         if (pending && attempts > failures_to_skip) {
             pending = false;
             failed_destroy_handle = handle;
             failed_destroy_attempts = 1;
             failed_destroy_successes = 0;
+            --destroy_depth;
             return -4321;
         }
     }
     auto real_destroy = reinterpret_cast<int (*)(void *)>(dlsym(RTLD_NEXT, symbol));
     const int rc = real_destroy(handle);
+    --destroy_depth;
     if (retrying_handle && rc == 0) ++failed_destroy_successes;
     return rc;
 }
@@ -170,54 +180,56 @@ extern "C" int aclmdlRICaptureGetInfo(void *stream, void *status, void **model) 
     return query != nullptr ? query(stream, status, model) : -4323;
 }
 
-extern "C" void arm_copy_failure() { fail_next_copy = true; }
 extern "C" int copy_call_count() { return copies; }
 extern "C" int rtMemcpy(void *dst, uint64_t dst_bytes, const void *src, uint64_t src_bytes, int kind) {
     ++copies;
-    if (fail_next_copy) {
-        fail_next_copy = false;
-        return -4321;
-    }
     return real_memcpy != nullptr ? real_memcpy(dst, dst_bytes, src, src_bytes, kind) : -4323;
 }
-extern "C" int arm_descriptor_copy_failure() {
-    watched_source = latest_pinned;
-    reject_descriptor_copy = true;
-    descriptor_rejected = false;
-    descriptor_failures = watched_source_frees = descriptor_guard_hits = 0;
-    return watched_source == nullptr ? -1 : 0;
+
+extern "C" void arm_launch_publication_failure() {
+    fail_launch_publication = true;
+    launch_publication_failures = 0;
 }
-extern "C" int descriptor_copy_failures() { return descriptor_failures; }
-extern "C" int descriptor_source_frees() { return watched_source_frees; }
-extern "C" int descriptor_kernel_guard_hits() { return descriptor_guard_hits; }
-extern "C" int core_launch_call_count() { return core_launch_calls; }
-extern "C" int rtMallocHost(void **out, uint64_t size, uint16_t module_id) {
-    if (real_malloc_host == nullptr) return -4323;
-    const int rc = real_malloc_host(out, size, module_id);
-    if (rc == 0) latest_pinned = *out;
-    return rc;
-}
-extern "C" int rtFreeHost(void *ptr) {
-    if (ptr == watched_source) ++watched_source_frees;
-    return real_free_host == nullptr ? -4323 : real_free_host(ptr);
-}
-extern "C" int rtMemcpyAsync(void *dst, uint64_t cap, const void *src, uint64_t bytes, int kind, void *stream) {
-    if (reject_descriptor_copy && src == watched_source) {
-        reject_descriptor_copy = false;
-        descriptor_rejected = true;
-        ++descriptor_failures;
+extern "C" int launch_publication_failure_hits() { return launch_publication_failures; }
+
+// A host-side refusal before publication marks any device submission. This
+// boundary is shared by descriptor DMA and launch-owned RTS argument packets.
+int publish_for_launch(KernelArgsHelper &args, void *stream, LaunchProgressSink &sink, bool retained, bool kernel) {
+    if (fail_launch_publication) {
+        fail_launch_publication = false;
+        ++launch_publication_failures;
         return -4321;
     }
-    return real_memcpy_async == nullptr ? -4323 : real_memcpy_async(dst, cap, src, bytes, kind, stream);
+    return real_publish_for_launch == nullptr ? -4323 : real_publish_for_launch(args, stream, sink, retained, kernel);
+}
+extern "C" void arm_entry_record_failure(void *stream) {
+    entry_fault_stream = stream;
+    watched_event = nullptr;
+    reject_entry_record = true;
+    entry_rejected = false;
+    entry_failures = watched_event_destroys = entry_guard_hits = 0;
+}
+extern "C" int entry_record_failures() { return entry_failures; }
+extern "C" int entry_event_destroys() { return watched_event_destroys; }
+extern "C" int entry_kernel_guard_hits() { return entry_guard_hits; }
+extern "C" int core_launch_call_count() { return core_launch_calls; }
+extern "C" int aclrtRecordEvent(void *event, void *stream) {
+    if (reject_entry_record && stream == entry_fault_stream) {
+        reject_entry_record = false;
+        entry_rejected = true;
+        watched_event = event;
+        ++entry_failures;
+        return -4321;
+    }
+    return real_record_event == nullptr ? -4323 : real_record_event(event, stream);
 }
 extern "C" int rtKernelLaunchWithHandleV2(
     void *handle, uint64_t entry, uint32_t blocks, void *args, void *sm, void *stream, void *config
 ) {
     ++core_launch_calls;
-    // A regression that ignores the rejected publication cannot execute a
-    // kernel against its uninitialized descriptor in this fault test.
-    if (reject_descriptor_copy || descriptor_rejected) {
-        ++descriptor_guard_hits;
+    // Ignoring the rejected caller edge must not execute unordered user work.
+    if (reject_entry_record || entry_rejected) {
+        ++entry_guard_hits;
         return -4326;
     }
     return real_core_launch == nullptr ? -4323 : real_core_launch(handle, entry, blocks, args, sm, stream, config);
@@ -274,7 +286,15 @@ extern "C" int aclrtSynchronizeDeviceWithTimeout(int32_t timeout) {
 }
 
 // The ctypes loader has no ChipWorker to bind a process-owned logger sink.
+extern "C" int bind_test_owner(void *symbol) {
+    Dl_info owner{};
+    if (symbol == nullptr || dladdr(symbol, &owner) == 0) return -1;
+    runtime_owner_base = owner.dli_fbase;
+    return 0;
+}
+
 extern "C" int bind_test_rts(void *runtime) {
+    if (bind_test_owner(dlsym(runtime, "create_device_context")) != 0) return -1;
     // ACL is a dependency of the RTLD_LOCAL component and need not be in the
     // preload shim's RTLD_NEXT lookup scope.
     real_get_device = reinterpret_cast<int (*)(int *)>(dlsym(runtime, "aclrtGetDevice"));
@@ -282,12 +302,13 @@ extern "C" int bind_test_rts(void *runtime) {
     real_set_device = reinterpret_cast<int (*)(int)>(dlsym(runtime, "rtSetDevice"));
     real_set_op_timeout = reinterpret_cast<int (*)(uint64_t, uint64_t *)>(dlsym(runtime, "aclrtSetOpExecuteTimeOutV2"));
     real_memcpy = reinterpret_cast<int (*)(void *, uint64_t, const void *, uint64_t, int)>(dlsym(runtime, "rtMemcpy"));
-    real_memcpy_async = reinterpret_cast<decltype(real_memcpy_async)>(dlsym(runtime, "rtMemcpyAsync"));
-    real_malloc_host = reinterpret_cast<decltype(real_malloc_host)>(dlsym(runtime, "rtMallocHost"));
-    real_free_host = reinterpret_cast<decltype(real_free_host)>(dlsym(runtime, "rtFreeHost"));
+    real_record_event = reinterpret_cast<decltype(real_record_event)>(dlsym(runtime, "aclrtRecordEvent"));
     real_core_launch = reinterpret_cast<CoreLaunch>(dlsym(runtime, "rtKernelLaunchWithHandleV2"));
-    if (!real_get_device || !real_set_device || !real_set_op_timeout || !real_memcpy || !real_memcpy_async ||
-        !real_malloc_host || !real_free_host || !real_core_launch)
+    real_publish_for_launch = reinterpret_cast<PublishForLaunch>(
+        dlsym(runtime, "_Z18publish_for_launchR16KernelArgsHelperPvR18LaunchProgressSinkbb")
+    );
+    if (!real_get_device || !real_set_device || !real_set_op_timeout || !real_memcpy || !real_record_event ||
+        !real_core_launch || !real_publish_for_launch)
         return -1;
     return 0;
 }
@@ -306,7 +327,10 @@ extern "C" int bind_test_log(void *runtime) {
 }
 
 extern "C" int rtStreamDestroy(void *stream) { return destroy("rtStreamDestroy", stream, 1); }
-extern "C" int aclrtDestroyEvent(void *event) { return destroy("aclrtDestroyEvent", event, 2); }
+extern "C" int aclrtDestroyEvent(void *event) {
+    if (event == watched_event) ++watched_event_destroys;
+    return destroy("aclrtDestroyEvent", event, 2);
+}
 
 // Fail the device free of the next allocation to be made, once. `rtMalloc`
 // below is what learns the address.
@@ -332,6 +356,19 @@ extern "C" int rtMalloc(void **ptr, uint64_t size, uint32_t type, uint16_t modul
 }
 
 extern "C" int rtFree(void *ptr) {
+    // SDK teardown may free a recycled address after the runtime released its
+    // owner. Only calls from the bound runtime belong to this fault contract.
+    Dl_info caller{};
+    void *return_address = __builtin_extract_return_addr(__builtin_return_address(0));
+    const bool runtime_call = runtime_owner_base == nullptr ||
+                              (dladdr(return_address, &caller) != 0 && caller.dli_fbase == runtime_owner_base);
+    if (!runtime_call) return reinterpret_cast<int (*)(void *)>(dlsym(RTLD_NEXT, "rtFree"))(ptr);
+    if (failed_destroy_handle != nullptr && ptr == failed_destroy_handle)
+        std::fprintf(
+            stderr, "close fault: owned rtFree(%p), caller=%s, attempts=%d, successes=%d\n", ptr,
+            caller.dli_sname == nullptr ? "unknown" : caller.dli_sname, failed_destroy_attempts,
+            failed_destroy_successes
+        );
     if (watched_alloc_ptr != nullptr && ptr == watched_alloc_ptr) {
         watched_alloc_ptr = nullptr;
         ++watched_free_hits;

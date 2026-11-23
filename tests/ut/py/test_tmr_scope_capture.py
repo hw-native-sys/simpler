@@ -204,13 +204,13 @@ def _run(device, root, replays):
     eager_root = root / "eager"
     eager_root.mkdir()
     config.output_prefix = str(eager_root).encode()
-    eager = _Recording(lib, ctx, caller, config, _EPOCH + 1, 0, capture=False)
+    eager = _Recording(lib, ctx, caller, _EPOCH + 1)
+    eager.prepare(config, capture=False)
     eager.set_inputs(23)
     eager.record()
     assert lib.aclrtSynchronizeStreamWithTimeout(caller, 60000) == 0
     eager.check_output(23)
     assert lib.simpler_wait_run(ctx, eager.run) == 0
-    eager.retire_original_run()
     eager.close()
     _flush(lib, ctx)
     _check_export(eager_root / "scope_stats/scope_stats.jsonl", recorded=False, replays=1, epoch=_EPOCH + 1)

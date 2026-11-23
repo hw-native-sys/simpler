@@ -95,9 +95,10 @@ class _Model:
     frame: dict
     rhs_value: int
     ticket: object = None
+    second_ticket: object = None
 
 
-def _record(torch, worker, handle, config, stream, raw_stream, bridge, example, model, queue):
+def _record(torch, worker, handle, config, stream, bridge, example, model, queue, *, two_nodes=False):
     frame = model.frame
     a, rhs, output = frame["tensors"]
     result = frame["result"]
@@ -114,17 +115,27 @@ def _record(torch, worker, handle, config, stream, raw_stream, bridge, example, 
     try:
         with torch.npu.graph(model.graph, stream=stream, capture_error_mode="global"):
             try:
-                model.ticket = worker.prepare_submission(
-                    handle,
-                    frame["args"],
-                    config,
-                    caller_stream=raw_stream,
-                    keepalive=(stream, *frame["buffers"], *frame["tensors"]),
-                )
-                model.ticket._native_submission._retain_model_resources()
-                queued = bridge.enqueue_native(model.ticket.native_handle, frame["tensors"])
-                queued.check()
+
+                def enqueue(anchor=None):
+                    ticket = worker.prepare_submission(
+                        handle,
+                        frame["args"],
+                        config,
+                        caller_stream=stream.npu_stream,
+                        keepalive=(stream, *frame["buffers"], *frame["tensors"]),
+                    )
+                    ticket._native_submission._register_model_destroy_notice(anchor)
+                    queued = bridge.enqueue_native(ticket.native_handle, frame["tensors"])
+                    queued.check()
+                    return ticket
+
+                model.ticket = enqueue()
                 torch.add(output, output, out=result)
+                if two_nodes:
+                    # result observes the first node. The second must independently
+                    # restore output, and shares the first node's destroy notice.
+                    output.zero_()
+                    model.second_ticket = enqueue(model.ticket._native_submission)
             except BaseException as error:
                 recording_error = error
                 raise
@@ -135,7 +146,6 @@ def _record(torch, worker, handle, config, stream, raw_stream, bridge, example, 
         raise
 
     stream.synchronize()
-    del queued
     frame["tensors"] = (a, output)
     del rhs
     _require_live(model.ticket, frame, queue)
@@ -154,6 +164,26 @@ def _replay(torch, stream, model, example, value, queue):
     assert tuple(tensor.data_ptr() for tensor in (a, output, result)) == frame["pointers"]
     _require_live(model.ticket, frame, queue)
     return expected
+
+
+def _destroy_model(model, queue, example, worker_module):
+    frame = model.frame
+    model.graph.reset()
+    tickets = (model.ticket, model.second_ticket) if model.second_ticket is not None else (model.ticket,)
+    for ticket in tickets:
+        assert ticket._native_submission._model_destroyed()
+        assert not ticket.safe_to_release
+        _require_tensor_impl_live(frame, worker_module._native_submission_roots[ticket][1])
+        error = example._retire_ticket(ticket)
+        if error is not None:
+            raise error
+        assert ticket.safe_to_release
+        assert ticket not in worker_module._native_submission_roots
+    if queue == "0":
+        gc.collect()
+        assert frame["rhs_probe"].expired()
+    else:
+        _await_tensor_impl_release(frame)
 
 
 def _require_callable_retained(worker, handle):
@@ -208,11 +238,12 @@ def _retained_child(args, example_path, roots, shim):
                 "acl_notice": True,
                 "checked_close": True,
             }
-        frames, _ = helpers._prepare_frames(torch, worker, handle, stream, raw_stream, grants + 1)
+        frames, _ = helpers._prepare_frames(torch, worker, handle, stream, raw_stream, grants + 2)
+        unplayed_frame = frames.pop()
         models = [_Model(torch.npu.NPUGraph(), frame, 3 + index) for index, frame in enumerate(frames)]
         roots.append(models)
         for index, model in enumerate(models):
-            _record(torch, worker, handle, config, stream, raw_stream, bridge, example, model, queue)
+            _record(torch, worker, handle, config, stream, bridge, example, model, queue, two_nodes=index == 0)
             for retained in models[: index + 1]:
                 _require_live(retained.ticket, retained.frame, queue)
 
@@ -231,27 +262,20 @@ def _retained_child(args, example_path, roots, shim):
         survivor_replays = []
         for index in reversed(range(len(models))):
             model = models[index]
-            ticket, frame = model.ticket, model.frame
-            model.graph.reset()
-            assert ticket._native_submission._model_destroyed()
-            assert not ticket.safe_to_release
-            _require_tensor_impl_live(frame, worker_module._native_submission_roots[ticket][1])
-            error = example._retire_ticket(ticket)
-            if error is not None:
-                raise error
-            assert ticket.safe_to_release
-            assert ticket not in worker_module._native_submission_roots
-            if queue == "0":
-                gc.collect()
-                assert frame["rhs_probe"].expired()
-            else:
-                _await_tensor_impl_release(frame)
+            _destroy_model(model, queue, example, worker_module)
             release_order.append(index)
             for survivor in models[:index]:
                 _require_live(survivor.ticket, survivor.frame, queue)
             if index:
                 _require_callable_retained(worker, handle)
                 survivor_replays.append(_replay(torch, stream, models[0], example, 500 + index, queue))
+        # An unplayed model has no physical kernel completion to wait for.
+        unplayed = _Model(torch.npu.NPUGraph(), unplayed_frame, 7)
+        roots.append(unplayed)
+        _record(torch, worker, handle, config, stream, bridge, example, unplayed, queue)
+        example._assert_value(torch, unplayed.frame["result"], example.POISON)
+        _destroy_model(unplayed, queue, example, worker_module)
+        frames.append(unplayed_frame)
         worker.unregister(handle)
         worker.close()
         for frame in frames:
@@ -307,7 +331,7 @@ def _destroy_refusal(worker_module, worker, graph, slot, frames, example, shim, 
         try:
             example._close(worker, graph, slot, frames)
         except refusal as error:
-            assert "native resource release requires the ACL model destroy notice" in str(error), str(error)
+            assert "requires the ACL model destroy notice" in str(error), str(error)
         else:
             raise AssertionError("checked close succeeded without the destroy notice")
     finally:

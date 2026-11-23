@@ -551,13 +551,13 @@ int LoadAicpuOp::Init(const std::vector<std::string> &extra_symbols) {
 int LoadAicpuOp::AicpuKernelLaunch(
     rtFuncHandle func_handle, rtStream_t stream, void *args, size_t args_size, int aicpu_num
 ) {
-    if (args == nullptr || args_size == 0) {
+    if (args == nullptr || args_size == 0 || args_size > UINT32_MAX) {
         LOG_ERROR("AicpuKernelLaunch: invalid arguments (args is null or args_size is 0)");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     rtCpuKernelArgs_t cpu_args = {};
     cpu_args.baseArgs.args = args;
-    cpu_args.baseArgs.argsSize = args_size;
+    cpu_args.baseArgs.argsSize = static_cast<uint32_t>(args_size);
 
     rtKernelLaunchCfg_t kernelLaunchCfg = {nullptr, 0U};
     auto launchKernelAttr = std::make_unique<rtLaunchKernelAttr_t>();

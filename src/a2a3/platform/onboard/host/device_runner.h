@@ -79,10 +79,10 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper);
  */
 class DeviceRunner : public DeviceRunnerBase {
 public:
-    bool supports_scope_stats_capture() const override { return SIMPLER_DFX != 0; }
-    bool supports_pmu_capture() const override { return SIMPLER_DFX != 0; }
-    bool supports_swimlane_capture() const override { return SIMPLER_DFX != 0; }
-    bool supports_args_dump_capture() const override { return SIMPLER_DFX != 0; }
+    bool supports_caller_scope_stats() const override { return SIMPLER_DFX != 0; }
+    bool supports_caller_pmu() const override { return SIMPLER_DFX != 0; }
+    bool supports_caller_swimlane() const override { return SIMPLER_DFX != 0; }
+    bool supports_caller_args_dump() const override { return SIMPLER_DFX != 0; }
 
 private:
     int prepare_kernel_arch_context(rtStream_t control_stream) override;
@@ -170,7 +170,6 @@ public:
      * address. The register table is allocated on `mem_alloc_`; the FFTS
      * address is a query result and owns nothing.
      */
-    int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
 
     /**
      * Fill `InitArgs.l2_cache_offset` from the driver's per-device report.

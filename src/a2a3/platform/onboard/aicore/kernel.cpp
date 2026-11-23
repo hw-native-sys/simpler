@@ -15,6 +15,7 @@
 #include "aicore/aicore_profiling_state.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
+#include "common/aicore_runtime_packet.h"
 #include "common/chip_swimlane_profiling.h"
 
 #ifdef __DAV_VEC__
@@ -88,7 +89,7 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  * GM read. The host builds that block after collector arming, which is what
  * makes these addresses this run's final ones.
  *
- * @param runtime_args Device address of this run's Runtime image
+ * @param runtime_args Device Runtime address, or zero for the inline descriptor
  * @param enable_profiling_flag Profiling umbrella bitmask for this run
  * @param ffts_base_addr FFTS base for cross-core sync inside user kernels
  * @param chip_swimlane_aicore_rotation_table Device address of the
@@ -146,5 +147,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
         set_chip_swimlane_aicore_head_slot(nullptr);
     }
 
-    aicore_execute(reinterpret_cast<__gm__ Runtime *>(runtime_args), block_idx, core_type);
+    auto *runtime = reinterpret_cast<__gm__ Runtime *>(runtime_args);
+    if (runtime == nullptr) {
+        const uint64_t base = static_cast<uint64_t>(get_para_base());
+        auto *packet = reinterpret_cast<__gm__ AicoreRuntimePacket *>(base);
+        runtime = reinterpret_cast<__gm__ Runtime *>(&packet->descriptor);
+    }
+    aicore_execute(runtime, block_idx, core_type);
 }

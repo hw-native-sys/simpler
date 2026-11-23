@@ -73,8 +73,8 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
         call.gates.push_back(targets[i].teardown);
         if (observed_retirement_runtime != nullptr) {
             const auto worker = targets[i].teardown - observed_retirement_runtime->get_teardown_gates();
-            EXPECT_NE(observed_retirement_runtime->dev.workers[worker].aicore_done, 0u);
-            EXPECT_NE(observed_retirement_runtime->dev.workers[worker].aicpu_ready, 0u);
+            EXPECT_NE(observed_retirement_runtime->get_workers()[worker].aicore_done, 0u);
+            EXPECT_NE(observed_retirement_runtime->get_workers()[worker].aicpu_ready, 0u);
         }
         if (released != nullptr)
             released[i] = retirement_result == 0 || targets[i].reg_addr == released_despite_failure;
@@ -207,11 +207,11 @@ protected:
         set_platform_pmu_base(0);
     }
 
-    static void expect_group(const Runtime &runtime) {
+    static void expect_group(Runtime &runtime) {
         ASSERT_EQ(retire_calls.size(), 1u);
         EXPECT_EQ(retire_calls[0].addrs, std::vector<uint64_t>(kAddrs.begin(), kAddrs.end()));
         for (size_t i = 0; i < kAddrs.size(); ++i)
-            EXPECT_EQ(retire_calls[0].gates[i], &runtime.dev.teardown_gates[i]);
+            EXPECT_EQ(retire_calls[0].gates[i], &runtime.get_teardown_gates()[i]);
     }
 };
 
@@ -221,7 +221,7 @@ TEST_F(HbgRetirementWiring, OnlyAcknowledgedReportsAreInvalidatedOnEveryExitRout
             const bool fail = failure != 0;
             auto runtime = std::make_unique<Runtime>();
             for (int i = 0; i < 3; ++i) {
-                auto &report = runtime->dev.workers[i];
+                auto &report = runtime->get_workers()[i];
                 report.aicore_done = i + 1;
                 report.aicpu_ready = 2;
                 report.report_epoch = 42;
@@ -236,7 +236,7 @@ TEST_F(HbgRetirementWiring, OnlyAcknowledgedReportsAreInvalidatedOnEveryExitRout
                                         lifecycle.finish_shutdown_partition(0, runtime.get());
             EXPECT_EQ(rc, fail ? -1 : 0);
             for (int i = 0; i < 3; ++i) {
-                const auto &report = runtime->dev.workers[i];
+                const auto &report = runtime->get_workers()[i];
                 const bool acknowledged = !fail || (failure == 1 && i == 1);
                 EXPECT_EQ(report.aicore_done, acknowledged ? 0u : static_cast<uint32_t>(i + 1));
                 EXPECT_EQ(report.aicpu_ready, acknowledged ? 0u : 2u);
@@ -251,10 +251,10 @@ TEST_F(HbgRetirementWiring, OnlyAcknowledgedReportsAreInvalidatedOnEveryExitRout
 TEST_F(HbgRetirementWiring, WorkWindowIsCapturedByRetiringPartitionsAndNotReadAgain) {
     auto runtime = std::make_unique<Runtime>();
     runtime->set_worker_count(3);
-    runtime->dev.workers[0].work_start_cycle = 100;
-    runtime->dev.workers[0].work_end_cycle = 200;
-    runtime->dev.workers[2].work_start_cycle = 150;
-    runtime->dev.workers[2].work_end_cycle = 300;
+    runtime->get_workers()[0].work_start_cycle = 100;
+    runtime->get_workers()[0].work_end_cycle = 200;
+    runtime->get_workers()[2].work_start_cycle = 150;
+    runtime->get_workers()[2].work_end_cycle = 300;
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs, 2);
     AicoreWorkWindow result{};
@@ -263,8 +263,8 @@ TEST_F(HbgRetirementWiring, WorkWindowIsCapturedByRetiringPartitionsAndNotReadAg
     ASSERT_EQ(lifecycle.finish_shutdown_partition(1, runtime.get()), 0);
     // Final aggregation consumes the retired snapshots, not the report lines.
     for (int i = 0; i < 3; ++i) {
-        runtime->dev.workers[i].work_start_cycle = 0;
-        runtime->dev.workers[i].work_end_cycle = 0;
+        runtime->get_workers()[i].work_start_cycle = 0;
+        runtime->get_workers()[i].work_end_cycle = 0;
     }
     ASSERT_TRUE(lifecycle.retired_work_window(result, true));
     EXPECT_EQ(result.start_cycle, 100u);
@@ -280,9 +280,9 @@ TEST_F(HbgRetirementWiring, WorkWindowRejectsIncompleteEndpointsAndEntirelyIdleR
     for (bool incomplete : {false, true}) {
         auto runtime = std::make_unique<Runtime>();
         if (incomplete) {
-            runtime->dev.workers[0].work_start_cycle = 100;
-            runtime->dev.workers[0].work_end_cycle = 200;
-            runtime->dev.workers[2].work_end_cycle = 300;
+            runtime->get_workers()[0].work_start_cycle = 100;
+            runtime->get_workers()[0].work_end_cycle = 200;
+            runtime->get_workers()[2].work_end_cycle = 300;
         }
         AicoreLifecycle lifecycle;
         AicoreLifecycleTestPeer::seed(lifecycle, kAddrs, 2);
@@ -303,9 +303,9 @@ TEST_F(HbgRetirementWiring, PartialHandshakeTimeoutRetiresEveryAcceptedReport) {
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
     for (int i : {0, 2}) {
-        runtime->dev.workers[i].physical_core_id = i;
-        runtime->dev.workers[i].core_type = CoreType::AIV;
-        runtime->dev.workers[i].aicore_done = i + 1;
+        runtime->get_workers()[i].physical_core_id = i;
+        runtime->get_workers()[i].core_type = CoreType::AIV;
+        runtime->get_workers()[i].aicore_done = i + 1;
     }
     lifecycle.handshake_partition(runtime.get(), 0, 1);
     ASSERT_TRUE(AicoreLifecycleTestPeer::handshake_failed(lifecycle));
@@ -315,8 +315,8 @@ TEST_F(HbgRetirementWiring, PartialHandshakeTimeoutRetiresEveryAcceptedReport) {
     EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
     ASSERT_EQ(retire_calls.size(), 1u);
     EXPECT_EQ(retire_calls[0].addrs, (std::vector<uint64_t>{kAddrs[0], kAddrs[2]}));
-    EXPECT_EQ(retire_calls[0].gates[0], &runtime->dev.teardown_gates[0]);
-    EXPECT_EQ(retire_calls[0].gates[1], &runtime->dev.teardown_gates[2]);
+    EXPECT_EQ(retire_calls[0].gates[0], &runtime->get_teardown_gates()[0]);
+    EXPECT_EQ(retire_calls[0].gates[1], &runtime->get_teardown_gates()[2]);
 }
 
 TEST_F(HbgRetirementWiring, MissingReportsLeaveRetirementUnknownWithoutOpeningAWindow) {
@@ -340,7 +340,7 @@ TEST_F(HbgRetirementWiring, DuplicateReportsKeepOneWindowOwnerAndLeaveRetirement
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
     for (int32_t worker = 0; worker < 3; ++worker) {
-        auto &report = runtime->dev.workers[worker];
+        auto &report = runtime->get_workers()[worker];
         report.physical_core_id = 0;
         report.core_type = CoreType::AIC;
         report.aicore_done = worker + 1;
@@ -354,10 +354,10 @@ TEST_F(HbgRetirementWiring, DuplicateReportsKeepOneWindowOwnerAndLeaveRetirement
     ASSERT_EQ(retire_calls.size(), 1u);
     EXPECT_EQ(retire_calls[0].addrs, (std::vector<uint64_t>{kAddrs[0]}));
     ASSERT_EQ(retire_calls[0].gates.size(), 1u);
-    EXPECT_EQ(retire_calls[0].gates[0], &runtime->dev.teardown_gates[0]);
-    EXPECT_EQ(runtime->dev.workers[0].aicore_done, 0u);
-    EXPECT_EQ(runtime->dev.workers[1].aicore_done, 2u);
-    EXPECT_EQ(runtime->dev.workers[2].aicore_done, 3u);
+    EXPECT_EQ(retire_calls[0].gates[0], &runtime->get_teardown_gates()[0]);
+    EXPECT_EQ(runtime->get_workers()[0].aicore_done, 0u);
+    EXPECT_EQ(runtime->get_workers()[1].aicore_done, 2u);
+    EXPECT_EQ(runtime->get_workers()[2].aicore_done, 3u);
     EXPECT_EQ(AicoreLifecycleTestPeer::retired_cores(lifecycle), 1);
     EXPECT_FALSE(lifecycle.cores_retired());
     EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), false));
@@ -371,7 +371,7 @@ TEST_F(HbgRetirementWiring, AReportedCoreWithoutARegisterWindowCannotProveDiscov
     const std::array<uint64_t, 3> registers{kAddrs[0], 0, kAddrs[2]};
     AicoreLifecycleTestPeer::prepare_handshake(lifecycle, registers.data());
     for (int32_t worker = 0; worker < 3; ++worker) {
-        auto &report = runtime->dev.workers[worker];
+        auto &report = runtime->get_workers()[worker];
         report.physical_core_id = worker;
         report.core_type = CoreType::AIV;
         report.aicore_done = worker + 1;
@@ -381,7 +381,7 @@ TEST_F(HbgRetirementWiring, AReportedCoreWithoutARegisterWindowCannotProveDiscov
     EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
     ASSERT_EQ(retire_calls.size(), 1u);
     EXPECT_EQ(retire_calls[0].addrs, (std::vector<uint64_t>{kAddrs[0], kAddrs[2]}));
-    EXPECT_EQ(runtime->dev.workers[1].aicore_done, 2u);
+    EXPECT_EQ(runtime->get_workers()[1].aicore_done, 2u);
     EXPECT_EQ(AicoreLifecycleTestPeer::retired_cores(lifecycle), 2);
     EXPECT_FALSE(lifecycle.cores_retired());
 }
@@ -391,9 +391,9 @@ TEST_F(HbgRetirementWiring, CompleteHandshakePreservesFailureRetirementError) {
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
     for (int i = 0; i < 3; ++i) {
-        runtime->dev.workers[i].physical_core_id = i;
-        runtime->dev.workers[i].core_type = CoreType::AIV;
-        runtime->dev.workers[i].aicore_done = i + 1;
+        runtime->get_workers()[i].physical_core_id = i;
+        runtime->get_workers()[i].core_type = CoreType::AIV;
+        runtime->get_workers()[i].aicore_done = i + 1;
     }
     lifecycle.handshake_partition(runtime.get(), 0, 1);
     ASSERT_FALSE(AicoreLifecycleTestPeer::handshake_failed(lifecycle));
@@ -422,8 +422,8 @@ struct DiscoveryProofState {
             context.graph_summary_offset = offsetof(DiscoveryProofState, summary);
             context.worker_contexts_offset = offsetof(DiscoveryProofState, contexts);
             context.aicpu_lifecycle_traces_offset = offsetof(DiscoveryProofState, traces);
-            runtime.dev.workers[worker].aicpu_ready = 0;
-            runtime.dev.workers[worker].task = 0;
+            runtime.get_workers()[worker].aicpu_ready = 0;
+            runtime.get_workers()[worker].task = 0;
         }
         runtime.publish_scheduler_bootstrap(
             SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(contexts.data())
@@ -440,7 +440,7 @@ TEST_F(HbgRetirementWiring, DiscoveryProofPrecedesEveryReadyReply) {
     ASSERT_EQ(lifecycle.post_handshake_init(runtime.get()), 0);
     EXPECT_EQ(state.summary.topology_layout, SchedulerTopologyLayout::COMPACT_LAUNCH);
     for (uint64_t worker = 0; worker < state.contexts.size(); ++worker) {
-        EXPECT_EQ(runtime->dev.workers[worker].aicpu_ready, 0u);
+        EXPECT_EQ(runtime->get_workers()[worker].aicpu_ready, 0u);
         EXPECT_EQ(state.contexts[worker].worker_index, worker);
         EXPECT_EQ(state.contexts[worker].cluster_worker_ids[0], 0u);
         EXPECT_EQ(state.contexts[worker].cluster_worker_ids[1], 1u);
@@ -448,8 +448,8 @@ TEST_F(HbgRetirementWiring, DiscoveryProofPrecedesEveryReadyReply) {
     }
     lifecycle.publish_context_partition(runtime.get(), 0);
     for (uint64_t worker = 0; worker < state.contexts.size(); ++worker) {
-        EXPECT_EQ(runtime->dev.workers[worker].aicpu_ready, SCHEDULER_RUNTIME_MODE_RESIDENT_READY);
-        EXPECT_EQ(runtime->dev.workers[worker].task, reinterpret_cast<uint64_t>(&state.contexts[worker]));
+        EXPECT_EQ(runtime->get_workers()[worker].aicpu_ready, SCHEDULER_RUNTIME_MODE_RESIDENT_READY);
+        EXPECT_EQ(runtime->get_workers()[worker].task, reinterpret_cast<uint64_t>(&state.contexts[worker]));
     }
 }
 
@@ -464,7 +464,7 @@ TEST_F(HbgRetirementWiring, InvalidCompactIdentityCannotPublishATopologyProof) {
         EXPECT_EQ(lifecycle.post_handshake_init(runtime.get()), -1);
         EXPECT_EQ(state.summary.topology_layout, SchedulerTopologyLayout::GENERAL);
         for (uint64_t worker = 0; worker < 3; ++worker)
-            EXPECT_EQ(runtime->dev.workers[worker].aicpu_ready, 0u);
+            EXPECT_EQ(runtime->get_workers()[worker].aicpu_ready, 0u);
     }
 }
 
@@ -482,7 +482,8 @@ TEST_F(HbgRetirementWiring, ResidentShutdownSignalsAndRetiresTheSameGatedPartiti
 TEST_F(HbgRetirementWiring, ResidentClearsStaleRequestAndReleaseBeforeHandshake) {
     auto runtime = std::make_unique<Runtime>();
     runtime->set_worker_count(3);
-    for (auto &gate : runtime->dev.teardown_gates) {
+    for (size_t i = 0; i < RUNTIME_MAX_WORKER; ++i) {
+        auto &gate = runtime->get_teardown_gates()[i];
         gate.post_close_release = AICORE_POST_CLOSE_RELEASE;
         gate.exit_request = AICORE_EXIT_NONCE_1;
     }
@@ -490,8 +491,8 @@ TEST_F(HbgRetirementWiring, ResidentClearsStaleRequestAndReleaseBeforeHandshake)
 
     ASSERT_EQ(lifecycle.pre_handshake_init(runtime.get(), 1, 0), 0);
     for (size_t i = 0; i < kAddrs.size(); ++i) {
-        EXPECT_EQ(runtime->dev.teardown_gates[i].post_close_release, 0u);
-        EXPECT_EQ(runtime->dev.teardown_gates[i].exit_request, 0u);
+        EXPECT_EQ(runtime->get_teardown_gates()[i].post_close_release, 0u);
+        EXPECT_EQ(runtime->get_teardown_gates()[i].exit_request, 0u);
     }
 }
 
@@ -887,8 +888,8 @@ TEST_F(HbgRetirementWiring, ResidentSwimlaneAccumulatesInterleavedEpochsAndKeeps
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed_discovered_cluster(lifecycle, kAddrs);
     AicoreLifecycleTestPeer::prove_retired(lifecycle);
-    runtime->dev.workers[2].core_type = CoreType::AIV;
-    runtime->dev.workers[2].physical_core_id = 37;
+    runtime->get_workers()[2].core_type = CoreType::AIV;
+    runtime->get_workers()[2].physical_core_id = 37;
     for (bool first : {false, true, false, true, false, false}) {
         const uint64_t epoch = first ? 41 : 42;
         state.bind(*runtime, epoch);
@@ -1002,8 +1003,8 @@ TEST_F(HbgRetirementWiring, CanonicalSnapshotCannotAttributeAnEntirelyDroppedPar
     ResidentSwimlaneState state;
     state.bind(*runtime, 41);
     state.trace.worker_id = 2;
-    runtime->dev.workers[2].core_type = CoreType::AIV;
-    runtime->dev.workers[2].physical_core_id = 37;
+    runtime->get_workers()[2].core_type = CoreType::AIV;
+    runtime->get_workers()[2].physical_core_id = 37;
     snapshot_transport->arm(41);
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);

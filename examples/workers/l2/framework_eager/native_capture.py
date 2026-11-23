@@ -74,7 +74,7 @@ def _exercise(torch, worker, bridge, callable, config, stream, graph, frame, tic
                     keepalive=(stream, *frame["buffers"], *frame["tensors"]),
                 )
                 # This is the first native node in this exact graph scope.
-                ticket_slot[0]._native_submission._retain_model_resources()
+                ticket_slot[0]._native_submission._register_model_destroy_notice()
                 call = bridge.enqueue_native(ticket_slot[0].native_handle, frame["tensors"])
                 call.check()
                 torch.add(output, output, out=result)
@@ -100,7 +100,7 @@ def _exercise(torch, worker, bridge, callable, config, stream, graph, frame, tic
     _assert_value(torch, output, POISON)
     _assert_value(torch, result, POISON)
     ticket = ticket_slot[0]
-    assert not ticket.safe_to_release, "Host carrier retirement released the captured model's owners"
+    assert not ticket.safe_to_release, "the model must keep its submitted run alive"
     try:
         ticket.wait(timeout=0)
     except TimeoutError:
@@ -130,8 +130,8 @@ def _exercise(torch, worker, bridge, callable, config, stream, graph, frame, tic
 def _retire_ticket(ticket):
     from simpler.task_interface import RunPreparationRefused  # noqa: PLC0415
 
-    # Stock reset can return without a destruction receipt. Native release
-    # requires the registered ACL notice and checked carrier retirement.
+    # Stock reset can return before the destruction notice. Checked release
+    # finalizes the model's run after the notice arrives.
     cancelled = ticket._native_submission._release_model_resources()
     try:
         ticket.wait(timeout=0)

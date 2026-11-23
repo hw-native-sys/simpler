@@ -217,6 +217,11 @@ int aclrtMemset(void *p, size_t capacity, int32_t value, size_t bytes) {
     std::memset(p, value, bytes);
     return 0;
 }
+int aclrtMemsetAsync(void *p, size_t capacity, int32_t value, size_t bytes, aclrtStream) {
+    auto &c = native_admission_transport::control();
+    if (++c.async_memset_calls == c.fail_async_memset) return -872;
+    return aclrtMemset(p, capacity, value, bytes);
+}
 int aclrtSetOpExecuteTimeOutV2(uint64_t wanted, uint64_t *actual) {
     auto &c = native_admission_transport::control();
     ++c.op_timeout_calls;
@@ -266,6 +271,12 @@ int LoadAicpuOp::Init(const std::vector<std::string> &) {
 }
 int LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, int, const std::string &name) {
     auto &c = native_admission_transport::control();
+    if (name == KernelNames::RunName) {
+        if (args == nullptr) return -1;
+        auto &copy = c.aicpu_argument_copies.emplace_back(bytes);
+        std::memcpy(copy.data(), args, bytes);
+        args = copy.data();
+    }
     if (c.aicpu_payload) return c.aicpu_payload(stream, args, bytes, name);
     if (name != KernelNames::RegisterCallableName) return c.loader_start_rc;
     if (!c.allow_registration || bytes != sizeof(RegisterCallableArgs)) return -1;
@@ -274,6 +285,16 @@ int LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, in
     return c.registration_launch_rc;
 }
 }  // namespace host
+
+int initialize_private_workers(void *stream, void *workers, size_t bytes, int timeout_ms, bool &pending) {
+    if (!pending) {
+        std::memset(workers, 0, bytes);
+        pending = true;
+    }
+    const int rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_ms);
+    if (rc == 0) pending = false;
+    return rc;
+}
 
 KernelContextOps make_onboard_kernel_context_ops() {
     return {

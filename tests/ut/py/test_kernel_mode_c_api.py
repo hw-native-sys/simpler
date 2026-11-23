@@ -72,7 +72,7 @@ def kernel_close_faults(tmp_path_factory):
 @pytest.mark.skipif(sys.platform != "linux", reason="LD_PRELOAD interposition requires Linux")
 @pytest.mark.parametrize("delegated", [False, True])
 def test_close_fault_shim_tracks_owner_operations(kernel_close_faults, tmp_path, delegated):
-    """An ACL implementation may call the interposed RT entry internally."""
+    """An SDK may re-enter interposed RT operations internally."""
     fake = tmp_path / "fake_rts.so"
     subprocess.run(
         [
@@ -80,8 +80,21 @@ def test_close_fault_shim_tracks_owner_operations(kernel_close_faults, tmp_path,
             "-shared",
             "-fPIC",
             str(Path(__file__).with_name("support") / "kernel_close_fake_rts.cpp"),
+            "-ldl",
             "-o",
             str(fake),
+        ],
+        check=True,
+    )
+    owner = tmp_path / "fake_owner.so"
+    subprocess.run(
+        [
+            "c++",
+            "-shared",
+            "-fPIC",
+            str(Path(__file__).with_name("support") / "kernel_close_fake_owner.cpp"),
+            "-o",
+            str(owner),
         ],
         check=True,
     )
@@ -91,6 +104,7 @@ def test_close_fault_shim_tracks_owner_operations(kernel_close_faults, tmp_path,
     code = f"""
 import ctypes
 lib = ctypes.CDLL(None)
+lib.set_delegated_free({int(delegated)})
 lib.arm_acl_guard()
 assert lib.rtDeviceReset(0) == -4322
 assert lib.acl_call_count(5) == 1
@@ -112,8 +126,30 @@ for kind, destroy in ((2, lib.aclrtDestroyEvent), (4, lib.rtFree)):
     assert lib.failed_destroy_retry_attempts() == 1
     assert lib.failed_destroy_retry_successes() == 0
     assert destroy(0x1000) == 0
-    assert lib.failed_destroy_retry_attempts() == 2
+    assert lib.failed_destroy_retry_attempts() == 2, lib.failed_destroy_retry_attempts()
     assert lib.failed_destroy_retry_successes() == 1
+owner = ctypes.CDLL({str(owner)!r})
+owner.owner_free.argtypes = [ctypes.c_void_p]
+lib.bind_test_owner.argtypes = [ctypes.c_void_p]
+assert lib.bind_test_owner(ctypes.cast(owner.owner_free, ctypes.c_void_p)) == 0
+lib.sdk_internal_free.argtypes = [ctypes.c_void_p]
+lib.arm_destroy_failure_after(4, 0)
+assert lib.sdk_internal_free(0x1000) == 0
+assert lib.failed_destroy_retry_attempts() == 0
+assert owner.owner_free(0x1000) == -4321
+assert lib.failed_destroy_retry_attempts() == 1
+assert lib.sdk_internal_free(0x1000) == 0
+assert lib.failed_destroy_retry_attempts() == 1
+assert owner.owner_free(0x1000) == 0
+assert lib.failed_destroy_retry_attempts() == 2
+assert lib.failed_destroy_retry_successes() == 1
+assert lib.sdk_internal_free(0x1000) == 0
+assert lib.failed_destroy_retry_attempts() == 2
+assert lib.failed_destroy_retry_successes() == 1
+# A genuine repeated owner release must still be counted after success.
+assert owner.owner_free(0x1000) == 0
+assert lib.failed_destroy_retry_attempts() == 3
+assert lib.failed_destroy_retry_successes() == 2
 lib.arm_capture_query_failure.argtypes = [ctypes.c_void_p, ctypes.c_int]
 lib.aclmdlRICaptureGetInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_void_p)]
 status, model = ctypes.c_int(-1), ctypes.c_void_p()
@@ -488,11 +524,11 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             assert faults.failed_destroy_retry_successes() == 0
             assert lib.committed_device_memory_ctx(ctx) > 0
             assert lib.finalize_device(ctx) == 0
-            assert faults.failed_destroy_retry_attempts() == 2
+            assert faults.failed_destroy_retry_attempts() == 2, faults.failed_destroy_retry_attempts()
             assert faults.failed_destroy_retry_successes() == 1
             assert lib.committed_device_memory_ctx(ctx) == 0
             assert lib.finalize_device(ctx) == 0
-            assert faults.failed_destroy_retry_attempts() == 2
+            assert faults.failed_destroy_retry_attempts() == 2, faults.failed_destroy_retry_attempts()
             finalized = True
         elif scenario in ("repeat_init", "init_failure"):
             assert lib.simpler_kernel_mode_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
@@ -539,10 +575,10 @@ def _check_stream_or_event_close_retry(lib, ctx, faults, scenario):
     assert faults.failed_destroy_retry_attempts() == 1
     assert faults.failed_destroy_retry_successes() == 0
     assert lib.finalize_device(ctx) == 0
-    assert faults.failed_destroy_retry_attempts() == 2
+    assert faults.failed_destroy_retry_attempts() == 2, faults.failed_destroy_retry_attempts()
     assert faults.failed_destroy_retry_successes() == 1
     assert lib.finalize_device(ctx) == 0
-    assert faults.failed_destroy_retry_attempts() == 2
+    assert faults.failed_destroy_retry_attempts() == 2, faults.failed_destroy_retry_attempts()
     assert faults.failed_destroy_retry_successes() == 1
 
 
@@ -637,22 +673,12 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
-def test_simulated_capture_retention_is_unsupported(arch: str, runtime: str):
+def test_simulated_caller_owned_runs_are_unsupported(arch: str, runtime: str):
     lib = _load(arch, "sim", runtime)
-    lib.simpler_retain_run_resources.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    lib.simpler_retain_run_resources.restype = ctypes.c_int
-    lib.simpler_release_run_resources.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    lib.simpler_release_run_resources.restype = ctypes.c_int
-    reference = ctypes.c_void_p(1)
-    assert lib.simpler_retain_run_resources(None, None, None, ctypes.byref(reference)) == PTO_RUNTIME_ERR_UNSUPPORTED
-    assert reference.value is None
-    assert lib.simpler_retain_run_resources(None, None, None, None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    assert lib.simpler_release_run_resources(None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
+    _native_run_storage(lib)
+    lib.simpler_submit_run_on_stream.argtypes = [ctypes.c_void_p] * 3
+    assert lib.simpler_prepare_caller_run(None, None, 0, None, None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
+    assert lib.simpler_submit_run_on_stream(None, None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
@@ -1435,7 +1461,6 @@ class NativeRunDescriptor(ctypes.Structure):
         ("accepted_value", ctypes.c_int32),
         ("joinable_boundary", ctypes.c_uint32),
         ("provenance", NativeRunProvenance),
-        ("prepare_purpose", ctypes.c_uint32),
         ("ccu_workspace_addr", ctypes.c_uint64),
     ]
 
@@ -1513,6 +1538,7 @@ def _native_run_storage(lib):
         ctypes.POINTER(CallConfig),
         ctypes.POINTER(NativeRunDescriptor),
     ]
+    lib.simpler_prepare_caller_run.argtypes = lib.simpler_prepare_run.argtypes
     for name in ("simpler_finalize_run", "simpler_launch_run"):
         getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     return storage, run
@@ -1531,13 +1557,12 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
     lib = _load(arch, "onboard", runtime)
     faults = ctypes.CDLL(None)
     release_unproven = False
-    if release_failure:
-        faults.set_binding_release_result.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        release_function = ctypes.cast(lib.release_run_bindings_impl, ctypes.c_void_p)
-        faults.set_binding_release_result(release_function, 0)
-        faults.set_publication_result.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        publication_function = ctypes.cast(lib.publish_run_image_impl, ctypes.c_void_p)
-        faults.set_publication_result(publication_function, 0)
+    faults.set_binding_release_result.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    release_function = ctypes.cast(lib.release_run_bindings_impl, ctypes.c_void_p)
+    faults.set_binding_release_result(release_function, 0)
+    faults.set_publication_result.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    publication_function = ctypes.cast(lib.publish_run_image_impl, ctypes.c_void_p)
+    faults.set_publication_result(publication_function, 0)
     faults.bind_test_log.argtypes = [ctypes.c_void_p]
     assert faults.bind_test_log(lib._handle) == 0
     faults.force_current_device.argtypes = [ctypes.c_int]
@@ -1619,10 +1644,13 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
         assert prepare(device_args) == PTO_RUNTIME_ERR_INVALID_STATE
         assert ctypes.string_at(run, 8) == bytes(8)
         faults.force_current_device(-2)
-        # A failed metadata copy unwinds the reservation; the same run storage
-        # and slot must immediately accept another preparation.
-        faults.arm_copy_failure()
-        assert prepare(device_args) != 0
+        # A warmed slot reuses its handshake; host image publication still has
+        # a per-run rollback boundary that must release its bindings.
+        faults.set_publication_result(publication_function, -4321)
+        assert prepare(device_args) == -4321
+        assert faults.publication_call_count() == 1
+        assert faults.actual_publication_rc() == 0
+        faults.set_publication_result(publication_function, 0)
         receipt = (ctypes.c_uint64 * 2).from_address(run)
         release_magic = receipt[0]
         assert release_magic != 0 and receipt[1] == descriptor.run_epoch
@@ -1719,8 +1747,7 @@ def test_borrowed_context_uses_per_call_prepare_and_finalize(
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
-    if release_failure:
-        env["LD_PRELOAD"] = str(prepare_release_faults) + ":" + env["LD_PRELOAD"]
+    env["LD_PRELOAD"] = str(prepare_release_faults) + ":" + env["LD_PRELOAD"]
     result = subprocess.run(
         [
             sys.executable,
@@ -1750,11 +1777,12 @@ def test_borrowed_context_uses_per_call_prepare_and_finalize(
 @pytest.mark.parametrize("refusal_phase", ["prepare", "launch"])
 @pytest.mark.parametrize("borrowed", [False, True])
 def test_pre_execution_refusal_retries_through_public_worker(
-    arch, runtime, kernel_close_faults, request, refusal_phase, borrowed
+    arch, runtime, kernel_close_faults, prepare_release_faults, request, refusal_phase, borrowed
 ):
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+    env["LD_PRELOAD"] = str(prepare_release_faults) + ":" + env["LD_PRELOAD"]
     result = subprocess.run(
         [
             sys.executable,

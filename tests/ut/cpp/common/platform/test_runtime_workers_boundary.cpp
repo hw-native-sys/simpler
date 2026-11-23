@@ -8,102 +8,69 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// The three device lengths of a Runtime descriptor, checked against the real
-// layout of whichever variant this executable was compiled for. One source file
-// registered against all four arch/runtime combinations: the contract is that
-// they answer the same shape, not that they answer the same numbers.
 #include <gtest/gtest.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #include "runtime.h"
 
-namespace {
-
-// Bytes the handshake region occupies in this variant.
-constexpr size_t kWorkersBytes = sizeof(DeviceRuntimeLaunchDesc::workers);
-
-}  // namespace
-
-TEST(RuntimeWorkersBoundary, TheThreeLengthsAreOrderedAndNameDifferentBoundaries) {
+TEST(RuntimeWorkersBoundary, DescriptorLengthsExcludeSharedState) {
     const Runtime runtime;
-    const size_t copy = runtime_device_copy_size(runtime);
-    const size_t initialized = runtime_device_initialized_prefix_size(runtime);
-    const size_t extent = runtime_device_extent_size(runtime);
-
-    EXPECT_LT(copy, initialized) << "a steady-state run must publish strictly less than a first one";
-    EXPECT_LE(initialized, extent) << "no publication may run past the allocation";
-    EXPECT_EQ(extent, sizeof(DeviceRuntimeLaunchDesc));
+    EXPECT_LE(runtime_device_launch_size(runtime), runtime_device_extent_size(runtime));
+    EXPECT_LE(runtime_device_copy_size(runtime), runtime_device_extent_size(runtime));
+    EXPECT_EQ(runtime_device_initialized_prefix_size(runtime), sizeof(DeviceRuntimeLaunchDesc));
+    EXPECT_EQ(runtime_device_extent_size(runtime), sizeof(DeviceRuntimeLaunchDesc));
+    const auto descriptor_begin = reinterpret_cast<uintptr_t>(&runtime.dev);
+    const auto descriptor_end = descriptor_begin + sizeof(runtime.dev);
+    const auto workers = reinterpret_cast<uintptr_t>(runtime.get_workers());
+    EXPECT_TRUE(workers < descriptor_begin || workers >= descriptor_end);
 }
 
-TEST(RuntimeWorkersBoundary, TheSteadyStatePrefixNeverReachesTheHandshakeRegion) {
-    const Runtime runtime;
-    // The property every variant owes, whatever bounds its length: a
-    // steady-state publication stops at or before the first byte the device
-    // owns. The exact length is per-runtime, below.
-    EXPECT_LE(runtime_device_copy_size(runtime), offsetof(DeviceRuntimeLaunchDesc, workers));
+TEST(RuntimeWorkersBoundary, DistinctDescriptorsAddressTheSameSharedState) {
+    Runtime first;
+    Runtime second;
+    ASSERT_NE(first.get_workers(), second.get_workers());
+    second.dev.shared_state_addr = first.dev.shared_state_addr;
+    ASSERT_EQ(first.get_workers(), second.get_workers());
+    ASSERT_EQ(first.get_teardown_gates(), second.get_teardown_gates());
+    first.get_workers()[2].task = 0x12345678;
+    EXPECT_EQ(second.get_workers()[2].task, 0x12345678u);
+    second.get_workers()[2].aicore_done = 3;
+    EXPECT_EQ(first.get_workers()[2].aicore_done, 3);
 }
 
-TEST(RuntimeWorkersBoundary, TheInitializingPrefixEndsWithTheHandshakeRegion) {
-    const Runtime runtime;
-    EXPECT_EQ(
-        runtime_device_initialized_prefix_size(runtime), offsetof(DeviceRuntimeLaunchDesc, workers) + kWorkersBytes
-    );
-}
-
-TEST(RuntimeWorkersBoundary, EveryHandshakeOccupiesItsOwnCacheLine) {
+TEST(RuntimeWorkersBoundary, EveryHandshakeAndGateOccupiesItsOwnCacheLine) {
+    Runtime runtime;
     EXPECT_EQ(sizeof(Handshake), 64U);
     EXPECT_EQ(alignof(Handshake), 64U);
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, workers) % 64U, 0U);
-
-    // Not just the first one: the array has to keep the property element by
-    // element, because each AICore writes its own line back whole.
-    const Runtime runtime;
-    const auto base = reinterpret_cast<uintptr_t>(&runtime.dev.workers[0]);
-    for (int i = 1; i < RUNTIME_MAX_WORKER; ++i) {
-        const auto address = reinterpret_cast<uintptr_t>(&runtime.dev.workers[i]);
-        ASSERT_EQ((address - base) % 64U, 0U) << "worker " << i << " does not start a line";
+    EXPECT_EQ(offsetof(RuntimeSharedState, teardown_gates) % 64U, 0U);
+    for (int i = 0; i < RUNTIME_MAX_WORKER; ++i) {
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(&runtime.get_workers()[i]) % 64U, 0U);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(&runtime.get_teardown_gates()[i]) % 64U, 0U);
     }
 }
 
-// The first publication carries this region straight from the host object, so
-// what the constructor leaves there is what a fresh device block starts from.
-TEST(RuntimeWorkersBoundary, AFreshRuntimeHasAZeroedHandshakeRegion) {
+TEST(RuntimeWorkersBoundary, FreshHostStateIsZeroedAndCannotBeAccidentallyAliasedByCopy) {
     const Runtime runtime;
-    const auto *bytes = reinterpret_cast<const unsigned char *>(&runtime.dev.workers[0]);
-    for (size_t i = 0; i < kWorkersBytes; ++i) {
-        ASSERT_EQ(bytes[i], 0u) << "byte " << i << " of the handshake region is not zeroed";
-    }
+    const auto *bytes = reinterpret_cast<const unsigned char *>(runtime.get_workers());
+    for (size_t i = 0; i < sizeof(RuntimeSharedState::workers); ++i)
+        ASSERT_EQ(bytes[i], 0u);
+    EXPECT_FALSE(std::is_copy_constructible_v<Runtime>);
+    EXPECT_FALSE(std::is_move_constructible_v<Runtime>);
 }
 
-TEST(RuntimeWorkersBoundary, TheLaunchShapeRuleIsHostStateAndNotTheHandshakeRegion) {
+TEST(RuntimeWorkersBoundary, ShapeUpdatesDoNotWriteSharedWorkerState) {
     Runtime runtime;
-
-    // A sentinel, not zero: CoreType::AIC is 0, so a region left zeroed cannot
-    // distinguish "untouched" from "written with AIC".
-    constexpr unsigned char kSentinel = 0x3c;
-    auto *region = reinterpret_cast<unsigned char *>(&runtime.dev.workers[0]);
-    std::memset(region, kSentinel, kWorkersBytes);
-
-    runtime.set_core_type_rule(/*worker_count=*/9, /*aic_count=*/3);
-
+    constexpr unsigned char sentinel = 0x3c;
+    auto *region = reinterpret_cast<unsigned char *>(runtime.get_workers());
+    std::memset(region, sentinel, sizeof(RuntimeSharedState::workers));
+    runtime.set_core_type_rule(9, 3);
     EXPECT_EQ(runtime.core_type_rule_count(), 9U);
-    for (int i = 0; i < 3; ++i)
-        EXPECT_EQ(runtime.core_type_rule(i), CoreType::AIC) << "worker " << i;
-    for (int i = 3; i < 9; ++i)
-        EXPECT_EQ(runtime.core_type_rule(i), CoreType::AIV) << "worker " << i;
-
-    // Recording the rule must not write the region the device owns.
-    for (size_t i = 0; i < kWorkersBytes; ++i) {
-        ASSERT_EQ(region[i], kSentinel) << "byte " << i << " of the handshake region was written";
-    }
-
-    // A later shape replaces the rule rather than leaving a longer predecessor
-    // visible past its end.
-    runtime.set_core_type_rule(/*worker_count=*/3, /*aic_count=*/1);
-    EXPECT_EQ(runtime.core_type_rule_count(), 3U);
-    EXPECT_EQ(runtime.core_type_rule(0), CoreType::AIC);
-    EXPECT_EQ(runtime.core_type_rule(2), CoreType::AIV);
+    EXPECT_EQ(runtime.core_type_rule(2), CoreType::AIC);
+    EXPECT_EQ(runtime.core_type_rule(3), CoreType::AIV);
+    for (size_t i = 0; i < sizeof(RuntimeSharedState::workers); ++i)
+        ASSERT_EQ(region[i], sentinel);
 }

@@ -57,8 +57,8 @@ inline constexpr int RUNTIME_ENV_UINT64_FIELD_COUNT = RUNTIME_ENV_FIELD_GROUPS *
 // Per-task runtime-environment overrides — the programmatic equivalent of the
 // ring sizes, grouped under their own sub-struct so they read as a
 // distinct configuration tier from the top-level `aicpu_thread_num` knob.
-// Consumed by tensormap_and_ringbuffer only; other runtimes
-// ignore them.
+// TMR consumes all rings. A2/A3 and A5 HBG use ring_task_window[0] and ring_heap[0];
+// ring_heap[0] fixes the context heap capacity on first prepare (0 = 256 MiB).
 //
 // Each resource is a per-scope-depth-ring array (index 0..3). A 0 entry is
 // unset and falls through to the next precedence tier: per-ring entry >

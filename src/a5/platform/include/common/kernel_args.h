@@ -34,6 +34,8 @@
 
 #pragma once
 
+#include "common/runtime_shared_state.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -84,8 +86,13 @@ extern "C" {
 struct KernelArgs {
     // Offset-locked front: the front-less launch protocol and the device
     // entries require runtime_args @ 0 and regs @ 8 (see static_asserts below).
-    __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
-    uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
+    union {
+        // External descriptor when runtime_descriptor_bytes is zero.
+        __may_used_by_aicore__ Runtime *runtime_args{nullptr};
+        // Inline packet's optional HBG image. Both fields are zero for TMR.
+        LaunchImageSection image_section;
+    };
+    uint64_t regs{0};  // Per-core register base address array (platform-specific)
     // Remaining 64-bit fields grouped before the 32-bit tail so the struct needs
     // no interior alignment padding. Order among these is free (device reads by
     // field name, not offset); only runtime_args/regs are offset-locked.
@@ -165,23 +172,17 @@ struct KernelArgs {
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the
     // never-executed SIMT launch in simt_anchor.h survives DCE and bisheng
-    // still classifies the entry as SIMT. It is the trailing field.
+    // still classifies the entry as SIMT.
     uint32_t force_simt_anchor{0};
+    uint32_t runtime_descriptor_bytes{0};
+    RuntimeDescriptorSection runtime_section{};
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 
-// The swimlane bases are not offset-locked by any device contract — AICPU reads
-// them by field name from a CANN-private copy of the whole struct. These pin the
-// measured a5 layout so that appending, reordering, or widening a field is a
-// build failure rather than a silently different launch payload: `sizeof` is
-// what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
-// what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The field
-// offsets differ from a2a3's: this struct has no `ffts_base_addr`, so its
-// seventeen 8-byte fields end at 136 rather than 144, and its 32-bit tail holds
-// ten uint32_t rather than nine. This fills 176 bytes exactly; a2a3 rounds
-// its 180 bytes of members to 184 bytes for 8-byte alignment.
+// These assertions pin the launch header ABI. Optional sections and the Kernel
+// runtime descriptor follow this header within the RTS-owned argument package.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
@@ -198,7 +199,8 @@ static_assert(
 static_assert(offsetof(KernelArgs, graph_section_offset) == 156, "KernelArgs::graph_section_offset offset drift");
 static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 168, "entry cache policy offset drift");
 static_assert(offsetof(KernelArgs, force_simt_anchor) == 172, "SIMT anchor offset drift");
-static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, runtime_section) == 184, "runtime descriptor section offset drift");
+static_assert(sizeof(KernelArgs) == 192, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
@@ -256,7 +258,7 @@ static_assert(sizeof(AicoreLaunchArgs) == 48, "AicoreLaunchArgs size drift");
  * which selects the protocol that predates the stamp.
  */
 inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
-    args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
+    args.runtime_args = k_args.runtime_descriptor_bytes == 0 ? reinterpret_cast<uint64_t>(k_args.runtime_args) : 0;
     args.enable_profiling_flag = k_args.enable_profiling_flag;
     args.report_epoch = k_args.run_result_epoch;
 }

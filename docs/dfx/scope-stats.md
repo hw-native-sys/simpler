@@ -205,32 +205,27 @@ figure does not certify that every attempted sample reached the host.
 ### Native TMR capture/replay collection
 
 A3 native Kernel capture supports ScopeStats as the only enabled diagnostic
-family. It uses the same preparation, launch and resource-reference APIs as
+family. It uses the same caller-owned preparation and submission APIs as
 DFX-off capture. Program mode remains eager-only. HBG has no ScopeStats device
 producer; enabling this flag does not add one. A5 capture and framework graph
 capture are outside this collection contract.
 
 | When | API/action | ScopeStats lifetime |
 | ---- | ---------- | ------------------- |
-| Before capture | `simpler_prepare_run`, with `SIMPLER_PREPARE_CAPTURE`, `enable_scope_stats=1` and a nonempty `output_prefix` | Snapshots config and bound capacities; does not execute user work |
-| Before capture | `simpler_retain_run_resources` | Reserves the bounded collection window, starts readers and arms stable device addresses |
-| During capture | `simpler_launch_run_on_stream` | Records the common execution closure, including the existing device scope probes |
-| After recording the node | `simpler_finalize_run` | Retires only the original Host run; the external reference retains the diagnostic window |
-| Replay | Native RTS model execution | Device scope probes append samples; no per-replay Host callback or counter reset is required |
-| After all external uses end | Checked model destruction/cancellation, then `simpler_release_run_resources` | Drains the retained caller stream and readers, closes this window and hands Host-owned records to the writer |
-| After release | `simpler_flush_diagnostics_ctx` | Waits for artifact publication and reports diagnostic export failures |
+| Before capture | `simpler_prepare_caller_run` with ScopeStats enabled and a nonempty output prefix | Reserves the bounded collection window and arms stable device addresses |
+| During capture | `simpler_submit_run_on_stream` | Records the device probes |
+| Replay | RTS model execution | Device probes append samples to this run's window |
+| After the last use | Destroy or cancel the model and call `simpler_finalize_run` | Drains the stream and readers and hands records to the writer |
+| After finalization | `simpler_flush_diagnostics_ctx` | Waits for publication and reports export failures |
 
-The caller keeps its context, stream and device tensors alive through successful
-resource-reference release. A failed stream drain or uncertain reader settlement
-retains the reference for cleanup retry. A successful release proves resource
-settlement; it does not by itself promise that the writer has published the file.
-No file is promised at the original recording run's finalization.
+The caller keeps its run, context, stream and tensors alive through successful
+cleanup. A failed drain leaves the original run available for retry.
 
 All ScopeStats-enabled model replays and eager runs sharing this context's
 collector pool execute in one caller-ordered domain, without concurrent
-producers. Multiple retained references and collection windows may coexist.
-Before releasing any reference, the caller finishes all such producers sharing
-the pool and starts none until release returns. Closing one collection window
+producers. Each outstanding run owns its collection window.
+Before finalizing any run, the caller finishes all such producers sharing
+the pool and starts none until finalization returns. Closing one collection window
 does not close another live window. The retained caller stream's synchronization
 cannot prove that raw replays on other streams have stopped; the caller supplies
 that ordering. No whole-context stream synchronization is added by this rule.

@@ -16,6 +16,41 @@ int main(int argc, char **argv) {
     constexpr uint64_t request_bytes = 32ULL << 20;
     static_assert(maximum_models * request_bytes > workspace_budget);
     CaptureFixture fixture(argc, argv, maximum_models);
+    if (!fixture.tmr) {
+        const auto before = fixture.report("before-shared-models");
+        for (auto &model : fixture.models) {
+            check(fixture.prepare(model, request_bytes), "prepare-shared-model");
+            fixture.unchanged(model);
+            fixture.record(model);
+        }
+        const auto retained = fixture.report("nine-shared-models");
+        const auto workspace = fixture.models.front().image_address;
+        require(workspace != 0, "retained-image-observed");
+        for (const auto &model : fixture.models)
+            require(model.image_address == workspace, "retained-models-share-workspace");
+        require(
+            retained.reserved_bytes - before.reserved_bytes < 2 * fixture.config.runtime_env.ring_heap[0],
+            "heap-does-not-scale-with-retained-models"
+        );
+        for (size_t i = 0; i < maximum_models; ++i)
+            fixture.replay(fixture.models[i], static_cast<int>(i + 1));
+        fixture.release(fixture.models[0]);
+        fixture.poison(fixture.models[0]);
+        check(fixture.prepare(fixture.models[0], request_bytes), "same-pressure-readmitted");
+        fixture.record(fixture.models[0]);
+        fixture.replay(fixture.models[0], 30);
+        for (size_t i = 1; i < maximum_models; ++i)
+            fixture.replay(fixture.models[i], static_cast<int>(i + 40));
+        for (auto &model : fixture.models)
+            fixture.release(model);
+        fixture.close();
+        std::printf(
+            "CAPTURE_SHARED_HEAP_CAPACITY_PASS runtime=%s budget=%llu request=%llu models=9 grants=2 "
+            "same_pressure_recovered=1\n",
+            argv[6], static_cast<unsigned long long>(workspace_budget), static_cast<unsigned long long>(request_bytes)
+        );
+        return 0;
+    }
     size_t accepted_models = 0;
     int refused = 0;
     for (size_t i = 0; i < maximum_models; ++i) {

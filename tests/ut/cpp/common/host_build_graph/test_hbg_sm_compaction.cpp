@@ -24,6 +24,7 @@
 #include <cstring>
 #include <vector>
 
+#include "aicpu/hbg_execution_image.h"
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/task_id.h"
 
@@ -200,6 +201,58 @@ struct Compacted {
 };
 
 }  // namespace
+
+TEST(HbgSmCompaction, RestoresMixedTaskRecordsAndReadsArgumentPoolsFromTheLaunchImage) {
+    Mirror mirror;
+    mirror.storage()[1].slot.initial_task_state = CHIP_TASK_COMPLETED;
+    mirror.storage()[1].slot.logical_block_num = 3;
+    mirror.storage()[1].payload.predicate.addr = 0x4200;
+    Compacted snapshot(mirror);
+    const auto segments = snapshot.off();
+    AlignedImage workspace(segments.fanin_pool, 0xA5);
+    auto &header = *reinterpret_cast<SharedMemoryHeader *>(workspace.base());
+    const HbgExecutionImage binding{reinterpret_cast<uint64_t>(&header), snapshot.bytes, sizeof(header), 1};
+    const HbgImageReference reference{reinterpret_cast<uint64_t>(&header.tasks.initial_storage), segments.storage};
+    AlignedImage packet(CHIP_ALIGN_SIZE + snapshot.bytes + sizeof(reference));
+    char *image = packet.base() + CHIP_ALIGN_SIZE;
+    char *packet_header = image - sizeof(binding);
+    std::memcpy(packet_header, &binding, sizeof(binding));
+    std::memcpy(image, snapshot.image.base(), snapshot.bytes);
+    std::memcpy(image + snapshot.bytes, &reference, sizeof(reference));
+    const auto *initial = reinterpret_cast<const ChipTaskStorage *>(image + segments.storage);
+    const auto coherent = [](const void *, size_t) {};
+    for (int replay = 0; replay < 2; ++replay) {
+        ASSERT_EQ(
+            restore_hbg_execution_image(
+                packet_header, sizeof(binding) + snapshot.bytes + sizeof(reference), coherent, coherent
+            ),
+            0
+        );
+        ASSERT_EQ(header.tasks.initial_storage, initial);
+        header.tasks.task_storage = reinterpret_cast<ChipTaskStorage *>(workspace.base() + segments.storage);
+        header.tasks.task_states =
+            reinterpret_cast<std::atomic<ChipTaskState> *>(workspace.base() + segments.task_states);
+        header.reset_execution_state(header.tasks.initial_storage);
+        const auto &source = initial[1].payload;
+        auto &entry = header.tasks.storage_at(1);
+        EXPECT_EQ(&entry.payload.argument_source(), &source);
+        EXPECT_EQ(entry.payload.tensor_data(), source.tensor_data());
+        EXPECT_EQ(entry.payload.scalar_data(), source.scalar_data());
+        EXPECT_EQ(entry.payload.fanin_data(), source.fanin_data());
+        EXPECT_EQ(entry.payload.scalar_data()[0], 0x3010u);
+        EXPECT_EQ(entry.slot.logical_block_num, 3);
+        EXPECT_EQ(entry.payload.predicate.addr, 0x4200u);
+        EXPECT_EQ(entry.slot.next_block_idx.load(), 0);
+        EXPECT_EQ(entry.payload.early_dispatch_state.load(), EARLY_DISPATCH_NONE);
+        EXPECT_TRUE(header.tasks.is_completed(1));
+        EXPECT_FALSE(header.tasks.is_completed(0));
+        entry.slot.next_block_idx.store(2);
+        entry.payload.early_dispatch_state.store(EARLY_DISPATCH_STAGING);
+        header.tasks.store_completed(0);
+        header.tasks.reset_task_state(1);
+    }
+    EXPECT_EQ(std::memcmp(image, snapshot.image.base(), snapshot.bytes), 0);
+}
 
 // The point of the restack: the whole image is one range, and it is far smaller
 // than the mirror it came from.

@@ -32,13 +32,17 @@ import contextlib
 import importlib.util
 import inspect
 import mmap
+import os
 import sys
 import textwrap
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
+
+from simpler_setup.tools.strace_timing import parse_spans
 
 #: The suites carrying this reader. Both are loaded, because they hold separate copies of it and a
 #: repair applied to one would otherwise go missing from the other.
@@ -88,6 +92,8 @@ def _refill_scene_body(relative_path):
             nodes.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in functions:
             nodes.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name == "_ChildTrace":
+            nodes.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "TestDfxJoinedLaunchAttribution":
             for member in node.body:
                 if isinstance(member, ast.FunctionDef) and member.name in methods:
@@ -102,7 +108,8 @@ def _refill_scene_body(relative_path):
 
 
 @pytest.mark.parametrize("name", sorted(_REFILL_SUITES))
-def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
+@pytest.mark.parametrize("fail_at_flush", [False, True])
+def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path, fail_at_flush):
     """A stream observer can finish later executions without observing their own results.
 
     Two physical credits admit new work independently of retained semantic results. Waiting
@@ -115,6 +122,13 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
     torch = scene["torch"]
     jobs, events, spans, tiles = [], [], [], []
     generations = [0, 0]
+    tensor_refs = []
+
+    def tracked_frombuffer(*args, **kwargs):
+        tensor = torch.frombuffer(*args, **kwargs)
+        tensor_refs.append(weakref.ref(tensor))
+        return tensor
+
     owner_patterns = {
         owner: pattern.replace("*", "1")
         for owner, pattern in scene["_OWNER_ARTIFACTS"].items()
@@ -174,6 +188,8 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
     def flush():
         assert len(jobs) == 6 and all(job.observed for job in jobs)
         events.append(("flush", len(jobs)))
+        if fail_at_flush:
+            raise RuntimeError("injected diagnostic failure")
         for job in jobs:
             for pattern in owner_patterns.values():
                 artifact = job.prefix / pattern
@@ -197,7 +213,7 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
         tiles.append(actual.numel())
         return torch.allclose(actual, expected, **kwargs)
 
-    scene["torch"] = SimpleNamespace(frombuffer=torch.frombuffer, allclose=allclose)
+    scene["torch"] = SimpleNamespace(frombuffer=tracked_frombuffer, allclose=allclose)
     case = SimpleNamespace(
         RTOL=0,
         ATOL=0,
@@ -212,6 +228,12 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
         create_buffer=lambda nbytes: SimpleNamespace(shm=SimpleNamespace(buf=bytearray(nbytes))),
         flush_diagnostics=flush,
     )
+    if fail_at_flush:
+        with pytest.raises(RuntimeError, match="injected diagnostic failure") as failure:
+            scene["_refill_owns_its_records"](case, worker, tmp_path / name, False, None)
+        assert failure.value.__traceback__ is not None
+        assert not any(ref() is not None for ref in tensor_refs), "traceback retained CPU tensor exports"
+        return
     try:
         scene["_refill_owns_its_records"](case, worker, tmp_path / name, False, None)
     except AssertionError as error:
@@ -1056,3 +1078,77 @@ def test_hbg_three_run_wait_does_not_accept_a_permanently_missing_boundary(hbg_s
     records = []
     assert not hbg_suite._await_records(trace, records, 0, _three_run_wait_predicate(hbg_suite, trace, runs))
     assert hbg_suite._whole_operator_order(trace, records, runs)[3] == {(_SUCCESSOR, third)}
+
+
+@pytest.mark.parametrize("name", sorted(_REFILL_SUITES))
+def test_dfx_failure_keeps_initial_timing_outside_log_tail(name):
+    scene = _refill_scene_body(_REFILL_SUITES[name][0])
+    spans = [
+        SimpleNamespace(pid=42, inv=inv, name="chip.run.prepare_execution", ts=inv * 100, dur=10, attrs="")
+        for inv in (7, 8, 9)
+    ]
+    spans.append(
+        SimpleNamespace(pid=42, inv=8, name="chip.run.joined_launch", ts=999, dur=0, attrs="observed=1 unfired=0 rc=0")
+    )
+    trace = SimpleNamespace(_iter_spans=lambda: iter(spans), window_text=lambda: "tail omits first pair")
+    result = scene["_ChildTrace"].safe_window_text(trace)
+    assert "inv=7 name=chip.run.prepare_execution ts=700 dur=10" in result, result
+    assert "inv=8 name=chip.run.joined_launch ts=999 dur=0 observed=1 unfired=0 rc=0" in result
+    assert "inv=9" not in result
+    assert result.endswith("tail omits first pair")
+
+
+@pytest.mark.parametrize("name", sorted(_REFILL_SUITES))
+def test_dfx_failure_streams_only_the_opened_window(name, tmp_path, monkeypatch):
+    scene = _refill_scene_body(_REFILL_SUITES[name][0])
+    scene.update(os=os, parse_spans=parse_spans)
+    path = tmp_path / "host.42.log"
+    path.write_bytes(b"old history\n" * 10000)
+    opened_at = path.stat().st_size
+    with path.open("ab") as handle:
+        for inv in range(7, 1007):
+            handle.write(
+                f"[STRACE] v=1 pid=42 tid=1 inv={inv} hid=ab depth=0 "
+                f"name=chip.run.prepare_execution ts={inv * 100} dur=10\n".encode()
+            )
+        handle.write(b"refusal: current failure\n")
+        handle.write(b"[STRACE] v=1 pid=42 tid=1 inv=7 hid=ab depth=0 name=chip.run ts=999 dur=1")
+    trace = scene["_ChildTrace"].__new__(scene["_ChildTrace"])
+    trace._paths = {42: path}
+    trace._offsets = {42: opened_at}
+    original_open = Path.open
+
+    class WindowReader:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+        def read(self, size=-1):
+            assert self.handle.tell() >= opened_at, "must not read history before the window"
+            assert 0 <= size <= 16384, "failure collection must use bounded reads"
+            return self.handle.read(size)
+
+        def __iter__(self):
+            assert self.handle.tell() >= opened_at
+            return iter(self.handle)
+
+    def guarded_open(target, *args, **kwargs):
+        handle = original_open(target, *args, **kwargs)
+        return WindowReader(handle) if target == path else handle
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    result = trace.safe_window_text()
+    assert "inv=7 name=chip.run.prepare_execution ts=700 dur=10" in result, result
+    assert "inv=8 name=chip.run.prepare_execution ts=800 dur=10" in result
+    timing = result.split("--- child", 1)[0]
+    assert "inv=9 " not in timing
+    assert "ts=999 " not in timing, "partial final records are not evidence"
+    assert "refusal: current failure" in result

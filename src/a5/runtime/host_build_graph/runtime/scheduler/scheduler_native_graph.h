@@ -37,8 +37,8 @@ struct SchedulerNodeBinding {
     SchedulerNodeKind kind;
 };
 
-// All offsets name regions of the scheduler backing, including the existing
-// run control prefix. Absolute addresses are confined to per-run instances.
+// All offsets are relative to the read-only native graph image.
+// Absolute addresses are confined to per-run instances.
 struct alignas(64) SchedulerNativeGraphHeader {
     uint32_t magic;
     uint64_t image_bytes;

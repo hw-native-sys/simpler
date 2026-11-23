@@ -99,6 +99,10 @@ struct alignas(64) SharedMemoryTaskHeader {
     // claimed, and the bytes past task_states[total_tasks - 1] are not states.
     int32_t total_tasks;
 
+    // An onboard launch relocates this pointer to its immutable task records.
+    // task_storage always names the writable records after the handle attaches.
+    const ChipTaskStorage *initial_storage;
+
     // The byte holds a ChipTaskState and only ever advances:
     //   PENDING -> PUBLISHED -> COMPLETED
     // Both transitions are plain stores; monotonicity is by construction, not
@@ -133,9 +137,10 @@ struct alignas(64) SharedMemoryTaskHeader {
 
     // Serial invocation boundary: no scheduler or completion writer may still use this table.
     // Restore all producers before classification can inspect their state or register a waiter.
-    void reset_execution_state() {
+    void reset_execution_state(const ChipTaskStorage *initial = nullptr) {
         for (int32_t id = 0; id < total_tasks; ++id) {
             auto &entry = task_storage[id];
+            if (initial != nullptr) entry.bind_initial_task(initial[id]);
             entry.slot.reset_execution_state();
             entry.payload.reset_execution_state();
             task_states[id].store(entry.slot.initial_task_state, std::memory_order_relaxed);
@@ -176,8 +181,8 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
 
     // Exclusive invocation initialization, before publishing readiness to schedulers.
     // Historical fault evidence belongs to NativeInvocationEvidence, not this header.
-    void reset_execution_state() {
-        tasks.reset_execution_state();
+    void reset_execution_state(const ChipTaskStorage *initial = nullptr) {
+        tasks.reset_execution_state(initial);
         sched_error_bitmap.store(0, std::memory_order_relaxed);
         sched_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
         sched_error_thread.store(-1, std::memory_order_relaxed);
@@ -464,6 +469,7 @@ inline uint64_t compact_live_image(
     // lands where it already was.
     std::memcpy(out_base, mirror_base, to.storage);
     auto &out_tasks = reinterpret_cast<SharedMemoryHeader *>(out_base)->tasks;
+    out_tasks.initial_storage = nullptr;
     out_tasks.task_storage = nullptr;
     out_tasks.task_states = nullptr;
 

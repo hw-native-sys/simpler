@@ -200,7 +200,7 @@ protected:
         runtime->set_worker_count(kCores);
         ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
         for (int i = 0; i < kCores; ++i) {
-            auto &handshake = runtime->dev.workers[i];
+            auto &handshake = runtime->get_workers()[i];
             handshake.physical_core_id = i;
             handshake.core_type = i < 2 ? CoreType::AIC : CoreType::AIV;
             handshake.aicore_done = 1;
@@ -505,7 +505,7 @@ TEST_F(SchedulerRetirement, CancelledDrainRequiresEveryCoreRelease) {
 #endif
 
 TEST_F(SchedulerRetirement, InvalidPhysicalCoreIsNotPublishedOrRetired) {
-    runtime->dev.workers[0].physical_core_id = kCores;
+    runtime->get_workers()[0].physical_core_id = kCores;
     EXPECT_EQ(request_all(), 0);
     handshake();
     EXPECT_TRUE(SchedulerContextTestPeer::handshake_failed(*context));
@@ -594,13 +594,13 @@ TEST_F(SchedulerRetirement, NewGenerationClearsPendingRequestsAndReturnGates) {
 
 TEST_F(SchedulerRetirement, InitializationClearsRequestAndReleaseForEveryCore) {
     for (int i = 0; i < kCores; ++i) {
-        auto &control = runtime->dev.teardown_gates[i];
+        auto &control = runtime->get_teardown_gates()[i];
         control.post_close_release = AICORE_POST_CLOSE_RELEASE;
         control.exit_request = 9;
     }
     ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
     for (int i = 0; i < kCores; ++i) {
-        const auto &control = runtime->dev.teardown_gates[i];
+        const auto &control = runtime->get_teardown_gates()[i];
         EXPECT_EQ(control.post_close_release, 0u);
         EXPECT_EQ(control.exit_request, 0u);
     }
@@ -612,7 +612,7 @@ TEST_F(SchedulerRetirement, NativeModeClaimsOnlyAfterCurrentReportAndUsesCondNon
     for (int i = 0; i < kCores; ++i) {
         EXPECT_EQ(runtime->get_teardown_gates()[i].exit_request, 0U);
         EXPECT_EQ(runtime->get_teardown_gates()[i].post_close_release, 0U);
-        runtime->dev.workers[i].report_epoch = 42;
+        runtime->get_workers()[i].report_epoch = 42;
     }
     SchedulerContextTestPeer::assign(*context);
     EXPECT_EQ(request_all(), 0);
@@ -632,13 +632,13 @@ TEST_F(SchedulerRetirement, UnstampedModeUsesNonceAfterOwnershipPublication) {
 TEST_F(SchedulerRetirement, ReportsAreInvalidatedOnlyAfterTheirOwnExitAcknowledgement) {
     handshake();
     for (int i = 0; i < kCores; ++i) {
-        runtime->dev.workers[i].aicpu_ready = 2;
-        runtime->dev.workers[i].report_epoch = 42;
+        runtime->get_workers()[i].aicpu_ready = 2;
+        runtime->get_workers()[i].report_epoch = 42;
     }
     silent_first_core = true;
     EXPECT_NE(request_all(), 0);
     for (int i = 0; i < kCores; ++i) {
-        const auto &report = runtime->dev.workers[i];
+        const auto &report = runtime->get_workers()[i];
         EXPECT_EQ(report.aicore_done, i == 0 ? 1u : 0u);
         EXPECT_EQ(report.aicpu_ready, i == 0 ? 2u : 0u);
         EXPECT_EQ(report.report_epoch, 42u);
@@ -647,14 +647,14 @@ TEST_F(SchedulerRetirement, ReportsAreInvalidatedOnlyAfterTheirOwnExitAcknowledg
     const int previous_batches = batches.load();
     emergency();
     EXPECT_EQ(batches.load(), previous_batches);
-    EXPECT_EQ(runtime->dev.workers[0].aicore_done, 1u);
+    EXPECT_EQ(runtime->get_workers()[0].aicore_done, 1u);
 }
 
 TEST_F(SchedulerRetirement, MissingReportDoesNotTurnAcceptedRetirementIntoExitProof) {
     EXPECT_EXIT(
         {
             SchedulerContextTestPeer::clear_ownership(*context);
-            runtime->dev.workers[kCores - 1].aicore_done = 0;
+            runtime->get_workers()[kCores - 1].aicore_done = 0;
             context->handshake_partition(runtime.get(), 0, 2);
             for (int i = 0; i < kCores / 2; ++i)
                 if (opened[i].load() != 1) std::_Exit(1);

@@ -59,12 +59,6 @@ bool resource_wait_entered = false;
 std::atomic<int> resource_wait_return{-1};
 std::atomic<pthread_cond_t *> resource_wait_condition{nullptr};
 std::atomic<size_t> resource_notifications{0};
-thread_local bool inspect_acquire_failure = false;
-thread_local pthread_mutex_t *acquire_lane_mutex = nullptr;
-thread_local size_t acquire_lane_lock_count = 0;
-bool acquire_failure_entered = false;
-bool acquire_failure_proceed = false;
-
 template <typename Wait>
 int observe_resource_wait_call(pthread_cond_t *condition, Wait wait) {
     if (!observe_resource_wait) return wait();
@@ -80,22 +74,6 @@ int observe_resource_wait_call(pthread_cond_t *condition, Wait wait) {
 }
 }  // namespace
 
-extern "C" int __real_pthread_mutex_lock(pthread_mutex_t *);
-extern "C" int __wrap_pthread_mutex_lock(pthread_mutex_t *mutex) {
-    if (inspect_acquire_failure) {
-        if (acquire_lane_mutex == nullptr) acquire_lane_mutex = mutex;
-        if (mutex == acquire_lane_mutex && ++acquire_lane_lock_count == 2) {
-            inspect_acquire_failure = false;
-            std::unique_lock<std::mutex> lock(resource_wait_entry_mu);
-            acquire_failure_entered = true;
-            resource_wait_entry_changed.notify_all();
-            resource_wait_entry_changed.wait(lock, [] {
-                return acquire_failure_proceed;
-            });
-        }
-    }
-    return __real_pthread_mutex_lock(mutex);
-}
 extern "C" void __real__ZNSt18condition_variable10notify_allEv(std::condition_variable *);
 extern "C" void __wrap__ZNSt18condition_variable10notify_allEv(std::condition_variable *condition) {
     if (condition->native_handle() == resource_wait_condition.load(std::memory_order_acquire))
@@ -142,10 +120,10 @@ std::vector<int> g_finalize_rc;
 std::vector<bool> g_finalize_no_submission;
 std::vector<uint64_t> g_epochs;
 std::vector<size_t> g_prepare_count;
-std::vector<uint32_t> g_prepare_purpose;
 std::vector<std::array<int32_t, 2>> g_host_controls;
 std::vector<uint64_t> g_control_scalars;
 std::multiset<uint64_t> g_span_borrows;
+std::unordered_map<void *, uint64_t> g_caller_owned_loans;
 std::vector<bool> g_reject_first_prepare;
 size_t g_poll_count{0};
 size_t g_completion_wait_count{0};
@@ -163,61 +141,7 @@ std::mutex g_wait_mu;
 std::condition_variable g_wait_cv;
 bool g_wait_entered{false};
 bool g_release_wait{true};
-bool g_hold_retain{false};
 std::vector<std::string> g_events;
-int g_retain_rc{0};
-bool g_retain_output_on_error{false};
-int g_release_rc{0};
-uintptr_t g_next_reference{0};
-std::unordered_map<void *, uint32_t> g_resource_references;
-std::unordered_map<void *, uint64_t> g_resource_epochs;
-ChipWorker *g_active_worker{nullptr};
-
-int retain_resources(void *, void *runtime, void *, void **out_reference) {
-    const uint32_t slot = g_slots.at(runtime);
-    g_events.push_back("retain" + std::to_string(slot));
-    *out_reference = nullptr;
-    {
-        std::unique_lock<std::mutex> lock(g_wait_mu);
-        if (g_hold_retain) {
-            g_wait_entered = true;
-            g_wait_cv.notify_all();
-            g_wait_cv.wait(lock, [] {
-                return g_release_wait;
-            });
-        }
-    }
-    if (g_retain_rc != 0 && !g_retain_output_on_error) return g_retain_rc;
-    *out_reference = reinterpret_cast<void *>(++g_next_reference);
-    g_resource_references.emplace(*out_reference, slot);
-    g_resource_epochs.emplace(*out_reference, g_epochs[slot]);
-    return g_retain_rc;
-}
-
-int release_resources(void *, void *reference) {
-    const uint32_t slot = g_resource_references.at(reference);
-    g_events.push_back("release" + std::to_string(slot));
-    if (g_release_rc != 0) return g_release_rc;
-    const uint64_t epoch = g_resource_epochs.at(reference);
-    g_resource_references.erase(reference);
-    g_resource_epochs.erase(reference);
-    const bool referenced = std::any_of(g_resource_epochs.begin(), g_resource_epochs.end(), [epoch](const auto &one) {
-        return one.second == epoch;
-    });
-    // This fake leaf models the common API's retained loan. The real common
-    // ledger is tested separately: a known-retired carrier's last reference
-    // releases one loan, including when a successor reused its pipeline slot.
-    bool carrier_retired;
-    {
-        std::lock_guard<std::mutex> lock(g_active_worker->native_run_mu_);
-        carrier_retired = g_active_worker->native_runs_.count(epoch) == 0;
-    }
-    if (!referenced && carrier_retired) {
-        const auto loan = g_span_borrows.find(static_cast<uint64_t>(slot) + 1);
-        if (loan != g_span_borrows.end()) g_span_borrows.erase(loan);
-    }
-    return 0;
-}
 
 uint32_t slot_of(void *runtime) { return g_slots.at(runtime); }
 
@@ -229,7 +153,6 @@ int prepare_run(
     g_epochs[descriptor->pipeline_slot] = descriptor->run_epoch;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
     ++g_prepare_count[descriptor->pipeline_slot];
-    g_prepare_purpose[descriptor->pipeline_slot] = descriptor->prepare_purpose;
     const auto &args = *static_cast<const ChipStorageTaskArgs *>(arguments);
     if (args.tensor_count() != 0 && args.tensor(0).address_space == AddressSpace::HOST) {
         const auto &tensor = args.tensor(0);
@@ -298,16 +221,7 @@ int finalize_run(void *, void *runtime, int) {
     if (g_finalize_no_submission[slot] && g_finalize_rc[slot] == 0) {
         publish_released_preparation(runtime, g_epochs[slot]);
     }
-    if (g_finalize_rc[slot] == 0 && g_prepare_purpose[slot] == SIMPLER_PREPARE_CAPTURE) {
-        const uint64_t epoch = g_epochs[slot];
-        const bool retained = std::any_of(g_resource_epochs.begin(), g_resource_epochs.end(), [epoch](const auto &one) {
-            return one.second == epoch;
-        });
-        if (!retained) {
-            const auto loan = g_span_borrows.find(static_cast<uint64_t>(slot) + 1);
-            if (loan != g_span_borrows.end()) g_span_borrows.erase(loan);
-        }
-    }
+    if (g_finalize_rc[slot] == 0) g_caller_owned_loans.erase(runtime);
     return g_finalize_rc[slot];
 }
 
@@ -330,10 +244,10 @@ void prime_worker(ChipWorker &worker, size_t depth = 2) {
     g_finalize_no_submission.assign(depth, {});
     g_epochs.assign(depth, {});
     g_prepare_count.assign(depth, {});
-    g_prepare_purpose.assign(depth, {});
     g_host_controls.assign(depth, {});
     g_control_scalars.assign(depth, {});
     g_span_borrows.clear();
+    g_caller_owned_loans.clear();
     g_reject_first_prepare.assign(depth, {});
     g_poll_count = 0;
     g_completion_wait_count = 0;
@@ -350,14 +264,6 @@ void prime_worker(ChipWorker &worker, size_t depth = 2) {
         g_release_wait = true;
     }
     g_events.clear();
-    g_retain_rc = 0;
-    g_retain_output_on_error = false;
-    g_release_rc = 0;
-    g_hold_retain = false;
-    g_next_reference = 0;
-    g_resource_references.clear();
-    g_resource_epochs.clear();
-    g_active_worker = &worker;
     worker.initialized_ = true;
     worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, static_cast<uint32_t>(depth), {}};
     // One generation per granted set, as `init` sizes it: an unsized filter has no entry for
@@ -367,13 +273,12 @@ void prime_worker(ChipWorker &worker, size_t depth = 2) {
     for (size_t slot = 0; slot < depth; ++slot)
         worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     worker.prepare_run_fn_ = prepare_run;
+    worker.prepare_caller_run_fn_ = prepare_run;
     worker.launch_run_fn_ = launch_run;
     worker.poll_run_fn_ = poll_run;
     worker.wait_run_fn_ = wait_run;
     worker.wait_run_completion_fn_ = wait_run_completion;
     worker.finalize_run_fn_ = finalize_run;
-    worker.retain_run_resources_fn_ = retain_resources;
-    worker.release_run_resources_fn_ = release_resources;
     worker.supports_concurrent_native_prepare_fn_ = supports_successor;
 }
 
@@ -386,6 +291,16 @@ void prime_capture_worker(ChipWorker &worker, size_t depth = 2) {
     worker.launch_run_on_stream_fn_ = [](void *, void *runtime, void *, void *) {
         g_events.push_back("stream_launch" + std::to_string(slot_of(runtime)));
         return g_launch_rc[slot_of(runtime)];
+    };
+    worker.submit_run_on_stream_fn_ = [](void *, void *runtime, void *) {
+        const uint32_t slot = slot_of(runtime);
+        g_events.push_back("stream_launch" + std::to_string(slot));
+        const auto loan = g_span_borrows.find(static_cast<uint64_t>(slot) + 1);
+        if (g_launch_rc[slot] == 0 && loan != g_span_borrows.end()) {
+            g_caller_owned_loans.emplace(runtime, g_epochs[slot]);
+            g_span_borrows.erase(loan);
+        }
+        return g_launch_rc[slot];
     };
     worker.device_borrow_caller_buffers_ctx_fn_ = [](void *, const CallerBufferSpan *, uint32_t, uint64_t identity) {
         g_span_borrows.insert(identity);
@@ -416,7 +331,7 @@ ChipStorageTaskArgs device_args() {
 }
 
 template <typename Finish>
-void expect_capture_wait_notification(ChipRun &run, Finish finish) {
+void expect_last_use_notification(ChipRun &run, Finish finish) {
 #if defined(__linux__) && defined(__GLIBCXX__)
     {
         std::lock_guard<std::mutex> lock(resource_wait_entry_mu);
@@ -492,7 +407,7 @@ int transfer_completed_run(void *, void *runtime) {
 }
 ChipRun submit_framework(ChipRunLane &lane) {
     ChipStorageTaskArgs args{};
-    return lane.submit(1, args, CallConfig{}, nullptr, 0, nullptr, SIMPLER_PREPARE_EAGER, nullptr, true);
+    return lane.submit(1, args, CallConfig{}, nullptr, 0, nullptr, nullptr, ChipRunOwner::FrameworkObserver);
 }
 void enable_framework_transfer(ChipWorker &worker) {
     framework_transfer_rc = 0;
@@ -1424,17 +1339,13 @@ TEST(ChipRunLaneTest, TerminalHostRecoveryDrainsAnUnobservedRunWithoutResettingM
     worker.finalize();
 }
 
-TEST(ChipRunLaneTest, TerminalHostRecoveryRefusesBorrowedContextsAndExternalReferences) {
+TEST(ChipRunLaneTest, TerminalHostRecoveryRefusesBorrowedContexts) {
     ChipWorker worker;
     prime_worker(worker);
     worker.execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, true};
     EXPECT_THROW(worker.quiesce_host_uses(), std::runtime_error);
     EXPECT_FALSE(worker.native_runs_closing_);
     worker.execution_environment_.reset();
-    worker.native_resource_references_ = 1;
-    EXPECT_THROW(worker.quiesce_host_uses(), std::runtime_error);
-    EXPECT_FALSE(worker.host_uses_quiesced_);
-    worker.native_resource_references_ = 0;
     worker.finalize();
 }
 
@@ -1691,821 +1602,13 @@ TEST(ChipRunLaneTest, NativeSubmissionPinsTheNativeWorkerUntilCancellation) {
     EXPECT_TRUE(g_events.empty());
 }
 
-TEST(ChipRunLaneTest, CapturePreparationRejectsProgramBeforeBackendEntry) {
-    ChipWorker worker;
-    prime_worker(worker);
-    ChipStorageTaskArgs args{};
-    EXPECT_THROW(
-        worker.prepare_native_run(
-            1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 0, 0, nullptr, 0, {}, SIMPLER_PREPARE_CAPTURE
-        ),
-        RunPreparationRefused
-    );
-    EXPECT_TRUE(g_events.empty());
-    EXPECT_TRUE(worker.native_runs_.empty());
-    worker.finalize();
-}
-
-TEST(ChipRunLaneTest, CapturePreparesTwoDistinctGrantedSetsWithoutLaunchingOrDraining) {
-    ChipWorker worker;
-    prime_worker(worker);
-    worker.execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, true};
-    g_supports_successor = false;
-    ChipStorageTaskArgs args{};
-    auto first = worker.prepare_native_run(
-        1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 0, 0, nullptr, 0, {}, SIMPLER_PREPARE_CAPTURE
-    );
-    auto second = worker.prepare_native_run(
-        1, &args, CallConfig{}, PipelineSlotLease{1, 0, 2}, 0, 0, nullptr, 0, {}, SIMPLER_PREPARE_CAPTURE
-    );
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "prepare1"}));
-    EXPECT_EQ(g_prepare_purpose, (std::vector<uint32_t>{SIMPLER_PREPARE_CAPTURE, SIMPLER_PREPARE_CAPTURE}));
-    EXPECT_EQ(g_poll_count, 0);
-    EXPECT_EQ(g_completion_wait_count, 0);
-    EXPECT_THROW(
-        worker.prepare_native_run(
-            1, &args, CallConfig{}, PipelineSlotLease{0, 0, 3}, 0, 0, nullptr, 0, {}, SIMPLER_PREPARE_CAPTURE
-        ),
-        RunPreparationRefused
-    );
-    EXPECT_EQ(g_events.size(), 2);
-    worker.finalize_native_run(first);
-    worker.finalize_native_run(second);
-    worker.finalize();
-}
-
-TEST(ChipRunLaneTest, CapturePreparedCarrierFinalizationDelegatesWithoutEagerWait) {
-    ChipWorker worker;
-    prime_worker(worker);
-    worker.execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, true};
-    worker.validate_caller_stream_fn_ = [](void *, void *) {
-        return 0;
-    };
-    worker.launch_run_on_stream_fn_ = [](void *, void *runtime, void *, void *) {
-        g_events.push_back("stream_launch" + std::to_string(slot_of(runtime)));
-        return 0;
-    };
-    ChipStorageTaskArgs args{};
-    auto run = worker.prepare_native_run(
-        1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 0, 0, nullptr, 0, {}, SIMPLER_PREPARE_CAPTURE
-    );
-    ASSERT_EQ(worker.launch_native_run(run, reinterpret_cast<void *>(1)), ChipWorker::NativeLaunch::Launched);
-    worker.finalize_native_run(run);
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "stream_launch0", "finalize0"}));
-    EXPECT_EQ(g_completion_wait_count, 0);
-    worker.finalize();
-}
-
-TEST(ChipRunLaneTest, CapturePreparationCannotJoinAnEagerActiveRun) {
-    ChipWorker worker;
-    prime_worker(worker);
-    worker.execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, true};
-    ChipStorageTaskArgs args{};
-    auto eager = worker.prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1});
-    ASSERT_EQ(worker.launch_native_run(eager), ChipWorker::NativeLaunch::Launched);
-    EXPECT_THROW(
-        worker.prepare_native_run(
-            1, &args, CallConfig{}, PipelineSlotLease{1, 0, 2}, 0, 0, nullptr, 0, {}, SIMPLER_PREPARE_CAPTURE
-        ),
-        RunPreparationRefused
-    );
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0"}));
-    worker.finalize_native_run(eager);
-    worker.finalize();
-}
-
-TEST(ChipRunLaneTest, NativeResourceReferenceSurvivesOriginalCarrierAndReleasesOnNativeThread) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_worker(*worker);
-    ChipStorageTaskArgs args{};
-    auto run = worker->prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1});
-    auto resources = worker->retain_native_run_resources(run, reinterpret_cast<void *>(1));
-    worker->finalize_native_run(run);
-    EXPECT_TRUE(worker->native_runs_.empty());
-    EXPECT_EQ(worker->native_resource_references_, 1);
-    std::weak_ptr<ChipWorker> observed = worker;
-    worker.reset();
-    EXPECT_FALSE(observed.expired());
-    std::thread retirement([resources = std::move(resources)] {
-        resources->release();
-        resources->release();
-    });
-    retirement.join();
-    EXPECT_TRUE(observed.expired());
-    EXPECT_TRUE(g_resource_references.empty());
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "retain0", "finalize0", "release0"}));
-}
-
-TEST(ChipRunLaneTest, NativeResourceAcquireFailureAllowsPreparedRetryWithoutCharge) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_worker(*worker);
-    ChipStorageTaskArgs args{};
-    auto run = worker->prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1});
-    g_retain_rc = -71;
-    EXPECT_THROW(worker->retain_native_run_resources(run, reinterpret_cast<void *>(1)), std::runtime_error);
-    EXPECT_EQ(worker->native_resource_references_, 0);
-    EXPECT_TRUE(g_resource_references.empty());
-    EXPECT_EQ(worker->native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::PREPARED);
-    g_retain_rc = 0;
-    auto resources = worker->retain_native_run_resources(run, reinterpret_cast<void *>(1));
-    EXPECT_EQ(worker->native_resource_references_, 1);
-    resources->release();
-    worker->finalize_native_run(run);
-    worker->finalize();
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "retain0", "retain0", "release0", "finalize0"}));
-}
-
-TEST(ChipRunLaneTest, NativeResourceReleaseFailurePreservesReferenceAndRefusesCloseBeforeMutation) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_worker(*worker);
-    worker->run_lane_ = std::make_unique<ChipRunLane>(*worker);
-    ChipStorageTaskArgs args{};
-    auto run = worker->prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1});
-    auto resources = worker->retain_native_run_resources(run, reinterpret_cast<void *>(1));
-    g_release_rc = -72;
-    EXPECT_THROW(resources->release(), std::runtime_error);
-    EXPECT_EQ(worker->native_resource_references_, 1);
-    EXPECT_EQ(g_resource_references.size(), 1);
-    const auto events = g_events;
-    EXPECT_THROW(worker->finalize(), std::runtime_error);
-    EXPECT_EQ(g_events, events);
-    EXPECT_TRUE(worker->initialized_);
-    EXPECT_FALSE(worker->native_runs_closing_);
-    EXPECT_EQ(worker->native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::PREPARED);
-    g_release_rc = 0;
-    resources->release();
-    EXPECT_EQ(worker->native_resource_references_, 0);
-    worker->finalize_native_run(run);
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, NativeResourceReferencesReleaseIndependentlyForTwoPreparedRuns) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_worker(*worker);
-    worker->execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, true};
-    ChipStorageTaskArgs args{};
-    auto first = worker->prepare_native_run(
-        1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 0, 0, nullptr, 0, {}, SIMPLER_PREPARE_CAPTURE
-    );
-    auto second = worker->prepare_native_run(
-        1, &args, CallConfig{}, PipelineSlotLease{1, 0, 2}, 0, 0, nullptr, 0, {}, SIMPLER_PREPARE_CAPTURE
-    );
-    auto first_resources = worker->retain_native_run_resources(first, reinterpret_cast<void *>(1));
-    auto second_resources = worker->retain_native_run_resources(second, reinterpret_cast<void *>(1));
-    worker->finalize_native_run(first);
-    worker->finalize_native_run(second);
-    first_resources->release();
-    EXPECT_EQ(worker->native_resource_references_, 1);
-    EXPECT_EQ(g_resource_references.size(), 1);
-    EXPECT_THROW(worker->finalize(), std::runtime_error);
-    second_resources->release();
-    EXPECT_EQ(worker->native_resource_references_, 0);
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, DroppedUnreleasedNativeResourceReferenceRetainsExactNativeBacking) {
-    EXPECT_EXIT(
-        ([] {
-            auto worker = std::make_shared<ChipWorker>();
-            prime_worker(*worker);
-            ChipStorageTaskArgs args{};
-            auto run = worker->prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1});
-            auto resources = worker->retain_native_run_resources(run, reinterpret_cast<void *>(1));
-            worker->finalize_native_run(run);
-            std::weak_ptr<ChipWorker> observed = worker;
-            worker.reset();
-            resources.reset();
-            auto retained = observed.lock();
-            if (!retained || retained->native_resource_references_ != 1 || g_resource_references.size() != 1) _exit(1);
-            try {
-                retained->finalize();
-                _exit(2);
-            } catch (const std::runtime_error &) {}
-            _exit(0);
-        }()),
-        ::testing::ExitedWithCode(0), ""
-    );
-}
-
-TEST(ChipRunLaneTest, NativeResourceClosedRunRefusalPrecedesClearedRuntimeEntryInspection) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_worker(*worker);
-    ChipStorageTaskArgs args{};
-    auto run = worker->prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1});
-    worker->finalize_native_run(run);
-    std::thread closer([&] {
-        worker->finalize();
-    });
-    closer.join();
-    ASSERT_EQ(worker->retain_run_resources_fn_, nullptr);
-    ASSERT_EQ(worker->release_run_resources_fn_, nullptr);
-    try {
-        (void)worker->retain_native_run_resources(run, reinterpret_cast<void *>(1));
-        FAIL() << "a closed worker cannot retain the old carrier";
-    } catch (const std::runtime_error &error) {
-        EXPECT_NE(std::string(error.what()).find("another finalization is in progress"), std::string::npos);
-    }
-    EXPECT_EQ(worker->native_resource_references_, 0);
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "finalize0"}));
-}
-
-TEST(ChipRunLaneTest, InFlightNativeResourceAcquireRefusesCloseWithoutWaitingOrTeardown) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_worker(*worker);
-    ChipStorageTaskArgs args{};
-    auto run = worker->prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1});
-    {
-        std::lock_guard<std::mutex> lock(g_wait_mu);
-        g_hold_retain = true;
-        g_release_wait = false;
-    }
-    std::unique_ptr<ChipRunResources> resources;
-    std::exception_ptr acquire_error;
-    std::thread acquiring([&] {
-        try {
-            resources = worker->retain_native_run_resources(run, reinterpret_cast<void *>(1));
-        } catch (...) {
-            acquire_error = std::current_exception();
-        }
-    });
-    bool entered;
-    {
-        std::unique_lock<std::mutex> lock(g_wait_mu);
-        entered = g_wait_cv.wait_for(lock, std::chrono::seconds(5), [] {
-            return g_wait_entered;
-        });
-    }
-    if (entered) {
-        EXPECT_THROW(worker->finalize(), std::runtime_error);
-        EXPECT_FALSE(worker->native_runs_closing_);
-        EXPECT_TRUE(worker->initialized_);
-        EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "retain0"}));
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_wait_mu);
-        g_release_wait = true;
-    }
-    g_wait_cv.notify_all();
-    acquiring.join();
-    ASSERT_TRUE(entered);
-    ASSERT_EQ(acquire_error, nullptr);
-    ASSERT_NE(resources, nullptr);
-    EXPECT_EQ(worker->native_resource_references_, 1);
-    worker->finalize_native_run(run);
-    resources->release();
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureLanePreparesTwoGrantedSlotsAndSnapshotsWithoutOrdinaryProgress) {
+TEST(ChipRunLaneTest, CallerOwnedRunLeavesItsSlotAvailableForEagerExecution) {
     auto worker = std::make_shared<ChipWorker>();
     prime_capture_worker(*worker);
-    int32_t controls[] = {99, 7, 11, 13};
-    ChipStorageTaskArgs args{};
-    ChipTensor host{};
-    host.buffer.addr = reinterpret_cast<uintptr_t>(controls);
-    host.buffer.size = sizeof(controls);
-    host.shapes[0] = 2;
-    host.strides[0] = 2;
-    host.start_offset = 1;
-    host.ndims = 1;
-    host.dtype = DataType::INT32;
-    host.address_space = AddressSpace::HOST;
-    host.transfer = TensorTransfer::NONE;
-    args.add_tensor(host);
-    args.add_scalar(41);
-    CallArgumentSnapshot snapshot(args, {ArgDirection::IN});
-    controls[1] = 19;
-    args.scalars_[0] = 22;
-    auto first = worker->submit_chip_run(
-        1, snapshot.args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto second = worker->submit_chip_run(
-        1, snapshot.args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    EXPECT_EQ(g_host_controls, (std::vector<std::array<int32_t, 2>>{{7, 13}, {7, 13}}));
-    EXPECT_EQ(g_control_scalars, (std::vector<uint64_t>{41, 41}));
-    EXPECT_EQ(g_prepare_purpose, (std::vector<uint32_t>{SIMPLER_PREPARE_CAPTURE, SIMPLER_PREPARE_CAPTURE}));
-    EXPECT_FALSE(first.done());
-    EXPECT_FALSE(second.wait_until(ChipRun::Clock::now()));
-    EXPECT_THROW(
-        worker->submit_chip_run(
-            1, snapshot.args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-        ),
-        RunPreparationRefused
-    );
-    EXPECT_THROW(worker->submit_chip_run(1, snapshot.args(), CallConfig{}), RunPreparationRefused);
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "prepare1"}));
-    EXPECT_EQ(g_poll_count, 0);
-    EXPECT_EQ(g_completion_wait_count, 0);
-    first.abandon();
-    second.abandon();
-    EXPECT_TRUE(first.done());
-    EXPECT_TRUE(second.done());
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureCarrierRetirementReusesSlotsButKeepsSpansUntilCheckedRelease) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto args = device_args();
-    auto first = worker->submit_chip_run(
-        1, args, CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto second = worker->submit_chip_run(
-        1, args, CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto first_resources = first.retain_resources();
-    auto second_resources = second.retain_resources();
-    first.activate();
-    second.activate();
-    EXPECT_TRUE(worker->native_runs_.empty());
-    EXPECT_FALSE(first.done());
-    EXPECT_FALSE(first.execution_ended());
-    EXPECT_TRUE(first.owner_recovery_required());
-    EXPECT_FALSE(second.done());
-    EXPECT_EQ(g_span_borrows.size(), 2);
-    auto third = worker->submit_chip_run(
-        1, args, CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto third_resources = third.retain_resources();
-    third.activate();
-    EXPECT_EQ(g_span_borrows.size(), 3);
-    EXPECT_THROW(worker->finalize(), std::runtime_error);
-    g_release_rc = -72;
-    EXPECT_THROW(first_resources->release(), std::runtime_error);
-    EXPECT_FALSE(first.wait_until(ChipRun::Clock::now()));
-    EXPECT_EQ(g_span_borrows.size(), 3);
-    g_release_rc = 0;
-    first_resources->release();
-    EXPECT_TRUE(first.done());
-    EXPECT_FALSE(first.owner_recovery_required());
-    EXPECT_FALSE(second.done());
-    EXPECT_EQ(g_span_borrows.size(), 2);
-    second_resources->release();
-    EXPECT_TRUE(second.done());
-    EXPECT_FALSE(third.done());
-    EXPECT_EQ(g_span_borrows.size(), 1);
-    third_resources->release();
-    EXPECT_TRUE(third.done());
-    EXPECT_TRUE(g_span_borrows.empty());
-    EXPECT_EQ(g_poll_count, 0);
-    EXPECT_EQ(g_completion_wait_count, 0);
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureLaneDoesNotProgressAnEagerPredecessorToManufactureCapacity) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto eager = worker->submit_chip_run(1, ChipStorageTaskArgs{}, CallConfig{});
-    const auto events = g_events;
-    EXPECT_THROW(
-        worker->submit_chip_run(
-            1, ChipStorageTaskArgs{}, CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-        ),
-        RunPreparationRefused
-    );
-    EXPECT_EQ(g_events, events);
-    EXPECT_EQ(g_poll_count, 0);
-    EXPECT_EQ(g_completion_wait_count, 0);
-    g_complete[0] = true;
-    EXPECT_TRUE(eager.wait_until(ChipRun::Deadline::max()));
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureLastUseWaitsForEveryAcquiredReferenceAndFailedAcquireCanRetry) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    g_retain_rc = -71;
-    EXPECT_THROW(run.retain_resources(), std::runtime_error);
-    g_retain_rc = 0;
-    auto first = run.retain_resources();
-    // The real CAPI permits one reference; the fake deliberately accepts two
-    // so first release cannot be mistaken for discharge of all obligations.
-    auto second = run.retain_resources();
-    run.activate();
-    first->release();
-    EXPECT_FALSE(run.done());
-    EXPECT_EQ(g_span_borrows.size(), 1);
-    EXPECT_TRUE(run.owner_recovery_required());
-    second->release();
-    EXPECT_TRUE(run.done());
-    EXPECT_TRUE(g_span_borrows.empty());
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CheckedCaptureResourceReleaseNotifiesTheActualBlockedLaneWait) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto resources = run.retain_resources();
-    run.activate();
-    expect_capture_wait_notification(run, [&] {
-        g_release_rc = -72;
-        EXPECT_THROW(resources->release(), std::runtime_error);
-        EXPECT_FALSE(run.done());
-        EXPECT_EQ(g_span_borrows.size(), 1);
-        g_release_rc = 0;
-        resources->release();
-    });
-    EXPECT_TRUE(run.done());
-    EXPECT_EQ(g_poll_count, 0);
-    EXPECT_EQ(g_completion_wait_count, 0);
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureReferencePinsWorkerWithoutLaneOwnershipCycle) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto resources = run.retain_resources();
-    run.activate();
-    std::weak_ptr<ChipWorker> observed = worker;
-    worker.reset();
-    EXPECT_FALSE(observed.expired());
-    std::thread retirement([resources = std::move(resources)]() mutable {
-        resources->release();
-        resources.reset();
-    });
-    retirement.join();
-    EXPECT_TRUE(observed.expired());
-    EXPECT_TRUE(run.done());
-    EXPECT_FALSE(run.owner_recovery_required());
-    EXPECT_TRUE(g_span_borrows.empty());
-}
-
-TEST(ChipRunLaneTest, CaptureAcquireKeepsNativeOwnerAcrossConcurrentCloseRefusal) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    std::weak_ptr<ChipWorker> observed = worker;
-    {
-        std::lock_guard<std::mutex> lock(g_wait_mu);
-        g_hold_retain = true;
-        g_release_wait = false;
-    }
-    std::unique_ptr<ChipRunResources> resources;
-    std::exception_ptr error;
-    std::thread acquiring([&] {
-        try {
-            resources = run.retain_resources();
-        } catch (...) {
-            error = std::current_exception();
-        }
-    });
-    bool entered;
-    {
-        std::unique_lock<std::mutex> lock(g_wait_mu);
-        entered = g_wait_cv.wait_for(lock, std::chrono::seconds(5), [] {
-            return g_wait_entered;
-        });
-    }
-    if (entered) {
-        worker.reset();
-        auto pinned = observed.lock();
-        EXPECT_NE(pinned, nullptr);
-        if (pinned) {
-            EXPECT_THROW(pinned->finalize(), std::runtime_error);
-            EXPECT_FALSE(pinned->native_runs_closing_);
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_wait_mu);
-        g_release_wait = true;
-    }
-    g_wait_cv.notify_all();
-    acquiring.join();
-    ASSERT_TRUE(entered);
-    ASSERT_EQ(error, nullptr);
-    ASSERT_NE(resources, nullptr);
-    run.abandon();
-    EXPECT_FALSE(run.done());
-    resources->release();
-    resources.reset();
-    EXPECT_TRUE(observed.expired());
-    EXPECT_TRUE(run.done());
-    EXPECT_TRUE(g_span_borrows.empty());
-}
-
-TEST(ChipRunLaneTest, CaptureAbandonWithoutExternalReferenceNotifiesTheExistingWaiter) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    expect_capture_wait_notification(run, [&] {
-        run.abandon();
-    });
-    EXPECT_TRUE(run.done());
-    EXPECT_TRUE(g_span_borrows.empty());
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureStopAdmissionNotifiesTheExistingWaiterAfterKnownCancellation) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    expect_capture_wait_notification(run, [&] {
-        worker->run_lane_->stop_admission();
-    });
-    EXPECT_TRUE(run.done());
-    EXPECT_TRUE(g_span_borrows.empty());
-    worker->finalize();
-}
-
-#if defined(__linux__) && defined(__GLIBCXX__)
-TEST(ChipRunLaneTest, FailedCaptureAcquireCompletesConcurrentCarrierRetirement) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    {
-        std::lock_guard<std::mutex> lock(resource_wait_entry_mu);
-        acquire_failure_entered = false;
-        acquire_failure_proceed = false;
-    }
-    g_retain_rc = -71;
-    std::exception_ptr error;
-    std::thread acquiring([&] {
-        inspect_acquire_failure = true;
-        acquire_lane_mutex = nullptr;
-        acquire_lane_lock_count = 0;
-        try {
-            (void)run.retain_resources();
-        } catch (...) {
-            error = std::current_exception();
-        }
-        inspect_acquire_failure = false;
-    });
-    struct JoinAcquire {
-        std::thread &thread;
-        ~JoinAcquire() {
-            if (!thread.joinable()) return;
-            {
-                std::lock_guard<std::mutex> lock(resource_wait_entry_mu);
-                acquire_failure_proceed = true;
-            }
-            resource_wait_entry_changed.notify_all();
-            thread.join();
-        }
-    } join_acquire{acquiring};
-    bool entered;
-    {
-        std::unique_lock<std::mutex> lock(resource_wait_entry_mu);
-        entered = resource_wait_entry_changed.wait_for(lock, std::chrono::seconds(5), [] {
-            return acquire_failure_entered;
-        });
-    }
-    ASSERT_TRUE(
-        entered
-    ) << "failed observer must reach the actual second lane-lock entry after releasing its native op";
-    expect_capture_wait_notification(run, [&] {
-        run.abandon();
-        EXPECT_TRUE(worker->native_runs_.empty());
-        EXPECT_FALSE(run.done());
-        // The failed native acquire already returned with no reference. Only
-        // its lane notification is parked; checked Host retirement ends the
-        // active loan before that notification establishes terminal last-use.
-        EXPECT_TRUE(g_span_borrows.empty());
-        {
-            std::lock_guard<std::mutex> lock(resource_wait_entry_mu);
-            acquire_failure_proceed = true;
-        }
-        resource_wait_entry_changed.notify_all();
-        acquiring.join();
-        EXPECT_NE(error, nullptr);
-        const bool released = run.done();
-        EXPECT_TRUE(released);
-        EXPECT_TRUE(g_span_borrows.empty());
-        // The unchanged old mechanism needs an extra explicit cancel just for
-        // cleanup. The assertion above still records its missing last-use proof.
-        if (!released) run.abandon();
-    });
-    EXPECT_TRUE(run.done());
-    worker->finalize();
-}
-#endif
-
-TEST(ChipRunLaneTest, CaptureEmissionDelegatesActiveStreamValidationToTheCommonBackend) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto resources = run.retain_resources();
-    // The ordinary validator rejects ACTIVE. Only the common caller-stream
-    // launch entry may validate and classify actual recording for this intent.
-    worker->validate_caller_stream_fn_ = [](void *, void *) -> int {
-        return PTO_RUNTIME_ERR_UNSUPPORTED;
-    };
-    EXPECT_NO_THROW(run.activate());
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "retain0", "stream_launch0", "finalize0"}));
-    resources->release();
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureLaunchFailureDoesNotEagerPollAndPreservesTheOriginalError) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto resources = run.retain_resources();
-    g_launch_rc[0] = -81;
-    EXPECT_THROW(run.activate(), std::runtime_error);
-    EXPECT_EQ(g_poll_count, 0);
-    EXPECT_EQ(g_completion_wait_count, 0);
-    EXPECT_FALSE(run.done());
-    resources->release();
-    try {
-        (void)run.wait_until(ChipRun::Clock::now());
-        FAIL() << "launch error must remain observable";
-    } catch (const std::runtime_error &error) {
-        EXPECT_NE(std::string(error.what()).find("-81"), std::string::npos);
-    }
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureCarrierCanonicalRefusalCanRetryWithoutAnotherLaunch) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto resources = run.retain_resources();
-    worker->finalize_run_fn_ = [](void *, void *storage, int) {
-        g_events.push_back("finalize" + std::to_string(slot_of(storage)));
-        const uint64_t tag = g_finalize_rc[0] != 0 ? kNativeRunContextMagic : 0;
-        std::memcpy(storage, &tag, sizeof(tag));
-        return g_finalize_rc[0];
-    };
-    g_finalize_rc[0] = -73;
-    EXPECT_THROW(run.activate(), std::runtime_error);
-    ASSERT_EQ(worker->native_runs_.size(), 1);
-    const auto *entry = worker->native_runs_.begin()->second.get();
-    EXPECT_FALSE(entry->destruction_unknown);
-    EXPECT_FALSE(entry->finalize_reserved);
-    EXPECT_TRUE(run.launched());
-    EXPECT_FALSE(run.done());
-    EXPECT_EQ(g_span_borrows.size(), 1);
-    EXPECT_THROW(resources->release(), std::runtime_error);
-    EXPECT_THROW(worker->finalize(), std::runtime_error);
-    EXPECT_THROW(run.activate(), std::runtime_error);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
-    const auto refused_before = g_events;
-    EXPECT_THROW(worker->submit_chip_run(1, device_args(), CallConfig{}), RunPreparationRefused);
-    EXPECT_THROW(
-        worker->run_lane_->submit(
-            1, device_args(), CallConfig{}, PipelineSlotLease{1, 0, 1}, 500, 500, nullptr, 0, true
-        ),
-        RunPreparationRefused
-    );
-    EXPECT_EQ(g_events, refused_before);
-    EXPECT_EQ(g_span_borrows, (std::multiset<uint64_t>{1}));
-    g_finalize_rc[0] = 0;
-    try {
-        run.abandon();
-        FAIL() << "the original cleanup failure remains observable after safe retry";
-    } catch (const std::runtime_error &error) {
-        EXPECT_NE(std::string(error.what()).find("-73"), std::string::npos);
-    }
-    EXPECT_TRUE(worker->native_runs_.empty());
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 2);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
-    EXPECT_FALSE(run.done());
-    EXPECT_EQ(g_span_borrows.size(), 1);
-    if (!worker->native_runs_.empty())
-        return;  // Failed RED keeps the exact unresolved reference; no fake cleanup proof.
-    resources->release();
-    EXPECT_TRUE(run.done());
-    EXPECT_FALSE(run.owner_recovery_required());
-    EXPECT_TRUE(g_span_borrows.empty());
-    EXPECT_THROW(run.wait_until(ChipRun::Clock::now()), std::runtime_error);
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureCarrierContextRefusalCanRetryAfterContextRestoration) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    int context = 0;
-    worker->device_ctx_ = &context;
-    worker->validate_execution_context_fn_ = validate_context;
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto resources = run.retain_resources();
-    worker->launch_run_on_stream_fn_ = [](void *, void *storage, void *, void *) {
-        g_events.push_back("stream_launch" + std::to_string(slot_of(storage)));
-        g_context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
-        return 0;
-    };
-    EXPECT_THROW(run.activate(), ExecutionContextRefused);
-    ASSERT_EQ(worker->native_runs_.size(), 1);
-    EXPECT_FALSE(worker->native_runs_.begin()->second->destruction_unknown);
-    EXPECT_FALSE(worker->native_runs_.begin()->second->finalize_reserved);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 0);
-    g_context_rc = 0;
-    EXPECT_THROW(run.abandon(), ExecutionContextRefused);
-    EXPECT_TRUE(worker->native_runs_.empty());
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 1);
-    if (!worker->native_runs_.empty()) return;  // Preserve unresolved RED state instead of forcing destruction.
-    EXPECT_FALSE(run.done());
-    resources->release();
-    EXPECT_TRUE(run.done());
-    EXPECT_TRUE(g_span_borrows.empty());
-    worker->device_ctx_ = nullptr;
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureCarrierRetryKeepsTheOriginalLaunchFailure) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto resources = run.retain_resources();
-    worker->finalize_run_fn_ = [](void *, void *storage, int) {
-        g_events.push_back("finalize" + std::to_string(slot_of(storage)));
-        const uint64_t tag = g_finalize_rc[0] != 0 ? kNativeRunContextMagic : 0;
-        std::memcpy(storage, &tag, sizeof(tag));
-        return g_finalize_rc[0];
-    };
-    g_launch_rc[0] = -81;
-    g_finalize_rc[0] = -73;
-    try {
-        run.activate();
-        FAIL() << "launch and cleanup both fail";
-    } catch (const std::runtime_error &error) {
-        EXPECT_NE(std::string(error.what()).find("-81"), std::string::npos);
-    }
-    EXPECT_EQ(g_poll_count, 0);
-    g_finalize_rc[0] = 0;
-    try {
-        run.abandon();
-        FAIL() << "the original launch failure remains observable after safe retry";
-    } catch (const std::runtime_error &error) {
-        EXPECT_NE(std::string(error.what()).find("-81"), std::string::npos);
-    }
-    ASSERT_TRUE(worker->native_runs_.empty());
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 2);
-    resources->release();
-    EXPECT_TRUE(run.done());
-    EXPECT_THROW(run.wait_until(ChipRun::Clock::now()), std::runtime_error);
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, CaptureCarrierUnknownDestructionNeverReentersTheCommonFinalizer) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto run = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto resources = run.retain_resources();
-    worker->finalize_run_fn_ = [](void *, void *storage, int) {
-        g_events.push_back("finalize" + std::to_string(slot_of(storage)));
-        const uint64_t tag = UINT64_MAX;  // Neither known-intact nor known-destroyed.
-        std::memcpy(storage, &tag, sizeof(tag));
-        return -74;
-    };
-    EXPECT_THROW(run.activate(), std::runtime_error);
-    ASSERT_EQ(worker->native_runs_.size(), 1);
-    EXPECT_TRUE(worker->native_runs_.begin()->second->destruction_unknown);
-    EXPECT_THROW(run.abandon(), std::runtime_error);
-    EXPECT_THROW(run.abandon(), std::runtime_error);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
-    EXPECT_FALSE(run.done());
-    EXPECT_TRUE(run.owner_recovery_required());
-    EXPECT_EQ(g_span_borrows.size(), 1);
-    EXPECT_THROW(resources->release(), std::runtime_error);
-    EXPECT_THROW(worker->finalize(), std::runtime_error);
-    std::weak_ptr<ChipWorker> retained = worker;
-    resources.reset();  // Exact unknown Backing is deliberately retained, with no SDK/destructor retry.
-    worker.reset();
-    EXPECT_FALSE(retained.expired());
-}
-
-TEST(ChipRunLaneTest, RetainedCaptureLeavesItsOtherGrantAvailableForEagerExecution) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto model = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto reference = model.retain_resources();
-    model.activate();
+    ChipRun model;
+    worker->submit_caller_owned_run(1, device_args(), CallConfig{}, reinterpret_cast<void *>(1), model);
+    EXPECT_THROW(model.activate(), std::logic_error);
+    EXPECT_THROW(model.abandon(), std::logic_error);
     const auto before = g_events;
     std::optional<ChipRun> eager;
     try {
@@ -2522,10 +1625,11 @@ TEST(ChipRunLaneTest, RetainedCaptureLeavesItsOtherGrantAvailableForEagerExecuti
             (std::vector<std::string>{"prepare0", "launch0", "wait0", "finalize0"})
         );
         EXPECT_FALSE(model.done());
-        EXPECT_EQ(g_span_borrows, (std::multiset<uint64_t>{1}));
-        EXPECT_EQ(g_resource_references.size(), 1);
+        EXPECT_EQ(g_caller_owned_loans.size(), 1);
     }
-    reference->release();
+    expect_last_use_notification(model, [&] {
+        model.finalize_after_last_use();
+    });
     EXPECT_TRUE(model.done());
     worker->finalize();
 }
@@ -2533,16 +1637,10 @@ TEST(ChipRunLaneTest, RetainedCaptureLeavesItsOtherGrantAvailableForEagerExecuti
 TEST(ChipRunLaneTest, FullLiveGrantBesideRetainedModelsRefusesWithoutProgress) {
     auto worker = std::make_shared<ChipWorker>();
     prime_capture_worker(*worker);
-    auto a = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto ar = a.retain_resources();
-    a.activate();
-    auto b = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto br = b.retain_resources();
-    b.activate();
+    ChipRun a;
+    worker->submit_caller_owned_run(1, device_args(), CallConfig{}, reinterpret_cast<void *>(1), a);
+    ChipRun b;
+    worker->submit_caller_owned_run(1, device_args(), CallConfig{}, reinterpret_cast<void *>(1), b);
     auto first = worker->submit_chip_run(1, device_args(), CallConfig{});
     auto second = worker->run_lane_->submit(
         1, device_args(), CallConfig{}, PipelineSlotLease{1, 0, 1}, 100, 100, nullptr, 0, true
@@ -2552,29 +1650,32 @@ TEST(ChipRunLaneTest, FullLiveGrantBesideRetainedModelsRefusesWithoutProgress) {
     EXPECT_EQ(g_events, before);
     EXPECT_EQ(g_poll_count, 0);
     EXPECT_EQ(g_completion_wait_count, 0);
-    EXPECT_EQ(g_span_borrows.size(), 4);
+    EXPECT_EQ(g_span_borrows.size() + g_caller_owned_loans.size(), 4);
     EXPECT_FALSE(a.done());
     EXPECT_FALSE(b.done());
     g_complete[0] = true;
     EXPECT_TRUE(first.wait_until(ChipRun::Deadline::max()));
     g_complete[1] = true;
     EXPECT_TRUE(second.wait_until(ChipRun::Deadline::max()));
-    EXPECT_EQ(g_span_borrows, (std::multiset<uint64_t>{1, 1}));
-    ar->release();
+    EXPECT_EQ(g_caller_owned_loans.size(), 2);
+    a.finalize_after_last_use();
     EXPECT_TRUE(a.done());
     EXPECT_FALSE(b.done());
-    EXPECT_EQ(g_span_borrows, (std::multiset<uint64_t>{1}));
-    br->release();
+    EXPECT_EQ(g_caller_owned_loans.size(), 1);
+    b.finalize_after_last_use();
     EXPECT_TRUE(b.done());
     EXPECT_TRUE(g_span_borrows.empty());
     worker->finalize();
 }
 
-TEST(ChipRunLaneTest, UnretiredCaptureRefusesBothEagerAdmissionPathsBeforeSideEffects) {
+TEST(ChipRunLaneTest, FailedCallerOwnedSubmitPreservesItsSlotUntilFinalization) {
     auto worker = std::make_shared<ChipWorker>();
     prime_capture_worker(*worker);
-    auto pending = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
+    ChipRun pending;
+    g_launch_rc[0] = -8;
+    EXPECT_THROW(
+        worker->submit_caller_owned_run(1, device_args(), CallConfig{}, reinterpret_cast<void *>(1), pending),
+        std::runtime_error
     );
     const auto before = g_events;
     EXPECT_THROW(worker->submit_chip_run(1, device_args(), CallConfig{}), RunPreparationRefused);
@@ -2586,9 +1687,9 @@ TEST(ChipRunLaneTest, UnretiredCaptureRefusesBothEagerAdmissionPathsBeforeSideEf
     } catch (const RunPreparationRefused &) {}
     EXPECT_FALSE(leased.has_value());
     EXPECT_EQ(g_events, before);
-    EXPECT_EQ(g_span_borrows, (std::multiset<uint64_t>{1}));
+    EXPECT_EQ(g_span_borrows.size(), 1);
     if (leased) leased->abandon();
-    pending.abandon();
+    pending.finalize_after_last_use();
     worker->finalize();
 }
 
@@ -2603,16 +1704,10 @@ TEST(ChipRunLaneTest, LargerExplicitGrantSelectsOrdinaryJoinAfterMultipleRetaine
         g_events.push_back("join" + std::to_string(slot_of(runtime)) + "_after" + std::to_string(slot_of(predecessor)));
         return 0;
     };
-    auto a = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto ar = a.retain_resources();
-    a.activate();
-    auto b = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto br = b.retain_resources();
-    b.activate();
+    ChipRun a;
+    worker->submit_caller_owned_run(1, device_args(), CallConfig{}, reinterpret_cast<void *>(1), a);
+    ChipRun b;
+    worker->submit_caller_owned_run(1, device_args(), CallConfig{}, reinterpret_cast<void *>(1), b);
     const auto before = g_events;
     std::optional<ChipRun> first;
     try {
@@ -2636,7 +1731,7 @@ TEST(ChipRunLaneTest, LargerExplicitGrantSelectsOrdinaryJoinAfterMultipleRetaine
         EXPECT_TRUE(first->wait_until(ChipRun::Clock::now()));
         for (auto slot : g_polled_slots)
             EXPECT_TRUE(slot == 0 || slot == 3);
-        EXPECT_EQ(g_span_borrows, (std::multiset<uint64_t>{1, 1}));
+        EXPECT_EQ(g_caller_owned_loans.size(), 2);
         EXPECT_FALSE(a.done());
         EXPECT_FALSE(b.done());
         auto c = worker->submit_chip_run(1, device_args(), CallConfig{});
@@ -2652,7 +1747,7 @@ TEST(ChipRunLaneTest, LargerExplicitGrantSelectsOrdinaryJoinAfterMultipleRetaine
         const auto full_before = g_events;
         EXPECT_THROW(worker->submit_chip_run(1, device_args(), CallConfig{}), RunPreparationRefused);
         EXPECT_EQ(g_events, full_before);
-        EXPECT_EQ(g_span_borrows.size(), 6);
+        EXPECT_EQ(g_span_borrows.size() + g_caller_owned_loans.size(), 6);
         g_complete[0] = true;
         g_complete[3] = true;
         EXPECT_TRUE(c.wait_until(ChipRun::Clock::now()));
@@ -2661,14 +1756,14 @@ TEST(ChipRunLaneTest, LargerExplicitGrantSelectsOrdinaryJoinAfterMultipleRetaine
         g_complete[2] = true;
         EXPECT_TRUE(e.wait_until(ChipRun::Clock::now()));
         EXPECT_TRUE(f.wait_until(ChipRun::Clock::now()));
-        EXPECT_EQ(g_span_borrows, (std::multiset<uint64_t>{1, 1}));
+        EXPECT_EQ(g_caller_owned_loans.size(), 2);
     }
-    ar->release();
-    br->release();
+    a.finalize_after_last_use();
+    b.finalize_after_last_use();
     worker->finalize();
 }
 
-TEST(ChipRunLaneTest, RetainedCaptureReleaseDuringCreditWaitRechecksTheExecutingHead) {
+TEST(ChipRunLaneTest, CallerOwnedRunFinalizedDuringCreditWaitRechecksTheExecutingHead) {
     auto worker = std::make_shared<ChipWorker>();
     prime_capture_worker(*worker);
     static int context;
@@ -2676,9 +1771,9 @@ TEST(ChipRunLaneTest, RetainedCaptureReleaseDuringCreditWaitRechecksTheExecuting
     worker->device_ctx_ = &context;
     static std::atomic<uint64_t> generation{1};
     generation.store(1);
-    worker->release_run_resources_fn_ = [](void *ctx, void *reference) {
-        const int rc = release_resources(ctx, reference);
-        if (rc == 0) generation.fetch_add(1);
+    worker->finalize_run_fn_ = [](void *ctx, void *runtime, int mode) {
+        const int rc = finalize_run(ctx, runtime, mode);
+        if (rc == 0 && generation.load() == 1) generation.fetch_add(1);
         return rc;
     };
     worker->credit_generation_fn_ = [](void *) -> uint64_t {
@@ -2695,11 +1790,8 @@ TEST(ChipRunLaneTest, RetainedCaptureReleaseDuringCreditWaitRechecksTheExecuting
         return generation.load() != seen ? 1 : 0;
     };
     worker->run_lane_ = std::make_unique<ChipRunLane>(*worker);
-    auto model = worker->submit_chip_run(
-        1, device_args(), CallConfig{}, nullptr, 0, reinterpret_cast<void *>(1), SIMPLER_PREPARE_CAPTURE
-    );
-    auto reference = model.retain_resources();
-    model.activate();
+    ChipRun model;
+    worker->submit_caller_owned_run(1, device_args(), CallConfig{}, reinterpret_cast<void *>(1), model);
     g_launch_rc[0] = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
     auto eager = worker->submit_chip_run(1, device_args(), CallConfig{});
     {
@@ -2738,7 +1830,7 @@ TEST(ChipRunLaneTest, RetainedCaptureReleaseDuringCreditWaitRechecksTheExecuting
     if (entered) {
         // Real checked release takes lane.mu while the actual credit callback
         // is parked outside it, removing the physical model prefix.
-        reference->release();
+        model.finalize_after_last_use();
         EXPECT_TRUE(model.done());
     }
     {
@@ -2754,7 +1846,7 @@ TEST(ChipRunLaneTest, RetainedCaptureReleaseDuringCreditWaitRechecksTheExecuting
     EXPECT_EQ(generation.load(), 2);
     EXPECT_EQ(g_completion_waited_slots, (std::vector<uint32_t>{0}));
     EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 2);
-    if (!entered) reference->release();
+    if (!entered) model.finalize_after_last_use();
     worker->device_ctx_ = nullptr;
     worker->finalize();
 }
@@ -2825,7 +1917,7 @@ TEST(ChipRunLaneTest, SharedOriginFrameworkClaimUsesTheSameQueueAndPhysicalTrans
     state->note_export();
     auto reference = origin_ref(state);
     int started = 1;
-    EXPECT_THROW(state->retain_model_resources(started), std::runtime_error);
+    EXPECT_THROW(state->register_model_destroy_notice(started), std::runtime_error);
     EXPECT_FALSE(started);
     EXPECT_TRUE(g_events.empty());
     reference.submit();
@@ -2835,7 +1927,6 @@ TEST(ChipRunLaneTest, SharedOriginFrameworkClaimUsesTheSameQueueAndPhysicalTrans
     EXPECT_TRUE(state->retire_framework(false, ChipRun::Clock::now()));
     EXPECT_TRUE(state->framework_transferred());
     EXPECT_TRUE(worker->native_runs_.empty());
-    EXPECT_EQ(worker->native_resource_references_, 0);
     EXPECT_EQ(g_completion_wait_count, 0);
     EXPECT_EQ(g_events.back(), "transfer0");
     state->retire();
@@ -2855,20 +1946,16 @@ TEST(ChipRunLaneTest, SharedOriginCaptureRegistrationCannotBeClaimedByTheEagerOb
     };
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
     int started = 0;
-    state->retain_model_resources(started);
+    state->register_model_destroy_notice(started);
     ASSERT_EQ(started, 1);
     EXPECT_THROW(state->claim_framework(), RunPreparationRefused);
     EXPECT_FALSE(state->framework_claimed());
     auto reference = origin_ref(state);
     reference.submit();
-    EXPECT_EQ(worker->native_resource_references_, 1);
     EXPECT_FALSE(state->done());
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_TRUE(cleanup.carrier_retired);
     ASSERT_EQ(notice.registrations.size(), 1u);
     notice.registrations.front().notify();
-    state->release_resources();
+    state->release_model_resources();
     EXPECT_TRUE(state->done());
     EXPECT_FALSE(state->framework_transferred());
     state->retire();
@@ -2904,28 +1991,24 @@ TEST(ChipRunLaneTest, OriginStateOwnsTheHostSnapshotBeforeLateRegistration) {
     }
     auto reference = origin_ref(state);
     int started = 0;
-    state->retain_model_resources(started);
+    state->register_model_destroy_notice(started);
     ASSERT_TRUE(started);
+    EXPECT_EQ(g_prepare_count[0], 0);
+    reference.submit();
     EXPECT_EQ(g_host_controls[0], (std::array<int32_t, 2>{7, 13}));
     EXPECT_EQ(g_control_scalars[0], 41);
     EXPECT_EQ(g_prepare_count[0], 1);
-    reference.submit();
-    EXPECT_TRUE(worker->native_runs_.empty());
-    EXPECT_EQ(worker->native_resource_references_, 1);
+    EXPECT_EQ(worker->native_runs_.size(), 1u);
     EXPECT_FALSE(state->done());
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_EQ(cleanup.disposition, NativeSubmissionDisposition::Submitted);
-    EXPECT_TRUE(cleanup.carrier_retired);
     ASSERT_EQ(notice.registrations.size(), 1u);
     notice.registrations.front().notify();
-    state->release_resources();
+    state->release_model_resources();
     EXPECT_TRUE(state->done());
     state->retire();
     worker->finalize();
 }
 
-TEST(ChipRunLaneTest, OriginCapsuleViewsShareOneRegistrationAndTheOriginalResourceSlot) {
+TEST(ChipRunLaneTest, OriginCapsuleViewsShareOneRegistrationAndTheOriginalRun) {
     auto worker = std::make_shared<ChipWorker>();
     prime_capture_worker(*worker);
     int model;
@@ -2935,89 +2018,37 @@ TEST(ChipRunLaneTest, OriginCapsuleViewsShareOneRegistrationAndTheOriginalResour
     auto first = origin_ref(state);
     auto second = origin_ref(state);
     int started = 0;
-    state->retain_model_resources(started);
+    state->register_model_destroy_notice(started);
     ASSERT_TRUE(started);
     int duplicate_started = 1;
-    EXPECT_THROW(state->retain_model_resources(duplicate_started), std::runtime_error);
+    EXPECT_THROW(state->register_model_destroy_notice(duplicate_started), std::runtime_error);
     EXPECT_FALSE(duplicate_started);
-    EXPECT_EQ(worker->native_resource_references_, 1);
-    EXPECT_EQ(g_resource_references.size(), 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "retain0"), 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 0);
+    EXPECT_TRUE(worker->native_runs_.empty());
+    EXPECT_TRUE(g_events.empty());
     first.submit();
     EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
     EXPECT_THROW(second.submit(), std::runtime_error);
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_TRUE(cleanup.carrier_retired);
     ASSERT_EQ(notice.registrations.size(), 1u);
     notice.registrations.front().notify();
-    state->release_resources();
-    state->release_resources();
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "release0"), 1);
+    state->release_model_resources();
+    state->release_model_resources();
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 1);
     EXPECT_TRUE(g_span_borrows.empty());
     state->retire();
     worker->finalize();
 }
 
-TEST(ChipRunLaneTest, OriginNullAcquireFailureStillOwnsThePreparedCarrierForCancellation) {
+TEST(ChipRunLaneTest, ModelRegistrationRejectsWritableHostArgumentsBeforePreparingARun) {
     auto worker = std::make_shared<ChipWorker>();
     prime_capture_worker(*worker);
-    auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
-    auto reference = origin_ref(state);
-    g_retain_rc = -71;
-    int started = 0;
-    EXPECT_THROW(state->retain_model_resources(started), std::runtime_error);
-    EXPECT_TRUE(started);
-    EXPECT_EQ(worker->native_resource_references_, 0);
-    EXPECT_EQ(worker->native_runs_.size(), 1);
-    EXPECT_FALSE(g_span_borrows.empty());
-    int duplicate_started = 1;
-    EXPECT_THROW(state->retain_model_resources(duplicate_started), std::runtime_error);
-    EXPECT_FALSE(duplicate_started);
-    EXPECT_THROW(reference.submit(), std::runtime_error);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 0);
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_EQ(cleanup.disposition, NativeSubmissionDisposition::Submitted);
-    EXPECT_TRUE(cleanup.carrier_retired);
-    EXPECT_TRUE(worker->native_runs_.empty());
-    EXPECT_TRUE(g_span_borrows.empty());
-    state->release_resources();
-    EXPECT_THROW(state->wait_until(ChipRun::Clock::now()), std::runtime_error);
-    state->retire();
-    worker->finalize();
-}
-
-TEST(ChipRunLaneTest, OriginNonNullAcquireFailureKeepsTheSameWrapperForCheckedReleaseRetry) {
-    auto worker = std::make_shared<ChipWorker>();
-    prime_capture_worker(*worker);
-    auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
-    g_retain_rc = -71;
-    g_retain_output_on_error = true;
-    int started = 0;
-    EXPECT_THROW(state->retain_model_resources(started), std::runtime_error);
-    ASSERT_TRUE(started);
-    ASSERT_EQ(g_resource_references.size(), 1);
-    EXPECT_EQ(worker->native_resource_references_, 1);
-    const void *original_reference = g_resource_references.begin()->first;
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_EQ(cleanup.disposition, NativeSubmissionDisposition::Cancelled);
-    EXPECT_TRUE(cleanup.carrier_retired);
-    g_release_rc = -72;
-    EXPECT_THROW(state->release_resources(), std::runtime_error);
-    ASSERT_EQ(g_resource_references.size(), 1);
-    EXPECT_EQ(g_resource_references.begin()->first, original_reference);
-    EXPECT_EQ(worker->native_resource_references_, 1);
-    EXPECT_THROW(state->retire(), RunPreparationRefused);
-    g_release_rc = 0;
-    state->release_resources();
-    EXPECT_TRUE(g_resource_references.empty());
-    EXPECT_EQ(worker->native_resource_references_, 0);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "retain0"), 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "release0"), 2);
-    EXPECT_TRUE(g_span_borrows.empty());
+    auto args = device_args();
+    args.tensor(0).address_space = AddressSpace::HOST;
+    auto state = capture_origin(worker, CallArgumentSnapshot(args, {ArgDirection::OUT}));
+    int started = 1;
+    EXPECT_THROW(state->register_model_destroy_notice(started), RunPreparationRefused);
+    EXPECT_FALSE(started);
+    EXPECT_TRUE(g_events.empty());
+    EXPECT_TRUE(state->release_model_resources());
     state->retire();
     worker->finalize();
 }
@@ -3031,19 +2062,15 @@ TEST(ChipRunLaneTest, OriginModelQueryRefusalConsumesTheTokenAndStillAllowsCheck
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
     auto reference = origin_ref(state);
     int started = 0;
-    state->retain_model_resources(started);
+    state->register_model_destroy_notice(started);
     notice.capture_status = 0;
     EXPECT_THROW(reference.submit(), std::runtime_error);
     notice.capture_status = 1;
     EXPECT_THROW(reference.submit(), std::runtime_error);
     EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 0);
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_EQ(cleanup.disposition, NativeSubmissionDisposition::Submitted);
-    EXPECT_TRUE(cleanup.carrier_retired);
     ASSERT_EQ(notice.registrations.size(), 1u);
     notice.registrations.front().notify();
-    state->release_resources();
+    state->release_model_resources();
     EXPECT_TRUE(worker->native_runs_.empty());
     EXPECT_TRUE(g_span_borrows.empty());
     state->retire();
@@ -3059,7 +2086,7 @@ TEST(ChipRunLaneTest, OriginSubmittingModelQueryCannotBeCancelledOrReleaseItsRes
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
     auto reference = origin_ref(state);
     int started = 0;
-    state->retain_model_resources(started);
+    state->register_model_destroy_notice(started);
     {
         std::lock_guard<std::mutex> lock(g_wait_mu);
         notice.hold_query = true;
@@ -3082,12 +2109,7 @@ TEST(ChipRunLaneTest, OriginSubmittingModelQueryCannotBeCancelledOrReleaseItsRes
     }
     EXPECT_TRUE(entered);
     if (entered) {
-        NativeSubmissionCleanup cleanup;
-        state->cancel_pending(cleanup);
-        EXPECT_EQ(cleanup.disposition, NativeSubmissionDisposition::Submitting);
-        EXPECT_FALSE(cleanup.carrier_retired);
-        EXPECT_THROW(state->release_resources(), std::runtime_error);
-        EXPECT_EQ(worker->native_resource_references_, 1);
+        EXPECT_THROW(state->release_model_resources(), std::runtime_error);
         EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 0);
     }
     {
@@ -3098,12 +2120,9 @@ TEST(ChipRunLaneTest, OriginSubmittingModelQueryCannotBeCancelledOrReleaseItsRes
     queue.join();
     EXPECT_EQ(submission_error, nullptr);
     EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_TRUE(cleanup.carrier_retired);
     ASSERT_EQ(notice.registrations.size(), 1u);
     notice.registrations.front().notify();
-    state->release_resources();
+    state->release_model_resources();
     state->retire();
     worker->finalize();
 }
@@ -3117,7 +2136,7 @@ TEST(ChipRunLaneTest, OriginCleanupProgressDoesNotReplaceTheHistoricalLaunchErro
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
     auto reference = origin_ref(state);
     int started = 0;
-    state->retain_model_resources(started);
+    state->register_model_destroy_notice(started);
     worker->finalize_run_fn_ = [](void *, void *storage, int) {
         g_events.push_back("finalize" + std::to_string(slot_of(storage)));
         const uint64_t tag = g_finalize_rc[0] != 0 ? kNativeRunContextMagic : 0;
@@ -3127,17 +2146,13 @@ TEST(ChipRunLaneTest, OriginCleanupProgressDoesNotReplaceTheHistoricalLaunchErro
     g_launch_rc[0] = -81;
     g_finalize_rc[0] = -73;
     EXPECT_THROW(reference.submit(), std::runtime_error);
-    EXPECT_THROW(state->release_resources(), std::runtime_error);
-    NativeSubmissionCleanup cleanup;
-    EXPECT_THROW(state->cancel_pending(cleanup), std::runtime_error);
-    EXPECT_EQ(cleanup.disposition, NativeSubmissionDisposition::Submitted);
-    EXPECT_FALSE(cleanup.carrier_retired);
-    EXPECT_EQ(worker->native_resource_references_, 1);
+    EXPECT_THROW(state->release_model_resources(), std::runtime_error);
+    ASSERT_EQ(notice.registrations.size(), 1u);
+    notice.registrations.front().notify();
+    EXPECT_THROW(state->release_model_resources(), std::runtime_error);
     g_finalize_rc[0] = 0;
-    EXPECT_NO_THROW(state->cancel_pending(cleanup));
-    EXPECT_TRUE(cleanup.carrier_retired);
+    EXPECT_NO_THROW(state->release_model_resources());
     EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 3);
     EXPECT_EQ(g_poll_count, 0);
     try {
         state->wait_until(ChipRun::Clock::now());
@@ -3146,9 +2161,6 @@ TEST(ChipRunLaneTest, OriginCleanupProgressDoesNotReplaceTheHistoricalLaunchErro
         EXPECT_NE(std::string(error.what()).find("-81"), std::string::npos);
         EXPECT_EQ(std::string(error.what()).find("-73"), std::string::npos);
     }
-    ASSERT_EQ(notice.registrations.size(), 1u);
-    notice.registrations.front().notify();
-    state->release_resources();
     state->retire();
     worker->finalize();
 }
@@ -3157,19 +2169,19 @@ TEST(ChipRunLaneTest, OriginPrepareFailureKeepsItsActualCleanRollbackProof) {
     auto worker = std::make_shared<ChipWorker>();
     prime_capture_worker(*worker);
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
+    int model;
+    AclNoticeTransport notice{&model};
+    bind_acl_notice_transport(*worker, notice);
     g_prepare_rc[0] = -72;
     int started = 0;
-    EXPECT_THROW(state->retain_model_resources(started), std::runtime_error);
+    state->register_model_destroy_notice(started);
+    EXPECT_THROW(state->submit(), std::runtime_error);
     EXPECT_TRUE(started);
+    notice.registrations.front().notify();
     EXPECT_EQ(g_prepare_count[0], 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "retain0"), 0);
     EXPECT_TRUE(worker->native_runs_.empty());
     EXPECT_TRUE(g_span_borrows.empty());
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_EQ(cleanup.disposition, NativeSubmissionDisposition::Cancelled);
-    EXPECT_TRUE(cleanup.carrier_retired);
-    state->release_resources();
+    state->release_model_resources();
     state->retire();
     worker->finalize();
 }
@@ -3182,13 +2194,15 @@ TEST(ChipRunLaneTest, OriginUnknownPrepareRollbackPinsTheExactNativeOwnersWithou
     auto reference = std::make_unique<NativeSubmissionRef>(origin_ref(state));
     g_prepare_rc[0] = -72;
     g_prepare_release_proven = false;
+    int model;
+    AclNoticeTransport notice{&model};
+    bind_acl_notice_transport(*worker, notice);
     int started = 0;
-    EXPECT_THROW(state->retain_model_resources(started), std::runtime_error);
+    state->register_model_destroy_notice(started);
+    EXPECT_THROW(state->submit(), std::runtime_error);
     EXPECT_TRUE(started);
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_FALSE(cleanup.carrier_retired);
-    EXPECT_THROW(state->release_resources(), std::runtime_error);
+    notice.registrations.front().notify();
+    EXPECT_THROW(state->release_model_resources(), std::runtime_error);
     EXPECT_THROW(state->retire(), RunPreparationRefused);
     EXPECT_EQ(g_span_borrows.size(), 1);
     auto events = g_events;
@@ -3210,14 +2224,12 @@ TEST(ChipRunLaneTest, OriginRetiredTokenRejectsRegistrationBeforeTouchingTheRele
     worker->device_ctx_ = &context;
     worker->validate_execution_context_fn_ = validate_context;
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    ASSERT_TRUE(cleanup.carrier_retired);
+    EXPECT_TRUE(state->release_model_resources());
     state->retire();
     const size_t checks = g_context_checks;
     g_context_rc = -89;
     int started = 1;
-    EXPECT_THROW(state->retain_model_resources(started), std::runtime_error);
+    EXPECT_THROW(state->register_model_destroy_notice(started), std::runtime_error);
     EXPECT_FALSE(started);
     EXPECT_EQ(g_context_checks, checks);
     g_context_rc = 0;
@@ -3226,7 +2238,7 @@ TEST(ChipRunLaneTest, OriginRetiredTokenRejectsRegistrationBeforeTouchingTheRele
     worker.reset();
     EXPECT_TRUE(observed.expired());
     started = 1;
-    EXPECT_THROW(state->retain_model_resources(started), std::runtime_error);
+    EXPECT_THROW(state->register_model_destroy_notice(started), std::runtime_error);
     EXPECT_FALSE(started);
 }
 
@@ -3249,7 +2261,7 @@ TEST(ChipRunLaneTest, OriginSnapshotOnlyFactoryStillEnforcesOrdinaryStreamAdmiss
     EXPECT_EQ(stream_checks, 1);
     EXPECT_TRUE(g_events.empty());
     int started = 1;
-    EXPECT_THROW(state->retain_model_resources(started), std::runtime_error);
+    EXPECT_THROW(state->register_model_destroy_notice(started), std::runtime_error);
     EXPECT_FALSE(started);
     state->retire();
     worker->device_ctx_ = nullptr;
@@ -3267,14 +2279,14 @@ TEST(ChipRunLaneTest, OriginRegistrationGateRefusesSubmitAndReportsInFlightToEve
     auto second = origin_ref(state);
     {
         std::lock_guard<std::mutex> lock(g_wait_mu);
-        g_hold_retain = true;
+        notice.hold_query = true;
         g_release_wait = false;
     }
     int started = 0;
     std::exception_ptr registration_error;
     std::thread registration([&] {
         try {
-            state->retain_model_resources(started);
+            state->register_model_destroy_notice(started);
         } catch (...) {
             registration_error = std::current_exception();
         }
@@ -3290,14 +2302,10 @@ TEST(ChipRunLaneTest, OriginRegistrationGateRefusesSubmitAndReportsInFlightToEve
     if (entered) {
         EXPECT_THROW(second.submit(), std::runtime_error);
         int duplicate_started = 1;
-        EXPECT_THROW(state->retain_model_resources(duplicate_started), std::runtime_error);
+        EXPECT_THROW(state->register_model_destroy_notice(duplicate_started), std::runtime_error);
         EXPECT_FALSE(duplicate_started);
-        NativeSubmissionCleanup cleanup;
-        state->cancel_pending(cleanup);
-        EXPECT_EQ(cleanup.disposition, NativeSubmissionDisposition::Submitting);
-        EXPECT_FALSE(cleanup.carrier_retired);
         EXPECT_FALSE(state->cancel(std::make_exception_ptr(RunPreparationRefused("concurrent cancel"))));
-        EXPECT_THROW(state->release_resources(), std::runtime_error);
+        EXPECT_THROW(state->release_model_resources(), std::runtime_error);
         EXPECT_THROW(state->retire(), RunPreparationRefused);
         EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 0);
         EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 0);
@@ -3311,16 +2319,12 @@ TEST(ChipRunLaneTest, OriginRegistrationGateRefusesSubmitAndReportsInFlightToEve
     registration.join();
     EXPECT_EQ(registration_error, nullptr);
     EXPECT_TRUE(started);
-    EXPECT_EQ(g_prepare_count[0], 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "retain0"), 1);
+    EXPECT_EQ(g_prepare_count[0], 0);
     first.submit();
     EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
-    NativeSubmissionCleanup cleanup;
-    state->cancel_pending(cleanup);
-    EXPECT_TRUE(cleanup.carrier_retired);
     ASSERT_EQ(notice.registrations.size(), 1u);
     notice.registrations.front().notify();
-    state->release_resources();
+    state->release_model_resources();
     state->retire();
     worker->finalize();
 }
@@ -3373,7 +2377,7 @@ TEST(ChipRunLaneTest, OriginOrdinarySubmitCanWinBeforeRegistrationClaimsWithoutC
     std::exception_ptr registration_error;
     std::thread registration([&] {
         try {
-            state->retain_model_resources(started);
+            state->register_model_destroy_notice(started);
         } catch (...) {
             registration_error = std::current_exception();
         }
@@ -3385,9 +2389,7 @@ TEST(ChipRunLaneTest, OriginOrdinarySubmitCanWinBeforeRegistrationClaimsWithoutC
     registration.join();
     EXPECT_NE(registration_error, nullptr);
     EXPECT_FALSE(started);
-    EXPECT_EQ(g_prepare_purpose[0], SIMPLER_PREPARE_EAGER);
     EXPECT_EQ(g_prepare_count[0], 1);
-    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "retain0"), 0);
     EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stream_launch0"), 1);
     g_complete[0] = true;
     EXPECT_TRUE(state->wait_until(ChipRun::Clock::now()));
@@ -3410,7 +2412,7 @@ TEST(ChipRunLaneTest, OriginCancellationCanWinBeforeRegistrationClaimAndKeepsIts
     std::exception_ptr registration_error;
     std::thread registration([&] {
         try {
-            state->retain_model_resources(started);
+            state->register_model_destroy_notice(started);
         } catch (...) {
             registration_error = std::current_exception();
         }
@@ -3419,10 +2421,7 @@ TEST(ChipRunLaneTest, OriginCancellationCanWinBeforeRegistrationClaimAndKeepsIts
     EXPECT_TRUE(entered);
     std::weak_ptr<ChipWorker> observed = worker;
     if (entered) {
-        NativeSubmissionCleanup cleanup;
-        state->cancel_pending(cleanup);
-        EXPECT_EQ(cleanup.disposition, NativeSubmissionDisposition::Cancelled);
-        EXPECT_TRUE(cleanup.carrier_retired);
+        EXPECT_TRUE(state->release_model_resources());
         state->retire();
         worker.reset();
         EXPECT_FALSE(observed.expired());
@@ -3450,12 +2449,11 @@ TEST(ChipRunLaneTest, DefaultGrantRecordsFiveTokensWhileEveryModelReferenceStays
         references.push_back(origin_ref(states.back()));
         int started = 0;
         try {
-            states.back()->retain_model_resources(started, index == 0 ? nullptr : states.front().get());
+            states.back()->register_model_destroy_notice(started, index == 0 ? nullptr : states.front().get());
             EXPECT_TRUE(started);
             references.back().submit();
             ++submitted;
-            EXPECT_TRUE(worker->native_runs_.empty());
-            EXPECT_EQ(worker->native_resource_references_, submitted);
+            EXPECT_EQ(worker->native_runs_.size(), submitted);
             for (const auto &state : states)
                 EXPECT_FALSE(state->done());
             const auto events = g_events;
@@ -3472,25 +2470,14 @@ TEST(ChipRunLaneTest, DefaultGrantRecordsFiveTokensWhileEveryModelReferenceStays
     ASSERT_EQ(notice.registrations.size(), 1u);
     notice.registrations.front().notify();
     for (size_t index = 0; index < references.size(); ++index) {
-        NativeSubmissionCleanup cleanup;
-        states[index]->cancel_pending(cleanup);
-        EXPECT_TRUE(cleanup.carrier_retired);
-        states[index]->release_resources();
+        states[index]->release_model_resources();
         states[index]->retire();
     }
-    EXPECT_EQ(worker->native_resource_references_, 0);
+    EXPECT_TRUE(worker->native_runs_.empty());
     worker->finalize();
 }
 
-namespace {
-void cancel_capture_carrier(NativeSubmissionState &state) {
-    NativeSubmissionCleanup cleanup;
-    state.cancel_pending(cleanup);
-    EXPECT_TRUE(cleanup.carrier_retired);
-}
-}  // namespace
-
-TEST(ChipRunLaneTest, AclModelNoticeHoldsAllRetiredCarriersUntilTheSharedCallback) {
+TEST(ChipRunLaneTest, AclModelNoticeHoldsAllOriginalRunsUntilTheSharedCallback) {
     int model;
     AclNoticeTransport transport{&model};
     auto worker = std::make_shared<ChipWorker>();
@@ -3500,19 +2487,19 @@ TEST(ChipRunLaneTest, AclModelNoticeHoldsAllRetiredCarriersUntilTheSharedCallbac
     for (int i = 0; i < 3; ++i) {
         auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
         int started = 0;
-        state->retain_model_resources(started, states.empty() ? nullptr : states.front().get());
+        state->register_model_destroy_notice(started, states.empty() ? nullptr : states.front().get());
         EXPECT_EQ(started, 1);
         state->submit();
-        EXPECT_TRUE(worker->native_runs_.empty());
+        EXPECT_EQ(worker->native_runs_.size(), states.size() + 1);
+        EXPECT_EQ(g_caller_owned_loans.size(), states.size() + 1);
         EXPECT_FALSE(state->done());
         EXPECT_FALSE(state->model_destroyed());
         const auto before = g_events;
-        EXPECT_THROW(state->release_resources(), RunPreparationRefused);
+        EXPECT_THROW(state->release_model_resources(), RunPreparationRefused);
         EXPECT_EQ(g_events, before);
         states.push_back(std::move(state));
     }
     ASSERT_EQ(transport.registrations.size(), 1u);
-    ASSERT_EQ(worker->native_resource_references_, states.size());
     const auto before = g_events;
     const auto callback = transport.registrations.front();
     std::thread destroy([&] {
@@ -3523,21 +2510,21 @@ TEST(ChipRunLaneTest, AclModelNoticeHoldsAllRetiredCarriersUntilTheSharedCallbac
     });
     destroy.join();
     EXPECT_EQ(g_events, before);
-    EXPECT_EQ(worker->native_resource_references_, states.size());
     for (auto &state : states) {
         EXPECT_TRUE(state->model_destroyed());
-        state->release_resources();
+        const size_t live = g_caller_owned_loans.size();
+        state->release_model_resources();
+        EXPECT_EQ(g_caller_owned_loans.size() + 1, live);
         EXPECT_TRUE(state->done());
         const auto released = g_events;
-        state->release_resources();
+        state->release_model_resources();
         EXPECT_EQ(g_events, released);
         state->retire();
     }
-    EXPECT_EQ(worker->native_resource_references_, 0u);
     worker->finalize();
 }
 
-TEST(ChipRunLaneTest, AclModelNoticeCannotReplaceCarrierRetirement) {
+TEST(ChipRunLaneTest, DestroyedModelCannotStartItsFirstRun) {
     int model;
     AclNoticeTransport transport{&model};
     auto worker = std::make_shared<ChipWorker>();
@@ -3545,19 +2532,16 @@ TEST(ChipRunLaneTest, AclModelNoticeCannotReplaceCarrierRetirement) {
     bind_acl_notice_transport(*worker, transport);
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
     int started = 0;
-    state->retain_model_resources(started);
+    state->register_model_destroy_notice(started);
     ASSERT_EQ(transport.registrations.size(), 1u);
     transport.registrations.front().notify();
     EXPECT_TRUE(state->model_destroyed());
     const auto before = g_events;
     EXPECT_THROW(state->submit(), RunPreparationRefused);
-    EXPECT_THROW(state->release_resources(), RunPreparationRefused);
+    EXPECT_FALSE(state->release_model_resources());
     EXPECT_EQ(g_events, before);
-    EXPECT_EQ(worker->native_resource_references_, 1u);
-    cancel_capture_carrier(*state);
-    state->release_resources();
+    state->release_model_resources();
     state->retire();
-    EXPECT_EQ(worker->native_resource_references_, 0u);
     worker->finalize();
 }
 
@@ -3569,32 +2553,29 @@ TEST(ChipRunLaneTest, AclModelHandleReuseRequiresTheEarlierDestroyNotice) {
     bind_acl_notice_transport(*worker, transport);
     int started = 0;
     auto first = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
-    first->retain_model_resources(started);
+    first->register_model_destroy_notice(started);
     first->submit();
     auto uncertain = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
-    EXPECT_THROW(uncertain->retain_model_resources(started), RunPreparationRefused);
+    EXPECT_THROW(uncertain->register_model_destroy_notice(started), RunPreparationRefused);
     EXPECT_EQ(started, 1);
-    cancel_capture_carrier(*uncertain);
-    uncertain->release_resources();
+    uncertain->release_model_resources();
     uncertain->retire();
     ASSERT_EQ(transport.registrations.size(), 1u);
-    EXPECT_EQ(worker->native_resource_references_, 1u);
 
     transport.registrations.front().notify();
     auto successor = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
-    successor->retain_model_resources(started);
+    successor->register_model_destroy_notice(started);
     successor->submit();
     ASSERT_EQ(transport.registrations.size(), 2u);
     EXPECT_NE(transport.registrations[0].cookie, transport.registrations[1].cookie);
     EXPECT_TRUE(first->model_destroyed());
     EXPECT_FALSE(successor->model_destroyed());
-    first->release_resources();
+    first->release_model_resources();
     first->retire();
-    EXPECT_THROW(successor->release_resources(), RunPreparationRefused);
+    EXPECT_THROW(successor->release_model_resources(), RunPreparationRefused);
     transport.registrations.back().notify();
-    successor->release_resources();
+    successor->release_model_resources();
     successor->retire();
-    EXPECT_EQ(worker->native_resource_references_, 0u);
     worker->finalize();
 }
 
@@ -3606,29 +2587,26 @@ TEST(ChipRunLaneTest, AclModelAnchorAndSubmitRefuseAnotherActiveModel) {
     bind_acl_notice_transport(*worker, transport);
     int started = 0;
     auto first = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
-    first->retain_model_resources(started);
+    first->register_model_destroy_notice(started);
     auto wrong_stream = worker->prepare_chip_submission(
         1, CallArgumentSnapshot(device_args(), {}), CallConfig{}, reinterpret_cast<void *>(2)
     );
-    EXPECT_THROW(wrong_stream->retain_model_resources(started, first.get()), RunPreparationRefused);
-    cancel_capture_carrier(*wrong_stream);
-    wrong_stream->release_resources();
+    EXPECT_THROW(wrong_stream->register_model_destroy_notice(started, first.get()), RunPreparationRefused);
+    wrong_stream->release_model_resources();
     wrong_stream->retire();
 
     transport.active_model = &other_model;
     auto wrong = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
-    EXPECT_THROW(wrong->retain_model_resources(started, first.get()), RunPreparationRefused);
-    cancel_capture_carrier(*wrong);
-    wrong->release_resources();
+    EXPECT_THROW(wrong->register_model_destroy_notice(started, first.get()), RunPreparationRefused);
+    wrong->release_model_resources();
     wrong->retire();
     const auto before = g_events;
     EXPECT_THROW(first->submit(), RunPreparationRefused);
     EXPECT_EQ(g_events, before);
     ASSERT_EQ(transport.registrations.size(), 1u);
-    cancel_capture_carrier(*first);
-    EXPECT_THROW(first->release_resources(), RunPreparationRefused);
+    EXPECT_THROW(first->release_model_resources(), RunPreparationRefused);
     transport.registrations.front().notify();
-    first->release_resources();
+    first->release_model_resources();
     first->retire();
     worker->finalize();
 }
@@ -3643,12 +2621,10 @@ TEST(ChipRunLaneTest, AclModelRegistrationFailurePreservesTheCallbackCookie) {
         bind_acl_notice_transport(*worker, transport);
         auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
         int started = 0;
-        EXPECT_THROW(state->retain_model_resources(started), RunPreparationRefused);
+        EXPECT_THROW(state->register_model_destroy_notice(started), RunPreparationRefused);
         EXPECT_EQ(started, 1);
-        cancel_capture_carrier(*state);
-        state->release_resources();
+        state->release_model_resources();
         state->retire();
-        EXPECT_EQ(worker->native_resource_references_, 0u);
         worker->finalize();
     }
     // An ambiguous registration failure can leave RTS holding its cookie
@@ -3661,11 +2637,10 @@ TEST(ChipRunLaneTest, AclModelRegistrationFailurePreservesTheCallbackCookie) {
     bind_acl_notice_transport(*worker, transport);
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
     int started = 0;
-    state->retain_model_resources(started);
+    state->register_model_destroy_notice(started);
     ASSERT_EQ(transport.registrations.size(), 2u);
-    cancel_capture_carrier(*state);
     transport.registrations.back().notify();
-    state->release_resources();
+    state->release_model_resources();
     state->retire();
     worker->finalize();
 }
@@ -3678,18 +2653,21 @@ TEST(ChipRunLaneTest, AclModelNoticeKeepsTheCheckedReleaseFailureRetryable) {
     bind_acl_notice_transport(*worker, transport);
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
     int started = 0;
-    state->retain_model_resources(started);
+    state->register_model_destroy_notice(started);
     state->submit();
     ASSERT_EQ(transport.registrations.size(), 1u);
     transport.registrations.front().notify();
-    g_release_rc = -72;
-    EXPECT_THROW(state->release_resources(), std::runtime_error);
-    EXPECT_EQ(worker->native_resource_references_, 1u);
+    worker->finalize_run_fn_ = [](void *, void *storage, int) {
+        uint64_t tag = g_finalize_rc[0] ? kNativeRunContextMagic : 0;
+        std::memcpy(storage, &tag, sizeof(tag));
+        return g_finalize_rc[0];
+    };
+    g_finalize_rc[0] = -72;
+    EXPECT_THROW(state->release_model_resources(), std::runtime_error);
     EXPECT_TRUE(state->model_destroyed());
-    g_release_rc = 0;
-    state->release_resources();
+    g_finalize_rc[0] = 0;
+    state->release_model_resources();
     state->retire();
-    EXPECT_EQ(worker->native_resource_references_, 0u);
     worker->finalize();
 }
 
@@ -3702,14 +2680,13 @@ TEST(ChipRunLaneTest, AclModelRetentionRefusesInactiveCaptureWithoutEmitting) {
     bind_acl_notice_transport(*worker, transport);
     auto state = capture_origin(worker, CallArgumentSnapshot(device_args(), {}));
     int started = 0;
-    EXPECT_THROW(state->retain_model_resources(started), RunPreparationRefused);
+    EXPECT_THROW(state->register_model_destroy_notice(started), RunPreparationRefused);
     EXPECT_EQ(started, 1);
     EXPECT_TRUE(transport.registrations.empty());
     const auto before = g_events;
     EXPECT_THROW(state->submit(), RunPreparationRefused);
     EXPECT_EQ(g_events, before);
-    cancel_capture_carrier(*state);
-    state->release_resources();
+    state->release_model_resources();
     state->retire();
     worker->finalize();
 }

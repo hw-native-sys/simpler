@@ -33,7 +33,10 @@ public:
             if (static_cast<size_t>(i) >= directions.size())
                 throw std::invalid_argument("HOST/NONE snapshot requires callable direction");
             // Writable HOST arguments retain their externally visible destination.
-            if (directions[i] != ArgDirection::IN) continue;
+            if (directions[i] != ArgDirection::IN) {
+                has_writable_host_arguments_ = true;
+                continue;
+            }
             if (tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS)
                 throw std::invalid_argument("HOST control snapshot has invalid rank");
             const auto element_size = get_element_size(tensor.dtype);
@@ -57,9 +60,11 @@ public:
         }
     }
 
+    bool has_writable_host_arguments() const { return has_writable_host_arguments_; }
     const ChipStorageTaskArgs &args() const { return args_; }
 
 private:
+    bool has_writable_host_arguments_{false};
     ChipStorageTaskArgs args_;
     std::vector<std::shared_ptr<std::vector<uint64_t>>> storage_;
 };

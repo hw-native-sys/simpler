@@ -105,9 +105,28 @@ public:
             host_capacity_ = bytes;
         }
 
-        if (!fits(device_addr_, device_capacity_, bytes, alignment)) {
+        const auto status = acquire_device(bytes, alignment, device_alloc, device_free, device_out);
+        if (status == Status::Ok) *host_out = host_addr_;
+        return status;
+    }
+
+    bool covers_device(size_t bytes, size_t alignment) const {
+        return bytes != 0 && alignment != 0 && (alignment & (alignment - 1)) == 0 &&
+               fits(device_addr_, device_capacity_, bytes, alignment);
+    }
+
+    // Onboard binds build their initialization data in slot-local host memory.
+    template <class DeviceAlloc, class DeviceFree>
+    Status acquire_device(
+        size_t bytes, size_t alignment, DeviceAlloc device_alloc, DeviceFree device_free, void **device_out
+    ) {
+        if (device_out == nullptr) return Status::InvalidRequest;
+        *device_out = nullptr;
+        if (bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1))
+            return Status::InvalidRequest;
+        if (!covers_device(bytes, alignment)) {
             if (failed_release_ != nullptr) return Status::GrowthRefused;
-            void *allocation = device_alloc(raw_bytes);
+            void *allocation = device_alloc(bytes + alignment - 1);
             if (allocation == nullptr) return Status::DeviceUnavailable;
             void *previous = device_allocation_;
             device_allocation_ = allocation;
@@ -119,7 +138,6 @@ public:
         }
 
         *device_out = device_addr_;
-        *host_out = host_addr_;
         return Status::Ok;
     }
 
