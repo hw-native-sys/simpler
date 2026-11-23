@@ -63,11 +63,10 @@ class TestDeferWaitProgress(SceneTestCase):
 @pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestDeferWaitReadyFairness(SceneTestCase):
-    """Observe bounded progress on nonpreemptive AICore workers.
+    """Complete deferred waits alongside ready background work.
 
-    A simulator host can deschedule a CHECK/FINISH owner while other host
-    threads exhaust the finite workload. That is not an AICore service-budget
-    violation; CPU tests drive the production service steps deterministically.
+    The waiter-dependent consumer releases a pending background task through an
+    explicit acknowledgement. CPU control tests cover per-worker CHECK cadence.
     """
 
     RTOL = 0
@@ -87,7 +86,7 @@ class TestDeferWaitReadyFairness(SceneTestCase):
             }
         ],
     }
-    CASES = [{"name": "continuous_ready", "platforms": ["a5"], "manual": True, "params": {"count": 2048}}]
+    CASES = [{"name": "ready_work_handshake", "platforms": ["a5sim", "a5"], "manual": True, "params": {"count": 2048}}]
 
     def generate_args(self, params):
         return TaskArgsBuilder(
