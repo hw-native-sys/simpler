@@ -646,7 +646,7 @@ __attribute__((weak)) void AicpuExecutor::publish_partition(Runtime *runtime, in
 }
 
 void AicpuExecutor::service_args_dump(int32_t thread_idx) {
-    if (args_dump_services_ != nullptr && args_dump_services_[thread_idx].step())
+    if (__builtin_expect(args_dump_services_ != nullptr, false) && args_dump_services_[thread_idx].step())
         ready_watchdog_.record_progress(get_sys_cnt_aicpu());
 }
 

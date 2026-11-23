@@ -46,9 +46,9 @@ inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 64;
 // it is not a scalar ordering guarantee. See the data-layout contract.
 inline constexpr uint64_t SCHEDULER_GM_ATOMIC_SECTOR_BYTES = 128;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
-inline constexpr uint32_t SCHEDULER_EXECUTION_TOKEN_COUNT = 2;
+inline constexpr uint32_t SCHEDULER_EXECUTION_TOKEN_COUNT = 1;
 inline constexpr uint32_t SCHEDULER_CLUSTER_MIX_EXECUTION = SCHEDULER_EXECUTION_TOKEN_COUNT;
-inline constexpr uint32_t SCHEDULER_MIX_MEMBER_COUNT = 2;
+inline constexpr uint32_t SCHEDULER_MIX_MEMBER_COUNT = 1;
 inline constexpr uint32_t SCHEDULER_LOCAL_EXECUTION_COUNT =
     SCHEDULER_CLUSTER_MIX_EXECUTION + SCHEDULER_MIX_MEMBER_COUNT;
 // MIX keeps the same trace identity in both window-depth builds.
@@ -336,6 +336,15 @@ inline __aicore__ bool scheduler_task_is_inline(uint8_t flags) { return (flags &
 
 inline __aicore__ bool scheduler_task_has_predicate(uint8_t flags) {
     return (flags & SCHEDULER_TASK_HAS_PREDICATE) != 0;
+}
+
+// Pair the halves of a full Cube + Vector MIX wave while preserving the four block stripes.
+// Flipping the high bit according to bit one is its own inverse, so every
+// physical cluster still owns exactly one block without a shared claim.
+inline __aicore__ uint32_t scheduler_fixed_mix_block(uint32_t cluster, uint32_t clusters, LaneMask lanes) {
+    if (lanes.is_mix() && lanes.has_aic() && clusters >= 8 && (clusters & (clusters - 1)) == 0 && (cluster & 2U) != 0)
+        return cluster ^ (clusters / 2);
+    return cluster;
 }
 
 inline __aicore__ bool scheduler_task_has_fixed_owners(uint8_t flags) {
@@ -814,13 +823,14 @@ inline __aicore__ __gm__ T *scheduler_state_at(__gm__ void *base, uint64_t offse
 
 #if !defined(__CCE_AICORE__)
 #include <type_traits>
-// A bank retains its last publication through FIN. A third, unassigned ticket
-// may coexist with both banks when the proxy is waiting for a bank to retire.
+// A bank retains its last publication through FIN. A pending ticket can
+// coexist with an occupied bank while the proxy waits for the bank to retire.
 template <typename Visitor>
 inline void scheduler_visit_mix_proxy_records(const SchedulerWorkerContext &context, Visitor visit) {
-    static_assert(SCHEDULER_MIX_MEMBER_COUNT == 2);
+    static_assert(SCHEDULER_MIX_MEMBER_COUNT >= 1 && SCHEDULER_MIX_MEMBER_COUNT <= 2);
     const uint64_t acquired = __atomic_load_n(&context.mix_proxy_acquired, __ATOMIC_ACQUIRE);
-    uint64_t published[SCHEDULER_MIX_MEMBER_COUNT];
+    // The snapshot treats a disabled bank as having no publication.
+    uint64_t published[2]{};
     for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank)
         published[bank] = __atomic_load_n(&context.mix_proxy_published[bank], __ATOMIC_ACQUIRE);
     const uint64_t cancelled = __atomic_load_n(&context.mix_proxy_cancelled, __ATOMIC_ACQUIRE);

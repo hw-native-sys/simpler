@@ -15,7 +15,23 @@
 #include <memory>
 #include <vector>
 
-enum class SchedulerNotificationPurpose : uint32_t { TASK_STATE, MIX_ACK, COMPLETION_COUNTER };
+enum class SchedulerNotificationPurpose : uint32_t {
+    TASK_STATE,
+    MIX_ACK,
+    COMPLETION_COUNTER,
+    HBG_REQUIRED_TASK_STATE,
+    HBG_REQUIRED_COMPLETION_COUNTER
+};
+
+inline constexpr bool scheduler_notification_is_required(SchedulerNotificationPurpose purpose) {
+    return purpose == SchedulerNotificationPurpose::HBG_REQUIRED_TASK_STATE ||
+           purpose == SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER;
+}
+
+inline constexpr bool scheduler_notification_uses_counter(SchedulerNotificationPurpose purpose) {
+    return purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER ||
+           purpose == SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER;
+}
 
 struct SchedulerDoneNotifications {
     std::vector<uint64_t> addresses;

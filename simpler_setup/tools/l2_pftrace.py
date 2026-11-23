@@ -52,6 +52,8 @@ def _collect_tracks(events):
                 counters[counter].append((ts, value))
         elif phase == "i":
             streams[key].append((ts, phase, event))
+            if "id" in event:
+                by_id[key, event["id"]] = event
         elif phase not in ("s", "f"):
             raise ValueError(f"Unsupported L2 trace phase {phase!r}")
 

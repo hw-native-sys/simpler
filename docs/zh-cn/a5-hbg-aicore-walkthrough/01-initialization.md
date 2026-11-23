@@ -45,7 +45,7 @@ AICPU 发布实际 active_worker_count 与 watchdog budget；PMU 仅在本轮确
 WorkerContext 最后一行归本核诊断；其字段不会与配置写者并发覆盖。
 普通和 native Graph 的首批工作都在 DMB 开启前准备。
 
-1. 图含 MIX 时，AIV0 清空本簇两个 SSBUF bank，发布 INIT。AIC 和 AIV1 确认 INIT 后访问 SSBUF。无 MIX 的图由 Host 预置 INIT。
+1. 图含 MIX 时，AIV0 清空本簇的 SSBUF bank，发布 INIT。AIC 和 AIV1 确认 INIT 后访问 SSBUF。无 MIX 的图由 Host 预置 INIT。
 2. 每核按图类型服务控制节点，并尝试获取首份可执行工作。此时可以观察 Host 已绑定的 Call。
 3. AIC 和 AIV1 各自完成首轮准备后发布 DONE。AIV0 确认两个 DONE，为本簇的三个 worker 记数。最后一簇发布 bootstrap_complete。
 

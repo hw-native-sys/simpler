@@ -20,6 +20,7 @@ from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
 from simpler_setup.scene_test import compile_chip_callable_spec
+from simpler_setup.tools.percounter import display
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
 
 pytestmark = [
@@ -236,15 +237,18 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                     if level == 2:
                         starts = [e for e in events if e["ph"] == "b" and e["cat"] == "Percounter L2"]
                         assert starts and not any(e["name"].startswith(("EXECUTE", "Kernel execution")) for e in starts)
+                        workers = [
+                            e for e in events if e["pid"] == 4 and e["ph"] == "X" and "kernel-duration-us" in e["args"]
+                        ]
+                        assert len(workers) == blocks * TASKS
+                        assert all(e["name"].startswith(display(e["args"]["taskId"]) + "-") for e in workers)
                         tracks = {
                             e["tid"]: e["args"]["name"]
                             for e in events
                             if e["pid"] == 4 and e["ph"] == "M" and e["name"] == "thread_name"
                         }
                         actual = sorted(
-                            (tracks[e["tid"]], e["args"]["taskId"], e["ts"], e["ts"] + e["dur"])
-                            for e in events
-                            if e["pid"] == 4 and e["ph"] == "X" and e["name"].startswith("EXECUTE · ")
+                            (tracks[e["tid"]], e["args"]["taskId"], e["ts"], e["ts"] + e["dur"]) for e in workers
                         )
                         expected = sorted(
                             (f"C{r['cluster_index']:02d} / AIC", r["task_id"], r["kernel_start_us"], r["time_us"])

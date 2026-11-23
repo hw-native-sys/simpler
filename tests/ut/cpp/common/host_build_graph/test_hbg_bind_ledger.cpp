@@ -3053,13 +3053,12 @@ TEST_F(HbgResidentSchedulerStorageTest, IndependentAsyncSinksUseAvailableChainAn
     ops.acquire_scheduler_notifications = [](void *, uint32_t, SchedulerNotificationPurpose purpose, size_t count,
                                              SchedulerDoneNotifications *out) {
         *out = {std::vector<uint64_t>(count), std::vector<uint64_t>(count), {}};
-        if (purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER && count == 2) {
+        if (purpose == SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER && count == 2) {
             // One of the two independent tasks fits the INC pool.
             out->addresses = {0x1000, 0};
             out->add_addresses = {0x1008, 0};
-        } else if (purpose == SchedulerNotificationPurpose::TASK_STATE && count == 3) {
-            // DONE accepts a word-aligned SET address. Only the second CHECK half has bit aliases.
-            out->addresses = {0x2004, 0x2044, 0x2080};
+        } else if (purpose == SchedulerNotificationPurpose::HBG_REQUIRED_TASK_STATE && count == 1) {
+            out->addresses = {0x2004};
         } else {
             return -1;
         }
@@ -3106,10 +3105,7 @@ TEST_F(HbgResidentSchedulerStorageTest, IndependentAsyncSinksUseAvailableChainAn
     const auto &summary = *reinterpret_cast<const SchedulerGraphSummary *>(base + ctx.graph_summary_offset);
     ASSERT_NE(summary.async_layout_offset, 0u);
     const auto &layout = *reinterpret_cast<const SchedulerAsyncLayout *>(base + summary.async_layout_offset);
-    const auto *directory = reinterpret_cast<const SchedulerAsyncDirectoryWord *>(base + layout.check_directory_offset);
     ASSERT_EQ(layout.group_count, 34u);
-    EXPECT_EQ(directory[0].notification_addresses[0], 0u);
-    EXPECT_EQ(directory[0].notification_addresses[1], 0x2080u);
 }
 
 TEST_F(HbgResidentSchedulerStorageTest, GraphHeapReservationContainsArgumentsWithoutAicpuTaskStorage) {
@@ -3185,7 +3181,7 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
         ASSERT_LE(summary->async_layout_offset + sizeof(SchedulerAsyncLayout), region.bytes);
         const auto *async = reinterpret_cast<const SchedulerAsyncLayout *>(source + summary->async_layout_offset);
         EXPECT_EQ(async->image_bytes, context->scheduler_state_bytes);
-        EXPECT_EQ(async->group_leases_offset, region.bytes);
+        EXPECT_EQ(async->group_progress_offset, region.bytes);
         EXPECT_LT(region.bytes, context->scheduler_state_bytes);
         const auto *tasks = reinterpret_cast<const SchedulerArgsDumpTask *>(
             reinterpret_cast<const uint8_t *>(dump) + dump->tasks_offset

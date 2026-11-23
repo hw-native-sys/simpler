@@ -28,6 +28,7 @@ thread_local std::function<void()> writeback_barrier_observer;
 thread_local std::function<void(volatile uint64_t *)> prepared_cas_observer;
 thread_local const volatile void *query_target = nullptr;
 thread_local uint32_t query_count = 0;
+thread_local uint64_t issue_ticks = 0;
 thread_local const volatile uint32_t *notify_target = nullptr;
 thread_local uint32_t notify_count = 0;
 
@@ -128,6 +129,9 @@ public:
 #define scheduler_writeback_cache_line observe_binding_writeback
 #define scheduler_gm_query observe_query
 #define scheduler_notify_query observe_notify_query
+#define scheduler_cycles() issue_ticks
+#include "scheduler/scheduler_issue.h"
+#undef scheduler_cycles
 #include "hbg_scheduler_test_support.h"
 #include "prepared_execution_plan.h"
 #include "scheduler/scheduler_completion.h"
@@ -416,6 +420,55 @@ TEST(HbgExecutionRefill, ContinuationExhaustionIsReusedWithoutAdvancingAnUnseale
     ));
     EXPECT_EQ(fixture.local->issue_cursor, 1u);
     EXPECT_EQ(query_count, 1u);
+}
+
+TEST(HbgExecutionRefill, RechecksOpenSealAtDeadlineAndReadsNewHeadImmediately) {
+    RefillFixture fixture(3);
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    fixture.local->previous_round_idle = true;
+    const auto graph = fixture.graph.graph();
+    auto &binding = fixture.local->issue_binding;
+    auto bind = [&](int64_t ref) {
+        return scheduler_bind_issue_entry(graph, fixture.base(), fixture.local, fixture.storage.run_control, ref);
+    };
+    bool closed = false;
+    auto poll = [&] {
+        return scheduler_task_supply_closed(
+            graph, fixture.base(), fixture.local, fixture.storage.run_control, binding.task_ref, &closed, &binding
+        );
+    };
+    struct ResetClock {
+        ~ResetClock() { issue_ticks = 0; }
+    } reset_clock;
+
+    ASSERT_TRUE(bind(0));
+    ScopedQueryObserver observer(&fixture.control(0)->claim_seal);
+    issue_ticks = 100;
+    ASSERT_TRUE(poll());
+    EXPECT_FALSE(closed);
+    EXPECT_EQ(query_count, 1u);
+    fixture.control(0)->claim_seal = 1;
+    issue_ticks = 599;
+    ASSERT_TRUE(poll());
+    EXPECT_FALSE(closed);
+    EXPECT_EQ(query_count, 1u);
+    issue_ticks = 600;
+    ASSERT_TRUE(poll());
+    EXPECT_TRUE(closed);
+    EXPECT_EQ(query_count, 2u);
+
+    ASSERT_TRUE(bind(1));
+    ASSERT_TRUE(poll());
+    EXPECT_FALSE(closed);
+    fixture.control(1)->claim_seal = 1;
+    fixture.local->previous_round_idle = false;
+    ASSERT_TRUE(poll());
+    EXPECT_TRUE(closed);
+    fixture.local->previous_round_idle = true;
+    ASSERT_TRUE(bind(2));
+    fixture.control(2)->claim_seal = 1;
+    ASSERT_TRUE(poll());
+    EXPECT_TRUE(closed);
 }
 
 TEST(HbgExecutionRefill, ChangedHeadClaimsSuccessorWithoutInheritingContinuationFanin) {

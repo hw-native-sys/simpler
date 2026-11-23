@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -194,9 +195,126 @@ inline bool scheduler_can_defer_side_tasks(
     });
 }
 
+// An edge strictly decreases bottom level, so descending bottom level is topological.
+// Only reorder consecutive synchronous ordinary tasks. Keep every resource or async
+// boundary at its original rank, including when a dependency is external to this graph.
+inline void scheduler_prioritize_ordinary_segments(
+    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<LaneMask> &async_lanes,
+    const SchedulerDependencyPlan &deps, const std::vector<std::vector<int64_t>> &successors, uint32_t clusters,
+    SchedulerTaskOrder &order
+) {
+    const auto movable = [&](int64_t ref) {
+        const auto flags = metadata[ref].flags;
+        return scheduler_task_is_executable(flags) && !scheduler_task_is_inline(flags) &&
+               !scheduler_task_is_mix(flags) && !scheduler_task_requires_sync_start(flags) &&
+               !scheduler_task_has_predicate(flags) && async_lanes[ref].is_empty();
+    };
+    auto &refs = order.task_order;
+    std::vector<uint8_t> pending(refs.size());
+    std::vector<int64_t> packed;
+    for (auto begin = refs.begin(); begin != refs.end();) {
+        if (!movable(*begin)) {
+            ++begin;
+            continue;
+        }
+        const auto end = std::find_if_not(begin, refs.end(), movable);
+        std::stable_sort(begin, end, [&](int64_t left, int64_t right) {
+            return order.task_bottom_levels[left] > order.task_bottom_levels[right];
+        });
+        // Give the critical branch first choice. Independent siblings may use the rest of
+        // this wave if every predecessor already precedes them in the new directory.
+        for (auto it = begin; it != end; ++it)
+            pending[*it] = 1;
+        packed.clear();
+        for (auto it = begin; it != end; ++it) {
+            const auto first = *it;
+            if (!pending[first]) continue;
+            packed.push_back(first);
+            pending[first] = 0;
+            const auto &task = metadata[first];
+            std::array<uint32_t, 2> free{clusters, clusters * PLATFORM_AIV_CORES_PER_BLOCKDIM};
+            const size_t engine = task.active_mask.has_aic() ? 0 : 1;
+            if (task.logical_block_num >= free[engine]) continue;
+            free[engine] -= task.logical_block_num;
+            // Use the latest executable predecessor; folded controls often fan out to the whole graph.
+            int64_t fork = -1;
+            for (const auto pred : deps.fanin[first]) {
+                if (!scheduler_task_is_executable(metadata[pred].flags) ||
+                    scheduler_task_is_inline(metadata[pred].flags))
+                    continue;
+                if (fork < 0 || order.task_ranks[pred] > order.task_ranks[fork]) fork = pred;
+            }
+            if (fork < 0) continue;
+            // Packing is optional. Inspect at most one wave of candidate siblings per first task.
+            // Successor rows are sorted by ref. On wide forks, start just after this child so
+            // later waves can still pack their nearby siblings without rescanning the entire row.
+            const auto &siblings = successors[fork];
+            const size_t budget = clusters * PLATFORM_CORES_PER_BLOCKDIM;
+            auto sibling_it =
+                siblings.size() > budget ? std::upper_bound(siblings.begin(), siblings.end(), first) : siblings.begin();
+            for (size_t checked = 0; checked < std::min(siblings.size(), budget); ++checked) {
+                if (sibling_it == siblings.end()) sibling_it = siblings.begin();
+                const auto next = *sibling_it++;
+                if (!pending[next] || order.task_levels[next] > order.task_levels[first]) continue;
+                const auto &sibling = metadata[next];
+                auto &remaining = free[sibling.active_mask.has_aic() ? 0 : 1];
+                if (sibling.logical_block_num > remaining ||
+                    std::any_of(deps.fanin[next].begin(), deps.fanin[next].end(), [&](int64_t pred) {
+                        return pending[pred] != 0;
+                    }))
+                    continue;
+                remaining -= sibling.logical_block_num;
+                packed.push_back(next);
+                pending[next] = 0;
+            }
+        }
+        std::copy(packed.begin(), packed.end(), begin);
+        for (auto it = begin; it != end; ++it)
+            order.task_ranks[*it] = static_cast<uint32_t>(it - refs.begin());
+        begin = end;
+    }
+}
+
+// A fixed-wave MIX can be prepared before an independent, later-submitted ordinary branch.
+// Keep its predecessors and the other direct inputs to its consumers ahead of it.
+inline void scheduler_advance_fixed_mix(
+    const std::vector<std::vector<int64_t>> &successors, const std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<LaneMask> *async_lanes, SchedulerTaskOrder &order
+) {
+    auto &refs = order.task_order;
+    size_t begin = 0;
+    for (size_t rank = 0; rank < refs.size(); ++rank) {
+        const auto ref = refs[rank];
+        const auto flags = metadata[ref].flags;
+        const bool synchronous = scheduler_task_is_executable(flags) && !scheduler_task_is_inline(flags) &&
+                                 !scheduler_task_has_predicate(flags) &&
+                                 (async_lanes == nullptr || (*async_lanes)[ref].is_empty());
+        if (synchronous && !scheduler_task_is_mix(flags) && !scheduler_task_requires_sync_start(flags)) continue;
+        if (synchronous && scheduler_task_is_mix(flags) && scheduler_task_has_fixed_owners(flags)) {
+            size_t pos = rank;
+            while (pos > begin && refs[pos - 1] > ref) {
+                // Advancing the vector directory must not take a pure Cube branch's earlier execution opportunity.
+                if (metadata[refs[pos - 1]].active_mask.has_aic()) break;
+                const auto &consumers = successors[refs[pos - 1]];
+                if (std::any_of(consumers.begin(), consumers.end(), [&](int64_t child) {
+                        return child == ref ||
+                               std::binary_search(successors[ref].begin(), successors[ref].end(), child);
+                    }))
+                    break;
+                --pos;
+            }
+            std::rotate(refs.begin() + pos, refs.begin() + rank, refs.begin() + rank + 1);
+            for (size_t i = pos; i <= rank; ++i)
+                order.task_ranks[refs[i]] = static_cast<uint32_t>(i);
+        }
+        begin = rank + 1;
+    }
+}
+
 inline bool scheduler_order_task_catalog(
     const SchedulerDependencyPlan &decoded, const std::vector<SchedulerTaskMetadata> &metadata,
-    SchedulerTaskCatalogPlan *plan, std::string *error = nullptr, bool defer_side_tasks = false
+    SchedulerTaskCatalogPlan *plan, std::string *error = nullptr, bool defer_side_tasks = false,
+    const std::vector<LaneMask> *async_lanes = nullptr
 ) {
     const size_t count = metadata.size();
     if (plan == nullptr || plan->header.task_count != count || decoded.fanin.size() != count ||
@@ -209,6 +327,14 @@ inline bool scheduler_order_task_catalog(
     SchedulerTaskOrder ordered;
     if (!scheduler_topological_task_order(successors, metadata, plan->cluster_count, defer_side_tasks, &ordered, error))
         return false;
+    if (async_lanes != nullptr) {
+        if (async_lanes->size() != count) return false;
+        scheduler_prioritize_ordinary_segments(
+            metadata, *async_lanes, decoded, successors, plan->cluster_count, ordered
+        );
+    }
+    if (defer_side_tasks || async_lanes != nullptr)
+        scheduler_advance_fixed_mix(successors, metadata, async_lanes, ordered);
     for (size_t producer = 0; producer < count; ++producer)
         for (const auto consumer : successors[producer])
             if (ordered.task_ranks[producer] >= ordered.task_ranks[consumer]) {
@@ -216,6 +342,78 @@ inline bool scheduler_order_task_catalog(
                 return false;
             }
     return scheduler_apply_task_order(std::move(ordered), metadata, plan, error);
+}
+
+// The two terminal MIX Calls have one immutable identity per physical lane. Additional inputs
+// into either MIX are allowed: their completion is still checked on the execution path.
+inline void scheduler_plan_terminal_mix_calls(
+    const SchedulerDependencyPlan &deps, const std::vector<SchedulerTaskMetadata> &metadata,
+    SchedulerTaskCatalogPlan &catalog
+) {
+    const auto &refs = catalog.catalogs[static_cast<uint32_t>(SchedulerExecutionEngine::AIV)];
+    if (refs.size() < 3 || deps.sinks.size() != 1 || refs.back() != deps.sinks[0]) return;
+    const auto first = refs.end() - 3;
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto &task = metadata[first[i]];
+        const bool mix = i != 0;
+        const LaneMask lanes = mix ? LaneMask{true, true, true} : LaneMask::aiv0();
+        if (task.active_mask != lanes || !scheduler_task_has_fixed_owners(task.flags) ||
+            scheduler_task_requires_sync_start(task.flags) || scheduler_task_has_predicate(task.flags) ||
+            task.logical_block_num != catalog.cluster_count * (mix ? 1 : PLATFORM_AIV_CORES_PER_BLOCKDIM))
+            return;
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        bool linked = false;
+        for (size_t consumer = 0; consumer < deps.fanin.size(); ++consumer) {
+            if (deps.host_done[consumer]) continue;
+            const auto &fanin = deps.fanin[consumer];
+            if (std::find(fanin.begin(), fanin.end(), first[i]) == fanin.end()) continue;
+            if (consumer != static_cast<size_t>(first[i + 1])) return;
+            linked = true;
+        }
+        if (!linked) return;
+    }
+    catalog.header.terminal_mix_refs[0] = static_cast<uint32_t>(first[1]);
+    catalog.header.terminal_mix_refs[1] = static_cast<uint32_t>(first[2]);
+}
+
+// A member observes every data predecessor's logical completion before it applies its MIX floor.
+// Track only contiguous prefixes of ordinary work. A larger rank on an independent branch cannot
+// certify an earlier task. An uncertain edge or task contributes no completion proof.
+inline void scheduler_elide_proven_mix_floors(
+    const SchedulerDependencyPlan &deps, const std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<LaneMask> &possible_async_lanes, SchedulerTaskCatalogPlan &catalog
+) {
+    using LaneFloors = std::array<uint32_t, PLATFORM_CORES_PER_BLOCKDIM>;
+    std::vector<LaneFloors> completed_prefix(metadata.size());
+    LaneFloors last_ordinary{};
+    for (const int64_t ref : catalog.task_order) {
+        const auto &task = metadata[ref];
+        if (deps.host_done[ref] || !scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags))
+            continue;
+        auto &proof = completed_prefix[ref];
+        const bool known = !scheduler_task_has_predicate(task.flags) && possible_async_lanes[ref].is_empty();
+        if (known)
+            for (const int64_t pred : deps.fanin[ref])
+                for (size_t lane = 0; lane < proof.size(); ++lane)
+                    proof[lane] = std::max(proof[lane], completed_prefix[pred][lane]);
+
+        auto &row = catalog.order_rows[ref];
+        const auto lanes = scheduler_task_claim_lanes(task.flags, task.active_mask).merged_with(task.active_mask);
+        if (scheduler_task_is_mix(task.flags)) {
+            // Keep the full peer protocol if even one participating lane can owe earlier work.
+            bool all_clear = known;
+            for (size_t lane = 0; lane < proof.size(); ++lane)
+                if (lanes.has(static_cast<SubtaskSlot>(lane)) && proof[lane] < last_ordinary[lane]) all_clear = false;
+            if (all_clear) std::fill_n(row.required_floor, proof.size(), 0u);
+        } else {
+            for (size_t lane = 0; lane < proof.size(); ++lane) {
+                if (!lanes.has(static_cast<SubtaskSlot>(lane))) continue;
+                if (known && proof[lane] >= last_ordinary[lane]) proof[lane] = row.rank + 1;
+                last_ordinary[lane] = row.rank + 1;
+            }
+        }
+    }
 }
 
 // The original topology fixes issue order. Fold pure controls with at most one consumer within the fan-in limit.

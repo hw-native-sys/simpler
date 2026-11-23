@@ -74,6 +74,23 @@ bool prepare_ordinary(scheduler_test::BasicGraphBuffer<MaxTasks> &graph, std::ve
     return prepare_ordinary(graph, metadata, completed, image.plan, dependencies);
 }
 
+TEST(HbgTaskCatalog, TerminalMixCallsRequireAClosedFixedWaveChain) {
+    const LaneMask mix{true, true, true};
+    std::vector<SchedulerTaskMetadata> tasks{physical(LaneMask::aiv0(), 4), physical(mix, 2), physical(mix, 2)};
+    for (auto &task : tasks)
+        task.flags |= SCHEDULER_TASK_FIXED_OWNER;
+    SchedulerDependencyPlan dependencies{{{}, {0}, {1}}, {2}, {false, false, false}};
+    CatalogImage closed(tasks);
+    scheduler_plan_terminal_mix_calls(dependencies, tasks, closed.plan);
+    EXPECT_EQ(closed.plan.header.terminal_mix_refs[0], 1u);
+    EXPECT_EQ(closed.plan.header.terminal_mix_refs[1], 2u);
+
+    dependencies.fanin[2].push_back(0);
+    CatalogImage forked(tasks);
+    scheduler_plan_terminal_mix_calls(dependencies, tasks, forked.plan);
+    EXPECT_EQ(forked.plan.header.terminal_mix_refs[0], UINT32_MAX);
+}
+
 TEST(HbgTaskCatalog, PhysicalTasksUseTwoEngineListsAndControlsRemainSeparate) {
     std::vector<SchedulerTaskMetadata> metadata{
         physical(LaneMask::aic(), 4),
@@ -181,6 +198,107 @@ SchedulerTaskMetadata spmd(LaneMask lanes, uint16_t blocks, bool sync_start = fa
     task.flags |= SCHEDULER_TASK_SPMD;
     if (sync_start) task.flags |= SCHEDULER_TASK_SYNC_START;
     return task;
+}
+
+TEST(HbgTaskCatalog, PrioritizesOrdinaryChainWithinTheDeferredTaskBoundary) {
+    std::vector<SchedulerTaskMetadata> tasks(6, physical(LaneMask::aiv0()));
+    std::vector<LaneMask> async_lanes(tasks.size());
+    async_lanes[4] = LaneMask::aiv0();
+    SchedulerDependencyPlan deps;
+    deps.fanin = {{}, {}, {0}, {2}, {3}, {4}};
+    CatalogImage image(tasks);
+
+    ASSERT_TRUE(scheduler_order_task_catalog(deps, tasks, &image.plan));
+    EXPECT_EQ(image.plan.task_order, (std::vector<int64_t>{0, 1, 2, 3, 4, 5}));
+    ASSERT_TRUE(scheduler_order_task_catalog(deps, tasks, &image.plan, nullptr, false, &async_lanes));
+    EXPECT_EQ(image.plan.task_order, (std::vector<int64_t>{0, 2, 3, 1, 4, 5}));
+    tasks[2] = spmd(LaneMask::aiv0(), 2, true);
+    ASSERT_TRUE(scheduler_order_task_catalog(deps, tasks, &image.plan, nullptr, false, &async_lanes));
+    EXPECT_EQ(image.plan.task_order, (std::vector<int64_t>{0, 1, 2, 3, 4, 5}));
+}
+
+TEST(HbgTaskCatalog, PacksOnlyReadySiblingsThatFitBesideTheCriticalTask) {
+    std::vector<SchedulerTaskMetadata> tasks(7, physical(LaneMask::aic()));
+    tasks[2] = physical(LaneMask::aiv0(), 2);
+    tasks[3] = physical(LaneMask::aic(), 2);
+    SchedulerDependencyPlan deps;
+    deps.fanin = {{}, {0}, {0}, {0}, {1}, {4}, {5, 2, 3}};
+    std::vector<LaneMask> async_lanes(tasks.size());
+    CatalogImage image(tasks, 2);
+    ASSERT_TRUE(scheduler_order_task_catalog(deps, tasks, &image.plan, nullptr, false, &async_lanes));
+    const auto &rank = image.plan.task_ranks;
+    EXPECT_EQ(rank[2], rank[1] + 1);
+    EXPECT_LT(rank[4], rank[3]);
+    EXPECT_LT(rank[5], rank[6]);
+}
+
+TEST(HbgTaskCatalog, WideForkBoundsPackingAndStillFindsNearbySiblings) {
+    constexpr size_t children = 1024;
+    constexpr uint32_t clusters = 4;
+    constexpr size_t budget = clusters * PLATFORM_CORES_PER_BLOCKDIM;
+    // Five of eight AIV lanes per child. Only the last child fits beside another one.
+    std::vector<SchedulerTaskMetadata> tasks(children + 1, physical(LaneMask::aiv0(), 5));
+    tasks.back() = physical(LaneMask::aiv0(), 3);
+    SchedulerDependencyPlan deps;
+    deps.fanin.resize(tasks.size(), {0});
+    deps.fanin[0].clear();
+    std::vector<LaneMask> async_lanes(tasks.size());
+    CatalogImage image(tasks, clusters);
+    ASSERT_TRUE(scheduler_order_task_catalog(deps, tasks, &image.plan, nullptr, false, &async_lanes));
+    EXPECT_EQ(image.plan.task_ranks[0], 0u);
+    EXPECT_EQ(image.plan.task_ranks[children], children - budget + 1);
+    for (size_t ref = 1; ref < children; ++ref)
+        EXPECT_EQ(image.plan.task_ranks[ref], ref + (ref > children - budget));
+}
+
+TEST(HbgTaskCatalog, AdvancesFixedMixPastSideWorkWhilePreservingJoinAndAsyncOrder) {
+    std::vector<SchedulerTaskMetadata> tasks(7, physical(LaneMask::aiv0()));
+    tasks[1] = spmd(LaneMask::all(), 2);
+    tasks[1].flags |= SCHEDULER_TASK_FIXED_OWNER;
+    const std::vector<std::vector<int64_t>> successors{{1}, {5}, {5}, {6}, {}, {6}, {}};
+    std::vector<LaneMask> async_lanes(tasks.size());
+    const std::vector<int64_t> original{0, 2, 3, 4, 1, 5, 6};
+    const auto plan = [&] {
+        SchedulerTaskOrder order;
+        order.task_order = original;
+        order.task_ranks.resize(tasks.size());
+        for (uint32_t rank = 0; rank < original.size(); ++rank)
+            order.task_ranks[original[rank]] = rank;
+        scheduler_advance_fixed_mix(successors, tasks, &async_lanes, order);
+        for (uint32_t rank = 0; rank < original.size(); ++rank)
+            EXPECT_EQ(order.task_ranks[order.task_order[rank]], rank);
+        return order.task_order;
+    };
+    EXPECT_EQ(plan(), (std::vector<int64_t>{0, 2, 1, 3, 4, 5, 6}));
+    async_lanes[4] = LaneMask::aiv0();
+    EXPECT_EQ(plan(), original);
+    async_lanes[4] = {};
+    tasks[4] = physical(LaneMask::aic());
+    EXPECT_EQ(plan(), original);
+}
+
+TEST(HbgTaskCatalog, ElidesMixHandshakeOnlyForACompletedOrdinaryPrefix) {
+    const std::vector<SchedulerTaskMetadata> tasks{
+        spmd(LaneMask::aic(), 2, true), physical(LaneMask::aic()), physical(LaneMask::all())
+    };
+    const auto mix_floor = [&](bool dependent, bool asynchronous, bool predicated) {
+        auto metadata = tasks;
+        if (predicated) metadata[1].flags |= SCHEDULER_TASK_HAS_PREDICATE;
+        SchedulerDependencyPlan deps;
+        deps.fanin = {{}, dependent ? std::vector<int64_t>{0} : std::vector<int64_t>{}, {1}};
+        deps.host_done.resize(metadata.size());
+        std::vector<LaneMask> async_lanes(metadata.size());
+        if (asynchronous) async_lanes[1] = LaneMask::aic();
+        CatalogImage image(metadata);
+        EXPECT_TRUE(scheduler_order_task_catalog(deps, metadata, &image.plan));
+        EXPECT_NE(image.plan.order_rows[2].required_floor[0], 0u);
+        scheduler_elide_proven_mix_floors(deps, metadata, async_lanes, image.plan);
+        return image.plan.order_rows[2].required_floor[0];
+    };
+    EXPECT_EQ(mix_floor(true, false, false), 0u);
+    EXPECT_NE(mix_floor(false, false, false), 0u);
+    EXPECT_NE(mix_floor(true, true, false), 0u);
+    EXPECT_NE(mix_floor(true, false, true), 0u);
 }
 
 void expect_wave_order(
@@ -392,17 +510,10 @@ TEST(HbgTaskCatalog, FoldingSingleConsumerControlsPreservesRealCompletionDebt) {
     SchedulerFaninView fanin{};
     ASSERT_EQ(scheduler_node_fanin_view(graph.graph(), 4, &fanin), SchedulerGraphResult::OK);
     uint32_t prefix = 0;
-    bool ready = false;
-    ASSERT_TRUE(
-        scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix, &ready)
-    );
-    EXPECT_FALSE(ready);
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix));
     EXPECT_EQ(prefix, 0u);
     scheduler_task_control_at(base, local, 0)->completion_state = scheduler_completion_completed_state(1);
-    ASSERT_TRUE(
-        scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix, &ready)
-    );
-    EXPECT_TRUE(ready);
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix));
     EXPECT_EQ(prefix, 2u);
 }
 

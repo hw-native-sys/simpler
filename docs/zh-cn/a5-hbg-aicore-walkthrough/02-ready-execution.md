@@ -9,7 +9,8 @@
 native child 从 template/instance 获取形状和参数地址。
 16 B SchedulerTaskMetadata 为每 expanded node 保存 flags、active mask、kernel IDs、block 数和 trace prefix。
 
-Host 按现有数据和 Graph 控制依赖，以 `(level, -b_level, node_ref)` 排序，再投影为纯 AIC 目录和含 MIX 的 AIV 目录。
+Host 先按数据和 Graph 控制依赖计算 `(level, -b_level, node_ref)`，得到初始拓扑顺序。对满足条件的同步图，Host 可延后与宽任务争用资源的窄侧支；对含 deferred 工作的普通 Host 图，Host 在连续的同步 ordinary 区间内优先安排剩余依赖链较长的任务，再用剩余 AIC/AIV 容量安排前驱已排定的窄兄弟任务。协同任务、谓词、控制及异步任务限定这些区间。
+在允许调整的区间内，固定归属的 MIX 还可越过独立的纯 Vector 侧支，同时保留 Cube 工作、MIX 的直接输入及共同消费者的其他直接输入的先后约束。Host 最后逐边验证生产者排在消费者之前，再将最终顺序投影为纯 AIC 目录和含 MIX 的 AIV 目录。
 每个 logical kernel node 出现一次，目录运行中只读；本核游标在确认当前任务供给关闭后推进。
 跨引擎后继领票前确认前驱供给已关闭；领票不等于依赖完成，执行仍等待真实 DONE。
 一次查询最多推进八项；本核已持有头部任务时不领该任务第二块，也不越过尚未关闭的头部。
@@ -18,7 +19,7 @@ Host 按现有数据和 Graph 控制依赖，以 `(level, -b_level, node_ref)` �
 
 每个真实 block/lane 都有已发布 Call 和 Binding。普通任务通过有效 block ticket
 取得一个具体执行 token，验证函数、任务、epoch、block/lane 和 generation。
-每核可持有两份普通自取记录和两份按 bank 索引的 MIX 成员记录；取得 Call 责任不等于取得 kernel 执行许可。
+每核有一个普通自取位置和一个 MIX 成员位置。取得 Call 责任后仍需通过 kernel 执行门禁。
 
 ```text
 查询本核目录游标并确认前驱供给
@@ -34,7 +35,7 @@ completion_state 的 total/remaining_compute/debt 必须合法。
 Graph 外部 fanin 经过 completion_refs，child-local index 加实例 child_begin；root 依赖 ENTER。
 不存在每条边 remaining decrement、wake-list 或 per-successor 通知。
 
-自取窗口被等待依赖的项占满时，保留两份自取责任及准备状态；原核在依赖满足后继续执行。
+自取位置被等待依赖的项占用时，原核保留这份自取责任及准备状态，依赖满足后继续执行。
 执行责任从首次有效领取到退休不转移，不再发布 PARKING/PARKED 或让其他核重领。
 等待期间继续服务独立 async/control 和已有协作责任，MIX 成员使用各自的 bank 记录。
 

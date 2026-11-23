@@ -65,6 +65,46 @@ void change_binding_shape(__gm__ int64_t *args) {
     context->block_num = 99;
 }
 
+TEST(HbgClusterGroupOwnership, TimeoutSnapshotDistinguishesFaninWaitFromKernelEntryAtL4) {
+    for (bool l4 : {false, true}) {
+        SCOPED_TRACE(l4);
+        GmMixFixture fixture({{1, LaneMask::aiv0()}, {1, LaneMask::all()}}, l4, 1);
+        fixture.graph.executable(1, 0, {0});
+        ASSERT_TRUE(fixture.prepare_calls());
+        GmExecution producer{};
+        for (unsigned i = 0; i < 8; ++i) {
+            ASSERT_TRUE(fixture.fill(1));
+            if (fixture.begin(1, &producer)) break;
+        }
+        ASSERT_EQ(producer.task, 0);
+        auto *member = fixture.locals[0];
+        uint64_t index = UINT64_MAX;
+        ASSERT_TRUE(scheduler_prepared_execution_index(fixture.base(), member->config.prepared, 1, 0, 0, &index));
+        auto *cell = scheduler_prepared_control_at(fixture.base(), member->config.prepared, index);
+        for (unsigned i = 0; i < 8; ++i) {
+            for (unsigned worker = 0; worker < 3; ++worker)
+                ASSERT_TRUE(fixture.fill(worker));
+        }
+        ASSERT_EQ(member->mix_groups[0].task_ref, 1);
+        ASSERT_EQ(member->mix_groups[0].prepared.execution_index, index);
+        GmExecution consumer{};
+        ASSERT_FALSE(fixture.begin(0, &consumer));
+        EXPECT_STREQ(scheduler_prepared_mix_entry(cell->state, "unknown"), l4 ? "false" : "unknown");
+        ASSERT_TRUE(fixture.complete(producer));
+        bool entered = false;
+        for (unsigned i = 0; i < 8 && !entered; ++i) {
+            for (unsigned worker = 0; worker < 3; ++worker)
+                ASSERT_TRUE(fixture.fill(worker));
+            entered = fixture.begin(0, &consumer);
+        }
+        ASSERT_TRUE(entered);
+        ASSERT_EQ(consumer.task, 1);
+        EXPECT_STREQ(scheduler_prepared_mix_entry(cell->state, "unknown"), l4 ? "true" : "unknown");
+        ASSERT_TRUE(fixture.complete(consumer));
+        EXPECT_STREQ(scheduler_prepared_mix_entry(cell->state, "unknown"), "true");
+    }
+}
+
 TEST(HbgDirectDispatch, BeginReportsTheEntryIdentityWhenTheKernelChangesItsBinding) {
     GmMixFixture fixture({{1, LaneMask::aiv0()}});
     fixture.storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&change_binding_shape);
@@ -83,23 +123,25 @@ TEST(HbgDirectDispatch, BeginReportsTheEntryIdentityWhenTheKernelChangesItsBindi
 }
 
 TEST(HbgClusterGroupOwnership, PendingReservationCreditsItsOwnTaskWhenAnotherTaskRequestsPublication) {
-    for (const uint32_t request : {2u, 3u}) {
+    constexpr uint32_t pending_task = SCHEDULER_MIX_MEMBER_COUNT;
+    constexpr uint32_t next_task = pending_task + 1;
+    for (const uint32_t request : {pending_task, next_task}) {
         SCOPED_TRACE(request);
         const GmShape mix{1, LaneMask::all()};
-        GmMixFixture fixture({mix, mix, mix, mix}, false, 1);
+        GmMixFixture fixture(std::vector<GmShape>(next_task + 1, mix), false, 1);
         ASSERT_TRUE(fixture.prepare_calls());
         auto *proxy = fixture.locals[1];
         auto &groups = fixture.signal(0)->groups;
         bool published = false;
-        for (uint32_t task : {0u, 1u}) {
+        for (uint32_t task = 0; task < pending_task; ++task) {
             ASSERT_TRUE(fixture.ordinary_arm(task, 0, &published));
             ASSERT_TRUE(published);
             ASSERT_EQ(groups[task].task_ref, task);
             ASSERT_TRUE(scheduler_cluster_mix_armed(groups[task].armed_generation));
         }
-        ASSERT_TRUE(fixture.ordinary_arm(2, 0, &published));
+        ASSERT_TRUE(fixture.ordinary_arm(pending_task, 0, &published));
         ASSERT_FALSE(published);
-        ASSERT_EQ(proxy->cluster_pending.task_ref, 2);
+        ASSERT_EQ(proxy->cluster_pending.task_ref, pending_task);
 
         const auto complete_group = [&](uint32_t task) {
             for (uint32_t pass = 0; pass < 3; ++pass)
@@ -116,25 +158,25 @@ TEST(HbgClusterGroupOwnership, PendingReservationCreditsItsOwnTaskWhenAnotherTas
         ASSERT_NO_FATAL_FAILURE(complete_group(0));
         int64_t head = SCHEDULER_TASK_REF_INVALID;
         bool progress = false;
-        for (uint32_t probe = 0; probe < 2 && head != 3; ++probe)
+        for (uint32_t probe = 0; probe < 2 && head != next_task; ++probe)
             ASSERT_TRUE(
                 scheduler_issue_head(fixture.graph.graph(), fixture.base(), proxy, fixture.run(), &head, &progress)
             );
-        ASSERT_EQ(head, 3);
+        ASSERT_EQ(head, next_task);
         ASSERT_TRUE(fixture.ordinary_arm(request, 0, &published));
-        EXPECT_EQ(published, request == 2);
-        EXPECT_EQ(groups[0].task_ref, 2);
+        EXPECT_EQ(published, request == pending_task);
+        EXPECT_EQ(groups[0].task_ref, pending_task);
         EXPECT_TRUE(scheduler_cluster_mix_armed(groups[0].armed_generation));
         EXPECT_EQ(proxy->cluster_pending.task_ref, SCHEDULER_TASK_REF_INVALID);
-        EXPECT_EQ(fixture.control(3)->next_block, 0u);
+        EXPECT_EQ(fixture.control(next_task)->next_block, 0u);
         const uint32_t generation = groups[0].armed_generation;
-        ASSERT_TRUE(fixture.ordinary_arm(2, 0, &published));
+        ASSERT_TRUE(fixture.ordinary_arm(pending_task, 0, &published));
         EXPECT_FALSE(published);
         EXPECT_EQ(groups[0].armed_generation, generation);
-        ASSERT_NO_FATAL_FAILURE(complete_group(1));
-        ASSERT_NO_FATAL_FAILURE(complete_group(2));
-        EXPECT_EQ(scheduler_completion_count(fixture.control(2)->completion_state), 3u);
-        EXPECT_EQ(scheduler_completion_count(fixture.control(3)->completion_state), 0u);
+        for (uint32_t task = 1; task <= pending_task; ++task)
+            ASSERT_NO_FATAL_FAILURE(complete_group(task));
+        EXPECT_EQ(scheduler_completion_count(fixture.control(pending_task)->completion_state), 3u);
+        EXPECT_EQ(scheduler_completion_count(fixture.control(next_task)->completion_state), 0u);
     }
 }
 
@@ -348,10 +390,15 @@ TEST(HbgDirectDispatch, PureSyncWaitsForItsEarlierOwnerBeforeJoiningACrossCluste
             at_barrier.clear();
         }
     };
-    for (unsigned pass = 0; pass < 12 && !scheduler_execution_token_has_task(f.locals[2], collective); ++pass)
+    constexpr bool spare_slot = SCHEDULER_EXECUTION_TOKEN_COUNT > 1;
+    const auto collective_claimed = [&] {
+        return scheduler_execution_token_has_task(f.locals[2], collective);
+    };
+    for (unsigned pass = 0; pass < 12 && (!at_barrier.count(1) || collective_claimed() != spare_slot); ++pass)
         service(false);
     EXPECT_TRUE(scheduler_execution_token_has_task(f.locals[2], producer));
-    EXPECT_TRUE(scheduler_execution_token_has_task(f.locals[2], collective));
+    EXPECT_EQ(collective_claimed(), spare_slot);
+    EXPECT_TRUE(at_barrier.count(1));
     EXPECT_FALSE(at_barrier.count(2));
 
     ASSERT_TRUE(f.complete(running));
@@ -364,7 +411,7 @@ TEST(HbgDirectDispatch, PureSyncWaitsForItsEarlierOwnerBeforeJoiningACrossCluste
     EXPECT_EQ(scheduler_read_error(f.run()), 0u);
 }
 
-TEST(HbgDirectDispatch, FullyClaimedPureSyncCanReleaseAWaitHeldByAnEarlierOwner) {
+TEST(HbgDirectDispatch, PureSyncAdmissionDependsOnTheSpaceBesideAnEarlierOwner) {
     GmMixFixture f({{1, LaneMask::aic()}, {1, LaneMask::aiv0()}, {4, LaneMask::aiv0(), true}}, false, 2);
     f.graph.executable(1, 1, {0});
     GmExecution outstanding{};
@@ -374,34 +421,49 @@ TEST(HbgDirectDispatch, FullyClaimedPureSyncCanReleaseAWaitHeldByAnEarlierOwner)
     ASSERT_TRUE(f.claim_ordinary(1, 2));
     std::set<uint32_t> arrived;
     std::vector<GmExecution> held;
-    for (unsigned pass = 0; pass < 16 && arrived.size() < 4; ++pass) {
-        for (uint32_t worker : {2U, 1U, 4U, 5U}) {
-            if (arrived.count(worker)) continue;
-            bool failed = false;
-            uint32_t selected = UINT32_MAX;
-            scheduler_find_local_execution(f.graph.graph(), f.base(), f.locals[worker], f.run(), 0, &failed, &selected);
-            ASSERT_FALSE(failed);
-            if (selected == UINT32_MAX) continue;
-            GmExecution unit{};
-            ASSERT_TRUE(f.begin(worker, selected, &unit));
-            ASSERT_EQ(unit.slot, selected);
-            ASSERT_EQ(unit.task, 2);
-            if (worker == 2) EXPECT_EQ(f.control(2)->claim_seal, 4u);
-            arrived.insert(worker);
-            held.push_back(unit);
-        }
-    }
-    ASSERT_EQ(arrived.size(), 4u);
+    const auto join = [&](uint32_t worker) {
+        if (arrived.count(worker)) return;
+        bool failed = false;
+        uint32_t selected = UINT32_MAX;
+        scheduler_find_local_execution(f.graph.graph(), f.base(), f.locals[worker], f.run(), 0, &failed, &selected);
+        ASSERT_FALSE(failed);
+        if (selected == UINT32_MAX) return;
+        GmExecution unit{};
+        ASSERT_TRUE(f.begin(worker, selected, &unit));
+        ASSERT_EQ(unit.slot, selected);
+        ASSERT_EQ(unit.task, 2);
+        arrived.insert(worker);
+        held.push_back(unit);
+    };
+    const auto complete_collective = [&] {
+        ASSERT_EQ(arrived.size(), 4u);
+        EXPECT_EQ(f.control(2)->claim_seal, 4u);
+        for (const auto &unit : held)
+            ASSERT_TRUE(f.complete(unit));
+        EXPECT_TRUE(f.task_done(2));
+    };
+    constexpr bool spare_slot = SCHEDULER_EXECUTION_TOKEN_COUNT > 1;
+    constexpr uint32_t initial_arrivals = spare_slot ? 4 : 3;
+    for (unsigned pass = 0; pass < 16 && arrived.size() < initial_arrivals; ++pass)
+        for (uint32_t worker : {2U, 1U, 4U, 5U})
+            ASSERT_NO_FATAL_FAILURE(join(worker));
+    ASSERT_EQ(arrived.size(), initial_arrivals);
+    EXPECT_EQ(arrived.count(2) != 0, spare_slot);
     EXPECT_TRUE(scheduler_execution_token_has_task(f.locals[2], 1));
     EXPECT_FALSE(f.task_done(0));
-    for (const auto &unit : held)
-        ASSERT_TRUE(f.complete(unit));
+    if constexpr (spare_slot) ASSERT_NO_FATAL_FAILURE(complete_collective());
+
     ASSERT_TRUE(f.complete(outstanding));
     ASSERT_TRUE(f.progress_ordinary(2));
     GmExecution dependent{};
     ASSERT_TRUE(f.begin(2, &dependent));
     ASSERT_EQ(dependent.task, 1);
     ASSERT_TRUE(f.complete(dependent));
+    if constexpr (!spare_slot) {
+        for (unsigned pass = 0; pass < 16 && !arrived.count(2); ++pass)
+            ASSERT_NO_FATAL_FAILURE(join(2));
+        ASSERT_NO_FATAL_FAILURE(complete_collective());
+    }
 }
 
 TEST(HbgCompletionPacking, GroupCreditsLeaveDeferredDebtForTheUniqueFinish) {

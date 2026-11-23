@@ -988,7 +988,8 @@ bool chip_swimlane_aicpu_record_staged_task(
     }
     buffer->records[buffer->count++] = record;
     pool->head.live_record_count = buffer->count;
-    wmb();
+    // L2 readers acquire the paired ready entries. Their queue-tail publication orders both buffers.
+    if (g_chip_swimlane_level != ChipSwimlaneLevel::SCHEDULE_TIMING) wmb();
     return true;
 }
 

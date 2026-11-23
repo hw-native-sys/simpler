@@ -12,7 +12,6 @@
 #pragma once
 
 #include "async_condition_writer.h"
-#include "scheduler_async_directory.h"
 #include "scheduler_async_layout.h"
 #include "scheduler_graph.h"
 #include "scheduler_completion_counter.h"
@@ -26,16 +25,18 @@ struct SchedulerAsyncLocalState {
     uint64_t task_metadata_offset{0};
     uint64_t protocol_layout_offset{0};
     uint32_t worker_index{0};
-    uint32_t check_cursor{0};
+    uint32_t pending_group{pto2::resident::ASYNC_INVALID_INDEX};
+    uint32_t queued_head{pto2::resident::ASYNC_INVALID_INDEX};
+    uint32_t queued_tail{pto2::resident::ASYNC_INVALID_INDEX};
+    uint32_t condition_cursor{0};
+    uint64_t pending_mask{0};
+    // A validated singleton COUNTER retained after the first pending observation.
+    uint64_t retry_counter_address{0};
+    uint32_t retry_counter_threshold{0};
     int64_t failed_task_ref{-1};
     int32_t error_code{0};
-    uint32_t business_returns{0};
-    uint8_t check_service_countdown{0};
     bool work_activated{false};
-    uint8_t idle_probe_countdown{0};
 };
-
-static_assert(sizeof(SchedulerAsyncLocalState) == 88);
 
 enum class SchedulerAsyncCompletionResult : uint8_t { NONE, WAITING, FINISH_OWNER, ERROR };
 
@@ -48,21 +49,8 @@ struct SchedulerAsyncCompletion {
     uint64_t joined{0};
 };
 
-inline constexpr uint8_t SCHEDULER_ASYNC_IDLE_PROBE_INTERVAL = 16;
-
-// Cold idle cores still discover remote work within a bounded number of service
-// opportunities. Business returns, active work and local errors are never delayed.
-inline __aicore__ bool scheduler_async_service_due(SchedulerAsyncLocalState &local) {
-    if (local.work_activated || local.error_code != 0) {
-        local.idle_probe_countdown = 0;
-        return true;
-    }
-    if (local.business_returns != 0 || local.idle_probe_countdown == 0) {
-        local.idle_probe_countdown = SCHEDULER_ASYNC_IDLE_PROBE_INTERVAL - 1;
-        return true;
-    }
-    --local.idle_probe_countdown;
-    return false;
+inline __aicore__ bool scheduler_async_service_due(const SchedulerAsyncLocalState &local) {
+    return local.pending_group != pto2::resident::ASYNC_INVALID_INDEX || local.error_code != 0;
 }
 
 inline __aicore__ SchedulerGraphResult scheduler_async_error_result(const SchedulerAsyncLocalState *local) {
@@ -111,11 +99,6 @@ static inline __aicore__ void writeback(__gm__ void *address, uint64_t bytes) {
         scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(address) + offset);
 }
 
-static inline __aicore__ void publish(__gm__ void *address, uint64_t bytes) {
-    writeback(address, bytes);
-    scheduler_cache_barrier();
-}
-
 static inline __aicore__ void publish_activity(SchedulerAsyncLocalState &local) {
     if (local.work_activated) return;
     auto *activity = scheduler_state_at<SchedulerAsyncActivity>(local.base, local.layout->activity_offset);
@@ -162,46 +145,52 @@ static inline __aicore__ SchedulerAsyncCompletion settle_group(SchedulerAsyncLoc
     return completion_error(local, task_ref);
 }
 
-// A snapshot grants no responsibility. The returned CAS is the acquisition
-// proof; an old runnable generation can reuse its returned current state.
-static inline __aicore__ SchedulerAsyncLeaseOutcome
-claim_observed(__gm__ SchedulerAsyncLease &lease, uint64_t observed) {
-    auto result = scheduler_async_lease_try_claim(lease, observed);
-    if (result.result == SchedulerAsyncLeaseResult::CONTENDED &&
-        scheduler_async_lease_phase(result.word) == SchedulerAsyncPhase::RUNNABLE)
-        result = scheduler_async_lease_try_claim(lease, result.word);
-    return result;
+// The sink watchdog samples pending_mask from GM, including for the group kept in the worker.
+inline __aicore__ void
+publish_condition_progress(SchedulerAsyncLocalState &local, uint32_t index, uint64_t pending, uint32_t cursor) {
+    auto &row = scheduler_state_at<SchedulerAsyncGroupProgress>(local.base, local.layout->group_progress_offset)[index];
+    row.pending_mask = pending;
+    row.condition_cursor = cursor;
+    scheduler_publish_cache_line(&row);
 }
 
-// A directory scan visits one word. Cursors advance past a claimed record so
-// a low pending bit cannot starve a later condition in the same word.
-static inline __aicore__ bool claim(
-    SchedulerAsyncLocalState &local, uint64_t directory_offset, uint64_t lease_offset, uint32_t count, uint32_t &cursor,
-    uint32_t &index, uint64_t &owned
-) {
-    index = ASYNC_INVALID_INDEX;
-    owned = 0;
-    if (count == 0 || cursor >= count) return fail(local, -1);
-    auto *words = scheduler_state_at<SchedulerAsyncDirectoryWord>(local.base, directory_offset);
-    const uint32_t word = cursor / 64;
-    const uint32_t bit = cursor % 64;
-    const uint64_t mask = scheduler_async_directory_query(words[word], bit, count - word * 64) & (UINT64_MAX << bit);
-    const uint64_t next_word = static_cast<uint64_t>(word + 1) * 64;
-    cursor = next_word < count ? static_cast<uint32_t>(next_word) : 0;
-    if (mask == 0) return true;
-    const uint32_t found = word * 64 + static_cast<uint32_t>(__builtin_ctzll(mask));
-    if (found >= count) return fail(local, -1);
-    cursor = found + 1 == count ? 0 : found + 1;
-    auto *leases = scheduler_state_at<SchedulerAsyncLease>(local.base, lease_offset);
-    const auto result = claim_observed(leases[found], scheduler_async_lease_load(leases[found]));
-    if (result.result == SchedulerAsyncLeaseResult::NOT_RUNNABLE ||
-        result.result == SchedulerAsyncLeaseResult::CONTENDED)
-        return true;
-    if (result.result != SchedulerAsyncLeaseResult::SUCCESS) return fail(local, -1);
+// An execution has a unique Host-assigned group. Only its registering worker
+// polls it. Keep the current group in the worker, spilling extra groups to
+// their own cache lines. Rotating after a bounded probe keeps later groups live.
+inline __aicore__ void enqueue(SchedulerAsyncLocalState &local, uint32_t group, uint64_t mask, uint32_t cursor) {
+    if (local.pending_group == ASYNC_INVALID_INDEX) {
+        local.pending_group = group;
+        local.pending_mask = mask;
+        local.condition_cursor = cursor;
+        return;
+    }
+    local.retry_counter_address = 0;
+    auto *rows = scheduler_state_at<SchedulerAsyncGroupProgress>(local.base, local.layout->group_progress_offset);
+    auto &row = rows[group];
+    row.pending_mask = mask;
+    row.condition_cursor = cursor;
+    row.next_group = ASYNC_INVALID_INDEX;
+    scheduler_writeback_cache_line(&row);
+    if (local.queued_tail == ASYNC_INVALID_INDEX) {
+        local.queued_head = group;
+    } else {
+        rows[local.queued_tail].next_group = group;
+        scheduler_writeback_cache_line(&rows[local.queued_tail]);
+    }
     scheduler_cache_barrier();
-    index = found;
-    owned = result.word;
-    return true;
+    local.queued_tail = group;
+}
+
+inline __aicore__ void advance(SchedulerAsyncLocalState &local) {
+    local.retry_counter_address = 0;
+    local.pending_group = local.queued_head;
+    if (local.queued_head == ASYNC_INVALID_INDEX) return;
+    const auto *rows = scheduler_state_at<SchedulerAsyncGroupProgress>(local.base, local.layout->group_progress_offset);
+    const auto &row = rows[local.queued_head];
+    local.pending_mask = row.pending_mask;
+    local.condition_cursor = row.condition_cursor;
+    local.queued_head = row.next_group;
+    if (local.queued_head == ASYNC_INVALID_INDEX) local.queued_tail = ASYNC_INVALID_INDEX;
 }
 
 }  // namespace scheduler_async_detail
@@ -249,20 +238,12 @@ static inline __aicore__ bool scheduler_initialize_async(
             pto2::resident::ASYNC_RECORD_ALIGNMENT
         ) ||
         !span(
-            bytes, layout->group_leases_offset, layout->group_count, sizeof(SchedulerAsyncLease),
-            pto2::resident::ASYNC_RECORD_ALIGNMENT
-        ) ||
-        !span(
             bytes, layout->group_progress_offset, layout->group_count, sizeof(SchedulerAsyncGroupProgress),
             pto2::resident::ASYNC_RECORD_ALIGNMENT
         ) ||
         !span(
             bytes, layout->joins_offset, layout->async_task_count, sizeof(SchedulerAsyncTaskJoin),
             pto2::resident::ASYNC_RECORD_ALIGNMENT
-        ) ||
-        !span(
-            bytes, layout->check_directory_offset, (static_cast<uint64_t>(layout->group_count) + 63) / 64,
-            pto2::resident::ASYNC_RECORD_ALIGNMENT, pto2::resident::ASYNC_RECORD_ALIGNMENT
         ))
         return fail(local, -1);
     local.base = static_cast<__gm__ uint8_t *>(base);
@@ -288,14 +269,18 @@ static inline __aicore__ bool scheduler_async_begin_prebound_execution(
     SchedulerScalarScope scalar_detail(SchedPhaseKind::ScalarAsyncBeginPrebound, task_ref);
     using namespace scheduler_async_detail;
     writer = AsyncWriter{};
-    global.async_present = 0;
-    if (local == nullptr || global.async_group_index == ASYNC_INVALID_INDEX) return true;
     const uint32_t index = global.async_group_index;
+    if (local == nullptr || index == ASYNC_INVALID_INDEX) {
+        global.async_present = 0;
+        return true;
+    }
     if (local->layout == nullptr || index >= local->layout->group_count ||
         global.async_image_address != reinterpret_cast<uint64_t>(local->base) ||
         global.async_image_bytes != local->bytes || global.async_run_epoch != local->layout->run_epoch ||
-        global.async_group_offset != local->layout->groups_offset + uint64_t{index} * sizeof(AsyncGroupData))
+        global.async_group_offset != local->layout->groups_offset + uint64_t{index} * sizeof(AsyncGroupData)) {
+        global.async_present = 0;
         return fail(*local, task_ref);
+    }
     writer = scheduler_async_writer_for_group(*local, index);
     global.async_output_capture_refused = 0;
     global.async_present = 1;
@@ -360,16 +345,9 @@ static inline __aicore__ bool scheduler_async_seal_execution(
         if (data == nullptr || data->task_ref != task_ref || data->block_index != block || data->subtask_slot != lane)
             return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     }
-    auto *leases = scheduler_state_at<SchedulerAsyncLease>(local->base, local->layout->group_leases_offset);
     const bool unpublished = data->state == AsyncPublicationState::OPEN;
     const uint32_t count = unpublished ? data->count : 0;
     if (!unpublished || !pto2::resident::detail::seal_open_conditions<BoundExecution>(writer, *data, count)) {
-        // No CHECK can own a group whose first seal failed. A duplicate seal
-        // must not overwrite a lease that may already be RUNNABLE or OWNED.
-        if (unpublished)
-            scheduler_gm_store(
-                leases[writer.group_index].word, scheduler_async_lease_encode(1, SchedulerAsyncPhase::FAILED)
-            );
         return fail(
             *local, task_ref, data->error_code != 0 ? data->error_code : SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED
         );
@@ -386,10 +364,11 @@ static inline __aicore__ bool scheduler_async_seal_execution(
     }
     writeback(writer.image + data->entries_offset, static_cast<uint64_t>(count) * sizeof(DeferredCompletionEntry));
     scheduler_cache_barrier();
-    uint32_t task_index_value = ASYNC_INVALID_INDEX;
-    if (!task_index(*local, task_ref, task_index_value) || task_index_value == ASYNC_INVALID_INDEX)
-        return fail(*local, task_ref);
-    if (scheduler_completion_counter_at(local->base, local->completion_counters_offset, task_ref) == nullptr) {
+    if (!SCHEDULER_REQUIRES_CNT_NOTIFY &&
+        scheduler_completion_counter_at(local->base, local->completion_counters_offset, task_ref) == nullptr) {
+        uint32_t task_index_value = ASYNC_INVALID_INDEX;
+        if (!task_index(*local, task_ref, task_index_value) || task_index_value == ASYNC_INVALID_INDEX)
+            return fail(*local, task_ref);
         auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
         uint64_t registered_before = 0;
         if (scheduler_async_pending::register_group(joins[task_index_value], &registered_before) !=
@@ -401,18 +380,12 @@ static inline __aicore__ bool scheduler_async_seal_execution(
             !scheduler_async_register_completion_credit(*local, task_ref))
             return false;
     }
-    auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local->base, local->layout->group_progress_offset);
-    progress[writer.group_index].pending_mask = scheduler_async_condition_mask(count);
-    progress[writer.group_index].condition_cursor = 0;
-    progress[writer.group_index].acquire_cursor = 0;
-    publish(&progress[writer.group_index], sizeof(SchedulerAsyncGroupProgress));
-    auto *directory =
-        scheduler_state_at<SchedulerAsyncDirectoryWord>(local->base, local->layout->check_directory_offset);
-    scheduler_async_lease_initialize(leases[writer.group_index]);
+    const uint64_t pending = scheduler_async_condition_mask(count);
+    if (count > 1 && local->pending_group == ASYNC_INVALID_INDEX)
+        publish_condition_progress(*local, writer.group_index, pending, 0);
+    enqueue(*local, writer.group_index, pending, 0);
+    // Consumers still use the run-wide flag when acquiring asynchronous inputs.
     publish_activity(*local);
-    if (scheduler_async_directory_publish(directory[writer.group_index / 64], writer.group_index % 64) !=
-        SchedulerAsyncDirectoryResult::SUCCESS)
-        return fail(*local, task_ref);
     if (has_deferred != nullptr) *has_deferred = true;
     return true;
 }
@@ -459,6 +432,19 @@ scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_
 
 namespace {
 
+static inline __aicore__ bool scheduler_async_counter_reached(uint64_t address, uint32_t threshold) {
+    auto *counter = reinterpret_cast<__gm__ uint32_t *>(address);
+    const uint32_t value = scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [counter]() __aicore__ {
+#if defined(__CCE_AICORE__)
+        return static_cast<uint32_t>(__builtin_cce_ld_dev(counter, 0));
+#else
+        return __atomic_load_n(counter, __ATOMIC_ACQUIRE);
+#endif
+    });
+    // A negative INT32 counter is below every supported threshold.
+    return value <= INT32_MAX && value >= threshold;
+}
+
 struct SchedulerAsyncCompletionObserver {
     inline __aicore__ CompletionPollResult operator()(const CompletionToken &token, uint32_t observer_mask) const {
         if (observer_mask == 0 || (observer_mask & ~3U) != 0 || !pto2::resident::detail::token_valid(token))
@@ -499,18 +485,11 @@ struct SchedulerAsyncCompletionObserver {
                 });
             return {completed >= token.backend_cookie ? CompletionPollState::READY : CompletionPollState::PENDING, 0};
         }
-        auto *counter = reinterpret_cast<__gm__ uint32_t *>(token.addr);
-        const uint32_t value = scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [counter]() __aicore__ {
-#if defined(__CCE_AICORE__)
-            return static_cast<uint32_t>(__builtin_cce_ld_dev(counter, 0));
-#else
-            return __atomic_load_n(counter, __ATOMIC_ACQUIRE);
-#endif
-        });
-        // COUNTER is INT32. A negative sample is below every supported
-        // nonnegative threshold; it is neither completion nor malformed data.
-        if (value > INT32_MAX) return {CompletionPollState::PENDING, 0};
-        return {value >= token.expected_value ? CompletionPollState::READY : CompletionPollState::PENDING, 0};
+        return {
+            scheduler_async_counter_reached(token.addr, token.expected_value) ? CompletionPollState::READY :
+                                                                                CompletionPollState::PENDING,
+            0
+        };
     }
 };
 
@@ -519,7 +498,7 @@ struct SchedulerAsyncCompletionObserver {
 template <typename Observer>
 static inline __aicore__ bool scheduler_async_check_step(
     SchedulerAsyncLocalState &local, uint32_t observer_mask, uint32_t budget, const Observer &observer,
-    bool &made_progress, SchedulerAsyncCompletion &completion
+    bool &made_progress, SchedulerAsyncCompletion &completion, bool retry_reached = false
 ) {
     using namespace scheduler_async_detail;
     made_progress = false;
@@ -527,46 +506,25 @@ static inline __aicore__ bool scheduler_async_check_step(
     if (local.error_code != 0 || local.layout == nullptr || budget == 0 || observer_mask == 0 ||
         (observer_mask & ~3U) != 0)
         return fail(local, -1);
-    uint32_t index = ASYNC_INVALID_INDEX;
-    uint64_t owned = 0;
-    if (!claim(
-            local, local.layout->check_directory_offset, local.layout->group_leases_offset, local.layout->group_count,
-            local.check_cursor, index, owned
-        ))
-        return false;
+    const uint32_t index = local.pending_group;
     if (index == ASYNC_INVALID_INDEX) return true;
-    auto *leases = scheduler_state_at<SchedulerAsyncLease>(local.base, local.layout->group_leases_offset);
-    auto failed = [&](int64_t ref, int32_t code = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID) __aicore__ {
-        scheduler_async_lease_fail(leases[index], owned);
-        return fail(local, ref, code);
-    };
+    if (index >= local.layout->group_count) return fail(local, -1);
     const uint64_t offset = local.layout->groups_offset + static_cast<uint64_t>(index) * sizeof(AsyncGroupData);
     if (!span(local.bytes, offset, 1, sizeof(AsyncGroupData), pto2::resident::ASYNC_RECORD_ALIGNMENT))
-        return failed(-1);
+        return fail(local, -1);
     auto *data = scheduler_state_at<AsyncGroupData>(local.base, offset);
-    auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local.base, local.layout->group_progress_offset);
-    auto &current = progress[index];
-    // Run entry acquires the Host-owned second header line. Only its first line
-    // and the prior CHECK owner's progress need reception after this claim.
-    static_assert(
-        offsetof(AsyncGroupData, block_index) == pto2::resident::ASYNC_RECORD_ALIGNMENT,
-        "device-written AsyncGroupData fields must stay in the first cache line"
-    );
-    scheduler_invalidate_cache_line(data);
-    scheduler_invalidate_cache_line(&current);
-    scheduler_cache_barrier();
+    const uint32_t count = data->count;
     const int64_t task_ref = data->task_ref;
     AsyncWriter writer{local.base, local.bytes, local.layout->run_epoch, offset, index};
     if (task_ref < 0 || static_cast<uint64_t>(task_ref) >= local.layout->task_count ||
         pto2::resident::detail::group(writer) == nullptr || data->state != AsyncPublicationState::SEALED ||
-        data->error_code != 0 || data->count == 0 || data->count > data->capacity ||
+        data->error_code != 0 || count == 0 || count > data->capacity ||
         !pto2::resident::detail::layout_valid(writer, *data))
-        return failed(task_ref);
-    uint64_t pending = current.pending_mask;
-    uint32_t cursor = current.condition_cursor;
-    if (pending == 0 || (pending & ~scheduler_async_condition_mask(data->count)) != 0 || cursor >= 64 ||
-        current.acquire_cursor != 0)
-        return failed(task_ref);
+        return fail(local, task_ref);
+    uint64_t pending = local.pending_mask;
+    uint32_t cursor = local.condition_cursor;
+    if (pending == 0 || (pending & ~scheduler_async_condition_mask(count)) != 0 || cursor >= 64)
+        return fail(local, task_ref);
     auto *entries = scheduler_state_at<DeferredCompletionEntry>(local.base, data->entries_offset);
     uint64_t visited = 0;
     for (uint32_t used = 0; used < budget && (pending & ~visited) != 0; ++used) {
@@ -576,35 +534,45 @@ static inline __aicore__ bool scheduler_async_check_step(
         const uint32_t condition = static_cast<uint32_t>(__builtin_ctzll(candidates));
         visited |= UINT64_C(1) << condition;
         cursor = (condition + 1) % 64;
-        observe(&entries[condition], sizeof(DeferredCompletionEntry));
         const auto &entry = entries[condition];
         const CompletionToken token{
             entry.addr, entry.expected_value, entry.engine, entry.completion_type, entry.backend_cookie
         };
-        if (entry._pad != 0 || !pto2::resident::detail::token_valid(token)) return failed(task_ref);
-        const CompletionPollResult result = observer(token, observer_mask);
+        if (entry._pad != 0 || !pto2::resident::detail::token_valid(token)) return fail(local, task_ref);
+        if (retry_reached &&
+            (count != 1 || token.completion_type != COMPLETION_TYPE_COUNTER ||
+             token.addr != local.retry_counter_address || token.expected_value != local.retry_counter_threshold))
+            return fail(local, task_ref);
+        const CompletionPollResult result =
+            retry_reached ? CompletionPollResult{CompletionPollState::READY, 0} : observer(token, observer_mask);
         if (result.state == CompletionPollState::FAILED || result.error_code != 0)
-            return failed(task_ref, result.error_code);
+            return fail(local, task_ref, result.error_code);
         if (result.state == CompletionPollState::READY) {
             pending &= ~(UINT64_C(1) << condition);
             made_progress = true;
-        } else if (result.state != CompletionPollState::PENDING) return failed(task_ref);
+        } else if (result.state != CompletionPollState::PENDING) {
+            return fail(local, task_ref);
+        } else if (count == 1 && token.completion_type == COMPLETION_TYPE_COUNTER &&
+                   local.queued_head == ASYNC_INVALID_INDEX) {
+            local.retry_counter_address = token.addr;
+            local.retry_counter_threshold = token.expected_value;
+        }
     }
-    current.pending_mask = pending;
-    current.condition_cursor = cursor;
-    publish(&current, sizeof(current));
-    if (pending != 0)
-        return scheduler_async_lease_release(leases[index], owned).result == SchedulerAsyncLeaseResult::SUCCESS ||
-               failed(task_ref);
-    auto *directory = scheduler_state_at<SchedulerAsyncDirectoryWord>(local.base, local.layout->check_directory_offset);
-    // Only the successful terminal transition owns the clear and Q contribution.
-    // A stale directory snapshot cannot turn a finished lease into another owner.
-    if (scheduler_async_lease_finish(leases[index], owned).result != SchedulerAsyncLeaseResult::SUCCESS)
-        return fail(local, task_ref);
-    if (scheduler_async_directory_clear(directory[index / 64], index % 64) != SchedulerAsyncDirectoryResult::SUCCESS)
-        return fail(local, task_ref);
-    const auto *counter = scheduler_completion_counter_at(local.base, local.completion_counters_offset, task_ref);
-    if (counter != nullptr) {
+    // Rotation writes the pending row in enqueue. Polling alone only moves the local cursor.
+    if (made_progress && count > 1 && (pending == 0 || local.queued_head == ASYNC_INVALID_INDEX))
+        publish_condition_progress(local, index, pending, cursor);
+    if (pending != 0 && local.queued_head == ASYNC_INVALID_INDEX) {
+        local.pending_mask = pending;
+        local.condition_cursor = cursor;
+        return true;
+    }
+    advance(local);
+    if (pending != 0) {
+        enqueue(local, index, pending, cursor);
+        return true;
+    }
+    const auto *counter = scheduler_execution_counter_at(local.base, local.completion_counters_offset, task_ref);
+    if (scheduler_execution_uses_counter(counter)) {
         if (!scheduler_counter_publish_condition(
                 local.base, *counter, task_ref, data->block_index, data->subtask_slot, local.task_metadata_offset,
                 local.protocol_layout_offset, local.worker_index, true

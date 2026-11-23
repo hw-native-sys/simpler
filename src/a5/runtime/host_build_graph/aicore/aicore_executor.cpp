@@ -78,7 +78,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     const uint32_t profiling_flag = get_aicore_profiling_flag();
     scheduler_observe_cache_line(handshake);
     const bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
-    uint64_t aicore_entry_cycles = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
+    uint64_t aicore_entry_cycles = __builtin_expect(chip_swimlane_enabled, false) ? get_sys_cnt_aicore() : 0;
     const uint64_t report_epoch = get_aicore_report_epoch();
     handshake->work_start_cycle = 0;
     handshake->work_end_cycle = 0;
@@ -171,8 +171,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     scheduler_observe_cache_line(&context->native_header_offset);
     const bool native_graph = context->native_header_offset != 0;
     AicoreWorkWindow work_window{};
-    if (scheduler_task_timing_enabled(profiling_level) ||
-        scheduler_gm_query(run_control->sampled_task_timing_enabled) != 0) {
+    if (__builtin_expect(scheduler_task_timing_enabled(profiling_level), false) ||
+        __builtin_expect(scheduler_gm_query(run_control->sampled_task_timing_enabled) != 0, false)) {
         if (scheduler_phase_timing_enabled(profiling_level)) {
             if (native_graph) {
                 dispatch_resident_scheduler<true, true>(

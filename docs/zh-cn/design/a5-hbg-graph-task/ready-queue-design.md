@@ -29,7 +29,7 @@ phase、固定 owner 与普通票的 TICKET_OWNED 标记同处 state 字；run e
 普通单块由 `next_block` 的有效 FAA 票确定归属；普通多块通过四个独立的 128 B 分区号段领取，在最终分区关闭时汇总供给进度。
 固定 owner 发布执行诊断、验证本轮 epoch、任务身份、block/lane 和函数地址，提前完成合法 Binding 准备。
 取得 token 不等于允许读取业务输入。
-每核有两个自取位置，同一任务最多占其中一个，fanin 观察规则见[canonical gate](dependency-counters.md)。
+每核有一个自取位置。fanin 观察规则见[canonical gate](dependency-counters.md)。
 
 ```text
 查询私有目录位置、当前 task 的共享供给证明及跨引擎前驱供给
@@ -45,6 +45,6 @@ MIX 和纯核 `sync_start` 共用 Host 的排名约束。MIX 的发布者、活�
 
 ## 执行记录与控制进展
 
-每核有两份自取记录，以及按 SSBUF bank 索引的两份 MIX 成员记录。取得 block 或收到本代描述符后可以提前准备 Call；最终 payload、执行、完成与退休沿用同一条来源记录。等待 fanin 或组内伙伴时保留已取得的责任，未满足条件的记录不授予执行许可。一次只有一个 kernel 在本核执行。
+每核有一份自取记录，以及对应本簇 SSBUF bank 的一份 MIX 成员记录。取得 block 或收到本代描述符后可以提前准备 Call。最终 payload、执行、完成与退休沿用同一条来源记录。等待 fanin 或组内伙伴时保留已取得的责任，未满足条件的记录不授予执行许可。一次只有一个 kernel 在本核执行。
 
 供给、依赖和协作成员的进度各有证明。私有游标只在前项供给关闭后继续分发；原子有效票授予唯一 owner；真正的数据后继还须等逻辑 DONE。异步 CHECK、控制节点和簇内已有责任继续按有界服务推进。窗口深度的实测见[调度设计](build-execute-separation.md)，运行全流程见[协议](protocol.md)。

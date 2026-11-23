@@ -51,11 +51,10 @@ static inline __aicore__ bool scheduler_progress_graph_controls(
         auto &cached = local->control_fanin_tags[static_cast<uint64_t>(ref) % SCHEDULER_TASK_PROOF_CACHE_COUNT];
         const uint32_t cached_prefix = cached >> 32 == tag ? static_cast<uint32_t>(cached) : 0;
         uint32_t next_fanin = cached_prefix;
-        bool ready = false;
-        if (!scheduler_observe_fanin_prefix(graph, base, local, run, ref, fanin, next_fanin, &ready)) return false;
+        if (!scheduler_observe_fanin_prefix(graph, base, local, run, ref, fanin, next_fanin)) return false;
         // A zero-progress visitor cannot displace another control's positive proof.
         if (next_fanin != cached_prefix) cached = (tag << 32) | next_fanin;
-        if (!ready) continue;
+        if (next_fanin != fanin.count) continue;
         const bool record = scheduler_protocol_enabled(local);
         auto *notification = scheduler_done_notification_at(base, local, ref);
         if (notification != nullptr) {
