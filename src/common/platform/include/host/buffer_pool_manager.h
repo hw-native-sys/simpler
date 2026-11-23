@@ -770,11 +770,11 @@ public:
     // counted once. Uncapped unless a caller sets a cap, which only a
     // collector retaining runs does.
     //
-    // Two figures, because a cap and an occupancy are different questions. The
-    // seed is what `init()` allocated and is the only thing a cap is derived
-    // from, so growth cannot widen its own bound. The live total is the seed
-    // plus every block replenishment has added, and is what an admission is
-    // compared against.
+    // The seed records `init()` allocations; live occupancy also includes every
+    // replenishment block still charged. A2/A3 and A5 PMU collectors snapshot
+    // max(seed, live occupancy, sizeof(PmuBuffer)) when installing a cap, then
+    // double that baseline. The snapshot stays fixed for the retention window,
+    // so subsequent growth cannot widen its own bound.
     //
     // Neither is credited when a buffer is recycled: a recycled buffer's block
     // is still allocated, so handing capacity back would hand back capacity
@@ -785,7 +785,10 @@ public:
     // release callback that fails leaves memory allocated that this manager no
     // longer has a record of either way.
 
-    /** Paired bytes `init()` seeded. A cap is derived from this and nothing else. */
+    /**
+     * Paired bytes `init()` seeded, unchanged by replenishment. Retained PMU
+     * caps also snapshot live charged occupancy when the window opens.
+     */
     size_t paired_initial(int kind) const {
         if (kind < 0 || kind >= Module::kBufferKinds) return 0;
         return paired_initial_[static_cast<size_t>(kind)].load(std::memory_order_relaxed);

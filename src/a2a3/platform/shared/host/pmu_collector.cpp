@@ -21,6 +21,7 @@
 
 #include "host/pmu_collector.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstring>
@@ -167,6 +168,7 @@ int PmuCollector::init(
             void *host_ptr = nullptr;
             void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr, &allocation_rc);
             if (dev_ptr == nullptr) return allocation_rc;
+            manager_.note_paired_allocation(0, buf_size);
             std::memset(host_ptr, 0, buf_size);
 
             if (b < PLATFORM_PMU_SLOT_COUNT) {
@@ -925,14 +927,12 @@ uint64_t PmuCollector::write_buffer_rows(
 }
 
 void PmuCollector::install_paired_caps() {
-    // Bound pool *growth* only: a device buffer and its non-SVM host shadow are
-    // allocated together, so the cap is a paired figure and not per side. An
-    // occupancy already above it is not reclaimed — `charge_paired` refuses the
-    // next block, and the device then drops and charges as it does when a pool
-    // runs dry.
+    // Reader startup precedes retained admission and can already grow the pool.
+    // Reserve refill headroom over that occupancy, including host shadows, so
+    // installing the cap cannot strand a dry lane while peers hold its buffers.
     for (int kind = 0; kind < PmuModule::kBufferKinds; kind++) {
-        const size_t seeded = manager_.paired_initial(kind);
-        const size_t baseline = seeded > sizeof(PmuBuffer) ? seeded : sizeof(PmuBuffer);
+        const size_t baseline =
+            std::max({manager_.paired_initial(kind), manager_.paired_charged(kind), sizeof(PmuBuffer)});
         const size_t cap = baseline > SIZE_MAX / 2 ? SIZE_MAX : baseline * 2;
         manager_.set_paired_cap(kind, cap);
     }
