@@ -29,7 +29,7 @@ enum class ProfilePhase : uint8_t {
     SharedService,
     Entry,
     Idle,
-    Aggregate,
+    ReleasePublication,
     AsyncPoll,
     LaneSetup,
     AsyncSeal,
@@ -81,8 +81,8 @@ constexpr const char *profile_phase_name(ProfilePhase kind) {
         return "scalar_percounter_entry";
     case ProfilePhase::Idle:
         return "scalar_percounter_idle";
-    case ProfilePhase::Aggregate:
-        return "scalar_percounter_complete_mix";
+    case ProfilePhase::ReleasePublication:
+        return "scalar_percounter_release_mix_publication";
     case ProfilePhase::AsyncPoll:
         return "scalar_percounter_async_tick";
     case ProfilePhase::LaneSetup:
@@ -141,6 +141,10 @@ enum class PercounterTaskEventKind : uint32_t {
     DeferRegistered,
     DeferredCompletionIssue,
     KernelEnd,
+    MixPublished,
+    InputsPending,
+    InputsReady,
+    EntryCommitted,
 };
 
 struct PercounterTaskEvent {
@@ -148,6 +152,9 @@ struct PercounterTaskEvent {
     uint64_t entry;
     uint64_t detail;  // Interval start, completion contribution or deferred group reference.
     PercounterTaskEventKind kind;
+    uint16_t slot;
+    uint8_t participant_mask;
+    uint8_t mix;
 };
 
 inline constexpr uint32_t PERCOUNTER_SCALAR_WORD_CAPACITY =

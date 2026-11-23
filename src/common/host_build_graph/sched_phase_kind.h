@@ -116,6 +116,8 @@ enum class SchedPhaseKind : uint8_t {
     ScalarDsbAll = 88,
     ScalarDsbDdr = 89,
     ScalarBypassLoad = 90,
+    ScalarGmLoad = 189,
+    ScalarCntNotifyLoad = 190,
     ScalarBypassStore = 91,
     ScalarTraceFinish = 92,
     ScalarTraceFinishClean = 93,
@@ -136,7 +138,6 @@ enum class SchedPhaseKind : uint8_t {
     ScalarClusterMixDrain = 114,
     ScalarClusterMixAll = 117,
     ScalarPreparedReceive = 118,
-    ScalarPreparedAcquire = 119,
     ScalarPreparedReturn = 123,
     ScalarPreparedObserve = 124,
     ScalarPreparedIndex = 125,
@@ -290,6 +291,10 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_dsb_ddr";
     case SchedPhaseKind::ScalarBypassLoad:
         return "scalar_bypass_load";
+    case SchedPhaseKind::ScalarGmLoad:
+        return "scalar_gm_load";
+    case SchedPhaseKind::ScalarCntNotifyLoad:
+        return "scalar_cnt_notify_load";
     case SchedPhaseKind::ScalarBypassStore:
         return "scalar_bypass_store";
     case SchedPhaseKind::ScalarTraceFinish:
@@ -330,8 +335,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_cluster_mix_all";
     case SchedPhaseKind::ScalarPreparedReceive:
         return "scalar_prepared_receive";
-    case SchedPhaseKind::ScalarPreparedAcquire:
-        return "scalar_prepared_acquire";
     case SchedPhaseKind::ScalarPreparedClaim:
         return "scalar_prepared_claim";
     case SchedPhaseKind::ScalarCounterAccounting:

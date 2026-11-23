@@ -35,7 +35,7 @@ trace.valid 在有效计时行 writeback 与 barrier 后原子发布，不能被
 同一个核持有 slot 直到这些退休步骤结束；LocalContext/GlobalContext 及 args 仍属于稳定的 execution Binding。
 
 DONE 与 run 汇总不同。消费者直接观察 producer gate，
-每个逻辑任务只由最终记账者报告一次完成。AICPU 监督本轮计数，全核退休后将其写入 resolved_task_count。
+AICPU 逐个确认终点的逻辑完成，随后请求 EXIT。L4 在导出时统计 `resolved_task_count`；若某个设备任务的计数器退休快照缺失，则导出 JSON `null`。
 控制节点通过独立有界 scan、fanin proof 和唯一 CAS 完成，没有后继通知或同步 fanout walk。
 逻辑依赖完成也不代替 MIX lane release、trace retirement 或全核清退。
 
@@ -50,5 +50,5 @@ AICPU 等待本轮 ACK 并完成 teardown，随后开放 post-close release。
 核看到 release 后才返回。缺失报告或缺失 ACK 都不是已经退出的证明。
 本轮确实初始化的 PMU/DFX 状态才由该 run 结算；错误启动不访问未建立的诊断所有权。
 
-最终的清退证明决定 backing 能否归还池，不能只检查 DONE 或 resolved_task_count。
+最终的清退证明决定 backing 能否归还池，还须确认所有核的退出握手。
 若证明失败，poison 并保留借用存储，阻止后续 epoch 覆盖它。

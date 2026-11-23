@@ -24,9 +24,7 @@ scheduler_completion_counter_at(__gm__ void *base, uint64_t offset, int64_t task
 
 inline __aicore__ int scheduler_completion_counter_observe(const __gm__ SchedulerTaskCompletionCounter &counter) {
     const uint32_t value = scheduler_notify_query(*reinterpret_cast<__gm__ volatile uint32_t *>(counter.read_address));
-    // A later task in this chain can legitimately exceed our threshold.
-    if (value > counter.limit) return -1;
-    return value >= counter.threshold ? 1 : 0;
+    return scheduler_classify_completion_counter(value, counter.threshold, counter.limit);
 }
 
 inline __aicore__ void

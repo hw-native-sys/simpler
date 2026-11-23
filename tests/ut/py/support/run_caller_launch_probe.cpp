@@ -66,7 +66,7 @@ static int allocation_attempts, fail_allocation;
 static int resource_release_calls;
 static int bind_thread_error;
 static int context_token;
-static thread_local rtContext_t current_owned_context;
+static thread_local rtContext_t current_rts_context;
 static int destroy_stream_error;
 static std::unordered_map<void *, size_t> live_allocations;
 static bool capture;
@@ -616,25 +616,24 @@ extern "C" aclError aclrtSynchronizeDeviceWithTimeout(int32_t) {
 extern "C" rtError_t rtSetDevice(int32_t) {
     assert(owned_close_active);
     if (bind_thread_error != 0) return bind_thread_error;
-    current_owned_context = &context_token;
+    current_rts_context = &context_token;
     return 0;
 }
 extern "C" rtError_t rtCtxGetCurrent(rtContext_t *context) {
-    assert(owned_close_active);
-    *context = current_owned_context;
+    *context = current_rts_context;
     return 0;
 }
 extern "C" rtError_t rtCtxSetCurrent(rtContext_t context) {
     assert(owned_close_active);
     assert(context == &context_token);
     if (bind_thread_error != 0) return bind_thread_error;
-    current_owned_context = context;
+    current_rts_context = context;
     return 0;
 }
 extern "C" rtError_t rtDeviceReset(int32_t) {
     assert(owned_close_active);
     ++normal_reset_calls;
-    current_owned_context = nullptr;
+    current_rts_context = nullptr;
     return 0;
 }
 extern "C" aclError aclInit(const char *) {
@@ -666,21 +665,22 @@ extern "C" aclError aclFinalizeReference(uint64_t *ref_count) {
 }
 extern "C" aclError aclrtSetDevice(int32_t) {
     assert(owned_close_active);
-    current_owned_context = &context_token;
+    current_rts_context = &context_token;
     return 0;
 }
+extern "C" aclError aclrtGetCurrentContext(aclrtContext *context) { return rtCtxGetCurrent(context); }
 extern "C" aclError aclrtSetCurrentContext(aclrtContext context) { return rtCtxSetCurrent(context); }
 extern "C" aclError aclrtResetDevice(int32_t) {
     assert(owned_close_active);
     ++normal_reset_calls;
-    current_owned_context = nullptr;
+    current_rts_context = nullptr;
     return 0;
 }
 extern "C" aclError aclrtResetDeviceForce(int32_t) {
     assert(owned_close_active);
     ++force_resets;
     if (fail_force_reset) return -980;
-    current_owned_context = nullptr;
+    current_rts_context = nullptr;
     destroy_stream_error = 0;
     for (const auto &allocation : live_allocations)
         reset_allocations.push_back(allocation.first);
@@ -735,6 +735,7 @@ int host::LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t byt
     return rc;
 }
 static void initialize_borrowed_context(DeviceRunnerBase &runner) {
+    current_rts_context = &tokens[61];
     assert(runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL) == 0);
     KernelContextOps ops;
     ops.get_current_device = [](void *, int *out) noexcept {
@@ -742,7 +743,7 @@ static void initialize_borrowed_context(DeviceRunnerBase &runner) {
         return 0;
     };
     ops.get_current_context = [](void *, void **out) noexcept {
-        *out = &tokens[61];
+        *out = current_rts_context;
         return 0;
     };
     ops.create_hidden_stream = [](void *, void **out) noexcept {
@@ -796,7 +797,6 @@ public:
     bool check_late_health{false};
     int recovery_calls{0};
     int recovery_rc{0};
-    void *current_context{&tokens[61]};
     using DeviceRunnerBase::prepare_submission_resources;
     void initialize(bool borrowed = true) {
         device_id_ = 0;
@@ -807,14 +807,15 @@ public:
             return;
         }
         assert(execution_mode_latch().latch(SIMPLER_MODE_KERNEL) == 0);
+        current_rts_context = &tokens[61];
         KernelContextOps ops;
         ops.context = this;
         ops.get_current_device = [](void *, int *out) noexcept {
             *out = 0;
             return 0;
         };
-        ops.get_current_context = [](void *context, void **out) noexcept {
-            *out = static_cast<ProbeRunner *>(context)->current_context;
+        ops.get_current_context = [](void *, void **out) noexcept {
+            *out = current_rts_context;
             return 0;
         };
         ops.create_hidden_stream = [](void *, void **out) noexcept {
@@ -2868,10 +2869,10 @@ static void check_submission_resource_binding() {
     const NativeRunIdentity id{1, 1, 1, 0};
     DeviceRunnerBase::PreparedExecution prepared(id, runtime, CallConfig{}, 0);
     const auto before = std::make_tuple(allocation_attempts, next_event, next_stream, submits);
-    runner.current_context = &tokens[62];
+    current_rts_context = &tokens[62];
     assert(runner.prepare_submission_resources(prepared) == PTO_RUNTIME_ERR_INVALID_STATE);
     assert(before == std::make_tuple(allocation_attempts, next_event, next_stream, submits));
-    runner.current_context = &tokens[61];
+    current_rts_context = &tokens[61];
     // A borrowed context does not make Simpler's missing binary registration optional.
     assert(runner.prepare_submission_resources(prepared) != 0);
     assert(before == std::make_tuple(allocation_attempts, next_event, next_stream, submits));

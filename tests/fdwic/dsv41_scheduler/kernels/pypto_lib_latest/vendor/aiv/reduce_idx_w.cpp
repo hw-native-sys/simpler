@@ -18,6 +18,7 @@
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 
+
 #include "intrinsic.h"
 
 
@@ -77,46 +78,46 @@ static __aicore__ void reduce_idx_w(__gm__ bfloat16_t* v1, __gm__ float* v2, int
   const int64_t v12 = 0;
   // pto: %c4_index
   const int64_t v13 = 4;
-  // pto: %weights_inline6165__ssa_v0_view
+  // pto: %weights_inline11585__ssa_v0_view
   const int64_t v14 = 1;
-  // pto: %weights_inline6165__ssa_v0_view
+  // pto: %weights_inline11585__ssa_v0_view
   const int64_t v15 = 1;
-  // pto: %weights_inline6165__ssa_v0_view
+  // pto: %weights_inline11585__ssa_v0_view
   const int64_t v16 = 1;
-  // pto: %weights_inline6165__ssa_v0_view
+  // pto: %weights_inline11585__ssa_v0_view
   int64_t v17 = (int64_t) v3;
-  // pto: %weights_inline6165__ssa_v0_view
+  // pto: %weights_inline11585__ssa_v0_view
   int64_t v18 = v17 * v9;
-  // pto: %weights_inline6165__ssa_v0_view
+  // pto: %weights_inline11585__ssa_v0_view
   int64_t v19 = v16 * v18;
-  // pto: %weights_inline6165__ssa_v0_view
+  // pto: %weights_inline11585__ssa_v0_view
   pto::Shape<1, 1, 1, -1, -1> v20 = pto::Shape<1, 1, 1, -1, -1>(v14, v15, v16, v17, v9);
-  // pto: %weights_inline6165__ssa_v0_view
+  // pto: %weights_inline11585__ssa_v0_view
   pto::Stride<-1, -1, -1, -1, -1> v21 = pto::Stride<-1, -1, -1, -1, -1>(v15 * v19, v19, v18, v9, v10);
-  // pto: %weights_inline6165__ssa_v0_view
+  // pto: %weights_inline11585__ssa_v0_view
   GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v22 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v1, v20, v21);
   // pto: %11
   int64_t v23 = (int64_t) ((uint64_t) v3 * (uint64_t) v13);
-  // pto: %partials_inline6169__rv_v2_view
+  // pto: %partials_inline11589__rv_v2_view
   const int64_t v24 = 1;
-  // pto: %partials_inline6169__rv_v2_view
+  // pto: %partials_inline11589__rv_v2_view
   const int64_t v25 = 1;
-  // pto: %partials_inline6169__rv_v2_view
+  // pto: %partials_inline11589__rv_v2_view
   const int64_t v26 = 1;
-  // pto: %partials_inline6169__rv_v2_view
+  // pto: %partials_inline11589__rv_v2_view
   int64_t v27 = v23 * v9;
-  // pto: %partials_inline6169__rv_v2_view
+  // pto: %partials_inline11589__rv_v2_view
   int64_t v28 = v26 * v27;
-  // pto: %partials_inline6169__rv_v2_view
+  // pto: %partials_inline11589__rv_v2_view
   pto::Shape<1, 1, 1, -1, -1> v29 = pto::Shape<1, 1, 1, -1, -1>(v24, v25, v26, v23, v9);
-  // pto: %partials_inline6169__rv_v2_view
+  // pto: %partials_inline11589__rv_v2_view
   pto::Stride<-1, -1, -1, -1, -1> v30 = pto::Stride<-1, -1, -1, -1, -1>(v25 * v28, v28, v27, v9, v10);
-  // pto: %partials_inline6169__rv_v2_view
+  // pto: %partials_inline11589__rv_v2_view
   GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v31 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v2, v29, v30);
-  // pto: %worker_inline6186__ssa_v0, %0
-  // pto: %attention_count_inline5370__ssa_v0_idx
+  // pto: %worker_inline11606__ssa_v0, %0
+  // pto: %attention_count_inline10549__ssa_v0_idx
   int64_t v32 = (int64_t) v4;
-  // pto: %workers_inline6187__ssa_v0, %1
+  // pto: %workers_inline11607__ssa_v0, %1
   set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
   set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
   for (int64_t v33 = (int64_t) ((uint64_t) ((int64_t) v5) * (uint64_t) v11); v33 < v32; v33 += (int64_t) ((uint64_t) ((int64_t) v6) * (uint64_t) v11)) {
@@ -126,54 +127,54 @@ static __aicore__ void reduce_idx_w(__gm__ bfloat16_t* v1, __gm__ float* v2, int
     // pto: %4
     ;
     int64_t v35 = v34 < v11 ? v34 : v11;
-    // pto: %reduced_inline6189__ssa_v0
+    // pto: %reduced_inline11609__ssa_v0
     ;
     Tile<TileType::Vec, float, 16, 32, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v36 = Tile<TileType::Vec, float, 16, 32, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v35, v9);
-    // pto: %reduced_inline6189__ssa_v0
+    // pto: %reduced_inline11609__ssa_v0
     ;
     uint64_t v37 = (uint64_t) v7;
     TASSIGN(v36, v37);
     // pto: %5
     ;
     int64_t v38 = v33 < v12 ? v12 : v33;
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     const int64_t v39 = 0;
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     __gm__ float* v40 = PTOAS__GLOBAL_TENSOR_DATA(v31);
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     const int64_t v41 = 1;
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     const int64_t v42 = 1;
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     const int64_t v43 = 1;
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     int64_t v44 = v35 * v9;
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     int64_t v45 = v43 * v44;
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     pto::Shape<1, 1, 1, -1, 32> v46 = pto::Shape<1, 1, 1, -1, 32>(v41, v42, v43, v35, v9);
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     pto::Stride<-1, -1, -1, -1, -1> v47 = pto::Stride<-1, -1, -1, -1, -1>(v42 * v45, v45, v44, v9, v10);
-    // pto: %partials_inline6169__rv_v2_pview
+    // pto: %partials_inline11589__rv_v2_pview
     ;
     GlobalTensor<float, pto::Shape<1, 1, 1, -1, 32>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v48 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, 32>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v40 + (v39 + v38 * v9 + v12 * v10), v46, v47);
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     TLOAD(v36, v48);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
     for (int64_t v49 = v10; v49 < v13; v49 += v10) {
-      // pto: %partial_value_inline6191__ssa_v0
+      // pto: %partial_value_inline11611__ssa_v0
       ;
       Tile<TileType::Vec, float, 16, 32, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v50 = Tile<TileType::Vec, float, 16, 32, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v35, v9);
-      // pto: %partial_value_inline6191__ssa_v0
+      // pto: %partial_value_inline11611__ssa_v0
       ;
       uint64_t v51 = (uint64_t) v8;
       TASSIGN(v50, v51);
@@ -219,10 +220,10 @@ static __aicore__ void reduce_idx_w(__gm__ bfloat16_t* v1, __gm__ float* v2, int
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       TLOAD(v50, v64);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      // pto: %reduced_inline6189__ssa_v3
+      // pto: %reduced_inline11609__ssa_v3
       ;
       Tile<TileType::Vec, float, 16, 32, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v65 = Tile<TileType::Vec, float, 16, 32, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v35, v9);
-      // pto: %reduced_inline6189__ssa_v3
+      // pto: %reduced_inline11609__ssa_v3
       ;
       uint64_t v66 = (uint64_t) v7;
       TASSIGN(v65, v66);
@@ -230,10 +231,10 @@ static __aicore__ void reduce_idx_w(__gm__ bfloat16_t* v1, __gm__ float* v2, int
       TADD(v65, v36, v50);
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     };
-    // pto: %rounded_inline6192__ssa_v0
+    // pto: %rounded_inline11612__ssa_v0
     ;
     Tile<TileType::Vec, bfloat16_t, 16, 32, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v67 = Tile<TileType::Vec, bfloat16_t, 16, 32, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v35, v9);
-    // pto: %rounded_inline6192__ssa_v0
+    // pto: %rounded_inline11612__ssa_v0
     ;
     uint64_t v68 = (uint64_t) v7;
     TASSIGN(v67, v68);
@@ -242,34 +243,34 @@ static __aicore__ void reduce_idx_w(__gm__ bfloat16_t* v1, __gm__ float* v2, int
     SaturationMode v70 = SaturationMode::OFF;
     TCVT(v67, v36, v69, v70);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     const int64_t v71 = 0;
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     __gm__ bfloat16_t* v72 = PTOAS__GLOBAL_TENSOR_DATA(v22);
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     const int64_t v73 = 1;
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     const int64_t v74 = 1;
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     const int64_t v75 = 1;
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     int64_t v76 = v35 * v9;
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     int64_t v77 = v75 * v76;
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     pto::Shape<1, 1, 1, -1, 32> v78 = pto::Shape<1, 1, 1, -1, 32>(v73, v74, v75, v35, v9);
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     pto::Stride<-1, -1, -1, -1, -1> v79 = pto::Stride<-1, -1, -1, -1, -1>(v74 * v77, v77, v76, v9, v10);
-    // pto: %weights_inline6165__iter_v1_pview
+    // pto: %weights_inline11585__iter_v1_pview
     ;
     GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, -1, 32>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v80 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, -1, 32>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v72 + (v71 + v38 * v9 + v12 * v10), v78, v79);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -300,24 +301,24 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t __pypto_spmd_block_idx = get_block_idx(args);
     int32_t __pypto_spmd_block_num = get_block_num(args);
 
-    // Unpack tensor: weights_inline6165__ssa_v0
-    __gm__ Tensor* weights_inline6165__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ bfloat16_t* weights_inline6165__ssa_v0 = reinterpret_cast<__gm__ bfloat16_t*>(weights_inline6165__ssa_v0_tensor->buffer.addr) + weights_inline6165__ssa_v0_tensor->start_offset;
+    // Unpack tensor: weights_inline11585__ssa_v0
+    __gm__ Tensor* weights_inline11585__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ bfloat16_t* weights_inline11585__ssa_v0 = reinterpret_cast<__gm__ bfloat16_t*>(weights_inline11585__ssa_v0_tensor->buffer.addr) + weights_inline11585__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: partials_inline6169__rv_v2
-    __gm__ Tensor* partials_inline6169__rv_v2_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ float* partials_inline6169__rv_v2 = reinterpret_cast<__gm__ float*>(partials_inline6169__rv_v2_tensor->buffer.addr) + partials_inline6169__rv_v2_tensor->start_offset;
+    // Unpack tensor: partials_inline11589__rv_v2
+    __gm__ Tensor* partials_inline11589__rv_v2_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ float* partials_inline11589__rv_v2 = reinterpret_cast<__gm__ float*>(partials_inline11589__rv_v2_tensor->buffer.addr) + partials_inline11589__rv_v2_tensor->start_offset;
 
-    // Unpack scalar: LOCAL_T_DYN
-    union { uint64_t u64; int64_t val; } LOCAL_T_DYN_conv;
-    LOCAL_T_DYN_conv.u64 = args[2];
-    int64_t LOCAL_T_DYN = LOCAL_T_DYN_conv.val;
+    // Unpack scalar: T_DYN
+    union { uint64_t u64; int64_t val; } T_DYN_conv;
+    T_DYN_conv.u64 = args[2];
+    int64_t T_DYN = T_DYN_conv.val;
 
-    // Unpack scalar: attention_count_inline5370__ssa_v0
-    union { uint64_t u64; int32_t val; } attention_count_inline5370__ssa_v0_conv;
-    attention_count_inline5370__ssa_v0_conv.u64 = args[3];
-    int32_t attention_count_inline5370__ssa_v0 = attention_count_inline5370__ssa_v0_conv.val;
+    // Unpack scalar: attention_count_inline10549__ssa_v0
+    union { uint64_t u64; int32_t val; } attention_count_inline10549__ssa_v0_conv;
+    attention_count_inline10549__ssa_v0_conv.u64 = args[3];
+    int32_t attention_count_inline10549__ssa_v0 = attention_count_inline10549__ssa_v0_conv.val;
 
     // Forward to ptoas-generated function
-    reduce_idx_w(weights_inline6165__ssa_v0, partials_inline6169__rv_v2, LOCAL_T_DYN, attention_count_inline5370__ssa_v0, __pypto_spmd_block_idx, __pypto_spmd_block_num);
+    reduce_idx_w(weights_inline11585__ssa_v0, partials_inline11589__rv_v2, T_DYN, attention_count_inline10549__ssa_v0, __pypto_spmd_block_idx, __pypto_spmd_block_num);
 }

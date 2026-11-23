@@ -26,6 +26,8 @@ struct ProfileOwner {
     const HostApi *api;
     void *device;
     PercounterLayout layout;
+    std::vector<int64_t> folded_task_indices;
+    std::vector<int64_t> inline_completed_task_indices;
 };
 std::mutex owners_mutex;
 std::unordered_map<Runtime *, ProfileOwner> owners;
@@ -59,6 +61,14 @@ const char *task_event_name(PercounterTaskEventKind kind) {
         return "defer_registered";
     case PercounterTaskEventKind::DeferredCompletionIssue:
         return "deferred_completion_issue";
+    case PercounterTaskEventKind::MixPublished:
+        return "mix_publish";
+    case PercounterTaskEventKind::InputsPending:
+        return "inputs_pending";
+    case PercounterTaskEventKind::InputsReady:
+        return "inputs_ready";
+    case PercounterTaskEventKind::EntryCommitted:
+        return "entry_commit";
     case PercounterTaskEventKind::KernelEnd:
         return "kernel_end";
     }
@@ -86,7 +96,8 @@ bool export_profile(const ProfileOwner &owner) {
     streams << "{\"streams\":[";
     bool first_task = true, first_stream = true;
     const auto epoch = owner.api->run_epoch();
-    const auto emit_task_event = [&](size_t worker, const PercounterTaskEvent &event) {
+    const auto emit_task_event = [&](size_t worker, const PercounterTaskEvent &event,
+                                     const PercounterTaskTiming *timing = nullptr) {
         const auto &header = headers[worker];
         const uint64_t id = percounter_order_task_id(event.entry);
         const auto block = percounter_order_block_idx(event.entry);
@@ -110,12 +121,15 @@ bool export_profile(const ProfileOwner &owner) {
                     << ",\"block_index\":" << block << ",\"block_count\":" << blocks << ",\"worker_id\":" << worker
                     << ",\"cluster_index\":" << header.cluster_index << ",\"cluster_lane\":" << header.cluster_lane;
         if (event.kind == PercounterTaskEventKind::Claim) task_events << ",\"claim_start_cycles\":" << event.detail;
+        if (layout.profiling_level == 2 && event.kind == PercounterTaskEventKind::Claim)
+            task_events << ",\"slot\":" << event.slot
+                        << ",\"participant_mask\":" << static_cast<unsigned>(event.participant_mask)
+                        << ",\"mix\":" << (event.mix ? "true" : "false");
+        if (layout.profiling_level == 2 && timing != nullptr)
+            task_events << ",\"dispatch_cycles\":" << timing->dispatch << ",\"finish_cycles\":" << timing->finish;
         if (event.kind == PercounterTaskEventKind::KernelEnd)
             task_events << ",\"kernel_start_cycles\":" << event.detail;
-        if (event.kind == PercounterTaskEventKind::CompletionIssue) {
-            const int64_t contribution = event.detail == UINT64_MAX ? -1 : static_cast<int64_t>(event.detail);
-            task_events << ",\"contribution\":" << contribution;
-        }
+        if (event.kind == PercounterTaskEventKind::CompletionIssue) task_events << ",\"contribution\":" << event.detail;
         if (event.kind == PercounterTaskEventKind::DeferRegistered ||
             event.kind == PercounterTaskEventKind::DeferredCompletionIssue)
             task_events << ",\"deferred_group\":" << event.detail;
@@ -141,13 +155,18 @@ bool export_profile(const ProfileOwner &owner) {
                 kernels << ',';
             }
             first_task = false;
+            // L2 reports pickup and fence on the scheduling tracks. Its Worker View row spans only the kernel.
+            const bool kernel_only = layout.profiling_level == 2;
             kernels << '[' << worker << ',' << TaskId::to_uint64(task.task_token) << ',' << registration << ','
-                    << task.start << ',' << task.finish << ',' << task.start - task.dispatch << ',' << epoch << ']';
+                    << task.start << ',' << (kernel_only ? task.kernel_end : task.finish) << ','
+                    << (kernel_only ? 0 : task.start - task.dispatch) << ',' << epoch << ']';
             tasks << '[' << worker << ',' << registration << ',' << task.dispatch << ',' << task.finish << ',' << epoch
                   << ']';
             if (task.kernel_end < task.start || task.kernel_end > task.finish)
                 throw std::runtime_error("invalid percounter kernel return timestamp");
-            emit_task_event(worker, {task.kernel_end, task.entry, task.start, PercounterTaskEventKind::KernelEnd});
+            emit_task_event(
+                worker, {task.kernel_end, task.entry, task.start, PercounterTaskEventKind::KernelEnd, 0, 0, 0}, &task
+            );
         }
         const auto event_offset =
             layout.event_records_offset + worker * layout.event_record_capacity * sizeof(PercounterTaskEvent);
@@ -238,7 +257,18 @@ bool export_profile(const ProfileOwner &owner) {
     }
     if (unmatched_updates != 0 && dropped_events == 0)
         throw std::runtime_error("percounter deferred completion has no producer task");
-    task_events << "],\"dropped\":" << dropped_events << ",\"unmatched_deferred_updates\":" << unmatched_updates << '}';
+    task_events << "],\"dropped\":" << dropped_events << ",\"unmatched_deferred_updates\":" << unmatched_updates;
+    const auto emit_task_ids = [&](const char *name, const std::vector<int64_t> &indices) {
+        task_events << ",\"" << name << "\":[";
+        for (size_t i = 0; i < indices.size(); ++i) {
+            if (i != 0) task_events << ',';
+            task_events << TaskId::to_uint64(TaskId::make_global(static_cast<int32_t>(indices[i])));
+        }
+        task_events << ']';
+    };
+    emit_task_ids("folded_task_ids", owner.folded_task_indices);
+    emit_task_ids("inline_completed_task_ids", owner.inline_completed_task_indices);
+    task_events << '}';
     return publish(owner, ChipSwimlaneExtensionSection::AicoreTasks, kernels) &&
            publish(owner, ChipSwimlaneExtensionSection::SchedulerTasks, tasks) &&
            publish(owner, ChipSwimlaneExtensionSection::PercounterTaskEvents, task_events) &&
@@ -246,10 +276,15 @@ bool export_profile(const ProfileOwner &owner) {
 }
 }  // namespace
 
-void retain_profile_state(Runtime *runtime, const HostApi *api, void *device, const PercounterLayout &layout) {
+void retain_profile_state(
+    Runtime *runtime, const HostApi *api, void *device, const PercounterLayout &layout,
+    const std::vector<int64_t> &folded_task_indices, const std::vector<int64_t> &inline_completed_task_indices
+) {
     if (layout.profiling_level < 2) return;
     std::scoped_lock lock(owners_mutex);
-    owners.insert_or_assign(runtime, ProfileOwner{api, device, layout});
+    owners.insert_or_assign(
+        runtime, ProfileOwner{api, device, layout, folded_task_indices, inline_completed_task_indices}
+    );
 }
 }  // namespace simpler::percounter
 

@@ -20,6 +20,7 @@
 
 
 
+
 using namespace pto;
 
 
@@ -70,7 +71,7 @@ static __aicore__ void pool_count(__gm__ int32_t* v1, __gm__ int32_t* v2, int64_
   for (int64_t v13 = v8; v13 < v3; v13 += v7) {
     // pto: %0
     ;
-    // pto: %published_count_inline7123__phi_v2
+    // pto: %published_count_inline13919__phi_v2
     ;
     int32_t v14;
     if (v13 < v4) {
@@ -148,34 +149,34 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     set_ctrl(sbitset0(get_ctrl(), pto::MAD_MODE_BIT));
 #endif
 
-    // Unpack tensor: c1a_compressed_lens_inline6702__ssa_v0
-    __gm__ Tensor* c1a_compressed_lens_inline6702__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ int32_t* c1a_compressed_lens_inline6702__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(c1a_compressed_lens_inline6702__ssa_v0_tensor->buffer.addr) + c1a_compressed_lens_inline6702__ssa_v0_tensor->start_offset;
+    // Unpack tensor: c1a_compressed_lens_inline12978__ssa_v0
+    __gm__ Tensor* c1a_compressed_lens_inline12978__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ int32_t* c1a_compressed_lens_inline12978__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(c1a_compressed_lens_inline12978__ssa_v0_tensor->buffer.addr) + c1a_compressed_lens_inline12978__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: pool_block_counts_inline6712__ssa_v0
-    __gm__ Tensor* pool_block_counts_inline6712__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ int32_t* pool_block_counts_inline6712__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(pool_block_counts_inline6712__ssa_v0_tensor->buffer.addr) + pool_block_counts_inline6712__ssa_v0_tensor->start_offset;
+    // Unpack tensor: pool_block_counts_inline13788__ssa_v0
+    __gm__ Tensor* pool_block_counts_inline13788__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ int32_t* pool_block_counts_inline13788__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(pool_block_counts_inline13788__ssa_v0_tensor->buffer.addr) + pool_block_counts_inline13788__ssa_v0_tensor->start_offset;
 
     // Unpack scalar: T_DYN
     union { uint64_t u64; int64_t val; } T_DYN_conv;
     T_DYN_conv.u64 = args[2];
     int64_t T_DYN = T_DYN_conv.val;
 
-    // Unpack scalar: active_tokens_inline6998__phi_v4
-    union { uint64_t u64; int64_t val; } active_tokens_inline6998__phi_v4_conv;
-    active_tokens_inline6998__phi_v4_conv.u64 = args[3];
-    int64_t active_tokens_inline6998__phi_v4 = active_tokens_inline6998__phi_v4_conv.val;
+    // Unpack scalar: active_tokens_inline13792__phi_v4
+    union { uint64_t u64; int64_t val; } active_tokens_inline13792__phi_v4_conv;
+    active_tokens_inline13792__phi_v4_conv.u64 = args[3];
+    int64_t active_tokens_inline13792__phi_v4 = active_tokens_inline13792__phi_v4_conv.val;
 
-    // Unpack scalar: positions_inline6996__ssa_v0
-    union { uint64_t u64; int64_t val; } positions_inline6996__ssa_v0_conv;
-    positions_inline6996__ssa_v0_conv.u64 = args[4];
-    int64_t positions_inline6996__ssa_v0 = positions_inline6996__ssa_v0_conv.val;
+    // Unpack scalar: positions_inline13790__ssa_v0
+    union { uint64_t u64; int64_t val; } positions_inline13790__ssa_v0_conv;
+    positions_inline13790__ssa_v0_conv.u64 = args[4];
+    int64_t positions_inline13790__ssa_v0 = positions_inline13790__ssa_v0_conv.val;
 
-    // Unpack scalar: capacity_inline6997__ssa_v0
-    union { uint64_t u64; int64_t val; } capacity_inline6997__ssa_v0_conv;
-    capacity_inline6997__ssa_v0_conv.u64 = args[5];
-    int64_t capacity_inline6997__ssa_v0 = capacity_inline6997__ssa_v0_conv.val;
+    // Unpack scalar: capacity_inline13791__ssa_v0
+    union { uint64_t u64; int64_t val; } capacity_inline13791__ssa_v0_conv;
+    capacity_inline13791__ssa_v0_conv.u64 = args[5];
+    int64_t capacity_inline13791__ssa_v0 = capacity_inline13791__ssa_v0_conv.val;
 
     // Forward to ptoas-generated function
-    pool_count(c1a_compressed_lens_inline6702__ssa_v0, pool_block_counts_inline6712__ssa_v0, T_DYN, active_tokens_inline6998__phi_v4, positions_inline6996__ssa_v0, capacity_inline6997__ssa_v0);
+    pool_count(c1a_compressed_lens_inline12978__ssa_v0, pool_block_counts_inline13788__ssa_v0, T_DYN, active_tokens_inline13792__phi_v4, positions_inline13790__ssa_v0, capacity_inline13791__ssa_v0);
 }

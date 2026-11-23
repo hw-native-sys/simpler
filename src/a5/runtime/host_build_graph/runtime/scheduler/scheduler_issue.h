@@ -53,8 +53,8 @@ static inline __aicore__ bool scheduler_bind_issue_entry(
     return true;
 }
 
-// The final valid claim publishes the block count. Other owners may still
-// be recording their membership or waiting to execute.
+// Fixed owners are known before dispatch. Dynamic supply closes on the last
+// valid claim. Neither certificate grants kernel entry.
 static inline __aicore__ bool scheduler_task_supply_closed(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t ref, bool *closed, const SchedulerIssueBinding *binding = nullptr
@@ -80,7 +80,7 @@ static inline __aicore__ bool scheduler_task_supply_closed(
         executable = scheduler_task_is_executable(flags) && !scheduler_task_is_inline(flags);
         blocks = metadata.logical_block_num;
     }
-    if (scheduler_cached_task_proof(local, ref) != SchedulerTaskProof::NONE) {
+    if (scheduler_task_has_fixed_owners(flags) || scheduler_cached_task_proof(local, ref) != SchedulerTaskProof::NONE) {
         *closed = true;
         return true;
     }
@@ -112,9 +112,10 @@ static inline __aicore__ bool scheduler_task_supply_closed(
 // contribute. A total of N therefore proves all N blocks have fixed owners.
 static inline __aicore__ bool scheduler_claim_ticket(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, uint32_t blocks, uint32_t *block, bool *closes_supply
+    int64_t ref, uint32_t blocks, uint32_t *block, bool *closes_supply, bool execution_claim = true
 ) {
     SchedulerScalarScope scope(local, SchedPhaseKind::ScalarOrdinaryBlockClaim, ref);
+    SchedulerExecutionClaimLoads claim_loads(execution_claim);
     *block = blocks;
     *closes_supply = false;
     auto *control = scheduler_task_control_at(base, local, ref);
@@ -166,8 +167,7 @@ static inline __aicore__ bool scheduler_close_ordinary_supply(
     scheduler_cache_barrier();
     scheduler_store_signal(control->claim_seal, static_cast<uint64_t>(blocks));
     if (cooperative) scheduler_protocol_claim_seal(base, local, ref, block, false, blocks);
-    const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
-    const auto catalog = scheduler_task_catalog(base, pool, local->config.self_core_type);
+    const auto &catalog = local->config.engine_catalog;
     if (!scheduler_task_catalog_valid(catalog)) return scheduler_issue_fail(graph, local, run, ref);
     scheduler_remember_task_proof(local, ref, SchedulerTaskProof::SUPPLY_CLOSED);
     const uint64_t head = local->issue_cursor;
@@ -254,26 +254,22 @@ static inline __aicore__ bool scheduler_find_issuable_task(
     if (base == nullptr || local == nullptr || run == nullptr || ref == nullptr || progress == nullptr) return false;
     *ref = SCHEDULER_TASK_REF_INVALID;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
-    if (local->config.task_catalog_offset == 0)
-        return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
-    const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
-    const auto catalog = scheduler_task_catalog(base, pool, local->config.self_core_type);
+    const auto &catalog = local->config.engine_catalog;
     if (!scheduler_task_catalog_valid(catalog))
         return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
-    if (catalog.count == 0) return true;
-    // The private cursor only crosses atomically confirmed supply seals or
-    // canonical terminal states. Every earlier catalog entry is closed.
+    // A fixed owner keeps its own entry until it binds the block or publishes
+    // the MIX group. Other engines can use its static supply proof immediately.
     uint64_t head = local->issue_cursor;
     if (head > catalog.count) return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
-    if (head == catalog.count) return true;
-    for (uint32_t visited = 0; visited < 8; ++visited) {
-        if (head > catalog.count) return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
-        if (head == catalog.count) return true;
+    for (uint32_t visited = 0; visited < 8 && head < catalog.count; ++visited) {
         const int64_t task_ref = catalog.refs[head];
         if (!scheduler_task_ref_valid(graph, task_ref)) return scheduler_issue_fail(graph, local, run, task_ref);
         if (!scheduler_bind_issue_entry(graph, base, local, run, task_ref)) return false;
         bool closed = false;
-        if (!scheduler_task_supply_closed(graph, base, local, run, task_ref, &closed, &local->issue_binding))
+        const auto flags = local->issue_binding.metadata.flags;
+        if (scheduler_task_has_fixed_owners(flags)) {
+            closed = scheduler_task_is_mix(flags) && !local->is_mix_coordinator();
+        } else if (!scheduler_task_supply_closed(graph, base, local, run, task_ref, &closed, &local->issue_binding))
             return false;
         if (closed) {
             local->issue_cursor = ++head;

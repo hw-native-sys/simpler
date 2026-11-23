@@ -109,6 +109,70 @@ TEST(HbgScalarTrace, ProgressKeepsTaskIdentityAndNestedDepth) {
     EXPECT_EQ(decode(trace)[1].kind >> 16, 1U);
 }
 
+TEST(HbgScalarTrace, L3RecordsOnlyClaimLoadsAndIdentifiesTheirSource) {
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    SchedulerScalarTrace trace;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.capture_trace_control = false;
+    SchedulerScalarBinding binding;
+    binding.attach(&trace);
+    uint64_t gm = 19;
+    uint32_t notify = 7;
+    EXPECT_EQ(scheduler_gm_query(gm), 19u);
+    {
+        SchedulerExecutionClaimLoads claim;
+        EXPECT_EQ(scheduler_gm_query(gm), 19u);
+        EXPECT_EQ(scheduler_notify_query(notify), 7u);
+        scheduler_writeback_cache_line(&gm);
+        scheduler_invalidate_cache_line(&gm);
+        scheduler_cache_barrier();
+    }
+    EXPECT_EQ(scheduler_notify_query(notify), 7u);
+    auto rows = decode(trace);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(kind(rows[0]), static_cast<uint32_t>(SchedPhaseKind::ScalarGmLoad));
+    EXPECT_EQ(kind(rows[1]), static_cast<uint32_t>(SchedPhaseKind::ScalarCntNotifyLoad));
+    EXPECT_EQ(kind(rows[2]), static_cast<uint32_t>(SchedPhaseKind::ScalarDsbAll));
+}
+
+TEST(HbgScalarTrace, L3OmitsTraceControlAndTheirLeavesButKeepsNestedBusinessWork) {
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    SchedulerScalarTrace trace;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.capture_trace_control = false;
+    trace.window_start = scheduler_cycles();
+    SchedulerScalarBinding binding;
+    binding.attach(&trace);
+    volatile uint64_t word = 0;
+    {
+        SchedulerScalarScope check(SchedPhaseKind::ScalarLoopControl);
+        {
+            SchedulerScalarScope observer(SchedPhaseKind::ScalarTraceBeforeExecution);
+            EXPECT_EQ(scheduler_gm_fetch_add(word, UINT64_C(1)), 0u);
+        }
+        {
+            SchedulerScalarScope fanin(SchedPhaseKind::ScalarExecutionTokenFanin);
+            EXPECT_EQ(scheduler_gm_fetch_add(word, UINT64_C(1)), 1u);
+        }
+        scheduler_cluster_barrier();
+    }
+    trace.append_function(SchedPhaseKind::ScalarFillOwnSlots, 10, 11, -1, 1);
+    trace.end_iteration(false);
+    trace.finish(scheduler_cycles());
+    const auto rows = decode(trace);
+    ASSERT_EQ(rows.size(), 4u);
+    EXPECT_EQ(kind(rows[0]), static_cast<uint32_t>(SchedPhaseKind::ScalarAtomicFetchAdd));
+    EXPECT_EQ(kind(rows[1]), static_cast<uint32_t>(SchedPhaseKind::ScalarExecutionTokenFanin));
+    EXPECT_EQ(kind(rows[2]), static_cast<uint32_t>(SchedPhaseKind::ScalarFillOwnSlots));
+    EXPECT_EQ(kind(rows[3]), static_cast<uint32_t>(SchedPhaseKind::ScalarWindow));
+    EXPECT_EQ(buffer->scalar_poll_loops, 1u);
+    EXPECT_EQ(buffer->scalar_dropped, 0u);
+}
+
 TEST(HbgScalarTrace, LargeSliceWritesEveryRecordWithoutStaging) {
     auto buffer = std::make_unique<SchedulerActivityBuffer>();
     auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
@@ -308,7 +372,7 @@ TEST(HbgScalarTrace, MemoryObservationPreservesResultsAndRecordsDistinctPrimitiv
         SchedPhaseKind::ScalarAtomicFetchAdd,
         SchedPhaseKind::ScalarAtomicFetchAddIssue,
         SchedPhaseKind::ScalarAtomicStoreIssue,
-        SchedPhaseKind::ScalarBypassLoad,
+        SchedPhaseKind::ScalarGmLoad,
         SchedPhaseKind::ScalarDcciOut,
         SchedPhaseKind::ScalarDcciSingle,
         SchedPhaseKind::ScalarDsbAll,

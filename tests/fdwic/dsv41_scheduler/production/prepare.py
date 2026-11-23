@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Prepare the selected 12-case matrix from the three original orchestrations."""
+"""Prepare the seven native PyPTO-lib cases."""
 
 import argparse
 import json
@@ -29,10 +29,7 @@ def main():
     parser.add_argument(
         "--build-dir", type=Path, default=Path(os.environ.get("DSV41_BUILD_DIR", ROOT / "build/portable"))
     )
-    parser.add_argument(
-        "--flavor", choices=["pypto_lib", "pypto_lib_dsl", "pypto_lib_latest", "both", "all"], default="all"
-    )
-    parser.add_argument("--sync-policy", choices=["half", "all-cap64", "both"], default="both")
+    parser.add_argument("--flavor", choices=("pypto_lib_latest", "all"), default="pypto_lib_latest")
     parser.add_argument("--native-moe-bundle", type=Path, help="Reuse an existing compatible native MoE bundle")
     parser.add_argument("--runtime", choices=("host_build_graph", "percounter"), default="host_build_graph")
     args = parser.parse_args()
@@ -53,44 +50,28 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, "DSV41_RUNNER": str(build / "host/native-runner")}
     (output / "runtime.json").write_text(json.dumps({"path": str(runtime), "runtime": args.runtime}, indent=2) + "\n")
-    flavors = (
-        ("pypto_lib", "pypto_lib_dsl", "pypto_lib_latest")
-        if args.flavor == "all"
-        else ("pypto_lib", "pypto_lib_dsl")
-        if args.flavor == "both"
-        else (args.flavor,)
+    flavor = "pypto_lib_latest"
+    bundle = build / "forward" / flavor
+    capture = output / "capture" / flavor
+    subprocess.run(
+        [
+            "bash",
+            str(ROOT / "production/run.sh"),
+            str(bundle),
+            str(runtime),
+            str(capture),
+            "1",
+            "0",
+            "1",
+            f"--runtime={args.runtime}",
+        ],
+        env=env,
+        check=True,
     )
-    for flavor in flavors:
-        bundle = build / "forward" / flavor
-        capture = output / "capture" / flavor
-        subprocess.run(
-            [
-                "bash",
-                str(ROOT / "production/run.sh"),
-                str(bundle),
-                str(runtime),
-                str(capture),
-                "1",
-                "0",
-                "1",
-                f"--runtime={args.runtime}",
-            ],
-            env=env,
-            check=True,
-        )
-        variants = export(
-            bundle,
-            capture,
-            flavor,
-            output / "cases",
-            build / "host",
-            args.sync_policy,
-            args.native_moe_bundle,
-        )
-        for variant in variants:
-            for case in sorted((output / "cases" / variant).iterdir()):
-                if json.loads((case / "case.json").read_text())["device_count"] == 1:
-                    materialize(case, runtime, output / "preparation" / variant / case.name, env, args.runtime)
+    cases = export(bundle, capture, flavor, output / "cases", build / "host", args.native_moe_bundle)
+    for case in cases:
+        if json.loads((case / "case.json").read_text())["device_count"] == 1:
+            materialize(case, runtime, output / "preparation" / flavor / case.name, env, args.runtime)
     print(f"Prepared cases: {output / 'cases'}")
 
 

@@ -63,6 +63,7 @@
 #include "scheduler/scheduler_async_layout.h"
 #include "scheduler/scheduler_args_dump.h"
 #include "scheduler/scheduler_graph.h"
+#include "scheduler/scheduler_task_catalog.h"
 #include "scheduler/scheduler_graph_binding.h"
 #endif
 
@@ -813,8 +814,8 @@ protected:
     // A Runtime as init leaves it: bind derives block_dim as
     // worker_count / PLATFORM_CORES_PER_BLOCKDIM and fails before it reaches the
     // staging ledger if that is zero.
-    static void init_runtime(Runtime &rt) {
-        rt.dev.worker_count = PLATFORM_CORES_PER_BLOCKDIM;
+    static void init_runtime(Runtime &rt, int clusters = 1) {
+        rt.dev.worker_count = clusters * PLATFORM_CORES_PER_BLOCKDIM;
         for (int i = 0; i < rt.dev.worker_count; ++i) {
             rt.dev.workers[i].core_type = CoreType::AIV;
             rt.dev.workers[i].physical_core_id = static_cast<uint32_t>(i);
@@ -2997,15 +2998,65 @@ TEST_F(HbgBindLedgerTest, MissingFinishCallbackRejectsBeforeOrchestration) {
     EXPECT_EQ(runtime.pending_publication().bytes, 0u);
 }
 
-TEST_F(HbgResidentSchedulerStorageTest, PartialNotificationPoolsKeepProgressChainsDoneAndCheckDisjoint) {
+TEST_F(HbgResidentSchedulerStorageTest, KernelCapabilitiesSelectTheWaveOrderOnEachBind) {
+    eps_.bind = capture_orch_bind;
+    eps_.entry = [](const ChipTaskArgs &) {
+        auto &orch = *g_orch_runtime->orchestrator;
+        MixedKernels kernels{};
+        kernels.aiv0_kernel_id = 0;
+        CoreTaskArgs side;
+        side.launch_spec.set_block_num(3);
+        ASSERT_TRUE(orch.submit_task(kernels, side).task_id().is_valid());
+        CoreTaskArgs ordinary;
+        const auto root = orch.submit_task(kernels, ordinary).task_id();
+        ASSERT_TRUE(root.is_valid());
+        CoreTaskArgs wave;
+        wave.launch_spec.set_block_num(6);
+        wave.set_dependencies(&root, 1);
+        const auto child = orch.submit_task(kernels, wave).task_id();
+        ASSERT_TRUE(child.is_valid());
+        CoreTaskArgs leaf;
+        leaf.set_dependencies(&child, 1);
+        ASSERT_TRUE(orch.submit_task(kernels, leaf).task_id().is_valid());
+    };
+    for (const auto mode : {CoreAsyncMode::SYNCHRONOUS, CoreAsyncMode::DEFERRED}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        Runtime runtime;
+        init_runtime(runtime, 4);
+        auto cleanup = cleanup_runtime(runtime);
+        const bool synchronous = mode == CoreAsyncMode::SYNCHRONOUS;
+        install_callable_tables(
+            runtime, synchronous ? CoreAsyncCapability{1, mode, 0, 0, 0} : CoreAsyncCapability{1, mode, 1, 1, 0}
+        );
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        ASSERT_FALSE(runtime.pending_publication().prerequisites.empty());
+        const auto &region = runtime.pending_publication().prerequisites.front();
+        auto *source = const_cast<void *>(static_cast<const void *>(region.source));
+        const auto context_offset =
+            runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
+        const auto *ctx = scheduler_state_at<SchedulerWorkerContext>(source, context_offset);
+        const auto *summary = scheduler_state_at<SchedulerGraphSummary>(source, ctx->graph_summary_offset);
+        const auto *header = scheduler_state_at<SchedulerTaskCatalogHeader>(source, summary->task_catalog_offset);
+        const auto vector = scheduler_task_catalog(source, *header, 1);
+        ASSERT_EQ(vector.count, 4u);
+        EXPECT_EQ(
+            std::vector<int64_t>(vector.refs, vector.refs + vector.count),
+            synchronous ? (std::vector<int64_t>{1, 2, 0, 3}) : (std::vector<int64_t>{1, 0, 2, 3})
+        );
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+    }
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, IndependentAsyncSinksUseAvailableChainAndDoneSlots) {
     HostApiOps ops = fake_ops();
     ops.acquire_scheduler_notifications = [](void *, uint32_t, SchedulerNotificationPurpose purpose, size_t count,
                                              SchedulerDoneNotifications *out) {
         *out = {std::vector<uint64_t>(count), std::vector<uint64_t>(count), {}};
-        if (purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER && count == 3) {
-            // Two of three slots are available: progress and the first independent task.
-            out->addresses = {0x1000, 0x1020, 0};
-            out->add_addresses = {0x1008, 0x1028, 0};
+        if (purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER && count == 2) {
+            // One of the two independent tasks fits the INC pool.
+            out->addresses = {0x1000, 0};
+            out->add_addresses = {0x1008, 0};
         } else if (purpose == SchedulerNotificationPurpose::TASK_STATE && count == 3) {
             // DONE accepts a word-aligned SET address. Only the second CHECK half has bit aliases.
             out->addresses = {0x2004, 0x2044, 0x2080};
@@ -3039,12 +3090,15 @@ TEST_F(HbgResidentSchedulerStorageTest, PartialNotificationPoolsKeepProgressChai
         rt.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
     const auto &ctx = *reinterpret_cast<const SchedulerWorkerContext *>(base + offset);
     const auto &run = *reinterpret_cast<const SchedulerRunControl *>(base + ctx.run_control_offset);
-    EXPECT_EQ(run.run_completed_read_address, 0x1000u);
-    EXPECT_EQ(run.run_completed_add_address, 0x1008u);
+    ASSERT_EQ(run.sink_count, 2u);
+    const auto *sinks = reinterpret_cast<const uint32_t *>(base + run.sinks_offset);
+    EXPECT_EQ(sinks[0], 0u);
+    EXPECT_EQ(sinks[1], 1u);
     const auto *chains =
         reinterpret_cast<const SchedulerTaskCompletionCounter *>(base + ctx.completion_counters_offset);
-    EXPECT_EQ(chains[0].read_address, 0x1020u);
-    EXPECT_EQ(chains[0].add_address, 0x1028u);
+    EXPECT_EQ(chains[0].read_address, 0x1000u);
+    EXPECT_EQ(chains[0].add_address, 0x1008u);
+    EXPECT_EQ(chains[0].threshold, 34u);
     EXPECT_EQ(chains[1].read_address, 0u);
     const auto *done = reinterpret_cast<const uint64_t *>(base + ctx.done_notifications_offset);
     EXPECT_EQ(done[0], 0u);

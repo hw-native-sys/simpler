@@ -37,7 +37,6 @@ struct SchedulerClusterDescriptor {
     volatile uint32_t order_ready[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t arrived[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t finished[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint32_t dependencies_generation;
     volatile uint32_t accounted_generation;
     volatile uint32_t trace_generation;
 };
@@ -45,6 +44,11 @@ struct SchedulerClusterSignal {
     volatile uint64_t run_epoch;
     volatile uint32_t mix_floor;
     SchedulerClusterDescriptor groups[SCHEDULER_MIX_MEMBER_COUNT];
+    // Only L2 uses this tail. A descriptor's existing release/acquire publishes it for one generation.
+    struct {
+        volatile uint64_t prepare_cycles;
+        volatile uint64_t arm_cycles;
+    } l2_proxy[SCHEDULER_MIX_MEMBER_COUNT];
 };
 static_assert(sizeof(SchedulerClusterSignal) <= SCHEDULER_CLUSTER_REGION_BYTES);
 static_assert(alignof(SchedulerClusterSignal) <= 8 && std::is_standard_layout_v<SchedulerClusterSignal>);
@@ -62,7 +66,7 @@ inline __aicore__ SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *scheduler_clus
 // The DSB remains in the SSBUF access path, without an outlined operation wrapper.
 inline __aicore__ void scheduler_cluster_barrier() {
     auto *trace = scheduler_scalar_current();
-    const bool record = trace != nullptr && trace->buffer != nullptr;
+    const bool record = trace != nullptr && trace->buffer != nullptr && trace->omitted_depth != trace->depth;
     const uint64_t begin = record ? scheduler_scalar_clock() : 0;
 #if defined(__CCE_AICORE__)
     dsb((mem_dsb_t)0);
@@ -114,7 +118,6 @@ scheduler_cluster_signal_clear(SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *s
         scheduler_cluster_store_field(&descriptor->block_idx, UINT32_MAX);
         scheduler_cluster_store_field(&descriptor->active_mask, UINT32_C(0));
         scheduler_cluster_store_field(&descriptor->trace_generation, UINT32_C(0));
-        scheduler_cluster_store_field(&descriptor->dependencies_generation, UINT32_C(0));
         scheduler_cluster_store_field(&descriptor->accounted_generation, UINT32_C(0));
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             scheduler_cluster_store_field(&descriptor->order_ready[lane], UINT32_C(0));

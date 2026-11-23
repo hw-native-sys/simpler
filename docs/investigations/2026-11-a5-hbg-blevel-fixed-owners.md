@@ -7,6 +7,9 @@ generation order with b-level and original ID as tie breakers. Existing deferred
 notification usage must continue to make progress without new frontend metadata
 requirements, ownership transfer or a larger pending window.
 
+The current scheduler assigns eligible exact-width waves deterministic block
+owners while retaining this topological task order.
+
 Same-device SWA L1 motivated the trial: both runtimes executed 578 instances
 with identical static kernel IDs and block counts. HBG scheduled independent
 tasks 23/26 at 45.960/68.413 µs relative to its first kernel; percounter scheduled

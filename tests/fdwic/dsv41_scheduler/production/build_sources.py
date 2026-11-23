@@ -10,14 +10,16 @@
 """Build the checked-in model sources with the existing Simpler compiler/cache."""
 
 import argparse
-import gzip
+import hashlib
 import json
 import logging
 import os
 import platform
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -30,7 +32,6 @@ from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test_cache import compile_incore_artifact_key, get_or_compile_incore
 
 ROOT = Path(__file__).resolve().parents[1]
-FLAVORS = ("pypto_lib", "pypto_lib_dsl", "pypto_lib_latest")
 
 
 MODES = {"SYNCHRONOUS": 1, "DEFERRED": 2}
@@ -53,6 +54,110 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+# The model contains separately compiled vector functions. Their portable LLVM
+# bodies are the output of the pinned PyPTO/PTOAS export.
+VF_FLAGS = (
+    "--cce-aicore-arch=dav-c310-vec",
+    "--cce-aicore-only",
+    "-O2",
+    "--cce-generic-addrspace=off",
+    "-cce-bitcode-is-aicore",
+    "-Wno-override-module",
+    "-dc",
+    "--cce-long-scbz=true",
+    "-mllvm",
+    "-cce-dyn-kernel-stack-size=true",
+)
+
+
+def validate_device_image(data: bytes) -> None:
+    """Reject linked images whose dependencies would be lost by .text extraction.
+
+    The persistent loader starts at byte zero and retains no ELF sections or
+    relocation metadata. This structural check does not prove arbitrary code
+    position-independent; helper authors must still obey the device-call ABI.
+    """
+    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+        raise ValueError("VPTO linking requires a little-endian ELF64 device image")
+    elf_type, machine = struct.unpack_from("<HH", data, 16)
+    if elf_type != 2 or machine != 0x1029:
+        raise ValueError("VPTO linking requires an executable AI Core ELF, not a host fatobj")
+    (entry,) = struct.unpack_from("<Q", data, 24)
+    (offset,) = struct.unpack_from("<Q", data, 40)
+    size, count, names_index = struct.unpack_from("<HHH", data, 58)
+    if size != 64 or not count or names_index >= count or offset + count * size > len(data):
+        raise ValueError("VPTO linked image has an invalid section table")
+    sections: list[tuple[int, ...]] = [struct.unpack_from("<IIQQQQIIQQ", data, offset + i * size) for i in range(count)]
+    names = sections[names_index]
+    strings = data[names[4] : names[4] + names[5]]
+    found_text = False
+    for name_offset, kind, flags, address, start, length, _, _, _, stride in sections:
+        name = strings[name_offset:].split(b"\x00", 1)[0]
+        if kind != 8 and start + length > len(data):  # SHT_NOBITS has no file payload.
+            raise ValueError("VPTO linked image has a truncated section")
+        if name == b".text":
+            found_text = bool(length)
+            if entry != address:
+                raise ValueError("VPTO kernel_entry must be at the start of .text")
+        if flags & 2 and length and name != b".text":  # SHF_ALLOC
+            raise ValueError(f"VPTO linked image needs unsupported allocated section {name!r}")
+        if kind in (4, 9) and length:  # SHT_RELA / SHT_REL
+            raise ValueError("VPTO linked image must have no remaining relocations")
+        if kind in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
+            if stride != 24 or length % stride:
+                raise ValueError("VPTO linked image has an invalid symbol table")
+            for position in range(start, start + length, stride):
+                symbol, _, _, section = struct.unpack_from("<IBBH", data, position)
+                if symbol and section == 0:
+                    raise ValueError("VPTO linked image has an unresolved symbol")
+    if not found_text:
+        raise ValueError("VPTO linked image requires a nonempty .text section")
+
+
+def compile_vector_functions(compiler, source, includes, helpers):
+    toolchain = compiler.ccec
+    bisheng = Path(toolchain.cxx_path).with_name("bisheng")
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        caller = directory / "caller.o"
+        subprocess.run(
+            [
+                toolchain.cxx_path,
+                *toolchain.get_compile_flags(core_type="aiv"),
+                *compiler._incore_feature_defines(),
+                "-ffunction-sections",
+                *(f"-I{path}" for path in includes),
+                "-o",
+                str(caller),
+                str(source),
+            ],
+            check=True,
+        )
+        objects = []
+        for i, helper in enumerate(helpers):
+            obj = directory / f"helper{i}.o"
+            subprocess.run([bisheng, *VF_FLAGS, "-c", "-x", "ir", helper, "-o", obj], check=True)
+            objects.append(obj)
+        order, elf = directory / "order.txt", directory / "kernel.elf"
+        order.write_text("kernel_entry\n")
+        subprocess.run(
+            [
+                toolchain.linker_path,
+                "-e",
+                "kernel_entry",
+                f"--symbol-ordering-file={order}",
+                "-o",
+                elf,
+                caller,
+                *objects,
+            ],
+            check=True,
+        )
+        binary = elf.read_bytes()
+        validate_device_image(binary)
+        return extract_text_section(binary)
+
+
 def build(flavor, output, tools, pto, jobs, runtime):
     sources = ROOT / "kernels" / flavor
     workload = ROOT / "workloads" / flavor
@@ -62,7 +167,6 @@ def build(flavor, output, tools, pto, jobs, runtime):
     compiler = KernelCompiler("a5")
     common_includes = compiler.get_orchestration_include_dirs(runtime)
     sdk = Path(os.environ["ASCEND_HOME_PATH"])
-    # Generated DSL C++ includes impl/c_api/... relative to the ASC SDK root.
     asc_roots = [str(path) for path in (sdk / "asc", sdk / "ascendc") if path.is_dir()]
     sdk_versions = {
         name: (sdk / name).read_text()
@@ -71,24 +175,23 @@ def build(flavor, output, tools, pto, jobs, runtime):
     }
     compiler_tokens = {core: compiler.incore_compile_cache_token(core) for core in ("aic", "aiv")}
 
+    vf_toolchain = None
+    if any(kernel.get("vf_llvm") for kernel in manifest["kernels"]):
+        if compiler.ccec is None:
+            raise RuntimeError("A5 vector functions require the CCEC toolchain")
+        bisheng = Path(compiler.ccec.cxx_path).with_name("bisheng")
+        vf_toolchain = subprocess.check_output([bisheng, "--version"], text=True)
+
     def compile_kernel(kernel):
         capability = capability_declaration(kernel)
         source = sources / kernel["source"]
         extra = common_includes + [str(sources / item) for item in kernel["include_dirs"]]
-        dsl_entry = flavor == "pypto_lib_dsl" and "/external/" in kernel["source"]
-        cache_extra = list(extra)
-        if dsl_entry:
-            extra += asc_roots
         includes = [
             str(pto / "include"),
             str(pto / "include/pto"),
             *compiler.get_incore_include_dirs(),
-            # Match the normal scene-test policy for SDK headers: CANN's
-            # legacy header symlinks contain ../ spellings which the lexical
-            # include scanner cannot normalize. Compiler/SDK identity covers
-            # those; source, PTO, Simpler and local headers remain in closure.
-            *([] if dsl_entry else compiler.get_ascend_incore_include_dirs()),
-            *cache_extra,
+            *compiler.get_ascend_incore_include_dirs(),
+            *extra,
         ]
         metadata = {
             "platform": "a5",
@@ -96,9 +199,18 @@ def build(flavor, output, tools, pto, jobs, runtime):
             "host_machine": platform.machine(),
             "compiler": compiler_tokens[kernel["core_type"]],
         }
-        if dsl_entry:
-            metadata["sdk_include_roots"] = compiler.get_ascend_incore_include_dirs() + asc_roots
-            metadata["sdk_versions"] = sdk_versions
+        helpers = [sources / path for path in kernel.get("vf_llvm", [])]
+        if helpers:
+            if kernel["core_type"] != "aiv":
+                raise ValueError("Vector functions require an AIV caller")
+            metadata["vf"] = {
+                "compiler": vf_toolchain,
+                "flags": VF_FLAGS,
+                "caller": "-ffunction-sections",
+                "entry": "kernel_entry",
+                "helpers": [hashlib.sha256(path.read_bytes()).hexdigest() for path in helpers],
+                "builder": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            }
         key = compile_incore_artifact_key(metadata, source, includes)
         compiled = False
 
@@ -106,6 +218,8 @@ def build(flavor, output, tools, pto, jobs, runtime):
             nonlocal compiled
             compiled = True
             with compile_slot():
+                if helpers:
+                    return compile_vector_functions(compiler, source, includes, helpers)
                 return extract_text_section(
                     compiler.compile_incore(
                         str(source),
@@ -142,7 +256,7 @@ def build(flavor, output, tools, pto, jobs, runtime):
         records = list(pool.map(compile_kernel, manifest["kernels"]))
 
     source = output / "orchestration.cpp"
-    source.write_bytes(gzip.decompress((workload / "vendor/orchestration.cpp.gz").read_bytes()))
+    shutil.copyfile(workload / "vendor/orchestration.cpp", source)
     includes, support = compiler.get_orchestration_cache_inputs(runtime)
     host_token = compiler.compile_cache_token(runtime, [])
     # Cache the Host ELF as bytes without importing Simpler's Python bindings.
@@ -199,7 +313,7 @@ def build(flavor, output, tools, pto, jobs, runtime):
         output / "name_map.json",
         {
             "level": 2,
-            "orchestrator_name": "l2_moe" if native else "l2_decode_fwd",
+            "orchestrator_name": manifest.get("orchestrator_name", "l2_moe" if native else "l2_decode_fwd"),
             "callable_id_to_name": {str(k["func_id"]): k["name"] for k in manifest["kernels"]},
         },
     )
@@ -221,7 +335,7 @@ def build(flavor, output, tools, pto, jobs, runtime):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--flavor", choices=[*FLAVORS, "both", "all"], default="all")
+    parser.add_argument("--flavor", choices=("pypto_lib_latest", "all"), default="pypto_lib_latest")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/portable")
     parser.add_argument("--pto-isa", type=Path, default=ROOT.parents[2] / "build/pto-isa")
     parser.add_argument("--jobs", type=int, default=4)
@@ -230,25 +344,12 @@ def main():
     if args.jobs < 1 or not (args.pto_isa / "include/pto").is_dir():
         parser.error("--jobs must be positive and --pto-isa must contain include/pto")
     logging.basicConfig(level=logging.DEBUG)
-    flavors = FLAVORS if args.flavor == "all" else FLAVORS[:2] if args.flavor == "both" else [args.flavor]
-    for flavor in flavors:
-        build(
-            flavor,
-            args.build_dir.resolve() / "forward" / flavor,
-            args.build_dir.resolve() / "host",
-            args.pto_isa.resolve(),
-            args.jobs,
-            args.runtime,
-        )
-        if flavor == "pypto_lib_latest":
-            build(
-                "native_moe",
-                args.build_dir.resolve() / "native-moe",
-                args.build_dir.resolve() / "host",
-                args.pto_isa.resolve(),
-                args.jobs,
-                args.runtime,
-            )
+    build_dir = args.build_dir.resolve()
+    for flavor, target in (
+        ("pypto_lib_latest", build_dir / "forward/pypto_lib_latest"),
+        ("native_moe", build_dir / "native-moe"),
+    ):
+        build(flavor, target, build_dir / "host", args.pto_isa.resolve(), args.jobs, args.runtime)
 
 
 if __name__ == "__main__":

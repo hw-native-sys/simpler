@@ -55,7 +55,7 @@ ScalarPolicyObservation observe_scalar_policy() {
             break;
         }
         const auto kind = static_cast<SchedPhaseKind>(record.kind & 0xffffU);
-        result.bypass_loads += kind == SchedPhaseKind::ScalarBypassLoad;
+        result.bypass_loads += kind == SchedPhaseKind::ScalarGmLoad;
         result.atomic_adds += kind == SchedPhaseKind::ScalarAtomicFetchAdd;
         result.floor_checks += kind == SchedPhaseKind::ScalarAdvanceMixFloor;
     }

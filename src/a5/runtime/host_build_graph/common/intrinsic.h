@@ -53,8 +53,8 @@
  *     issue #900 (PR #899 spmd_paged_attention_highperf); the kernel
  *     compiled, ran without error, and produced wrong output. Use
  *     `get_sub_block_id(args)` instead, which reads from the runtime's
- *     `GlobalContext.sub_block_id`. Resident Mix dispatch sets it
- *     from the final physical AIV placement before publication.
+ *     `GlobalContext.sub_block_id`. Host preparation sets it
+ *     from the execution's logical AIV lane before upload.
  *
  *   - `get_block_idx()` and `get_block_num()` are not redirected to
  *     simpler's LocalContext either — use the `(args)` variants below
@@ -99,8 +99,8 @@ static constexpr int32_t PAYLOAD_LOCAL_CONTEXT_INDEX = SPMD_LOCAL_CONTEXT_INDEX;
 static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDEX;
 
 /**
- * Per-invocation global context. Resident graph
- * Mix dispatch sets sub_block_id from the final physical AIV placement; the
+ * Per-invocation global context. Host-prepared
+ * calls set sub_block_id from the logical AIV lane; the
  * writer fields name this invocation's stable completion publication.
  */
 struct GlobalContext {

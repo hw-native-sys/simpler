@@ -41,18 +41,19 @@ inline __aicore__ bool gather_row(
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     auto *peer_out = data(reinterpret_cast<__gm__ Tensor *>(args[1]));
     auto *comm = reinterpret_cast<__gm__ CommContext *>(args[2]);
-    const uint64_t offset = static_cast<uint64_t>(args[3]);
     AsyncCtx async = get_async_ctx(args);
     const uint32_t block = get_block_idx(args);
     const uint32_t blocks = get_block_num(args);
     if (comm == nullptr || comm->rankNum != 2 || comm->rankId >= 2 || (blocks != 1 && blocks != 4) || block >= blocks ||
-        comm_workspace<CommWorkspaceKind::URMA>(*comm).addr == 0) {
+        comm_workspace<CommWorkspaceKind::URMA>(*comm).addr == 0 || comm->windowsIn[comm->rankId] == 0) {
         pto2::detail::defer_error(async, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         pto2::detail::defer_flush(async);
         return;
     }
     auto *workspace = reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::URMA>(*comm).addr);
     const uint32_t peer = 1u - comm->rankId;
+    auto *table = data(reinterpret_cast<__gm__ Tensor *>(args[0]));
+    const uint64_t offset = reinterpret_cast<uint64_t>(table) - comm->windowsIn[comm->rankId];
     auto *peer_table = pto2::urma_backend::peer_mr_ptr<float>(workspace, peer, offset);
 
     if (!gather_row<0, 0>(async, peer_table, peer_out, workspace, peer, block, blocks)) return;

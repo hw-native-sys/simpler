@@ -188,6 +188,7 @@ def build_host_resource_binary(build, rdma, *, ccu_backend=False):
         ]
     if rdma:
         defines.append("-DSIMPLER_ENABLE_PTO_RDMA_WORKSPACE=1")
+        defines.append("-DPTO_COMM_WORKSPACE_RDMA_SUPPORTED=1")
     isa = Path(ensure_pto_isa_root())
     binary = build / "host_resources"
     result = subprocess.run(
@@ -317,6 +318,12 @@ def test_rdma_workspace_free_failure_retains_owner(host_resource_binary):
 @pytest.mark.parametrize("failure", ["return", "throw"])
 def test_init_rollback_free_failure_retains_owner(host_resource_binary, engine, failure):
     subprocess.run([str(host_resource_binary), f"init_{engine}_{failure}"], check=True, timeout=20)
+
+
+@pytest.mark.parametrize("host_resource_binary", [True], indirect=True)
+@pytest.mark.parametrize("scenario", ["init_rdma_dbcos_fail", "init_urma_alloc_fail"])
+def test_init_partial_failure_retains_owner(host_resource_binary, scenario):
+    subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
 
 
 @pytest.mark.parametrize("kind", ["CommWorkspaceKind::COUNT", "static_cast<CommWorkspaceKind>(UINT32_MAX)"])

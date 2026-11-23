@@ -439,25 +439,10 @@ scheduler_fanin_ref(const SchedulerFaninView &view, int64_t task_ref, uint32_t i
     return SchedulerGraphResult::OK;
 }
 
-inline __aicore__ SchedulerGraphResult
-scheduler_node_fanin_count(const SchedulerGraphAccess &graph, int64_t task_ref, uint32_t *count) {
-    if (count == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
-    SchedulerFaninView view{};
-    const auto status = scheduler_node_fanin_view(graph, task_ref, &view);
-    if (status == SchedulerGraphResult::OK) *count = view.count;
-    return status;
-}
-
-inline __aicore__ SchedulerGraphResult
-scheduler_node_fanin_ref(const SchedulerGraphAccess &graph, int64_t task_ref, uint32_t index, int64_t *producer) {
-    if (producer == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
-    SchedulerFaninView view{};
-    const auto status = scheduler_node_fanin_view(graph, task_ref, &view);
-    return status == SchedulerGraphResult::OK ? scheduler_fanin_ref(view, task_ref, index, producer) : status;
-}
-
-inline __aicore__ SchedulerGraphResult
-scheduler_classify_task_shape(const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerTaskShape *shape) {
+inline __aicore__ SchedulerGraphResult scheduler_classify_task_shape(
+    const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerTaskShape *shape,
+    const SchedulerFaninView *fanin = nullptr, int64_t *decoded = nullptr
+) {
     if (shape == nullptr) return SchedulerGraphResult::UNSUPPORTED_SHAPE;
     *shape = {
         {SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID},
@@ -495,24 +480,26 @@ scheduler_classify_task_shape(const SchedulerGraphAccess &graph, int64_t task_re
     uint64_t stored_task_ref = *reinterpret_cast<__gm__ uint64_t *>(descriptor + SCHEDULER_GRAPH_TASK_ID_OFFSET);
     if (stored_task_ref != static_cast<uint64_t>(storage_ref)) return SchedulerGraphResult::INVALID_TASK_ID;
 
-    SchedulerFaninView fanin{};
-    const auto fanin_status = scheduler_node_fanin_view(graph, task_ref, &fanin);
-    if (fanin_status != SchedulerGraphResult::OK) return fanin_status;
-    for (uint32_t i = 0; i < fanin.count; ++i) {
+    SchedulerFaninView row{};
+    if (fanin == nullptr) {
+        const auto status = scheduler_node_fanin_view(graph, task_ref, &row);
+        if (status != SchedulerGraphResult::OK) return status;
+        fanin = &row;
+    }
+    for (uint32_t i = 0; i < fanin->count; ++i) {
         int64_t producer = -1;
-        if (scheduler_fanin_ref(fanin, task_ref, i, &producer) != SchedulerGraphResult::OK)
+        if (scheduler_fanin_ref(*fanin, task_ref, i, &producer) != SchedulerGraphResult::OK)
             return SchedulerGraphResult::INVALID_FANIN_ID;
-        if (graph.native_header_offset == 0) {
+        if (decoded != nullptr) {
+            // The ordinary host path checks for duplicates in its saved row of resolved producer references.
+            for (uint32_t prior = 0; prior < i; ++prior)
+                if (decoded[prior] == producer) return SchedulerGraphResult::INVALID_FANIN_ID;
+            decoded[i] = producer;
+        } else {
             for (uint32_t prior = 0; prior < i; ++prior) {
-                if (fanin.global_refs[prior] == producer) return SchedulerGraphResult::INVALID_FANIN_ID;
-            }
-            continue;
-        }
-        for (uint32_t prior = 0; prior < i; ++prior) {
-            int64_t previous = -1;
-            if (scheduler_fanin_ref(fanin, task_ref, prior, &previous) != SchedulerGraphResult::OK ||
-                previous == producer) {
-                return SchedulerGraphResult::INVALID_FANIN_ID;
+                const auto ref = fanin->global_refs[prior];
+                if ((fanin->completion_refs == nullptr ? ref : fanin->completion_refs[ref]) == producer)
+                    return SchedulerGraphResult::INVALID_FANIN_ID;
             }
         }
     }

@@ -14,7 +14,7 @@
 extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig host_comm_domain_config(const ChipTaskArgs &args) {
     (void)args;
-    return OrchestrationConfig{.expected_arg_count = 6};
+    return OrchestrationConfig{.expected_arg_count = 5};
 }
 
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &args) {
@@ -26,8 +26,7 @@ __attribute__((visibility("default"))) void host_comm_domain(const ChipTaskArgs 
     gather.add_input(args.tensor(0).ref());
     gather.add_output(args.tensor(1).ref());
     gather.add_scalar(args.scalar<uint64_t>(0));
-    gather.add_scalar(args.scalar<uint64_t>(1));
-    const auto blocks = args.scalar<int32_t>(2);
+    const auto blocks = args.scalar<int32_t>(1);
     gather.launch_spec.set_block_num(static_cast<int16_t>(blocks));
     gather.launch_spec.set_require_sync_start(blocks > 1);
     rt_submit_aiv_task(0, gather);

@@ -11,6 +11,10 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
+#if defined(__CCE_AICORE__)
+inline __aicore__ uint64_t get_sys_cnt_aicore() { return get_sys_cnt(); }
+#endif
+
 #include "scheduler/scheduler_async_control.h"
 #include "tensor.h"
 

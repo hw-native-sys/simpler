@@ -53,13 +53,16 @@ def features(item, platform, environment):
         if any(True for _ in item.iter_markers("execution_mode")):
             raise ValueError(f"{item.nodeid}: execution_mode is Kernel-only")
         mode = None
+    supported_runtimes = (*RUNTIMES, "common")
+    if platform == "a5" and environment == "default" and product != "kernel":
+        supported_runtimes += ("percounter",)
     runtimes = {
-        _declaration(item, "runtime", (*RUNTIMES, "common")),
-        _declaration(item, "coverage_runtime", (*RUNTIMES, "common")),
+        _declaration(item, "runtime", supported_runtimes),
+        _declaration(item, "coverage_runtime", supported_runtimes),
         getattr(getattr(item, "cls", None), "_st_runtime", None),
         getattr(getattr(item, "callspec", None), "params", {}).get("runtime"),
     } - {None}
-    if len(runtimes) != 1 or not runtimes <= {*RUNTIMES, "common"}:
+    if len(runtimes) != 1 or not runtimes <= set(supported_runtimes):
         raise ValueError(f"{item.nodeid}: missing or conflicting feature classification")
     if environment == "torch_npu" and product != "kernel":
         raise ValueError(f"{item.nodeid}: framework consumers must declare Kernel")
@@ -131,6 +134,8 @@ def policy(config, cases):
     runtime = config.getoption("--runtime")
     required = set()
     gaps = set()
+    if platform == "a5" and environment == "default" and runtime in (None, "percounter"):
+        required.add("program/percounter")
     for rt in RUNTIMES:
         if runtime and rt != runtime:
             continue

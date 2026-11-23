@@ -40,23 +40,25 @@ struct SchedulerProtocolTaskSpec {
 };
 
 inline std::vector<SchedulerProtocolTaskSpec>
-scheduler_protocol_freeze_graph(const SchedulerGraphView &graph, const std::vector<SchedulerTaskMetadata> &metadata) {
+scheduler_protocol_freeze_graph(const SchedulerGraphView &view, const std::vector<SchedulerTaskMetadata> &metadata) {
+    const SchedulerGraphAccess graph(view);
     if (graph.task_count != metadata.size()) throw std::invalid_argument("protocol graph task count mismatch");
+    if (!metadata.empty() && !scheduler_graph_view_valid(graph)) throw std::invalid_argument("invalid protocol graph");
     std::vector<SchedulerProtocolTaskSpec> result;
     result.reserve(metadata.size());
     for (size_t task = 0; task < metadata.size(); ++task) {
         SchedulerNodeKind kind{};
         if (scheduler_node_kind(graph, task, &kind) != SchedulerGraphResult::OK)
             throw std::invalid_argument("invalid protocol node kind");
+        SchedulerFaninView fanin{};
+        if (scheduler_node_fanin_view(graph, task, &fanin) != SchedulerGraphResult::OK)
+            throw std::invalid_argument("invalid frozen protocol fanin row");
         SchedulerTaskShape shape{};
-        const auto status = scheduler_classify_task_shape(graph, static_cast<int64_t>(task), &shape);
+        const auto status = scheduler_classify_task_shape(graph, task, &shape, &fanin);
         if (!scheduler_node_is_control(kind) && status != SchedulerGraphResult::OK &&
             !(status == SchedulerGraphResult::UNSUPPORTED_SHAPE &&
               (metadata[task].active_mask.is_empty() || scheduler_task_is_inline(metadata[task].flags))))
             throw std::invalid_argument("invalid frozen protocol graph");
-        uint32_t count = 0;
-        if (scheduler_node_fanin_count(graph, static_cast<int64_t>(task), &count) != SchedulerGraphResult::OK)
-            throw std::invalid_argument("invalid frozen protocol fanin row");
         SchedulerProtocolTaskSpec spec{metadata[task], {}};
         spec.kind = kind;
         if (scheduler_node_identity(graph, task, &spec.public_task_id) != SchedulerGraphResult::OK)
@@ -70,11 +72,10 @@ scheduler_protocol_freeze_graph(const SchedulerGraphView &graph, const std::vect
             if (kind == SchedulerNodeKind::CHILD_KERNEL || (kind == SchedulerNodeKind::CONTROL_DUMMY && node.instance))
                 spec.local_child_id = node.binding->source_index;
         }
-        spec.dependencies.reserve(static_cast<size_t>(count));
-        for (uint32_t index = 0; index < count; ++index) {
+        spec.dependencies.reserve(fanin.count);
+        for (uint32_t index = 0; index < fanin.count; ++index) {
             int64_t producer = -1;
-            if (scheduler_node_fanin_ref(graph, static_cast<int64_t>(task), index, &producer) !=
-                SchedulerGraphResult::OK)
+            if (scheduler_fanin_ref(fanin, task, index, &producer) != SchedulerGraphResult::OK)
                 throw std::invalid_argument("invalid frozen protocol dependency");
             spec.dependencies.push_back(static_cast<int32_t>(producer));
         }
@@ -383,6 +384,7 @@ inline std::string scheduler_export_protocol(
     {
         JsonObject root(out);
         root.string("schema", "hbg-native-protocol");
+        root.number("version", 2);
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
             root.field("node_map") << '[';
@@ -410,9 +412,7 @@ inline std::string scheduler_export_protocol(
         root.number("mix_task_count", layout.spmd.mix_task_count);
         root.number("sync_mix_task_count", layout.spmd.sync_mix_task_count);
         const auto &run = *image.array<SchedulerRunControl>(layout.run_control_offset, 1);
-        root.number("expected_task_count", run.expected_task_count);
         root.number("inline_completed_count", run.inline_completed_count);
-        root.number("resolved_task_count", run.resolved_task_count);
         root.number("active_worker_count", run.active_worker_count);
         root.number("scheduler_error", run.scheduler_error);
         root.number("error_claimed", run.error_claimed);
@@ -450,12 +450,16 @@ inline std::string scheduler_export_protocol(
         }
         out << ']';
         const auto *contexts = image.array<SchedulerWorkerContext>(layout.worker_contexts_offset, plan.worker_count);
+        if (contexts == nullptr) throw std::invalid_argument("protocol requires a worker context");
+        const uint64_t expected = contexts[0].graph_task_count;
+        root.number("expected_task_count", expected);
         const auto *workers = image.array<SchedulerProtocolWorkerTrace>(plan.workers_offset, plan.worker_count);
         root.field("workers") << '[';
         for (uint64_t index = 0; index < plan.worker_count; ++index) {
             if (index != 0) out << ',';
             JsonObject row(out);
             const auto &context = contexts[index];
+            if (context.graph_task_count != expected) throw std::invalid_argument("worker graph task counts disagree");
             const auto &worker = workers[index];
             row.number("index", index);
             row.number("worker_index", worker.worker_index);
@@ -475,6 +479,10 @@ inline std::string scheduler_export_protocol(
         const auto *counters =
             image.array<SchedulerTaskCompletionCounter>(layout.completion_counters_offset, plan.task_count);
         const auto *controls = image.array<SchedulerTaskControl>(layout.task_controls_offset, plan.task_count);
+        const auto *observations =
+            image.array<SchedulerProtocolCounterObservation>(plan.counter_observations_offset, plan.task_count);
+        uint64_t resolved = 0;
+        bool complete_snapshot = true;
         root.field("task_controls") << '[';
         for (uint64_t task = 0; task < plan.task_count; ++task) {
             if (task != 0) out << ',';
@@ -491,6 +499,20 @@ inline std::string scheduler_export_protocol(
             row.number("completed_subtasks", physical ? scheduler_completion_count(completion) : 0);
             row.number("claim_seal", controls[task].claim_seal);
             const bool counted = counters[task].add_address != 0;
+            // Host-completed tasks have no live geometry. For mapped tasks the
+            // retired register snapshot carries the same threshold as fanin.
+            if (tasks[task].metadata.logical_block_num != 0) {
+                const auto &counter = counters[task];
+                if (!counted) {
+                    resolved += scheduler_completion_done(completion);
+                } else if (observations[task].valid == 0) {
+                    complete_snapshot = false;
+                } else {
+                    resolved += scheduler_classify_completion_counter(
+                                    observations[task].value, counter.threshold, counter.limit
+                                ) == 1;
+                }
+            }
             row.number("completion_backend", counted ? 1 : 0);
             row.number("counter_index", counter_indices[task]);
             row.number("counter_threshold", counted ? counters[task].threshold : 0);
@@ -498,6 +520,8 @@ inline std::string scheduler_export_protocol(
             row.lane_mask("async_mask", task_async_masks[task]);
         }
         out << ']';
+        if (complete_snapshot) root.number("resolved_task_count", resolved);
+        else root.field("resolved_task_count") << "null";
         sparse(
             root, "task_events", image.array<SchedulerProtocolTaskTrace>(plan.tasks_offset, plan.task_count),
             plan.task_count, [](JsonObject &row, const auto &record) {

@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Assemble PyPTO-lib, half-sync DSL and capacity-bounded all-sync DSL cases."""
+"""Assemble the seven native PyPTO-lib cases."""
 
 import argparse
 import json
@@ -40,45 +40,28 @@ def _export_native(destination, root, tools, native_moe_bundle):
     subprocess.run(command, check=True)
 
 
-def _export_variant(bundle, capture, flavor, variant, policy, output, tools, native_moe_bundle=None):
+def export(bundle, capture, flavor, output, tools, native_moe_bundle=None):
+    if flavor != "pypto_lib_latest":
+        raise ValueError(f"Unknown workload: {flavor}")
     root = Path(__file__).resolve().parents[1]
     cases = json.loads((root / "workloads" / flavor / "source.json").read_text())["cases"]
-    cases = {name: case for name, case in cases.items() if variant in case.get("variants", [variant])}
     for name, case in cases.items():
-        destination = output / variant / name
+        destination = output / flavor / name
         if case.get("execution") == "native_moe_host_control":
             _export_native(destination, root, tools, native_moe_bundle)
             continue
         destination.mkdir(parents=True, exist_ok=False)
         first, last = str(case["first_source_task"]), str(case["last_source_task"])
         metadata = []
-        sync_reports = []
         for rank in range(2):
             plan = capture / f"rank{rank}/submissions.bin"
             detail = json.loads(
                 subprocess.check_output([str(tools / "record-tool"), str(plan), first, last], text=True)
             )
             if (detail["tasks"], detail["executions"]) != (case["tasks"], case["executions"]):
-                raise ValueError(f"{variant}/{name}: original task or physical execution count changed")
+                raise ValueError(f"{flavor}/{name}: original task or physical execution count changed")
             metadata.append(detail)
-            if flavor == "pypto_lib_dsl":
-                sync_reports.append(
-                    json.loads(
-                        subprocess.check_output(
-                            [
-                                str(tools / "record-tool"),
-                                "--all-sync-start-cap64" if policy == "all-cap64" else "--half-sync-start",
-                                str(plan),
-                                first,
-                                last,
-                                str(destination / f"plan-rank{rank}.bin"),
-                            ],
-                            text=True,
-                        )
-                    )
-                )
-            else:
-                link(plan, destination / f"plan-rank{rank}.bin")
+            link(plan, destination / f"plan-rank{rank}.bin")
             lines = (bundle / f"rank{rank}.txt").read_text().splitlines()
             count = int(lines[2])
             # The replay entry takes backing buffers. Original kernel views,
@@ -131,21 +114,9 @@ def _export_variant(bundle, capture, flavor, variant, policy, output, tools, nat
             json.dumps(
                 {
                     "flavor": flavor,
-                    "variant": variant,
+                    "variant": flavor,
                     "case": name,
                     "source": case,
-                    **(
-                        {
-                            "sync_start_policy": {
-                                "policy": "all_spmd_up_to_64"
-                                if policy == "all-cap64"
-                                else "half_spmd_preserve_existing",
-                                "plans": sync_reports,
-                            }
-                        }
-                        if sync_reports
-                        else {}
-                    ),
                     "ranks": metadata,
                     "device_count": 2 if name in ("moe", "layers_19_21") else 1,
                     "preparation": "Run the original prefix into persistent cut inputs; exclude it from measured runs.",
@@ -156,24 +127,11 @@ def _export_variant(bundle, capture, flavor, variant, policy, output, tools, nat
             + "\n"
         )
         print(
-            f"{variant}/{name}: {case['tasks']} tasks, {case['executions']} executions, "
+            f"{flavor}/{name}: {case['tasks']} tasks, {case['executions']} executions, "
             f"{len(metadata[0]['boundary_buffers'])} boundary buffers"
         )
 
-
-def export(bundle, capture, flavor, output, tools, sync_policy="both", native_moe_bundle=None):
-    """Export selected variants from the same unmodified source capture."""
-    if sync_policy not in ("half", "all-cap64", "both"):
-        raise ValueError(f"Unknown sync policy: {sync_policy}")
-    policies = ("half", "all-cap64") if sync_policy == "both" else (sync_policy,)
-    if flavor != "pypto_lib_dsl":
-        policies = ("half",)
-    variants = []
-    for policy in policies:
-        variant = "pypto_lib_dsl_all_sync64" if flavor == "pypto_lib_dsl" and policy == "all-cap64" else flavor
-        _export_variant(bundle, capture, flavor, variant, policy, output, tools, native_moe_bundle)
-        variants.append(variant)
-    return variants
+    return [output / flavor / name for name in cases]
 
 
 if __name__ == "__main__":
@@ -181,9 +139,8 @@ if __name__ == "__main__":
     parser.add_argument("bundle", type=Path)
     parser.add_argument("capture", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--flavor", choices=["pypto_lib", "pypto_lib_dsl", "pypto_lib_latest"], required=True)
+    parser.add_argument("--flavor", choices=["pypto_lib_latest"], default="pypto_lib_latest")
     parser.add_argument("--tools", type=Path, default=Path(__file__).resolve().parents[1] / "build/portable/host")
-    parser.add_argument("--sync-policy", choices=["half", "all-cap64", "both"], default="both")
     parser.add_argument("--native-moe-bundle", type=Path, help="Reuse an existing compatible native MoE bundle")
     args = parser.parse_args()
     export(
@@ -192,6 +149,5 @@ if __name__ == "__main__":
         args.flavor,
         args.output.resolve(),
         args.tools.resolve(),
-        args.sync_policy,
         args.native_moe_bundle,
     )

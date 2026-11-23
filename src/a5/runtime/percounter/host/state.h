@@ -185,6 +185,7 @@ inline StateSelection select_percounter_state(
     uint64_t mix_task_count = 0;
     uint64_t boundary_task_count = 0;
     uint64_t sync_cohort_count = 0;
+    uint64_t completion_notify_count = 0;
     // Each GRAPH task places its body's blocks, and holds one of its own that
     // no list carries.
     uint64_t block_total = graph.body_blocks;
@@ -228,6 +229,7 @@ inline StateSelection select_percounter_state(
             const uint64_t entries = 1;
             if (input.block_num > 1 || input.is_mix) ++boundary_task_count;
             if (input.sync_start) ++sync_cohort_count;
+            if (percounter_completion_notify_eligible(input)) ++completion_notify_count;
             if (input.is_mix) mix_task_count += entries;
             order_count[input.is_mix ? 1 : input.core_type_index] += entries;
             block_total += static_cast<uint64_t>(input.block_num);
@@ -243,9 +245,26 @@ inline StateSelection select_percounter_state(
     for (size_t t = 0; t < task_count; ++t)
         inputs[t].fanin_ids = inputs[t].fanin_count > 0 ? edges.data() + edge_begin[t] : nullptr;
 
+    std::vector<std::vector<int32_t>> folded_rows;
+    std::vector<int64_t> folded;
+    if (!percounter_fold_dependency_tasks(inputs, folded_rows, folded)) {
+        LOG_ERROR("A5 percounter: invalid dependency-only task fanin");
+        return StateSelection::FAILED;
+    }
+    uint64_t edge_count = edges.size();
+    if (!folded.empty()) {
+        edge_count = 0;
+        for (const auto &input : inputs)
+            edge_count += static_cast<uint64_t>(input.fanin_count);
+        for (const int64_t id : folded)
+            --order_count[inputs[id].core_type_index];
+        execution_count -= folded.size();
+        LOG_TIMING("A5 percounter: folded %zu dependency-only tasks", folded.size());
+    }
+
     PercounterLayout layout{};
     if (!plan_layout(
-            task_count, block_total, edges.size(), order_count, &layout, mix_task_count, boundary_task_count,
+            task_count, block_total, edge_count, order_count, &layout, mix_task_count, boundary_task_count,
             sync_cohort_count, graph.layout, execution_count, runtime->dev.chip_swimlane_level
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");
@@ -262,19 +281,81 @@ inline StateSelection select_percounter_state(
     }
     const uint64_t device_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_state));
 
+    SchedulerCompletionCounterPlan completion_plan;
+    if (completion_notify_count != 0) {
+        std::string error;
+        if (!plan_percounter_completion_counters(inputs, &completion_plan, &error)) {
+            LOG_ERROR("A5 percounter: completion counter plan failed: %s", error.c_str());
+            return StateSelection::FAILED;
+        }
+    }
+
+    // Keep sync cohorts first in the lease so allocation pressure does not
+    // displace their existing mappings. The AICPU clears both groups before READY.
+    std::vector<uint64_t> notify_addresses;
+    const uint64_t notify_count = sync_cohort_count + completion_plan.chains.size();
+    if (notify_count != 0) {
+        SchedulerDoneNotifications notifications{};
+        if (api->acquire_scheduler_notifications(
+                SchedulerNotificationPurpose::COMPLETION_COUNTER, static_cast<size_t>(notify_count), &notifications
+            ) == 0) {
+            notify_addresses = std::move(notifications.addresses);
+            if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));
+        }
+        const auto mapped = [&](size_t index) {
+            return index < notify_addresses.size() && a5_cnt_notify_increment_address(notify_addresses[index]) != 0;
+        };
+        uint64_t mapped_sync = 0;
+        for (size_t index = 0; index < sync_cohort_count; ++index)
+            mapped_sync += mapped(index);
+        size_t mapped_chains = 0;
+        for (size_t chain = 0; chain < completion_plan.chains.size(); ++chain)
+            mapped_chains += mapped(sync_cohort_count + chain);
+        const auto mapped_tasks =
+            std::count_if(completion_plan.task_chains.begin(), completion_plan.task_chains.end(), [&](uint32_t chain) {
+                return chain != UINT32_MAX && mapped(sync_cohort_count + chain);
+            });
+        LOG_TIMING(
+            "A5 percounter: completion counters planned_chains=%zu mapped_chains=%zu eligible_tasks=%" PRIu64
+            " mapped_tasks=%zu mapped_sync=%" PRIu64 " sync_cohorts=%" PRIu64,
+            completion_plan.chains.size(), mapped_chains, completion_notify_count, static_cast<size_t>(mapped_tasks),
+            mapped_sync, sync_cohort_count
+        );
+    }
+
     ExternalAddresses external{};
     external.graph_storage = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr()) + device_segments.storage;
     external.graph_storage_count = task_count;
     external.callable_table = runtime->callable_entry_table_addr();
     external.callable_count = static_cast<uint64_t>(runtime->callable_table_len());
+    external.sync_notify = notify_addresses.data();
+    external.sync_notify_count = std::min<uint64_t>(notify_addresses.size(), sync_cohort_count);
+    if (notify_addresses.size() > sync_cohort_count) {
+        external.completion_plan = &completion_plan;
+        external.completion_notify = notify_addresses.data() + sync_cohort_count;
+        external.completion_notify_count = notify_addresses.size() - sync_cohort_count;
+    }
     BuildResult build{};
     const GraphPlanInput graph_plan{
         graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
     };
+    const auto may_defer = [&](uint32_t id) {
+        const auto &input = inputs[id];
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            if ((input.active_mask & (1U << lane)) == 0) continue;
+            try {
+                const auto capability = runtime->get_function_async_capability(task_metadata[id].kernel_ids[lane]);
+                if (capability.mode != CoreAsyncMode::SYNCHRONOUS) return true;
+            } catch (const std::exception &) {
+                return true;
+            }
+        }
+        return false;
+    };
     if (!build_tables(
             inputs.data(), task_count, layout, host_base, device_base,
             static_cast<uint32_t>(runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM), external, &build,
-            graph_plan
+            graph_plan, true, may_defer
         )) {
         LOG_ERROR(
             "A5 percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status), build.task_id,
@@ -283,6 +364,14 @@ inline StateSelection select_percounter_state(
         return StateSelection::FAILED;
     }
 
+    const auto *terminal_control = region_at<PercounterControl>(host_base, layout.control_offset);
+    if (terminal_control->terminal.step_count != 0)
+        LOG_TIMING(
+            "A5 percounter: terminal pipeline %u steps, first=%u, last=%u, prerequisites=%u",
+            terminal_control->terminal.step_count, terminal_control->terminal.steps[0],
+            terminal_control->terminal.steps[terminal_control->terminal.step_count - 1],
+            terminal_control->terminal.prerequisite_count
+        );
     if (task_count != 0 && uploaded_sm == nullptr) return StateSelection::FAILED;
     const auto address_space = std::strcmp(get_platform(), "a5sim") == 0 ? SchedulerCallableAddressSpace::HOST :
                                                                            SchedulerCallableAddressSpace::DEVICE;
@@ -340,7 +429,7 @@ inline StateSelection select_percounter_state(
         }
         runtime->publish_graph_section(static_cast<GraphSectionSource>(source), base, graph.section_bytes);
     }
-    retain_profile_state(runtime, api, device_state, layout);
+    retain_profile_state(runtime, api, device_state, layout, folded, inline_completed_task_ids);
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);
     if (api != nullptr) api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_PERCOUNTER);
     runtime->add_pending_metadata(
@@ -350,9 +439,9 @@ inline StateSelection select_percounter_state(
         "A5 percounter: selected for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
         " MIX list entries, %" PRIu64 " sync cohorts, %zu edges, %zu Graph invocations of %zu Definitions with %" PRIu64
         " body tasks; %" PRIu64 " of %" PRIu64 " region bytes uploaded)",
-        total_tasks, order_count[0], order_count[1], mix_task_count, sync_cohort_count, edges.size(),
-        graph.invocations.size(), graph.templates.size(), graph.layout.body_task_count, layout.upload_size,
-        layout.total_size
+        total_tasks, terminal_control->order_count[0], terminal_control->order_count[1],
+        terminal_control->mix_task_count, sync_cohort_count, edges.size(), graph.invocations.size(),
+        graph.templates.size(), graph.layout.body_task_count, layout.upload_size, layout.total_size
     );
     return StateSelection::PERCOUNTER;
 }

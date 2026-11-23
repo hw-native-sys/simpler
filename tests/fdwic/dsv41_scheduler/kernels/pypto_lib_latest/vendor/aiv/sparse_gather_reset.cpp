@@ -20,6 +20,7 @@
 
 
 
+
 using namespace pto;
 
 
@@ -94,25 +95,25 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     set_ctrl(sbitset0(get_ctrl(), pto::MAD_MODE_BIT));
 #endif
 
-    // Unpack tensor: partials_inline5685__ssa_v0
-    __gm__ Tensor* partials_inline5685__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ float* partials_inline5685__ssa_v0 = reinterpret_cast<__gm__ float*>(partials_inline5685__ssa_v0_tensor->buffer.addr) + partials_inline5685__ssa_v0_tensor->start_offset;
+    // Unpack tensor: partials_inline10860__ssa_v0
+    __gm__ Tensor* partials_inline10860__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ float* partials_inline10860__ssa_v0 = reinterpret_cast<__gm__ float*>(partials_inline10860__ssa_v0_tensor->buffer.addr) + partials_inline10860__ssa_v0_tensor->start_offset;
 
-    // Unpack scalar: slots_inline5684__ssa_v0
-    union { uint64_t u64; int64_t val; } slots_inline5684__ssa_v0_conv;
-    slots_inline5684__ssa_v0_conv.u64 = args[1];
-    int64_t slots_inline5684__ssa_v0 = slots_inline5684__ssa_v0_conv.val;
+    // Unpack scalar: slots_inline10859__ssa_v0
+    union { uint64_t u64; int64_t val; } slots_inline10859__ssa_v0_conv;
+    slots_inline10859__ssa_v0_conv.u64 = args[1];
+    int64_t slots_inline10859__ssa_v0 = slots_inline10859__ssa_v0_conv.val;
 
-    // Unpack scalar: workers_inline5679__ssa_v3
-    union { uint64_t u64; int64_t val; } workers_inline5679__ssa_v3_conv;
-    workers_inline5679__ssa_v3_conv.u64 = args[2];
-    int64_t workers_inline5679__ssa_v3 = workers_inline5679__ssa_v3_conv.val;
+    // Unpack scalar: workers_v1_inline10854__ssa_v0
+    union { uint64_t u64; int64_t val; } workers_v1_inline10854__ssa_v0_conv;
+    workers_v1_inline10854__ssa_v0_conv.u64 = args[2];
+    int64_t workers_v1_inline10854__ssa_v0 = workers_v1_inline10854__ssa_v0_conv.val;
 
-    // Unpack scalar: ready_offset_inline5687__ssa_v0
-    union { uint64_t u64; int64_t val; } ready_offset_inline5687__ssa_v0_conv;
-    ready_offset_inline5687__ssa_v0_conv.u64 = args[3];
-    int64_t ready_offset_inline5687__ssa_v0 = ready_offset_inline5687__ssa_v0_conv.val;
+    // Unpack scalar: ready_offset_inline10861__ssa_v0
+    union { uint64_t u64; int64_t val; } ready_offset_inline10861__ssa_v0_conv;
+    ready_offset_inline10861__ssa_v0_conv.u64 = args[3];
+    int64_t ready_offset_inline10861__ssa_v0 = ready_offset_inline10861__ssa_v0_conv.val;
 
     // Forward to ptoas-generated function
-    sparse_gather_reset(partials_inline5685__ssa_v0, slots_inline5684__ssa_v0, workers_inline5679__ssa_v3, ready_offset_inline5687__ssa_v0);
+    sparse_gather_reset(partials_inline10860__ssa_v0, slots_inline10859__ssa_v0, workers_v1_inline10854__ssa_v0, ready_offset_inline10861__ssa_v0);
 }

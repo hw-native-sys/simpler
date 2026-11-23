@@ -32,11 +32,13 @@ __aicore__ inline int64_t stride(__gm__ int64_t* args, int i) {
 }
 
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+template <bool PackedScales>
 __aicore__ inline void quantize_pair(
     RegTensor<float> value, __ubuf__ uint8_t* dst, __ubuf__ uint16_t* codes,
     uint32_t offset, uint32_t scale_offset,
     MaskReg full, MaskReg lower, MaskReg upper, MaskReg bytes, MaskReg scalar,
-    RegTensor<uint8_t>& byte_indices, RegTensor<int32_t>& zero, RegTensor<int32_t>& one) {
+    RegTensor<uint8_t>& byte_indices, RegTensor<int32_t>& zero, RegTensor<int32_t>& one,
+    RegTensor<uint8_t>& scale_indices, RegTensor<int32_t>& exp254) {
     RegTensor<float> magnitude, lo, hi, maximum, reciprocal;
     vabs(magnitude, value, full);
     vcmax(lo, magnitude, lower);
@@ -49,8 +51,12 @@ __aicore__ inline void quantize_pair(
     vadds(exponent, exponent, -8, full, MODE_ZEROING);
     vmax(exponent, exponent, zero, full, MODE_ZEROING);
     vmin(nonzero, exponent, one, full, MODE_ZEROING);
-    vmuls(reciprocal_code, exponent, -1, full, MODE_ZEROING);
-    vadds(reciprocal_code, reciprocal_code, 254, full, MODE_ZEROING);
+    if constexpr (PackedScales) {
+        vsub(reciprocal_code, exp254, exponent, full, MODE_ZEROING);
+    } else {
+        vmuls(reciprocal_code, exponent, -1, full, MODE_ZEROING);
+        vadds(reciprocal_code, reciprocal_code, 254, full, MODE_ZEROING);
+    }
     vmul(reciprocal_code, reciprocal_code, nonzero, full, MODE_ZEROING);
     vshls((RegTensor<int32_t>&)reciprocal, reciprocal_code, 23, full, MODE_ZEROING);
     vmul(value, value, reciprocal, full, MODE_ZEROING);
@@ -61,17 +67,23 @@ __aicore__ inline void quantize_pair(
     vcvt(fp8, value, full, ROUND_R, RS_DISABLE, PART_P0);
     vselr(packed, (RegTensor<uint8_t>&)fp8, byte_indices);
     vsts(packed, dst, offset, NORM_B8, bytes);
-    RegTensor<uint32_t> first, second;
-    vdup(first, (RegTensor<uint32_t>&)exponent, full, POS_LOWEST, MODE_ZEROING);
-    vdup(second, (RegTensor<uint32_t>&)exponent, full, POS_HIGHEST, MODE_ZEROING);
-    vshls(second, second, 8u, full, MODE_ZEROING);
-    vor(first, first, second, full);
-    vsts((RegTensor<uint16_t>&)first, codes, scale_offset, ONEPT_B16, scalar);
+    if constexpr (PackedScales) {
+        RegTensor<uint8_t> pair;
+        vselr(pair, (RegTensor<uint8_t>&)exponent, scale_indices);
+        vsts((RegTensor<uint16_t>&)pair, codes, scale_offset, ONEPT_B16, scalar);
+    } else {
+        RegTensor<uint32_t> first, second;
+        vdup(first, (RegTensor<uint32_t>&)exponent, full, POS_LOWEST, MODE_ZEROING);
+        vdup(second, (RegTensor<uint32_t>&)exponent, full, POS_HIGHEST, MODE_ZEROING);
+        vshls(second, second, 8u, full, MODE_ZEROING);
+        vor(first, first, second, full);
+        vsts((RegTensor<uint16_t>&)first, codes, scale_offset, ONEPT_B16, scalar);
+    }
 }
 #endif
 
 #if defined(__DAV_VEC__)
-template <int C, typename Input>
+template <int C, typename Input, bool PackedScales = false>
 __tf__ __aicore__ inline void quantize(
     typename Vec<uint8_t, 16, C>::TileDType __out__ output,
     typename Vec<uint8_t, 1, 16 * C / 32>::TileDType __out__ scales,
@@ -110,6 +122,12 @@ __tf__ __aicore__ inline void quantize(
         vci((RegTensor<int8_t>&)byte_indices, (int8_t)0, INC_ORDER);
         vmuls((RegTensor<int16_t>&)byte_indices, (RegTensor<int16_t>&)byte_indices,
               (int16_t)4, pset_b8(PAT_ALL));
+        RegTensor<uint8_t> scale_indices;
+        RegTensor<int32_t> exp254;
+        if constexpr (PackedScales) {
+            vdup((RegTensor<uint16_t>&)scale_indices, uint16_t(0x8000), pset_b16(PAT_ALL), MODE_ZEROING);
+            vdup(exp254, 254, full, MODE_ZEROING);
+        }
         RegTensor<int32_t> zero, one;
         vdup(zero, 0, full, MODE_ZEROING);
         vdup(one, 1, full, MODE_ZEROING);
@@ -119,8 +137,8 @@ __tf__ __aicore__ inline void quantize(
                 RegTensor<float> value;
                 vlds(raw, src, row * C + chunk * 64, UNPK_B16);
                 vcvt(value, raw, full, PART_EVEN);
-                quantize_pair(value, dst, codes, row * C + chunk * 64, chunk * 16 + row,
-                              full, lower, upper, bytes, scalar, byte_indices, zero, one);
+                quantize_pair<PackedScales>(value, dst, codes, row * C + chunk * 64, chunk * 16 + row,
+                              full, lower, upper, bytes, scalar, byte_indices, zero, one, scale_indices, exp254);
             }
         }
         RegTensor<uint8_t> padding;

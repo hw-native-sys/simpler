@@ -55,8 +55,8 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
         window() | {"start_cycles": 100, "end_cycles": 10_100, "function_min_cycles": 1000},
         record("scalar_execution_token_refill", 200, 8200, 1, task_id=7),
         record("scalar_execution_token_receive", 1000, 5000, 2, task_id=7),
-        record("scalar_prepared_acquire", 2000, 4000, 3, task_id=7),
-        record("scalar_dcci_out", 2500, 2600, 4),
+        record("scalar_prepared_receive", 2000, 4000, 3, task_id=7),
+        record("scalar_dcci_single", 2500, 2600, 4),
         record("scalar_self_order_ready", 6000, 8000, 2, task_id=7),
     ]
     profile = partition(rows, [])
@@ -72,8 +72,8 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
     assert [(event["name"], event["dur"]) for event in events] == [
         ("DISPATCH · refill_execution_tokens(t7)", 8.0),
         ("DISPATCH · bind_ticketed_execution(t7)", 4.0),
-        ("DISPATCH · claim_and_receive_payload(t7)", 2.0),
-        ("MEM · DCCI: SINGLE CACHELINE_OUT issue", 0.1),
+        ("BUILD · receive_payload(t7)", 2.0),
+        ("BUILD · DCCI: SINGLE CACHELINE_ALL issue", 0.1),
         ("ENTRY_PERMIT · self_order_ready(t7)", 2.0),
     ]
     assert [event["args"]["scalar_depth"] for event in events] == [1, 2, 3, 4, 2]
@@ -96,6 +96,49 @@ def test_ticket_and_primitive_inherit_only_direct_recorded_claim(caller, expecte
     assert rows["scalar_ordinary_block_claim"]["hbg_stage"] == expected
     assert rows["scalar_atomic_fetch_add"]["hbg_stage"] == expected
     assert "hbg_stage" not in rows["scalar_bypass_load"]
+
+
+def test_l3_claim_loads_preserve_source_and_exclusive_cycles():
+    from simpler_setup.tools.hbg.scalar_profile import apply_l3_detail_policy  # noqa: PLC0415
+
+    profile = partition(
+        [
+            window() | {"function_min_cycles": 1},
+            record("scalar_prepared_claim", 15, 30, 1),
+            record("scalar_gm_load", 20, 21, 2),
+            record("scalar_gm_load", 36, 39, 2),
+            record("scalar_cnt_notify_load", 42, 45, 2),
+            record("scalar_dcci_out", 50, 51, 1),
+            record("scalar_dsb_all", 54, 57, 1),
+        ],
+        [],
+    )
+    apply_l3_detail_policy(profile)
+    loads = [(r["kind"], r["start_cycles"], r["hbg_stage"]) for r in profile["rows"] if "load" in r["kind"]]
+    assert loads == [
+        ("scalar_gm_load", 20, "CLAIM_EXECUTE"),
+        ("scalar_gm_load", 36, "CLAIM_EXECUTE"),
+        ("scalar_cnt_notify_load", 42, "CLAIM_EXECUTE"),
+    ]
+    segments = {row["start_cycles"]: row for row in profile["exclusive"]}
+    for kind, begin, stage in loads:
+        assert (segments[begin]["kind"], segments[begin]["hbg_stage"]) == (kind, stage)
+    assert profile["exclusive_cycles"]["scalar_gm_load"] == 4
+    assert profile["exclusive_cycles"]["scalar_cnt_notify_load"] == 3
+    assert profile["exclusive_cycles"]["scalar_unattributed"] == 66
+    assert "scalar_dcci_out" not in profile["exclusive_cycles"]
+    assert profile["exclusive_cycles"]["scalar_dsb_all"] == 3
+    assert sum(profile["exclusive_cycles"].values()) == 90
+
+
+def test_hbg_l3_requires_a_source_tag_even_inside_a_claim():
+    from simpler_setup.tools.hbg.scalar_profile import apply_l3_detail_policy  # noqa: PLC0415
+
+    profile = partition(
+        [window(), record("scalar_prepared_claim", 15, 30, 1), record("scalar_bypass_load", 20, 21, 2)], []
+    )
+    with pytest.raises(ValueError, match="L3.*load source"):
+        apply_l3_detail_policy(profile)
 
 
 def test_nested_intervals_conserve_time_without_counting_parents_twice():
@@ -268,7 +311,7 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_self_order_ready", "ENTRY_PERMIT · self_order_ready"),
         ("scalar_mix_lane_order_ready", "ENTRY_PERMIT · mix_lane_order_ready"),
         ("scalar_execution_token_refill", "DISPATCH · refill_execution_tokens"),
-        ("scalar_prepared_acquire", "DISPATCH · claim_and_receive_payload"),
+        ("scalar_prepared_receive", "BUILD · receive_payload"),
         ("scalar_prepared_claim", "CLAIM_EXECUTE · claim_for_execution"),
         ("scalar_cluster_mix_discover_task", "CLAIM_BUILD · claim_for_build"),
         ("scalar_build_payload", "BUILD · build_payload"),
@@ -277,7 +320,7 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_can_enter_execution", "ENTRY_PERMIT · check_entry_permit"),
         ("scalar_retire_execution", "RETIRE · retire_execution"),
         ("scalar_subtask_contribute", "FANOUT_PUBLISH · publish_fanout"),
-        ("scalar_counter_accounting", "CONTROL · account_completed_tasks"),
+        ("scalar_counter_accounting", "CONTROL · snapshot_counter_completions"),
         ("scalar_cluster_mix_service", "DISPATCH · cluster_mix_service"),
         ("scalar_group_acquire", "DISPATCH · acquire_group_lane"),
         ("scalar_execution_continuation", "DISPATCH · continue_same_task"),
@@ -316,7 +359,6 @@ def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path
     data = read_perf_data(raw)
     profile = data["scalar_profiles"][0]
     assert profile["complete"]
-    assert profile["exclusive_cycles"][phase] == 5
     assert sum(profile["exclusive_cycles"].values()) == 90
     output = tmp_path / "trace.json"
     generate_chrome_trace_json(
@@ -328,6 +370,12 @@ def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path
         scalar_profiles=data["scalar_profiles"],
     )
     details = [e for e in json.loads(output.read_text())["traceEvents"] if e["ph"] == "X" and e["pid"] == 2]
+    if function.startswith(("TRACE ·", "CONTROL ·")):
+        assert phase not in profile["exclusive_cycles"]
+        assert all(row["kind"] != phase for row in profile["rows"])
+        assert all(not e["name"].startswith(("TRACE ·", "CONTROL ·")) for e in details)
+        return
+    assert profile["exclusive_cycles"][phase] == 5
     parent = next(e for e in details if e["name"] == "DISPATCH · progress_mix_groups")
     child = next(e for e in details if e["name"].startswith(function + "("))
     assert child["name"] == f"{function}(t7)"

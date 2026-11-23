@@ -1,39 +1,28 @@
-# DSV4.1 12 组 L0 AICore 性能与同步约束下界
+# DSV4.1 7 组 L0 AICore 性能与同步约束极限
 
-**单位：ms，平均值。** HBG/percounter 保留2026-11-16上一轮12组结果；本轮新增11组 AICPU TMR 实测，新版原生 MoE 不测。同步约束下界沿用原值。
+7 组均沿用 2026-11-19 在 A5 上实测的 HBG 与 percounter 数据。单位为 ms，每格为 10 轮均值。
 
-| Case | 实现 | main HBG | main percounter | AICPU TMR | 同步约束下界 | 最优实测距下界 |
-| ---- | ---- | -------: | --------------: | --------: | -----------: | -------------: |
-| swa | 新版 PyPTO-lib | 0.293834 | 0.183123 | 0.478452 | 0.134880 | 35.77% |
-| c2a_full | 初版 PyPTO-lib | 1.159377 | 0.966131 | 1.315182 | 0.843450 | 14.55% |
-| c2a_full | DSL 半同步 | 1.521647 | 1.483052 | 1.589281 | 1.341990 | 10.51% |
-| c2a_full | DSL 全同步≤64 | 1.603249 | 1.520360 | 1.659525 | 1.354400 | 12.25% |
-| c2a_full | 新版 PyPTO-lib | 0.371800 | 0.250790 | 0.563781 | 0.198030 | 26.64% |
-| c1a_reindex | 新版 PyPTO-lib | 0.378103 | 0.244629 | 0.564632 | 0.189260 | 29.26% |
-| c1a_reuse | 新版 PyPTO-lib | 0.281126 | 0.192529 | 0.457989 | 0.149950 | 28.40% |
-| moe | DSL 半同步 | 1.450595 | 1.285974 | 1.572825 | — | — |
-| moe | 新版 PyPTO-lib | 0.777624 | 0.550216 | — | — | — |
-| engram | 新版 PyPTO-lib | 0.980122 | 0.847579 | 1.188929 | 0.732110† | 15.77%† |
-| layers_19_21 | DSL 半同步 | 8.981423 | 8.180093 | 9.519084 | — | — |
-| layers_19_21 | 新版 PyPTO-lib | 3.395367 | 2.307145 | 4.499391 | — | — |
+| Case | 实现 | main HBG | main percounter | 同步约束极限 | 最优实测距极限 |
+| ---- | ---- | -------: | --------------: | -----------: | -------------: |
+| swa | 新版 PyPTO-lib | 0.198426 | 0.155792 | 0.108480 | 43.61% |
+| c2a_full | 新版 PyPTO-lib | 0.259634 | 0.217625 | 0.177160 | 22.84% |
+| c1a_reindex | 新版 PyPTO-lib | 0.287002 | 0.267902 | 0.206900 | 29.48% |
+| c1a_reuse | 新版 PyPTO-lib | 0.198850 | 0.169707 | 0.125280 | 35.46% |
+| moe | 新版 PyPTO-lib | 0.489058 | 0.461403 | 0.369730† | 24.79%† |
+| engram | 新版 PyPTO-lib | 0.103850 | 0.102815 | 0.095130 | 8.08% |
+| layers_19_21 | 新版 PyPTO-lib | 2.165814 | 1.952667 | 1.552940† | 25.74%† |
+| 总时间 | 7 组 | 3.702633 | 3.327909 | 2.635620† | 26.27%† |
 
-## 版本与测试方式
+## 实测方式
 
-- 测试源码 `f1d91abdb80a1ea455e3239b4d060003170d693d`：当前本地 HBG `3730c4be060a5abc442250d37a1aa89f66afcc7d`，合入 [PR #3114](https://github.com/hw-native-sys/simpler/pull/3114) 的 `a0b90c0be790ddf445e11f50f118f8e37a28f5a5`，并保留独立 MoE 测试入口。两套运行库从这一固定源码构建；业务 kernel 和输入复用原包。表头保留 `main HBG` / `main percounter`，不表示 GitHub 当前 main。
-- TMR 列来自带首尾采集的测试运行库：AICPU 回放固定任务流，补充 L0 AICore 首尾采集。采集现已移到 `tmr_runtime.py` 创建的独立源码副本和输出目录；普通 TMR 源码及默认构建不包含这些改动。本次保留原11组数据，隔离构建另做验证。按 TMR Tensor ABI 重编实际使用的 kernel，数值计算源和输入不变。11组全部通过原有回放数值校验。TMR 另批次自动分配设备，三列不是同卡三方配对；不能把差值全部归因于调度算法。
-- 纯 L0：每个运行库1次预热、10次正式测量。AICore wall 为首个实际 AIC/AIV kernel 开始至最后一个实际 kernel 结束，包含中间调度、依赖与通信等待，不包含 AICPU 启动和收尾。Device wall 仅作诊断，不填入表格。
-- 每个用例的 HBG 与 percounter 在同一张卡或同一对卡上顺序测量，用例间交替执行顺序。双卡每次执行前均完成跨 Device 启动会合；逐轮取两卡各自 AICore 时长的最大值，再取10轮平均，不跨卡相减原始计数器。
-- 全程通过 `task-submit --device auto --device-num N` 自动分配，最多8卡并发。A5 Ascend950DT_9581（32 AIC / 64 AIV），CANN 9.3.0。本轮12组、两套运行库的配对测试共耗时220.81秒（包含排队，不含构建）。实际设备号、源码/运行库摘要和双卡会合证据保存在本地 `artifacts/pr3114-refresh/summary.json`、`build-audit.json`、`paired-state.json` 与各用例的 `wall.json`。
-- 新版模型固定为 [dev/hbg@a6a9a2d49047](https://github.com/hw-native-sys/pypto-lib/tree/a6a9a2d49047ce67a85857c6b15f9604a7287714/models/deepseek_v4_1_flash)。新版 MoE 执行原始 Host 编排及实际 `get_tensor_data<int32_t>(num_tokens)`，保留原非零权重和强制路由，只测 `72/72`；按性能测试定位跳过数值 golden 与 `0/6`、`6/0` 功能检查，结果标记 `numerical_validation: false`。权重缓存仅保存在本地忽略目录。
-- 表内其余11组保留固定回放输入及原有结果校验。回放覆盖捕获控制值下的设备任务和同步通信，不覆盖动态 Host tensor 读取；新版 MoE 的 `recv_count_local` 和 route 仍由 AICore task 读取。跨实现组的变化同时包含算子、融合和缓存布局差异。
-- TMR 设备号、逐轮时长和双卡会合证据保存在本地 `artifacts/tmr/summary.json` 和 `tmr-fixed/*/wall.json`。测试专用端点采集尚未单独完成小于1%的开销验收，表内 TMR 时间包含该采集；普通 TMR 不承担这部分开销。
-- 本表记录的是 AICore wall；更早的旧表使用包含 AICPU 的 Device wall，两者数值不能直接解释为调度加速比例。
+- Simpler 本地 `main` 为 `88226709a`，PTO-ISA 为 `83b1b2b52`，CANN 为 9.3.0。新版七组来自 [PyPTO-lib dev/hbg 的固定版本](https://github.com/hw-native-sys/pypto-lib/tree/4cb74422616359b3f95c598b1f9cdd31cf4e4173/models/deepseek_v4_1_flash)。
+- Ascend950DT_9581，32 AIC / 64 AIV。HBG、percounter 各预热 1 轮，测量 10 轮，共 140 个有效样本。两列都取同一口径的 L0 AICore wall，从第一个业务 kernel 开始到最后一个业务 kernel 结束。
+- 每个用例通过 `task-submit --device auto --device-num N` 分配设备。两种运行库在同一组卡上顺序运行。2 组双卡用例每轮计时前完成跨卡 Device 会合，再取两个 rank 的 AICore wall 较大值。
+- 6 组回放校验与原始执行的输出。新版原生 MoE 保留实际 Host 编排、`get_tensor_data<int32_t>(num_tokens)`、72/72 输入及非零权重，按性能用例约定跳过数值 golden。
 
-## 同步约束下界
+## 同步约束极限
 
-- 8个非通信配置沿用各自已计算的下界，本轮不重采 L1、不重求解。新版下界来自历史 HBG 534c L1，初版/DSL 来自各自历史21d2 L1；半同步和全同步使用独立模型与耗时。用例、kernel、依赖和同步策略保持不变。
-- 模型保留任务完成依赖、32 AIC / 64 AIV 容量、不可抢占 block、MIX 同 block 共同启动、sync_start 全 block 共同启动；调度成本为零，放宽 cluster 放置。时长向下量化为100ns，取10轮已证明下界的平均值。
-- 下界依赖历史 L1 kernel 时长，是同步约束下的参考模型，不是硬件绝对极限，也不保证是本轮 L0 的严格下界。通信场景不计算。
-- 最优实测距下界 = `(min(main HBG, main percounter, 可用的 AICPU TMR) / 同步约束下界 - 1) × 100%`，按未舍入值计算，不截断负值。
-- **†**：新版 Engram 的10轮未证明最优；平均已证明下界0.732110ms、可行排程0.735090ms，表中采用前者。其他7个配置均已证明全部轮次最优。
-- 用例和复现方式见 [README](README.md)，模型见 [BOUND.md](BOUND.md)。
+- 新版七组用各自的新图和 10 轮 HBG L1 kernel 耗时测算。模型保留 AIC/AIV 容量、MIX、`sync_start` 与任务依赖，令调度开销为零。具有提前调度标记的回放以本轮观测到的任务完成顺序为条件。
+- 新版原生 MoE 及 layers 19–21 保留通信 kernel 的实测耗时。模型按对端目标 block 完成发布、对端来源的 `defer_wait` 满足后才能完成来连接两卡，本卡来源分支直接返回。每轮分别有 4 和 12 条跨卡完成依赖。
+- † 表示部分轮次只有求解器给出的乐观界。新版原生 MoE 十轮平均的已证界与可行值为 0.369730 至 0.371210 ms，新版 layers 19–21 为 1.552940 至 2.003100 ms。新版五个单卡用例均已证明每轮模型最优。
+- 差距按 `(min(HBG, percounter) / 同步约束极限 - 1) × 100%` 计算。总时间取各列未舍入均值之和，再用两套运行库各自的合计计算差距。完整逐轮样本、实际卡号、会合记录和求解结果保存在本地 `artifacts/model-refresh-4cb74422/`。

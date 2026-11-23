@@ -35,8 +35,9 @@ struct CatalogImage {
     std::vector<uint8_t> storage;
     void *base{nullptr};
 
-    explicit CatalogImage(const std::vector<SchedulerTaskMetadata> &metadata) {
-        if (!scheduler_plan_task_catalog(metadata, 2, 64, &plan)) throw std::logic_error("cannot plan test catalog");
+    explicit CatalogImage(const std::vector<SchedulerTaskMetadata> &metadata, uint32_t clusters = 2) {
+        if (!scheduler_plan_task_catalog(metadata, clusters, 64, &plan))
+            throw std::logic_error("cannot plan test catalog");
         storage.resize(plan.total_size + SCHEDULER_STATE_BASE_ALIGNMENT);
         base = reinterpret_cast<void *>(
             (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_BASE_ALIGNMENT - 1) &
@@ -46,9 +47,32 @@ struct CatalogImage {
     }
 
     bool valid() {
-        return scheduler_task_catalog_validate(base, plan.total_size, plan.header_offset, plan.header.task_count, 2);
+        return scheduler_task_catalog_validate(
+            base, plan.total_size, plan.header_offset, plan.header.task_count, plan.cluster_count
+        );
     }
 };
+
+template <size_t MaxTasks>
+bool prepare_ordinary(
+    scheduler_test::BasicGraphBuffer<MaxTasks> &graph, std::vector<SchedulerTaskMetadata> &metadata,
+    std::vector<int64_t> &completed, SchedulerTaskCatalogPlan &catalog, SchedulerDependencyPlan &dependencies,
+    std::string *error = nullptr
+) {
+    const SchedulerOrdinaryFaninPool pool{graph.payload(0).fanin_data(), metadata.size() * SCHEDULER_GRAPH_MAX_FANIN};
+    return scheduler_order_task_catalog(graph.graph(), metadata, completed, &catalog, error, &dependencies, &pool) &&
+           scheduler_prepare_ordinary_fanin(
+               graph.storage(), pool.data, pool.capacity, metadata, completed, catalog, dependencies, error
+           );
+}
+
+template <size_t MaxTasks>
+bool prepare_ordinary(scheduler_test::BasicGraphBuffer<MaxTasks> &graph, std::vector<int64_t> completed = {}) {
+    std::vector<SchedulerTaskMetadata> metadata(graph.graph().task_count, physical(LaneMask::aic()));
+    CatalogImage image(metadata);
+    SchedulerDependencyPlan dependencies;
+    return prepare_ordinary(graph, metadata, completed, image.plan, dependencies);
+}
 
 TEST(HbgTaskCatalog, PhysicalTasksUseTwoEngineListsAndControlsRemainSeparate) {
     std::vector<SchedulerTaskMetadata> metadata{
@@ -152,6 +176,139 @@ TEST(HbgTaskCatalog, TopologicalGenerationsExposeIndependentBranchesBeforeDeeper
     EXPECT_EQ(image.plan.header.first_mix_ref, 4u);
 }
 
+SchedulerTaskMetadata spmd(LaneMask lanes, uint16_t blocks, bool sync_start = false) {
+    auto task = physical(lanes, blocks);
+    task.flags |= SCHEDULER_TASK_SPMD;
+    if (sync_start) task.flags |= SCHEDULER_TASK_SYNC_START;
+    return task;
+}
+
+void expect_wave_order(
+    uint32_t clusters, const std::vector<SchedulerTaskMetadata> &tasks, const std::vector<std::vector<int64_t>> &fanin,
+    const std::vector<int64_t> &expected, bool native = false, bool deferred = false, uint64_t controls = 0
+) {
+    SchedulerDependencyPlan deps;
+    deps.fanin = fanin;
+    CatalogImage image(tasks, clusters);
+    std::string error;
+    const bool promote = scheduler_can_defer_side_tasks(native, deferred, controls, tasks);
+    ASSERT_TRUE(scheduler_order_task_catalog(deps, tasks, &image.plan, &error, promote)) << error;
+    EXPECT_EQ(image.plan.task_order, expected);
+    EXPECT_EQ(deps.fanin, fanin);
+    for (size_t ref = 0; ref < tasks.size(); ++ref)
+        for (const auto pred : fanin[ref])
+            EXPECT_LT(image.plan.task_ranks[pred], image.plan.task_ranks[ref]);
+    scheduler_init_task_catalog(image.base, image.plan);
+    EXPECT_TRUE(image.valid());
+}
+
+TEST(HbgTaskCatalog, ShortIndependentBranchYieldsOnlyToAnOverlappingWaveOnItsOwnEngine) {
+    const std::vector<std::vector<int64_t>> fanin{{}, {}, {1}, {2}};
+    const std::vector<int64_t> original{1, 0, 2, 3}, delayed{1, 2, 0, 3};
+    for (const auto lanes : {LaneMask::aic(), LaneMask::aiv0()}) {
+        SCOPED_TRACE(static_cast<int>(lanes.raw()));
+        const uint16_t capacity = lanes.has_aic() ? 8 : 16;
+        const uint16_t side = capacity / 2 - 1;
+        const uint16_t wave = capacity - side + 1;
+        const auto other = lanes.has_aic() ? LaneMask::aiv0() : LaneMask::aic();
+        std::vector<SchedulerTaskMetadata> tasks{
+            spmd(lanes, side), physical(LaneMask::all()), spmd(lanes, wave), physical(other)
+        };
+        expect_wave_order(8, tasks, fanin, delayed);
+        tasks[2] = spmd(lanes, wave - 1);  // Both fit at once.
+        expect_wave_order(8, tasks, fanin, original);
+        tasks[2] = spmd(lanes, capacity, true);
+        expect_wave_order(8, tasks, fanin, delayed);  // The wave may use sync_start.
+        tasks[0] = spmd(lanes, capacity / 2);
+        expect_wave_order(8, tasks, fanin, original);
+        tasks[0] = spmd(lanes, side, true);
+        expect_wave_order(8, tasks, fanin, original);
+        tasks[0] = physical(other);
+        expect_wave_order(8, tasks, fanin, original);
+        tasks[0] = physical(LaneMask::all());
+        expect_wave_order(8, tasks, fanin, original);
+    }
+}
+
+TEST(HbgTaskCatalog, MixedWaveCountsItsComputingLanesOnTheContendedEngine) {
+    // Eight clusters have eight AICs and sixteen AIVs. A six-block MIX with one AIV
+    // per block leaves ten vector cores available; with two per block it leaves four.
+    const auto root = physical(LaneMask::all());
+    const auto one_aiv = spmd(LaneMask(true, false, true), 6);
+    const auto two_aivs = spmd(LaneMask::all(), 6, true);
+    const std::vector<std::vector<int64_t>> fanin{{}, {}, {1}, {2}};
+    expect_wave_order(8, {spmd(LaneMask::aic(), 3), root, one_aiv, root}, fanin, {1, 2, 0, 3});
+    expect_wave_order(8, {spmd(LaneMask::aiv0(), 7), root, one_aiv, root}, fanin, {1, 0, 2, 3});
+    expect_wave_order(8, {spmd(LaneMask::aiv0(), 7), root, two_aivs, root}, fanin, {1, 2, 0, 3});
+    expect_wave_order(8, {spmd(LaneMask::aic(), 3), root, spmd(LaneMask::both_aiv(), 8), root}, fanin, {1, 0, 2, 3});
+    // Ten MIX blocks execute in waves across eight clusters. A single AIV per cluster
+    // leaves eight AIVs free, while a two-AIV MIX occupies all sixteen.
+    const auto side = spmd(LaneMask::aiv0(), 7);
+    expect_wave_order(8, {side, root, spmd(LaneMask(true, false, true), 10), root}, fanin, {1, 0, 2, 3});
+    expect_wave_order(8, {side, root, spmd(LaneMask::all(), 10), root}, fanin, {1, 2, 0, 3});
+    // A pure vector wave can use either AIV per cluster, so all ten blocks can be active.
+    expect_wave_order(8, {side, root, spmd(LaneMask::aiv0(), 10), root}, fanin, {1, 2, 0, 3});
+}
+
+TEST(HbgTaskCatalog, DualAivSpmdRemainsAWideTargetBetweenVectorBranches) {
+    const std::vector<SchedulerTaskMetadata> tasks{
+        spmd(LaneMask::aiv0(), 7), spmd(LaneMask::both_aiv(), 7), physical(LaneMask::aic()), spmd(LaneMask::aiv0(), 16),
+        physical(LaneMask::aic())
+    };
+    for (const auto &task : tasks)
+        ASSERT_EQ(
+            task.flags, scheduler_task_metadata_flags_from_submit_state(
+                            task.active_mask, TaskAttrs{}, task.logical_block_num, false
+                        )
+        );
+    // The seven-block dual-AIV task uses fourteen of the sixteen vector cores. It cannot be deferred.
+    expect_wave_order(8, tasks, {{}, {}, {}, {2}, {3}}, {2, 0, 1, 3, 4});
+    // Give that task a longer branch than task 0. Task 0 may move behind it, but cannot pass the next wave.
+    expect_wave_order(8, tasks, {{}, {2}, {}, {2}, {1, 3}}, {2, 1, 0, 3, 4});
+}
+
+TEST(HbgTaskCatalog, NarrowBranchCannotPassAnotherCooperativeTaskOrAnEquallyCriticalBranch) {
+    const auto lanes = LaneMask::aic();
+    const auto side = spmd(lanes, 3), wave = spmd(lanes, 6);
+    const auto root = physical(LaneMask::aiv0());
+    const std::vector<std::vector<int64_t>> fork{{}, {}, {}, {2}, {3}};
+    for (const auto barrier : {physical(LaneMask::all()), spmd(LaneMask::aiv0(), 2, true)})
+        expect_wave_order(8, {side, barrier, root, wave, root}, fork, {2, 0, 1, 3, 4});
+    // Both independent branches still have one edge remaining.
+    expect_wave_order(8, {side, root, wave, root, root}, {{}, {}, {1}, {2}, {0}}, {1, 0, 2, 4, 3});
+    // An eligible wave two generations away is outside the search.
+    expect_wave_order(8, {side, root, root, wave, root}, {{}, {}, {1}, {2}, {3}}, {1, 0, 2, 3, 4});
+    // The would-be delayed branch supplies a direct input to the wave.
+    expect_wave_order(8, {side, root, wave, root}, {{}, {}, {0, 1}, {2}}, {0, 1, 2, 3});
+}
+
+TEST(HbgTaskCatalog, NarrowBranchStopsAtTheNearestCompetingWave) {
+    const auto lanes = LaneMask::aic();
+    const auto root = physical(LaneMask::aiv0());
+    const auto side = spmd(lanes, 3), wave = spmd(lanes, 6);
+    const std::vector<std::vector<int64_t>> fork{{}, {}, {1}, {1}, {2}, {3}};
+    expect_wave_order(8, {side, root, wave, wave, root, root}, fork, {1, 2, 0, 3, 4, 5});
+    // Leave the side task available alongside the first wave if both fit.
+    expect_wave_order(8, {side, root, spmd(lanes, 4), wave, root, root}, fork, {1, 0, 2, 3, 4, 5});
+    // A single wave can displace only the closest of two equally eligible side branches.
+    expect_wave_order(8, {side, side, root, wave, root}, {{}, {}, {}, {2}, {3}}, {2, 0, 3, 1, 4});
+}
+
+TEST(HbgTaskCatalog, NativeDeferredAndLiveControlGraphsKeepTheGenerationalOrder) {
+    const auto lanes = LaneMask::aic();
+    std::vector<SchedulerTaskMetadata> tasks{
+        spmd(lanes, 3), physical(LaneMask::all()), spmd(lanes, 6), physical(lanes)
+    };
+    const std::vector<std::vector<int64_t>> fanin{{}, {}, {1}, {2}};
+    const std::vector<int64_t> original{1, 0, 2, 3};
+    expect_wave_order(8, tasks, fanin, {1, 2, 0, 3});
+    expect_wave_order(8, tasks, fanin, original, true);
+    expect_wave_order(8, tasks, fanin, original, false, true);
+    expect_wave_order(8, tasks, fanin, original, false, false, 1);
+    tasks.back().flags |= SCHEDULER_TASK_HAS_PREDICATE;
+    expect_wave_order(8, tasks, fanin, original);
+}
+
 TEST(HbgTaskCatalog, OrdinaryFaninConfirmsEarlierBranchWithoutChangingDependenciesOrIssueOrder) {
     scheduler_test::BasicGraphBuffer<8> graph(5);
     graph.executable(0, 0);
@@ -170,7 +327,7 @@ TEST(HbgTaskCatalog, OrdinaryFaninConfirmsEarlierBranchWithoutChangingDependenci
     auto *const fanin_address = payload.fanin_data();
     std::vector<int32_t> original(fanin_address, fanin_address + payload.fanin_count);
 
-    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), image.plan.task_ranks, {}, &error)) << error;
+    ASSERT_TRUE(prepare_ordinary(graph)) << error;
     ASSERT_EQ(payload.fanin_count, 3);
     EXPECT_EQ(payload.fanin_data(), fanin_address);
     std::vector<int32_t> reordered(fanin_address, fanin_address + payload.fanin_count);
@@ -206,14 +363,12 @@ TEST(HbgTaskCatalog, FoldingSingleConsumerControlsPreservesRealCompletionDebt) {
             graph.storage()[ref].task.kernel_id[lane] = -1;
         }
     }
-    auto *pool = graph.payload(0).fanin_data();
     CatalogImage image(metadata);
-    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, completed, &image.plan));
     std::string error;
-    ASSERT_TRUE(scheduler_fold_ordinary_controls(
-        graph.storage(), pool, 8 * SCHEDULER_GRAPH_MAX_FANIN, &metadata, &completed, &error
-    )) << error;
+    SchedulerDependencyPlan dependencies;
+    ASSERT_TRUE(prepare_ordinary(graph, metadata, completed, image.plan, dependencies, &error)) << error;
     EXPECT_EQ(completed, (std::vector<int64_t>{2, 3, 5, 6}));
+    EXPECT_EQ(dependencies.sinks, (std::vector<uint32_t>{4, 7}));
     ASSERT_EQ(graph.payload(4).fanin_count, 2);
     EXPECT_EQ(
         std::vector<int32_t>(graph.payload(4).fanin_data(), graph.payload(4).fanin_data() + 2),
@@ -279,9 +434,9 @@ TEST(HbgTaskCatalog, SharedAndOversizedControlJoinsRemainLive) {
         }
         std::vector<int64_t> completed;
         auto *const consumer_fanin = graph.payload(count - 1).fanin_data();
-        ASSERT_TRUE(scheduler_fold_ordinary_controls(
-            graph.storage(), graph.payload(0).fanin_data(), count * SCHEDULER_GRAPH_MAX_FANIN, &metadata, &completed
-        ));
+        CatalogImage image(metadata);
+        SchedulerDependencyPlan dependencies;
+        ASSERT_TRUE(prepare_ordinary(graph, metadata, completed, image.plan, dependencies));
         EXPECT_TRUE(completed.empty());
         EXPECT_TRUE(scheduler_task_is_inline(metadata[join].flags));
         EXPECT_EQ(graph.payload(join).fanin_count, static_cast<int32_t>(parents.size()));
@@ -300,7 +455,7 @@ TEST(HbgTaskCatalog, CompletedNodesDoNotReadStaleIncomingDependenciesDuringOrder
     EXPECT_FALSE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan, &error));
     ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {0}, &image.plan, &error)) << error;
     EXPECT_EQ(image.plan.catalogs[0], (std::vector<int64_t>{0, 2, 1}));
-    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), image.plan.task_ranks, {0}, &error)) << error;
+    ASSERT_TRUE(prepare_ordinary(graph, {0})) << error;
     EXPECT_EQ(graph.payload(0).fanin_data()[0], INT32_MAX);
     EXPECT_EQ(graph.payload(1).fanin_count, 2);
 }
@@ -312,12 +467,14 @@ TEST(HbgTaskCatalog, ResidentFaninDropsOnlyPredecessorsProvenByAnotherLiveDepend
     graph.executable(2, 0, {0});
     graph.executable(3, 0, {0, 2});
     graph.executable(4, 0, {0, 1, 2, 3});
-    const std::vector<SchedulerTaskMetadata> metadata(5, physical(LaneMask::aic()));
+    std::vector<SchedulerTaskMetadata> metadata(5, physical(LaneMask::aic()));
     CatalogImage image(metadata);
     ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan));
     const auto catalogs = image.plan.catalogs;
     const auto order = image.plan.task_order;
-    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), image.plan.task_ranks, {}));
+    std::vector<int64_t> completed;
+    SchedulerDependencyPlan dependencies;
+    ASSERT_TRUE(prepare_ordinary(graph, metadata, completed, image.plan, dependencies));
     ASSERT_EQ(graph.payload(3).fanin_count, 1);
     EXPECT_EQ(graph.payload(3).fanin_data()[0], 2);
     ASSERT_EQ(graph.payload(4).fanin_count, 2);
@@ -332,7 +489,7 @@ TEST(HbgTaskCatalog, HostCompletedNodeCannotProveItsHistoricalPredecessorDone) {
     graph.executable(0, 0);
     graph.executable(1, 0, {0});
     graph.executable(2, 0, {0, 1});
-    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), {0, 1, 2}, {1}));
+    ASSERT_TRUE(prepare_ordinary(graph, {1}));
     EXPECT_EQ(graph.payload(2).fanin_count, 2);
 }
 
@@ -347,10 +504,8 @@ TEST(HbgTaskCatalog, AliasedFaninRowsKeepEveryOriginalDependency) {
         graph.executable(4, 0, {1});
         auto *const row = graph.payload(3).fanin_data();
         graph.payload(4).fanin.set(row + 1);
-        const std::vector<uint32_t> ranks =
-            transitive ? std::vector<uint32_t>{0, 1, 2, 3, 4} : std::vector<uint32_t>{0, 2, 1, 3, 4};
 
-        ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), ranks, {}));
+        ASSERT_TRUE(prepare_ordinary(graph));
         ASSERT_EQ(graph.payload(4).fanin_count, 1);
         EXPECT_EQ(graph.payload(4).fanin_data()[0], 1);
         EXPECT_EQ(graph.payload(3).fanin_count, 3);
@@ -358,20 +513,74 @@ TEST(HbgTaskCatalog, AliasedFaninRowsKeepEveryOriginalDependency) {
     }
 }
 
+TEST(HbgTaskCatalog, InsufficientAliasedPoolKeepsLiveJoinAndDuplicateDependencies) {
+    scheduler_test::BasicGraphBuffer<8> graph(6);
+    std::vector<SchedulerTaskMetadata> metadata(6, physical(LaneMask::aic()));
+    auto *shared = graph.payload(0).fanin_data();
+    shared[0] = 0;
+    shared[1] = 0;
+    for (uint32_t ref = 0; ref < 6; ++ref) {
+        graph.executable(ref, 0);
+        if (ref >= 2) {
+            graph.payload(ref).fanin.set(shared);
+            graph.payload(ref).fanin_count = 2;
+        }
+    }
+    metadata[5].flags |= SCHEDULER_TASK_INLINE;
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        metadata[5].kernel_ids[lane] = UINT16_MAX;
+    CatalogImage image(metadata);
+    SchedulerDependencyPlan plan;
+    std::vector<int64_t> completed;
+    const SchedulerOrdinaryFaninPool pool{shared, 2};
+    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, completed, &image.plan, nullptr, &plan, &pool));
+    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), shared, 2, metadata, completed, image.plan, plan));
+    EXPECT_TRUE(completed.empty());
+    EXPECT_TRUE(scheduler_task_is_inline(metadata[5].flags));
+    EXPECT_EQ(plan.sinks, (std::vector<uint32_t>{1, 2, 3, 4, 5}));
+    for (uint32_t ref = 2; ref < 6; ++ref) {
+        EXPECT_EQ(plan.fanin[ref], (std::vector<int64_t>{0, 0}));
+        EXPECT_EQ(graph.payload(ref).fanin_data(), shared);
+    }
+}
+
+TEST(HbgTaskCatalog, RejectsFaninPastPoolEndBeforeReadingIt) {
+    scheduler_test::BasicGraphBuffer<4> graph(3);
+    auto *pool_base = graph.payload(0).fanin_data();
+    graph.executable(2, 0, {0, 1});
+    graph.payload(2).fanin.set(pool_base + 1);
+    const SchedulerOrdinaryFaninPool pool{pool_base, 2};
+    SchedulerTaskShape shape;
+    std::vector<int64_t> decoded;
+    EXPECT_EQ(
+        scheduler_classify_host_task(graph.graph(), 2, &shape, pool, &decoded), SchedulerGraphResult::INVALID_FANIN_ID
+    );
+    EXPECT_TRUE(decoded.empty());
+    const SchedulerOrdinaryFaninPool valid_pool{pool_base, 3};
+    pool_base[1] = 0;
+    pool_base[2] = 0;
+    EXPECT_EQ(
+        scheduler_classify_host_task(graph.graph(), 2, &shape, valid_pool, &decoded),
+        SchedulerGraphResult::INVALID_FANIN_ID
+    );
+    pool_base[2] = 1;
+    EXPECT_EQ(scheduler_classify_host_task(graph.graph(), 2, &shape, valid_pool, &decoded), SchedulerGraphResult::OK);
+    EXPECT_EQ(decoded, (std::vector<int64_t>{0, 1}));
+    EXPECT_FALSE(pool.contains(reinterpret_cast<const int32_t *>(reinterpret_cast<uintptr_t>(pool_base) + 1), 1));
+}
+
 TEST(HbgTaskCatalog, BoundedAncestryRetainsDistantEdgesAndValidatesBeforeMutation) {
     scheduler_test::BasicGraphBuffer<128> graph(66);
-    std::vector<uint32_t> ranks(66);
     for (int32_t ref = 0; ref < 66; ++ref) {
         graph.executable(ref, 0);
-        ranks[ref] = ref;
     }
     graph.executable(1, 0, {0});
     graph.executable(64, 0, {0, 1});
     graph.executable(65, 0, {0, 1, 64, 65});
-    EXPECT_FALSE(scheduler_prepare_ordinary_fanin(graph.storage(), ranks, {}));
+    EXPECT_FALSE(prepare_ordinary(graph));
     EXPECT_EQ(graph.payload(64).fanin_count, 2);
     graph.executable(65, 0, {0, 1, 64});
-    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), ranks, {}));
+    ASSERT_TRUE(prepare_ordinary(graph));
     ASSERT_EQ(graph.payload(64).fanin_count, 1);
     EXPECT_EQ(graph.payload(64).fanin_data()[0], 1);
     ASSERT_EQ(graph.payload(65).fanin_count, 2);
@@ -481,19 +690,25 @@ TEST(HbgTaskCatalog, InvalidTopologyOrOverflowLeavesThePreviousPlanIntact) {
     EXPECT_EQ(plan.catalogs, catalogs);
 }
 
-TEST(HbgHostDependencies, ValidatesEveryLiveFaninWithoutAllocatingProducerCredits) {
+TEST(HbgHostDependencies, SinksFollowOnlyValidatedLiveEdges) {
     scheduler_test::BasicGraphBuffer<4> graph(2);
     graph.executable(0, 0);
     graph.executable(1, 0, {0, 0});
     const std::vector<SchedulerTaskMetadata> metadata(2, physical(LaneMask::aic()));
-    EXPECT_TRUE(scheduler_validate_dependencies(graph.graph(), metadata, {}));
-    EXPECT_TRUE(scheduler_validate_dependencies(graph.graph(), metadata, {0}));
-    EXPECT_FALSE(scheduler_validate_dependencies(graph.graph(), metadata, {2}));
-    EXPECT_FALSE(scheduler_validate_dependencies(graph.graph(), {metadata[0]}, {}));
+    SchedulerDependencyPlan dependencies;
+    ASSERT_TRUE(scheduler_plan_dependencies(graph.graph(), metadata, {}, dependencies));
+    EXPECT_EQ(dependencies.sinks, (std::vector<uint32_t>{1}));
+    ASSERT_TRUE(scheduler_plan_dependencies(graph.graph(), metadata, {1}, dependencies));
+    EXPECT_EQ(dependencies.sinks, (std::vector<uint32_t>{0}));
+    EXPECT_EQ(dependencies.host_done, (std::vector<bool>{false, true}));
+    ASSERT_TRUE(scheduler_plan_dependencies(graph.graph(), metadata, {0, 1}, dependencies));
+    EXPECT_TRUE(dependencies.sinks.empty());
+    EXPECT_FALSE(scheduler_plan_dependencies(graph.graph(), metadata, {2}, dependencies));
+    EXPECT_FALSE(scheduler_plan_dependencies(graph.graph(), {metadata[0]}, {}, dependencies));
     for (int32_t producer : {-1, 1, 2, INT32_MAX}) {
         SCOPED_TRACE(producer);
         graph.executable(1, 0, {producer});
-        EXPECT_FALSE(scheduler_validate_dependencies(graph.graph(), metadata, {}));
+        EXPECT_FALSE(scheduler_plan_dependencies(graph.graph(), metadata, {}, dependencies));
     }
 }
 

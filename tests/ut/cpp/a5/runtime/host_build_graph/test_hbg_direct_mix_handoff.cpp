@@ -86,14 +86,23 @@ protected:
             for (uint32_t worker = 0; worker < 3; ++worker) {
                 if (worker == held_worker) continue;
                 ASSERT_TRUE(fixture.fill(worker));
-                if (mask.has(static_cast<SubtaskSlot>(held_worker))) {
-                    GmExecution premature{};
-                    EXPECT_FALSE(fixture.begin(worker, &premature));
-                }
+                GmExecution member{};
+                if (!fixture.begin(worker, &member)) continue;
+                ASSERT_EQ(member.task, successor);
+                EXPECT_TRUE(executions.emplace(member.task, member.block, member.subtask).second);
+                if (first_entries.empty()) first_entries.push_back(member.task);
+                ASSERT_TRUE(fixture.complete(member));
             }
-            EXPECT_EQ(
-                fixture.locals[held_worker]->execution_at(held.slot).state, SchedulerDispatchSlotState::EXECUTING
-            );
+            if (producer_lane == 0 && mask == kAicAiv1) {
+                EXPECT_EQ(executions.count({successor, 0, 0}), 1u);
+            }
+            const auto &owner = fixture.locals[held_worker]->execution_at(held.slot);
+            EXPECT_EQ(owner.task_ref, held.task);
+            EXPECT_EQ(owner.state, SchedulerDispatchSlotState::EXECUTING);
+            if (mask.has(static_cast<SubtaskSlot>(held_worker))) {
+                EXPECT_FALSE(fixture.task_done(successor));
+                EXPECT_EQ(scheduler_completion_count(fixture.control(successor)->completion_state), 0u);
+            }
             ASSERT_TRUE(fixture.complete(held));
         }
         bool finished = false;
@@ -109,7 +118,7 @@ protected:
                     first_entries.push_back(execution.task);
                 ASSERT_TRUE(fixture.complete(execution));
             }
-            finished = scheduler_test::resolved_count(fixture.run()) == shapes.size();
+            finished = fixture.storage.completed_gm_records() == shapes.size();
         }
         ASSERT_TRUE(finished);
         EXPECT_EQ(executions.size(), static_cast<size_t>(mask.count()) * (second_mix ? 2 : 1));
@@ -148,7 +157,7 @@ TEST(HbgDirectMixHandoffOrder, AllEarlierSyncBlocksCanRunBeforeAnIndependentLate
         fixture.graph.executable(2, successor.has_aic() ? 0 : 1, {0});
         ASSERT_TRUE(fixture.prepare_calls());
         std::set<std::tuple<int64_t, uint32_t, uint8_t>> completed;
-        for (uint32_t pass = 0; pass < 64 && scheduler_test::resolved_count(fixture.run()) != 3; ++pass) {
+        for (uint32_t pass = 0; pass < 64 && fixture.storage.completed_gm_records() != 3; ++pass) {
             for (uint32_t worker = 0; worker < fixture.locals.size(); ++worker) {
                 ASSERT_TRUE(fixture.fill(worker));
                 GmExecution unit{};
@@ -159,7 +168,7 @@ TEST(HbgDirectMixHandoffOrder, AllEarlierSyncBlocksCanRunBeforeAnIndependentLate
             }
         }
         EXPECT_EQ(completed.size(), 4u + 2u * successor.count());
-        EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 3u);
+        EXPECT_EQ(fixture.storage.completed_gm_records(), 3u);
         EXPECT_EQ(fixture.run()->scheduler_error, 0u);
     }
 }

@@ -251,9 +251,9 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
         exits = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 4]
         assert len(enters) == len(exits) == 1
         assert controls[enters[0]]["state"] == 2 and controls[exits[0]]["state"] == 0
-        assert protocol["resolved_task_count"] == 1
-    else:
-        assert protocol["resolved_task_count"] == 0
+    unknown = any(counter["valid"] == 0 for counter in protocol["completion_counters"])
+    expected_resolved = None if unknown else int("node_map" in protocol)
+    assert protocol["resolved_task_count"] == expected_resolved
     assert all(controls[ref]["state"] == 0 for ref in (root["task_ref"], consumer["task_ref"]))
 
 

@@ -100,6 +100,20 @@ public:
     std::array<SchedulerClusterSignal, 2> signals{};
 };
 
+TEST(HbgResourceOrder, EmptyCatalogStillReportsAnOutOfRangeCursor) {
+    Ranked f({{LaneMask::aiv0(), 1, false}});
+    auto *cube = f.locals[0];
+    uint32_t selected;
+    ASSERT_TRUE(f.next(0, &selected));
+    ASSERT_EQ(selected, UINT32_MAX);
+    cube->issue_cursor = 1;
+    EXPECT_FALSE(f.next(0, &selected));
+    EXPECT_EQ(
+        scheduler_read_worker_error(f.run(), cube->worker_id()),
+        static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
+    );
+}
+
 TEST(HbgResourceOrder, PureSyncMemberCanReturnBeforeAnotherCoreClaimsAndNeverTakesItsPeerBlock) {
     Ranked f({{LaneMask::aic(), 2, true}, {LaneMask::aic(), 1, false}});
     uint32_t first = UINT32_MAX;
@@ -125,7 +139,7 @@ TEST(HbgResourceOrder, PureSyncMemberCanReturnBeforeAnotherCoreClaimsAndNeverTak
     ASSERT_LT(first, SCHEDULER_EXECUTION_TOKEN_COUNT);
     EXPECT_EQ(f.locals[0]->execution_at(first).task_ref, 1);
     EXPECT_TRUE(f.finish(0, first));
-    EXPECT_EQ(scheduler_test::resolved_count(f.run()), 2u);
+    EXPECT_EQ(f.store.completed_gm_records(), 2u);
 }
 
 TEST(HbgResourceOrder, OrdinaryBlockOwnerCanRefillAfterItsOwnReturn) {
@@ -139,7 +153,7 @@ TEST(HbgResourceOrder, OrdinaryBlockOwnerCanRefillAfterItsOwnReturn) {
         ASSERT_TRUE(f.finish(0, selected));
     }
     EXPECT_EQ(seen, (std::set<uint32_t>{0, 1, 2}));
-    EXPECT_EQ(scheduler_test::resolved_count(f.run()), 1u);
+    EXPECT_EQ(f.store.completed_gm_records(), 1u);
 }
 
 TEST(HbgResourceOrder, PureCohortWaitsForBothPublicationFloorAndItsOwnEarlierLaneObligation) {
@@ -188,8 +202,12 @@ TEST(HbgResourceOrder, EarlierSelfClaimRemainsAnObligationWhenItsDirectoryAdvanc
     const auto &later = f.order(1);
     ASSERT_GT(later.required_floor[2], 0u);
     bool ready = true;
+    SchedulerClusterMixLocalState group{};
+    group.task_ref = 1;
+    group.rank = later.rank;
+    group.required_floor = later.required_floor[lane->config.self_lane];
     const auto check = [&] {
-        return scheduler_mix_lane_order_ready(f.graph.graph(), f.base(), lane, f.run(), 1, &ready);
+        return scheduler_mix_lane_order_ready(f.graph.graph(), f.base(), lane, f.run(), group, &ready);
     };
     ASSERT_TRUE(check());
     EXPECT_FALSE(ready);

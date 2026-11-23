@@ -91,23 +91,21 @@ inline __aicore__ bool scheduler_owned_token_blocks_mix_arrival(const SchedulerL
 // Graph control predecessor. Already assigned pure cohorts remain in W.
 static inline __aicore__ bool scheduler_mix_lane_order_ready(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, bool *ready
+    const SchedulerClusterMixLocalState &group, bool *ready
 ) {
-    SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarMixLaneOrderReady, ref);
+    SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarMixLaneOrderReady, group.task_ref);
     *ready = false;
-    const auto &row = scheduler_order_for(base, local, ref);
-    if (scheduler_owned_token_blocks_mix_arrival(local, row.rank)) return true;
-    const auto required = row.required_floor[local->config.self_lane];
+    if (scheduler_owned_token_blocks_mix_arrival(local, group.rank)) return true;
+    const auto required = group.required_floor;
     local->observed_self_floor = 0;
     if (required != 0) {
-        const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
-        const auto catalog = scheduler_task_catalog(base, pool, local->config.self_core_type);
-        if (local->issue_cursor > catalog.count || required > row.rank)
-            return scheduler_issue_fail(graph, local, run, ref);
-        uint32_t floor = static_cast<uint32_t>(pool.task_count);
+        const auto &catalog = local->config.engine_catalog;
+        if (local->issue_cursor > catalog.count || required > group.rank)
+            return scheduler_issue_fail(graph, local, run, group.task_ref);
+        uint32_t floor = static_cast<uint32_t>(graph.task_count);
         if (local->issue_cursor != catalog.count) {
             const auto head = catalog.refs[local->issue_cursor];
-            if (!scheduler_task_ref_valid(graph, head)) return scheduler_issue_fail(graph, local, run, ref);
+            if (!scheduler_task_ref_valid(graph, head)) return scheduler_issue_fail(graph, local, run, group.task_ref);
             floor = scheduler_order_for(base, local, head).rank;
         }
         if (floor < required) return true;
@@ -132,7 +130,14 @@ static inline __aicore__ bool scheduler_advance_mix_floor(
     if (floor == local->published_mix_floor) {
         // A global seal includes our own not-yet-published reservation.
         if (local->cluster_pending.task_ref == ref) return true;
-        if (local->last_sync_mix_ref != ref) {
+        if (scheduler_task_has_fixed_owners(scheduler_task_metadata_at(base, local, ref)->flags)) {
+            // A fixed group must be published by this proxy before its floor
+            // can admit a conflicting self task, even if other clusters advanced.
+            const auto &catalog = local->config.engine_catalog;
+            if (local->issue_cursor < catalog.count &&
+                scheduler_order_for(base, local, catalog.refs[local->issue_cursor]).rank <= row.rank)
+                return true;
+        } else if (local->last_sync_mix_ref != ref) {
             bool closed = false;
             if (!scheduler_task_supply_closed(graph, base, local, run, ref, &closed)) return false;
             if (!closed) return true;

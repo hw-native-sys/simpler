@@ -164,7 +164,7 @@ L3 borrows the `SharedMemory` mapping until domain release. CPU access is explic
 requires ordering against Device tasks. With an empty workspace list, each requester
 imports peer Host windows and registers its own Device mappings, indexed by
 domain member order in `windowsIn`. Only local `windowsOut` is populated.
-A Host-source URMA domain leaves every `windowsIn` entry zero, including the local rank.
+A Host-source URMA domain publishes the local Host DDR device mapping in `windowsIn[rankId]` and leaves every peer entry zero.
 Kernels address asynchronous reads using the peer MR in the URMA workspace and the named buffer offset. Host and Device domains
 share the same retention, reuse checks, failure policy, and release fences.
 

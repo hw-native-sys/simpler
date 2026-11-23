@@ -18,11 +18,14 @@ __aicore__ inline void dispatch_qb(__gm__ int64_t* args) {
         project_qb<N, Workers, false, true, MT>(args);
         return;
     }
-    int tasks = (rows + MT - 1) / MT * 8;
+    int row_tiles = (rows + MT - 1) / MT;
+    int lanes = get_block_num(args) / row_tiles / 2 * 2;
+    lanes = lanes < 2 ? 2 : lanes;
+    int tasks = row_tiles * lanes;
     for (int task = get_block_idx(args); task < tasks; task += get_block_num(args)) {
-        int first = task / 8 * MT;
+        int first = task / lanes * MT;
         int count = rows - first < MT ? rows - first : MT;
-        project_qb<N, 0, false, true, MT>(args, first, count, task % 8, 8);
+        project_qb<N, 0, false, true, MT>(args, first, count, task % lanes, lanes);
     }
 }
 
@@ -41,16 +44,20 @@ __aicore__ inline void dispatch_width(__gm__ int64_t* args) {
         project_qb_rope<MT>(args);
         return;
     }
-    int tasks = (rows + MT - 1) / MT * 8;
+    int row_tiles = (rows + MT - 1) / MT;
+    int lanes = get_block_num(args) / row_tiles / 2 * 2;
+    lanes = lanes < 2 ? 2 : lanes;
+    int tasks = row_tiles * lanes;
     for (int task = get_block_idx(args); task < tasks; task += get_block_num(args)) {
-        int first = task / 8 * MT;
+        int first = task / lanes * MT;
         int count = rows - first < MT ? rows - first : MT;
-        project_qb_rope<MT>(args, first, count, task % 8, 8);
+        project_qb_rope<MT>(args, first, count, task % lanes, lanes);
     }
 }
 #endif
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    if (args[7] <= 0) return;
     if (args[10] == 128) {
         dispatch_width<128>(args);
     } else {

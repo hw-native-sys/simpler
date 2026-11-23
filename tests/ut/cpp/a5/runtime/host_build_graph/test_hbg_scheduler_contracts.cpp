@@ -24,6 +24,7 @@
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
 #include "scheduler_ready_watchdog.h"
+#include "scheduler_sink_observer.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_topology.h"
 #include "scheduler/scheduler_types.h"
@@ -221,6 +222,91 @@ TEST(AicoreSchedulerState, OrdinaryDemandCountsOneExecutionPositionOrMixGroup) {
         EXPECT_EQ(demand.aic, test.aic);
         EXPECT_EQ(demand.aiv, test.aiv);
     }
+}
+
+TEST(AicpuSinkObserver, AllSinksMustReachLogicalCompletionThroughTheirOwnSource) {
+    scheduler_test::FixtureStorage f(3);
+    auto *base = f.scheduler_state->base();
+    auto *refs = scheduler_state_at<uint32_t>(base, f.layout.sinks_offset);
+    auto *counters = scheduler_state_at<SchedulerTaskCompletionCounter>(base, f.layout.completion_counters_offset);
+    auto *controls = scheduler_state_at<SchedulerTaskControl>(base, f.layout.task_controls_offset);
+    auto *notifications = scheduler_state_at<uint64_t>(base, f.layout.done_notifications_offset);
+    std::copy_n(std::array<uint32_t, 3>{0, 1, 2}.begin(), 3, refs);
+    f.run_control->sink_count = 3;
+    f.contexts[0].completion_counters_offset = f.layout.completion_counters_offset;
+    uint32_t chain = 5;
+    counters[0] = {reinterpret_cast<uint64_t>(&chain), reinterpret_cast<uint64_t>(&chain), 6, 12};
+    uint32_t notification = 0;
+    notifications[1] = reinterpret_cast<uint64_t>(&notification);
+    controls[2].completion_state = scheduler_completion_encode(2, 0, 1);  // All physical returns, one async debt.
+
+    AicpuSinkObserver sinks;
+    ASSERT_TRUE(sinks.initialize(f.contexts[0], *f.run_control));
+    EXPECT_EQ(sinks.poll(), 0);
+    EXPECT_EQ(sinks.resolved(), 0u);
+    chain = 8;  // A descendant can advance the same monotonic register.
+    EXPECT_EQ(sinks.poll(), 0);
+    EXPECT_EQ(sinks.resolved(), 1u);
+    notification = 1;
+    EXPECT_EQ(sinks.poll(), 0);
+    EXPECT_EQ(sinks.resolved(), 2u);
+    controls[2].completion_state = scheduler_completion_completed_state(2);
+    EXPECT_EQ(sinks.poll(), 1);
+    EXPECT_EQ(sinks.resolved(), 3u);
+}
+
+TEST(AicpuSinkObserver, MalformedReferenceSignalOrCounterCannotCompleteTheRun) {
+    scheduler_test::FixtureStorage f(1);
+    auto *base = f.scheduler_state->base();
+    auto *ref = scheduler_state_at<uint32_t>(base, f.layout.sinks_offset);
+    f.run_control->sink_count = 1;
+    f.contexts[0].completion_counters_offset = f.layout.completion_counters_offset;
+    AicpuSinkObserver sinks;
+    ASSERT_TRUE(sinks.initialize(f.contexts[0], *f.run_control));
+    *ref = 1;
+    EXPECT_EQ(sinks.poll(), -1);
+    *ref = 0;
+    uint32_t word = 9;
+    *scheduler_state_at<uint64_t>(base, f.layout.done_notifications_offset) = reinterpret_cast<uint64_t>(&word);
+    EXPECT_EQ(sinks.poll(), -1);
+    *scheduler_state_at<SchedulerTaskCompletionCounter>(base, f.layout.completion_counters_offset) = {
+        reinterpret_cast<uint64_t>(&word), reinterpret_cast<uint64_t>(&word), 4, 8
+    };
+    EXPECT_EQ(sinks.poll(), -1);
+    f.run_control->sink_count = 0;
+    EXPECT_FALSE(AicpuSinkObserver{}.initialize(f.contexts[0], *f.run_control));
+}
+
+TEST(AicpuSinkWatchdog, ChangingNonSinkCounterKeepsAQuietSinkAliveAndAStallExpires) {
+    scheduler_test::FixtureStorage f(2);
+    auto *base = f.scheduler_state->base();
+    *scheduler_state_at<uint32_t>(base, f.layout.sinks_offset) = 1;
+    f.run_control->sink_count = 1;
+    f.contexts[0].completion_counters_offset = f.layout.completion_counters_offset;
+    uint32_t chain = 0;
+    *scheduler_state_at<SchedulerTaskCompletionCounter>(base, f.layout.completion_counters_offset) = {
+        reinterpret_cast<uint64_t>(&chain), reinterpret_cast<uint64_t>(&chain), 4, 8
+    };
+    AicpuSinkObserver sinks;
+    ASSERT_TRUE(sinks.initialize(f.contexts[0], *f.run_control));
+    AicpuReadyWatchdog peers;
+    AicpuSinkWatchdog watchdog;
+    int scans = 0;
+    auto sample = [&] {
+        ++scans;
+        return sinks.fingerprint(f.contexts[0]);
+    };
+    EXPECT_FALSE(watchdog.stalled(peers, 49, 100, sample));
+    EXPECT_EQ(scans, 0);
+    EXPECT_FALSE(watchdog.stalled(peers, 50, 100, sample));
+    ++chain;
+    EXPECT_FALSE(watchdog.stalled(peers, 100, 100, sample));
+    ++chain;
+    EXPECT_FALSE(watchdog.stalled(peers, 150, 100, sample));
+    EXPECT_EQ(peers.last_progress(), 150u);
+    EXPECT_TRUE(watchdog.stalled(peers, 200, 100, sample));
+    EXPECT_EQ(scans, 4);
+    EXPECT_EQ(sinks.poll(), 0);
 }
 
 TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {

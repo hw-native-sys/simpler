@@ -52,6 +52,7 @@
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
 #include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
+#include "pto/comm/workspace.hpp"
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
 // layer in case we need to swap (e.g., InitConfig variant) later.
@@ -1070,12 +1071,13 @@ static int domain_alloc_via_ipc(
     return status == ACL_SUCCESS ? 0 : -1;
 }
 
-// The Worker owns both the ISA manager and its external device allocation.
-// Keep the allocation independently: failed Init may not bind it to the manager.
-using SdmaManager = pto::comm::sdma::SdmaWorkspaceManager;
-
+// The workspace facade owns the ISA manager; the external device allocation is
+// tracked independently because a failed Init may not bind it to the manager.
+// The opaque handle returned to the runner IS this owner; dma_workspace_release()
+// destroys it. There is no per-device generation gate: an SDMA-enabled Worker
+// owns its provider for its whole life and releases it at finalize.
 struct SdmaWorkspaceOwner {
-    std::unique_ptr<SdmaManager> manager = std::make_unique<SdmaManager>();
+    pto::comm::Workspace workspace{};
     void *allocation = nullptr;
     bool reclamation_unconfirmed = false;
 };
@@ -1101,37 +1103,48 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
     if (count <= DMA_WORKSPACE_SDMA) return -1;
     try {
         auto owner = std::make_unique<SdmaWorkspaceOwner>();
-        auto &manager = owner->manager;
+        pto::comm::WorkspaceRequest req{};
         uint64_t workspace_size = 0;
-        void *&workspace_addr = owner->allocation;
-        SdmaManager::GetWorkspaceSize(&workspace_size);
-        if (workspace_size == 0) {
-            LOG_ERROR("dma_workspace_provision: SDMA GetWorkspaceSize returned zero");
+        const aclError size_status =
+            pto::comm::PtoCommGetWorkspaceSize(pto::comm::DmaEngine::SDMA, req, &workspace_size);
+        if (size_status != ACL_SUCCESS || workspace_size == 0) {
+            LOG_ERROR("dma_workspace_provision: SDMA GetWorkspaceSize failed");
             return -1;
         }
+        void *&workspace_addr = owner->allocation;
         if (aclrtMalloc(&workspace_addr, workspace_size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
             LOG_ERROR("dma_workspace_provision: workspace aclrtMalloc failed");
             return -1;
         }
-        bool init_ok = false;
-        try {
-            // Init creates STARS streams before binding the workspace. A null
-            // workspace address can therefore still mean partial stream ownership.
-            // Retain every failed Init manager: per-stream teardown can stall on
-            // an error-state card.
-            init_ok = manager->Init(workspace_addr, workspace_size);
-        } catch (...) {
-            LOG_ERROR("SdmaWorkspaceManager::Init threw; abandoning its partial resources");
-        }
-        if (!init_ok) {
-            if (manager->GetWorkspaceAddr() == nullptr && aclrtFree(workspace_addr) == ACL_SUCCESS) {
-                owner->allocation = nullptr;
+        const aclError status = pto::comm::CreateWorkspace(
+            pto::comm::DmaEngine::SDMA, req, workspace_addr, workspace_size, &owner->workspace,
+            pto::comm::WorkspaceFailurePolicy::Retain
+        );
+        if (status != ACL_SUCCESS) {
+            if (owner->workspace.impl != nullptr) {
+                // Init creates STARS streams before binding the workspace, so a
+                // null workspace address can still mean partial stream ownership.
+                // Retain the manager and the workspace: destroying either on an
+                // error-state card can stall. AbandonWorkspace only clears the
+                // descriptor, and the caller never sees this handle.
+                if (owner->workspace.addr == nullptr && aclrtFree(workspace_addr) == ACL_SUCCESS) {
+                    owner->allocation = nullptr;
+                }
+                owner->reclamation_unconfirmed = true;
+                *handle_out = owner.release();
+                return COMM_RECLAMATION_UNCONFIRMED;
             }
-            owner->reclamation_unconfirmed = true;
-            *handle_out = owner.release();
-            return COMM_RECLAMATION_UNCONFIRMED;
+            if (aclrtFree(workspace_addr) != ACL_SUCCESS) {
+                // The manager was never created, but the allocation is still
+                // live. Hand it back so the runner can retain it.
+                owner->reclamation_unconfirmed = true;
+                *handle_out = owner.release();
+                return COMM_RECLAMATION_UNCONFIRMED;
+            }
+            owner->allocation = nullptr;
+            return -1;
         }
-        const uint64_t addr = reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr());
+        const uint64_t addr = reinterpret_cast<uint64_t>(owner->workspace.addr);
         if (addr == 0) {
             owner->reclamation_unconfirmed = true;
             *handle_out = owner.release();
@@ -1153,8 +1166,9 @@ extern "C" int dma_workspace_release(void *handle) {
     if (owner->reclamation_unconfirmed) return COMM_RECLAMATION_UNCONFIRMED;
     owner->reclamation_unconfirmed = true;
     try {
-        owner->manager.reset();
-        if (aclrtFree(owner->allocation) != ACL_SUCCESS) {
+        void *workspace_addr = owner->allocation;
+        pto::comm::DestroyWorkspace(&owner->workspace);
+        if (workspace_addr != nullptr && aclrtFree(workspace_addr) != ACL_SUCCESS) {
             LOG_WARN("dma_workspace_release: workspace aclrtFree failed");
             return COMM_RECLAMATION_UNCONFIRMED;
         }

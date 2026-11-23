@@ -9,7 +9,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Prepare a standalone native MoE bundle; numerical files remain local."""
 
-import gzip
 import hashlib
 import importlib.util
 import json
@@ -47,9 +46,7 @@ INPUT_NAMES = [
 ]
 COMM = [
     ("recv_meta", 2, [2, 64]),
-    ("recv_x", 4, [10240, 5120]),
-    ("recv_scale", 5, [10240, 160]),
-    ("recv_weights", 0, [10240, 8]),
+    ("recv_x", 4, [10240, 5280]),
     ("recv_routes", 2, [10240, 8]),
     ("data_arrived", 2, [2, 64, 128]),
     ("routed_output", 6, [480, 5120]),
@@ -80,7 +77,11 @@ def validate_bundle(bundle):
             raise ValueError(f"Invalid native input file: {name}")
     for rank in range(2):
         rows = (bundle / f"rank{rank}.txt").read_text().splitlines()
-        if rows[0] != "DSV41_MOE_V1" or rows[2] != "33" or not rows[34].startswith("HOST 2 8 1 2 "):
+        if (
+            rows[0] != "DSV41_MOE_V1"
+            or int(rows[2]) != len(INPUT_NAMES) + len(COMM) + 2
+            or not rows[3 + source["host_tensor_indices"][0]].startswith("HOST 2 8 1 2 ")
+        ):
             raise ValueError("Native MoE must retain the live HOST num_tokens argument")
     return meta
 
@@ -143,14 +144,15 @@ def prepare_bundle(bundle, build_dir, reuse=None):
         comm_rows.append(f"COMM {dtype} {size} {len(shape)} " + " ".join(map(str, shape)) + f" {offset}")
         offset += (size + 63) // 64 * 64
     for rank, rows in enumerate(manifests):
-        rows[23:23] = comm_rows
-        text = f"DSV41_MOE_V1\n2 {offset}\n33\n" + "\n".join(rows)
-        text += "\n10\nRANK\nVALUE 1\n" + "COMM\n" * 8 + "VALIDATE_ZERO 0\n"
+        rows[len(INPUT_NAMES) : len(INPUT_NAMES)] = comm_rows
+        text = f"DSV41_MOE_V1\n2 {offset}\n{len(rows)}\n" + "\n".join(rows)
+        text += f"\n{len(COMM) + 2}\nRANK\nVALUE 1\n" + "COMM\n" * len(COMM) + "VALIDATE_ZERO 0\n"
         (bundle / f"rank{rank}.txt").write_text(text)
     shutil.copy2(callable_path, bundle / "callable.bin")
-    original = gzip.decompress((ROOT / "workloads/native_moe/vendor/orchestration.cpp.gz").read_bytes()).decode()
+    host_source = Path("workloads/native_moe/vendor/orchestration.cpp")
+    original = (ROOT / host_source).read_text()
     reads = [
-        {"file": "workloads/native_moe/vendor/orchestration.cpp.gz", "line": i, "code": line.strip()}
+        {"file": host_source.as_posix(), "line": i, "code": line.strip()}
         for i, line in enumerate(original.splitlines(), 1)
         if "get_tensor_data<int32_t>(ext_num_tokens" in line
     ]

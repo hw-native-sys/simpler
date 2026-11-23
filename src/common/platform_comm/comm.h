@@ -319,8 +319,9 @@ int comm_alloc_domain_windows(
  * The caller supplies the name and may borrow a CPU mapping. Local device
  * mappings support MTE. On A5, a Host domain with an empty workspace mask imports and registers peer
  * Host windows in the requesting process for synchronous MTE reads through
- * windowsIn. A Host URMA domain leaves all windowsIn entries zero and supplies
- * peer MR addresses through the workspace for asynchronous reads.
+ * windowsIn. A Host URMA domain publishes the local Host DDR device mapping in
+ * windowsIn[rankId] and leaves peer entries zero. Asynchronous reads use the
+ * peer MR addresses in the URMA workspace.
  * On A2/A3, the SDMA bit enables peer mappings for the
  * Worker-owned SDMA workspace.
  * Abort and release use the same entry points as comm_alloc_domain_windows.

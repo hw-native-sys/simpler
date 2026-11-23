@@ -18,6 +18,7 @@
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 
+
 #include "intrinsic.h"
 
 
@@ -50,239 +51,239 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
   dcci((__gm__ void*)ptr, cache_line_t::SINGLE_CACHE_LINE);
 }
 
-static __aicore__ void c2a_four_slot_requests(__gm__ int32_t* v1, __gm__ int32_t* v2, __gm__ int32_t* v3, __gm__ int32_t* v4, __gm__ int32_t* v5, __gm__ int32_t* v6, __gm__ int32_t* v7, int64_t v8, int64_t v9, int64_t v10, int32_t v11, int32_t v12, int64_t v13, int64_t v14, int64_t v15, int32_t v16, int32_t v17) {
+static __aicore__ void c2a_four_slot_requests(__gm__ int32_t* v1, __gm__ int32_t* v2, __gm__ int32_t* v3, __gm__ int32_t* v4, __gm__ int32_t* v5, __gm__ int32_t* v6, __gm__ int32_t* v7, int64_t v8, int64_t v9, int64_t v10, int32_t v11, int32_t v12, int64_t v13, int32_t v14, int32_t v15) {
   using T = float;
 
   #if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
   // pto: %c1_index
-  const int64_t v18 = 1;
+  const int64_t v16 = 1;
   // pto: %cn1_i32
-  const int32_t v19 = -1;
+  const int32_t v17 = -1;
   // pto: %c0_index
-  const int64_t v20 = 0;
+  const int64_t v18 = 0;
   // pto: %c0_i32
-  const int32_t v21 = 0;
+  const int32_t v19 = 0;
   // pto: %c4_index
-  const int64_t v22 = 4;
+  const int64_t v20 = 4;
   // pto: %c3_index
-  const int64_t v23 = 3;
+  const int64_t v21 = 3;
   // pto: %c2_index
-  const int64_t v24 = 2;
-  // pto: %worker_inline6104__ssa_v0
-  for (int64_t v25 = (int64_t) v16; v25 < v8; v25 += v18) {
-    (v1)[v25] = v19;
+  const int64_t v22 = 2;
+  // pto: %worker_inline11321__ssa_v0
+  for (int64_t v23 = (int64_t) v14; v23 < v8; v23 += v16) {
+    (v1)[v23] = v17;
   }
-  for (int64_t v26 = v20; v26 < v9; v26 += v18) {
-    (v2)[v26] = v11;
-    (v3)[v26] = v19;
+  for (int64_t v24 = v18; v24 < v9; v24 += v16) {
+    (v2)[v24] = v11;
+    (v3)[v24] = v17;
   }
   (v2)[v9] = v11;
-  // pto: %count_inline6107__rv_v2
-  int32_t v27;
-  v27 = v21;
-  for (int64_t v28 = v20; v28 < v10; v28 += v18) {
+  // pto: %count_inline11324__rv_v2
+  int32_t v25;
+  v25 = v19;
+  for (int64_t v26 = v18; v26 < v10; v26 += v16) {
     // pto: %t__tile
     ;
-    int32_t v29 = (v4)[v28];
+    int32_t v27 = (v4)[v26];
     // pto: %0
     ;
-    int32_t v30 = v29 < v11 ? v29 : v11;
+    int32_t v28 = v27 < v11 ? v27 : v11;
     // pto: %1
     ;
-    int64_t v31 = (int64_t) v30;
+    int64_t v29 = (int64_t) v28;
     // pto: %2
     ;
-    int64_t v32 = v31 < v20 ? v20 : v31;
+    int64_t v30 = v29 < v18 ? v18 : v29;
     // pto: %4, %3
     ;
-    int32_t v33 = (v4)[(int64_t) ((uint64_t) v28 + (uint64_t) v18)];
+    int32_t v31 = (v4)[(int64_t) ((uint64_t) v26 + (uint64_t) v16)];
     // pto: %5
     ;
-    int32_t v34 = v33 < v11 ? v33 : v11;
+    int32_t v32 = v31 < v11 ? v31 : v11;
     // pto: %6
     ;
-    int64_t v35 = (int64_t) v34;
+    int64_t v33 = (int64_t) v32;
     // pto: %7
     ;
-    int64_t v36 = v35 < v32 ? v32 : v35;
+    int64_t v34 = v33 < v30 ? v30 : v33;
     // pto: %8
     ;
-    // pto: %count_inline6107__phi_v6
+    // pto: %count_inline11324__phi_v6
     ;
-    int32_t v37;
-    if (v32 < v36) {
+    int32_t v35;
+    if (v30 < v34) {
       // pto: %9
       ;
-      int32_t v38 = (v5)[v32];
+      int32_t v36 = (v5)[v30];
       // pto: %10
       ;
-      int64_t v39 = (int64_t) v38;
+      int64_t v37 = (int64_t) v36;
       // pto: %11
       ;
-      int64_t v40 = v39 < v20 ? v20 : v39;
+      int64_t v38 = v37 < v18 ? v18 : v37;
       // pto: %12
       ;
-      int64_t v41 = v40 % v22;
+      int64_t v39 = v38 % v20;
       // pto: %13, %14, %15
       ;
-      int64_t v42 = v41 < v20 ? (int64_t) ((uint64_t) v41 + (uint64_t) v22) : v41;
+      int64_t v40 = v39 < v18 ? (int64_t) ((uint64_t) v39 + (uint64_t) v20) : v39;
       // pto: %16
       ;
-      int64_t v43 = (int64_t) ((uint64_t) v36 - (uint64_t) v32);
+      int64_t v41 = (int64_t) ((uint64_t) v34 - (uint64_t) v30);
       // pto: %17
       ;
-      int64_t v44 = (int64_t) ((uint64_t) v43 + (uint64_t) v42);
+      int64_t v42 = (int64_t) ((uint64_t) v41 + (uint64_t) v40);
       // pto: %18
       ;
-      int64_t v45 = (int64_t) ((uint64_t) v44 + (uint64_t) v23);
+      int64_t v43 = (int64_t) ((uint64_t) v42 + (uint64_t) v21);
       // pto: %19
       ;
-      const int64_t v46 = 1;
+      const int64_t v44 = 1;
       // pto: %19
       ;
-      const int64_t v47 = 0;
+      const int64_t v45 = 0;
       // pto: %19
       ;
-      int64_t v48 = v45 / v22;
+      int64_t v46 = v43 / v20;
       // pto: %19
       ;
-      bool v49 = v45 < v47;
+      bool v47 = v43 < v45;
       // pto: %19
       ;
-      bool v50 = v22 < v47;
+      bool v48 = v20 < v45;
       // pto: %19
       ;
-      bool v51 = v49 == v50;
+      bool v49 = v47 == v48;
       // pto: %19
       ;
-      // pto: %block_inline6114__tile
+      // pto: %block_inline11331__tile
       ;
-      int32_t v52 = (v6)[v28];
-      // pto: %count_inline6107__rv_v4
+      int32_t v50 = (v6)[v26];
+      // pto: %count_inline11324__rv_v4
       ;
-      int32_t v53;
-      v53 = v27;
-      for (int64_t v54 = v20; v54 < (v45 % v22 != v47 && v49 != v50 ? v48 - v46 : v48); v54 += v18) {
+      int32_t v51;
+      v51 = v25;
+      for (int64_t v52 = v18; v52 < (v43 % v20 != v45 && v47 != v48 ? v46 - v44 : v46); v52 += v16) {
         // pto: %22
         ;
-        int64_t v55 = (int64_t) ((uint64_t) v54 * (uint64_t) v22);
+        int64_t v53 = (int64_t) ((uint64_t) v52 * (uint64_t) v20);
         // pto: %23
         ;
-        int64_t v56 = (int64_t) ((uint64_t) v55 - (uint64_t) v42);
+        int64_t v54 = (int64_t) ((uint64_t) v53 - (uint64_t) v40);
         // pto: %24
         ;
-        int64_t v57 = v56 < v20 ? v20 : v56;
+        int64_t v55 = v54 < v18 ? v18 : v54;
         // pto: %25
         ;
-        int64_t v58 = (int64_t) ((uint64_t) v32 + (uint64_t) v57);
+        int64_t v56 = (int64_t) ((uint64_t) v30 + (uint64_t) v55);
         // pto: %27
         ;
-        int64_t v59 = (int64_t) ((uint64_t) v55 + (uint64_t) v22);
+        int64_t v57 = (int64_t) ((uint64_t) v53 + (uint64_t) v20);
         // pto: %28
         ;
-        int64_t v60 = (int64_t) ((uint64_t) v32 + (uint64_t) v59);
+        int64_t v58 = (int64_t) ((uint64_t) v30 + (uint64_t) v57);
         // pto: %29
         ;
-        int64_t v61 = (int64_t) ((uint64_t) v60 - (uint64_t) v42);
+        int64_t v59 = (int64_t) ((uint64_t) v58 - (uint64_t) v40);
         // pto: %30
         ;
-        int64_t v62 = v61 < v36 ? v61 : v36;
+        int64_t v60 = v59 < v34 ? v59 : v34;
         // pto: %31
         ;
-        int64_t v63 = (int64_t) ((uint64_t) v40 + (uint64_t) v58);
+        int64_t v61 = (int64_t) ((uint64_t) v38 + (uint64_t) v56);
         // pto: %32
         ;
-        int64_t v64 = (int64_t) ((uint64_t) v63 - (uint64_t) v32);
+        int64_t v62 = (int64_t) ((uint64_t) v61 - (uint64_t) v30);
         // pto: %33
         ;
-        int64_t v65 = (int64_t) v52;
+        int64_t v63 = (int64_t) v50;
         // pto: %34, %35, %36
         ;
-        // pto: %native_block_inline6119__phi_v2
+        // pto: %native_block_inline11336__phi_v2
         ;
-        int32_t v66;
-        if (v65 >= v20 & v52 < v12) {
+        int32_t v64;
+        if (v63 >= v18 & v50 < v12) {
           // pto: %38
           ;
-          int64_t v67 = (int64_t) ((uint64_t) v65 * (uint64_t) v24);
+          int64_t v65 = (int64_t) ((uint64_t) v63 * (uint64_t) v22);
           // pto: %39
           ;
-          const int64_t v68 = 1;
+          const int64_t v66 = 1;
           // pto: %39
           ;
-          const int64_t v69 = 0;
+          const int64_t v67 = 0;
           // pto: %39
           ;
-          int64_t v70 = v64 / v22;
+          int64_t v68 = v62 / v20;
           // pto: %39
           ;
-          bool v71 = v64 < v69;
+          bool v69 = v62 < v67;
           // pto: %39
           ;
-          bool v72 = v22 < v69;
+          bool v70 = v20 < v67;
           // pto: %39
           ;
-          bool v73 = v71 == v72;
+          bool v71 = v69 == v70;
           // pto: %39
           ;
-          int64_t v74 = v64 % v22 != v69 && v71 != v72 ? v70 - v68 : v70;
+          int64_t v72 = v62 % v20 != v67 && v69 != v70 ? v68 - v66 : v68;
           // pto: %40
           ;
-          int64_t v75 = v74 % v24;
+          int64_t v73 = v72 % v22;
           // pto: %41, %42, %43
           ;
-          int64_t v76 = v75 < v20 ? (int64_t) ((uint64_t) v75 + (uint64_t) v24) : v75;
+          int64_t v74 = v73 < v18 ? (int64_t) ((uint64_t) v73 + (uint64_t) v22) : v73;
           // pto: %44
           ;
-          int64_t v77 = (int64_t) ((uint64_t) v67 + (uint64_t) v76);
+          int64_t v75 = (int64_t) ((uint64_t) v65 + (uint64_t) v74);
           // pto: %45
           ;
-          v66 = (int32_t) v77;
+          v64 = (int32_t) v75;
         } else {
-          v66 = v19;
+          v64 = v17;
         };
         // pto: %46
         ;
-        int32_t v78 = (int32_t) v58;
+        int32_t v76 = (int32_t) v56;
         // pto: %47
         ;
-        int64_t v79 = (int64_t) v53;
-        (v2)[v79] = v78;
+        int64_t v77 = (int64_t) v51;
+        (v2)[v77] = v76;
         // pto: %48
         ;
-        int32_t v80 = (int32_t) v62;
+        int32_t v78 = (int32_t) v60;
         // pto: %47
         ;
-        int64_t v81 = (int64_t) v53;
+        int64_t v79 = (int64_t) v51;
         // pto: %50
         ;
-        int64_t v82 = (int64_t) ((uint64_t) v81 + (uint64_t) v18);
-        (v2)[v82] = v80;
+        int64_t v80 = (int64_t) ((uint64_t) v79 + (uint64_t) v16);
+        (v2)[v80] = v78;
         // pto: %47
         ;
-        int64_t v83 = (int64_t) v53;
-        (v3)[v83] = v66;
-        for (int64_t v84 = v58; v84 < v62; v84 += v18) {
+        int64_t v81 = (int64_t) v51;
+        (v3)[v81] = v64;
+        for (int64_t v82 = v56; v82 < v60; v82 += v16) {
           // pto: %54
           ;
-          int32_t v85 = (v7)[v84];
+          int32_t v83 = (v7)[v82];
           // pto: %55, %56
           ;
-          if ((int64_t) v85 == v28) {
-            (v1)[v84] = v53;
+          if ((int64_t) v83 == v26) {
+            (v1)[v82] = v51;
           };
         };
         // pto: %59
         ;
-        v53 = (int32_t) v82;
+        v51 = (int32_t) v80;
       };
-      v37 = v53;
+      v35 = v51;
     } else {
-      v37 = v27;
+      v35 = v25;
     };
-    v27 = v37;
+    v25 = v35;
   }
   pipe_barrier(PIPE_ALL);
   dcci((__gm__ void*)0, cache_line_t::ENTIRE_DATA_CACHE);
@@ -312,17 +313,17 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t __pypto_spmd_block_idx = get_block_idx(args);
     int32_t __pypto_spmd_block_num = get_block_num(args);
 
-    // Unpack tensor: mapped_requests_inline6099__ssa_v0
-    __gm__ Tensor* mapped_requests_inline6099__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ int32_t* mapped_requests_inline6099__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(mapped_requests_inline6099__ssa_v0_tensor->buffer.addr) + mapped_requests_inline6099__ssa_v0_tensor->start_offset;
+    // Unpack tensor: mapped_requests_inline11316__ssa_v0
+    __gm__ Tensor* mapped_requests_inline11316__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ int32_t* mapped_requests_inline11316__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(mapped_requests_inline11316__ssa_v0_tensor->buffer.addr) + mapped_requests_inline11316__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: mapped_starts_inline6098__ssa_v0
-    __gm__ Tensor* mapped_starts_inline6098__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ int32_t* mapped_starts_inline6098__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(mapped_starts_inline6098__ssa_v0_tensor->buffer.addr) + mapped_starts_inline6098__ssa_v0_tensor->start_offset;
+    // Unpack tensor: mapped_starts_inline11315__ssa_v0
+    __gm__ Tensor* mapped_starts_inline11315__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ int32_t* mapped_starts_inline11315__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(mapped_starts_inline11315__ssa_v0_tensor->buffer.addr) + mapped_starts_inline11315__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: mapped_blocks_inline6100__ssa_v0
-    __gm__ Tensor* mapped_blocks_inline6100__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ int32_t* mapped_blocks_inline6100__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(mapped_blocks_inline6100__ssa_v0_tensor->buffer.addr) + mapped_blocks_inline6100__ssa_v0_tensor->start_offset;
+    // Unpack tensor: mapped_blocks_inline11317__ssa_v0
+    __gm__ Tensor* mapped_blocks_inline11317__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ int32_t* mapped_blocks_inline11317__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(mapped_blocks_inline11317__ssa_v0_tensor->buffer.addr) + mapped_blocks_inline11317__ssa_v0_tensor->start_offset;
 
     // Unpack tensor: query_start_loc__ssa_v0
     __gm__ Tensor* query_start_loc__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[3]);
@@ -340,40 +341,34 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ Tensor* token_to_req_indices__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[6]);
     __gm__ int32_t* token_to_req_indices__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(token_to_req_indices__ssa_v0_tensor->buffer.addr) + token_to_req_indices__ssa_v0_tensor->start_offset;
 
-    // Unpack scalar: LOCAL_T_DYN
-    union { uint64_t u64; int64_t val; } LOCAL_T_DYN_conv;
-    LOCAL_T_DYN_conv.u64 = args[7];
-    int64_t LOCAL_T_DYN = LOCAL_T_DYN_conv.val;
+    // Unpack scalar: T_DYN
+    union { uint64_t u64; int64_t val; } T_DYN_conv;
+    T_DYN_conv.u64 = args[7];
+    int64_t T_DYN = T_DYN_conv.val;
 
-    // Unpack scalar: groups_inline6097__ssa_v0
-    union { uint64_t u64; int64_t val; } groups_inline6097__ssa_v0_conv;
-    groups_inline6097__ssa_v0_conv.u64 = args[8];
-    int64_t groups_inline6097__ssa_v0 = groups_inline6097__ssa_v0_conv.val;
+    // Unpack scalar: groups_inline11314__ssa_v0
+    union { uint64_t u64; int64_t val; } groups_inline11314__ssa_v0_conv;
+    groups_inline11314__ssa_v0_conv.u64 = args[8];
+    int64_t groups_inline11314__ssa_v0 = groups_inline11314__ssa_v0_conv.val;
 
-    // Unpack scalar: V41_B_DYN
-    union { uint64_t u64; int64_t val; } V41_B_DYN_conv;
-    V41_B_DYN_conv.u64 = args[9];
-    int64_t V41_B_DYN = V41_B_DYN_conv.val;
+    // Unpack scalar: B_DYN
+    union { uint64_t u64; int64_t val; } B_DYN_conv;
+    B_DYN_conv.u64 = args[9];
+    int64_t B_DYN = B_DYN_conv.val;
 
-    // Unpack scalar: active_tokens_inline6093__ssa_v0
-    union { uint64_t u64; int32_t val; } active_tokens_inline6093__ssa_v0_conv;
-    active_tokens_inline6093__ssa_v0_conv.u64 = args[10];
-    int32_t active_tokens_inline6093__ssa_v0 = active_tokens_inline6093__ssa_v0_conv.val;
+    // Unpack scalar: active_tokens_inline11310__ssa_v0
+    union { uint64_t u64; int32_t val; } active_tokens_inline11310__ssa_v0_conv;
+    active_tokens_inline11310__ssa_v0_conv.u64 = args[10];
+    int32_t active_tokens_inline11310__ssa_v0 = active_tokens_inline11310__ssa_v0_conv.val;
 
-    // Unpack scalar: blocks_inline6094__ssa_v0
-    union { uint64_t u64; int32_t val; } blocks_inline6094__ssa_v0_conv;
-    blocks_inline6094__ssa_v0_conv.u64 = args[11];
-    int32_t blocks_inline6094__ssa_v0 = blocks_inline6094__ssa_v0_conv.val;
+    // Unpack scalar: blocks_inline11311__ssa_v0
+    union { uint64_t u64; int32_t val; } blocks_inline11311__ssa_v0_conv;
+    blocks_inline11311__ssa_v0_conv.u64 = args[11];
+    int32_t blocks_inline11311__ssa_v0 = blocks_inline11311__ssa_v0_conv.val;
 
-    // Extract dynamic dim: V41_Q_START_DYN
-    int64_t V41_Q_START_DYN = static_cast<int64_t>(query_start_loc__ssa_v0_tensor->shapes[0]);
-
-    // Extract dynamic dim: T_DYN
-    int64_t T_DYN = static_cast<int64_t>(position_ids__ssa_v0_tensor->shapes[0]);
-
-    // Extract dynamic dim: V41_T_DYN
-    int64_t V41_T_DYN = static_cast<int64_t>(token_to_req_indices__ssa_v0_tensor->shapes[0]);
+    // Extract dynamic dim: Q_START_DYN
+    int64_t Q_START_DYN = static_cast<int64_t>(query_start_loc__ssa_v0_tensor->shapes[0]);
 
     // Forward to ptoas-generated function
-    c2a_four_slot_requests(mapped_requests_inline6099__ssa_v0, mapped_starts_inline6098__ssa_v0, mapped_blocks_inline6100__ssa_v0, query_start_loc__ssa_v0, position_ids__ssa_v0, state_block_table__ssa_v0, token_to_req_indices__ssa_v0, LOCAL_T_DYN, groups_inline6097__ssa_v0, V41_B_DYN, active_tokens_inline6093__ssa_v0, blocks_inline6094__ssa_v0, V41_Q_START_DYN, T_DYN, V41_T_DYN, __pypto_spmd_block_idx, __pypto_spmd_block_num);
+    c2a_four_slot_requests(mapped_requests_inline11316__ssa_v0, mapped_starts_inline11315__ssa_v0, mapped_blocks_inline11317__ssa_v0, query_start_loc__ssa_v0, position_ids__ssa_v0, state_block_table__ssa_v0, token_to_req_indices__ssa_v0, T_DYN, groups_inline11314__ssa_v0, B_DYN, active_tokens_inline11310__ssa_v0, blocks_inline11311__ssa_v0, Q_START_DYN, __pypto_spmd_block_idx, __pypto_spmd_block_num);
 }
