@@ -62,6 +62,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import enum
+import errno
 import hashlib
 import importlib
 import inspect
@@ -74,7 +75,6 @@ import re
 import shutil
 import signal
 import socket
-import stat
 import struct
 import subprocess
 import sys
@@ -958,14 +958,29 @@ _CTRL_SHM_NAME_BYTES = 32
 
 _COMM_ROOTINFO_DIR = "/tmp"
 _COMM_ROOTINFO_NAME_PATTERN = r"pto_multi_comm_([0-9a-f]{32})_([0-9a-f]{1,8})\.bin"
+_COMM_ROOTINFO_RE = re.compile(_COMM_ROOTINFO_NAME_PATTERN + r"(?:\.tmp\.[0-9]+)?")
 _COMM_DESTROY_MARKER_RE = re.compile(
-    _COMM_ROOTINFO_NAME_PATTERN + r"\.(?:destroy_failed\.[0-9a-f]{1,16}|destroy_released\.[0-9a-f]{1,16}\.[0-9]+)"
+    _COMM_ROOTINFO_NAME_PATTERN
+    + r"\.(?:destroy_failed\.[0-9a-f]{1,16}|destroy_released\.[0-9a-f]{1,16}\.[0-9]+)(?:\.tmp)?"
 )
-_COMM_HOST_PREPARE_MARKER_RE = re.compile(
-    r"barrier_"
-    + _COMM_ROOTINFO_NAME_PATTERN
-    + r"_alloc_[0-9]+_host_(?:ready|failed)_[0-9a-f]{1,16}_[0-9]+\.ready(?:\.tmp)?"
+_COMM_BARRIER_MARKER_RE = re.compile(
+    r"barrier_" + _COMM_ROOTINFO_NAME_PATTERN + r"_[a-z0-9_]+_[0-9a-f]{1,16}_[0-9]+\.ready(?:\.tmp(?:\.[0-9]+)?)?"
 )
+
+
+def _comm_marker_namespace(token: str) -> str:
+    return os.path.join(_COMM_ROOTINFO_DIR, f"simpler-comm-{token}")
+
+
+def _remove_empty_comm_directory(path: str) -> None:
+    try:
+        os.rmdir(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+            raise
+
 
 # Domain-allocation request shm layout: 48-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
@@ -6563,8 +6578,13 @@ class Worker:
         The startup-tree token and process group identify the owner to an
         ancestor even if the L3 exits before its chip children.
         """
-        tag = f"pto_multi_comm_{self._shm_token}_{os.getpgrp():x}.bin"
-        return os.path.join(_COMM_ROOTINFO_DIR, tag)
+        group = f"{os.getpgrp():x}"
+        namespace = _comm_marker_namespace(self._shm_token)
+        os.makedirs(namespace, mode=0o700, exist_ok=True)
+        directory = os.path.join(namespace, group)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        tag = f"pto_multi_comm_{self._shm_token}_{group}.bin"
+        return os.path.join(directory, tag)
 
     def _allocate_next_level_worker_id(self) -> int:
         worker_id = self._next_level_worker_id_count
@@ -16584,22 +16604,51 @@ class Worker:
         if errors:
             raise errors[0]
 
+    def _unlink_comm_marker_group(self, token: str, group: str, directory: str) -> None:
+        if not self._host_domain_owner_exited(token[:8], group):
+            return
+        errors: list[BaseException] = []
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                match = (
+                    _COMM_ROOTINFO_RE.fullmatch(entry.name)
+                    or _COMM_DESTROY_MARKER_RE.fullmatch(entry.name)
+                    or _COMM_BARRIER_MARKER_RE.fullmatch(entry.name)
+                )
+                if match is None or match.groups() != (token, group):
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    errors.append(exc)
+        if errors:
+            raise errors[0]
+        _remove_empty_comm_directory(directory)
+
     def _unlink_comm_markers(self) -> None:
-        """Retire this startup tree's Host preparation and destroy markers after their readers exit."""
+        """Retire owned marker directories only after their readers exit."""
         if not self._shm_tree_tokens:
             return
         errors: list[BaseException] = []
-        for name in os.listdir(_COMM_ROOTINFO_DIR):
-            match = _COMM_DESTROY_MARKER_RE.fullmatch(name) or _COMM_HOST_PREPARE_MARKER_RE.fullmatch(name)
-            if match is None:
-                continue
-            token, group = match.groups()
-            if token not in self._shm_tree_tokens:
-                continue
+        for token in self._shm_tree_tokens:
+            namespace = _comm_marker_namespace(token)
             try:
-                path = os.path.join(_COMM_ROOTINFO_DIR, name)
-                if stat.S_ISREG(os.lstat(path).st_mode) and self._host_domain_owner_exited(token[:8], group):
-                    os.unlink(path)
+                with os.scandir(namespace) as groups:
+                    if self._cleanup_journal.has_kind("child"):
+                        raise RuntimeError("Comm marker namespace still has unconfirmed child exit")
+                    for entry in groups:
+                        if not re.fullmatch(r"[0-9a-f]{1,8}", entry.name) or not entry.is_dir(follow_symlinks=False):
+                            continue
+                        try:
+                            self._unlink_comm_marker_group(token, entry.name, entry.path)
+                        except FileNotFoundError:
+                            pass
+                        except (OSError, RuntimeError) as exc:
+                            errors.append(exc)
+                _remove_empty_comm_directory(namespace)
             except FileNotFoundError:
                 pass
             except (OSError, RuntimeError) as exc:
@@ -16679,10 +16728,14 @@ class Worker:
         self._chip_shms.clear()
         self._next_level_shms.clear()
 
-        for identity, cleanup in (
+        namespace_cleanup = [
             (f"startup namespace {self._shm_token[:8]}", lambda: self._unlink_shm_namespace(protected_names)),
-            ("comm markers", self._unlink_comm_markers),
-        ):
+        ]
+        if self._cleanup_journal.has_kind("child"):
+            self._cleanup_journal.add_once("shm", "comm markers", self._unlink_comm_markers)
+        else:
+            namespace_cleanup.append(("comm markers", self._unlink_comm_markers))
+        for identity, cleanup in namespace_cleanup:
             try:
                 cleanup()
             except BaseException as exc:  # noqa: BLE001

@@ -164,8 +164,8 @@ def test_rejected_collective_reads_the_inherited_native_process_sink(
     assert "[ERROR] collective_sink_control: owned child host-log record" in captured[3]["text"]
 
 
-@pytest.fixture(params=[3, 4])
-def domain_worker(request):
+@contextmanager
+def _domain_worker(level):
     child = Worker(
         level=3,
         platform="a2a3sim",
@@ -178,11 +178,11 @@ def domain_worker(request):
     worker = child
     members = [1, 0]
     try:
-        if request.param == 4:
+        if level == 4:
             worker = Worker(level=4, num_sub_workers=0)
             node = worker.add_worker(child)
             members = [(node, 1), (node, 0)]
-        deadline = time.monotonic() + 10 if request.param == "external-l3" else None
+        deadline = time.monotonic() + 10 if level == "external-l3" else None
         worker.init(_startup_deadline=deadline)
         yield worker, members
     finally:
@@ -190,6 +190,12 @@ def domain_worker(request):
             _close_with_domain_debt(worker)
         else:
             worker.close()
+
+
+@pytest.fixture(params=[3, 4])
+def domain_worker(request):
+    with _domain_worker(request.param) as state:
+        yield state
 
 
 def _request(members, **changes) -> dict[str, Any]:
@@ -1066,6 +1072,45 @@ def test_domain_lookup_lease_drains_before_close(domain_worker, monkeypatch):
     with _race(lambda: found.append(worker._get_domain(domain.ref)), observe_close, entered, resume):
         worker.close()
     assert found == [domain] and domain.freed
+
+
+@pytest.mark.parametrize("level", [3, 4])
+def test_close_only_scans_owned_comm_directories(monkeypatch, tmp_path, level):
+    comm_root = tmp_path / "comm"
+    comm_root.mkdir()
+    scanned = tmp_path / "shared-directory-scan"
+    unrelated = comm_root / "unrelated.txt"
+    unrelated.write_text("other user's temporary file")
+    other_worker = comm_root / "other-worker"
+    other_worker.mkdir()
+    other_marker = other_worker / "marker.ready"
+    other_marker.touch()
+    listdir, scandir = os.listdir, os.scandir
+
+    def check_scan(path):
+        if path in (comm_root, str(comm_root)):
+            scanned.write_text(f"pid={os.getpid()}")
+            raise AssertionError("shared communication directory must not be enumerated")
+
+    def scoped_listdir(path="."):
+        check_scan(path)
+        return listdir(path)
+
+    def scoped_scandir(path="."):
+        check_scan(path)
+        return scandir(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker_mod, "_COMM_ROOTINFO_DIR", str(comm_root))
+        patch.setattr(os, "listdir", scoped_listdir)
+        patch.setattr(os, "scandir", scoped_scandir)
+        with _domain_worker(level) as (worker, members):
+            domain = _retained(worker, members)
+
+    assert not scanned.exists(), "a parent or child scanned the shared communication directory"
+    assert domain.freed
+    assert unrelated.read_text() == "other user's temporary file" and other_marker.is_file()
+    assert set(comm_root.iterdir()) == {unrelated, other_worker}
 
 
 @pytest.mark.parametrize("action", ["release", "lookup"])

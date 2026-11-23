@@ -177,6 +177,11 @@ Onboard L3 `tensormap_and_ringbuffer` domains use the same Host-source API.
 As on A5, L2 creates and unlinks its rank's POSIX backing and L3 borrows the CPU
 mapping. Worker teardown reclaims orphan windows in the startup namespace after
 the relevant L2 children or enclosing process group have exited.
+Communication handshake files live in a private directory per startup token and
+owner process group. Teardown scans only those owned directories, checks that
+their readers have exited, and removes empty directories without scanning `/tmp`.
+After owner exit, it also removes rootinfo and barrier files left by failed
+initialization, including temporary files.
 Local reads use MTE. For peer SDMA, initialize the Worker with `enable_sdma=True`
 and request `workspace_engines=("sdma",)` to map the peer windows. The kernel
 gets the source address from `CommContext` and the Worker workspace from

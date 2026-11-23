@@ -211,6 +211,11 @@ Host windows use the owning Worker's `sp-<token>-h-<pgid>-...` namespace. Worker
 teardown also unlinks orphan windows left by an abruptly terminated L2,
 including allocations that never returned a reply. Other Worker trees are
 outside that namespace and are not swept.
+Communication handshake files use private startup-token and process-group
+directories. Their cleanup checks owner exit and preserves failed cleanup for
+retry; it does not enumerate the shared temporary directory.
+After owner exit, it also removes rootinfo and barrier files left by failed
+initialization, including temporary files.
 
 Each `.shm.buf` access returns a managed, zero-copy memoryview. NumPy arrays
 created with either `np.ndarray(buffer=...)` or `np.frombuffer(...)`, including
