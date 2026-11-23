@@ -293,3 +293,5 @@ if(SIMPLER_SANITIZERS)
     include("${SIMPLER_CMAKE_DIR}/sanitizers.cmake")
     simpler_apply_sanitizers(host_runtime)
 endif()
+
+target_sources(host_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/l0_trace_records.cpp")

@@ -22,6 +22,9 @@ macro(a5_platform_case src)
         LABEL no_hardware ${ARGN})
 endmacro()
 
+a5_platform_case(test_l0_trace_decoder.cpp
+    SOURCES ${SIMPLER_SRC}/a5/platform/shared/host/l0_trace_records.cpp)
+
 # Host logger silent/off behavior — no runtime deps, just compile the same
 # self-contained host logger sources used by production consumers. It carries no
 # arch token: the logger is arch-agnostic and this is where the case happens to
