@@ -98,6 +98,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_native_module.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_run_lifecycle.cpp"
 )
+list(APPEND HOST_RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/l0_capture_collector.cpp")
 # Add common/aicpu_loader/host sources (LoadAicpuOp)
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_loader/host/load_aicpu_op.cpp"
