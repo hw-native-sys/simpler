@@ -259,6 +259,21 @@ def test_basic_window_issues_no_explicit_access(host_resource_binary):
 @pytest.mark.parametrize(
     "scenario",
     [
+        "barrier_complete",
+        "barrier_same_context",
+        "barrier_context_error",
+        "barrier_restore_error",
+        "barrier_submit_error",
+        "barrier_sync_error",
+    ],
+)
+def test_barrier_restores_caller_context_and_confirms_stream_completion(host_resource_binary, scenario):
+    subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
         "host_local",
         "host_urma",
         "host_urma_unsupported",

@@ -30,8 +30,10 @@
 #include "task_interface/ccu_module_package.h"
 
 #include "common/unified_log.h"
+#include "common/platform_config.h"
 #include "host/file_marker_handshake.h"
 #include "host/raii_scope_guard.h"
+#include "host/runtime_timeout_config.h"
 
 #include <algorithm>
 #include <array>
@@ -2059,16 +2061,33 @@ extern "C" int comm_derive_context(
 
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
-    // HcclBarrier is synchronous — it blocks until all ranks arrive.
-    // Do NOT call aclrtSynchronizeStream after it: HcclBarrier internally
-    // switches the thread's ACL context, which invalidates the caller-owned
-    // stream for context-checked ACL calls (error 507018).
+    if (h->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
+    aclrtContext caller_context = nullptr;
+    aclError rc = aclrtGetCurrentContext(&caller_context);
+    if (rc != ACL_SUCCESS) return rc;
     HcclResult hret = hccl_barrier(h->hccl_comm, h->stream);
+    // HCCL may change the calling thread's context; the stream belongs to its caller.
+    rc = aclrtSetCurrentContext(caller_context);
+    if (rc != ACL_SUCCESS) {
+        h->cleanup_failed = true;
+        publish_host_cleanup_failure(h);
+        LOG_ERROR("[comm rank %d] restoring barrier context failed: %d", h->rank, static_cast<int>(rc));
+        return rc;
+    }
     if (hret != HCCL_SUCCESS) {
         LOG_ERROR("[comm rank %d] HcclBarrier failed: %d", h->rank, static_cast<int>(hret));
         return static_cast<int>(hret);
     }
-    return 0;
+    const auto timeouts = resolve_runtime_timeout_config(
+        {PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS}
+    );
+    rc = aclrtSynchronizeStreamWithTimeout(h->stream, timeouts.stream_sync_timeout_ms);
+    if (rc != ACL_SUCCESS) {
+        h->cleanup_failed = true;
+        publish_host_cleanup_failure(h);
+        LOG_ERROR("[comm rank %d] barrier stream completion is unconfirmed: %d", h->rank, static_cast<int>(rc));
+    }
+    return rc;
 }
 
 static int
