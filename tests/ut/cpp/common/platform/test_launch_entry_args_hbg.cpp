@@ -34,7 +34,7 @@ TEST_F(LaunchEntryArgs, ARuntimeWithoutALaunchRouteReportsSo) {
     EXPECT_EQ(helper.launch_payload(), static_cast<void *>(&helper.args));
     EXPECT_EQ(helper.launch_payload_bytes(), sizeof(KernelArgs));
     EXPECT_EQ(helper.args.entry_args_source, static_cast<uint32_t>(EntryArgsSource::Descriptor));
-    EXPECT_EQ(helper.args.entry_args_offset, 0U);
+    EXPECT_EQ(helper.args.entry_args_data, nullptr);
 }
 
 // Unsupported and invalid are separate answers, and a runtime that examines no

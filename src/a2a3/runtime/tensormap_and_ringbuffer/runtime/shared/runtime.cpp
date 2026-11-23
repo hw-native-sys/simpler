@@ -149,7 +149,7 @@ size_t runtime_device_copy_size(const Runtime &rt) {
 // snapshot of values rather than a pointer into the descriptor: the launch side
 // consumes it after a successor's prepare may already have refilled the source.
 LaunchEntryArgsVerdict classify_launch_entry_args(
-    const Runtime &rt, uint32_t source, uint32_t offset, uint32_t tensor_count, uint32_t scalar_count
+    const Runtime &rt, uint32_t source, const void *data, uint32_t tensor_count, uint32_t scalar_count
 ) {
     if (source != static_cast<uint32_t>(EntryArgsSource::Descriptor) &&
         source != static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope)) {
@@ -157,7 +157,7 @@ LaunchEntryArgsVerdict classify_launch_entry_args(
     }
     if (source != static_cast<uint32_t>(rt.get_entry_args_source())) return LaunchEntryArgsVerdict::SourceMismatch;
     if (source == static_cast<uint32_t>(EntryArgsSource::Descriptor)) return LaunchEntryArgsVerdict::Descriptor;
-    if (offset != LAUNCH_ENVELOPE_HEADER_BYTES) return LaunchEntryArgsVerdict::UnexpectedOffset;
+    if (data == nullptr) return LaunchEntryArgsVerdict::MissingHostInput;
     if (tensor_count > CHIP_MAX_TENSOR_ARGS || scalar_count > CHIP_MAX_SCALAR_ARGS) {
         return LaunchEntryArgsVerdict::CountsPastCapacity;
     }

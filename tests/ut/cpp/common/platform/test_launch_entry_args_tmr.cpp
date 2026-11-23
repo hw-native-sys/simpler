@@ -54,10 +54,18 @@ TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedA
     EXPECT_EQ(header.run_result_data_base, 0u);
     EXPECT_EQ(header.run_result_epoch, 19u);
     EXPECT_EQ(header.entry_args_source, static_cast<uint32_t>(EntryArgsSource::KernelInvocation));
+    // Model RTS copying into a distinct allocation and relocating the input.
+    // No KernelArgs base is required to consume the relocated pointer.
+    std::vector<std::byte> device_packet(helper.launch_payload_bytes());
+    std::memcpy(device_packet.data(), helper.launch_payload(), device_packet.size());
+    header.entry_args_data = device_packet.data() + LAUNCH_ENVELOPE_HEADER_BYTES;
     PlatformEntryArgs view{
-        helper.launch_payload(), header.entry_args_offset, header.entry_tensor_count, header.entry_scalar_count,
-        header.entry_args_source
+        nullptr, header.entry_args_data, header.entry_tensor_count, header.entry_scalar_count, header.entry_args_source
     };
+    std::memset(
+        static_cast<std::byte *>(helper.launch_payload()) + LAUNCH_ENVELOPE_HEADER_BYTES, 0,
+        helper.launch_payload_bytes() - LAUNCH_ENVELOPE_HEADER_BYTES
+    );
     const auto *resident = reinterpret_cast<const Runtime *>(slot.runtime_args);
     simpler::tmr::EntryArgsStorage decoded{};
     ASSERT_TRUE(
@@ -145,7 +153,7 @@ TEST_F(LaunchEntryArgs, TheLaunchPackageCarriesTheSameCaptureAsItsDescriptor) {
     KernelArgs header{};
     std::memcpy(&header, package, sizeof(header));
     EXPECT_EQ(header.entry_args_source, static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope));
-    EXPECT_EQ(header.entry_args_offset, LAUNCH_ENVELOPE_HEADER_BYTES);
+    EXPECT_EQ(header.entry_args_data, nullptr);
     EXPECT_EQ(header.entry_tensor_count, 3U);
     EXPECT_EQ(header.entry_scalar_count, 2U);
     // The descriptor names the same counts and the same route, so the device's
@@ -159,6 +167,17 @@ TEST_F(LaunchEntryArgs, TheLaunchPackageCarriesTheSameCaptureAsItsDescriptor) {
     uint64_t scalar = 0;
     std::memcpy(&scalar, package + LAUNCH_ENVELOPE_HEADER_BYTES + 3 * sizeof(simpler::tmr::Tensor), sizeof(scalar));
     EXPECT_EQ(scalar, 0x4444U);
+}
+
+TEST_F(LaunchEntryArgs, EmptyInputKeepsRelocationTargetInsideArgumentBlock) {
+    runtime.set_orch_args(entry_args(0, 0, 0));
+    ASSERT_EQ(run_once(true), 0);
+    helper.release_run_view();
+    ASSERT_EQ(run_once(true), 0);
+    EXPECT_EQ(helper.args.entry_args_source, static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope));
+    ASSERT_GT(helper.launch_payload_bytes(), LAUNCH_ENVELOPE_HEADER_BYTES);
+    const auto *bytes = static_cast<const std::byte *>(helper.launch_payload());
+    EXPECT_EQ(bytes[LAUNCH_ENVELOPE_HEADER_BYTES], std::byte{0});
 }
 
 // A decode reads the region as bytes, so a source the tensor type could not be
@@ -316,26 +335,26 @@ TEST_F(LaunchEntryArgs, TheLaunchHeaderIsClassifiedBeforeAnyPayloadAddressExists
 
     constexpr uint32_t kEnvelope = static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope);
     constexpr uint32_t kDescriptor = static_cast<uint32_t>(EntryArgsSource::Descriptor);
-    const uint32_t offset = LAUNCH_ENVELOPE_HEADER_BYTES;
+    const void *data = helper.launch_payload();
 
-    EXPECT_EQ(classify_launch_entry_args(published, kEnvelope, offset, 3, 2), LaunchEntryArgsVerdict::Adopt);
+    EXPECT_EQ(classify_launch_entry_args(published, kEnvelope, data, 3, 2), LaunchEntryArgsVerdict::Adopt);
     // A value that is neither route is refused on its own, not by matching:
     // the descriptor holding the same unknown value must not license a read.
-    EXPECT_EQ(classify_launch_entry_args(published, 2, offset, 3, 2), LaunchEntryArgsVerdict::UndefinedSource);
-    EXPECT_EQ(classify_launch_entry_args(published, kDescriptor, offset, 3, 2), LaunchEntryArgsVerdict::SourceMismatch);
+    EXPECT_EQ(classify_launch_entry_args(published, 2, data, 3, 2), LaunchEntryArgsVerdict::UndefinedSource);
+    EXPECT_EQ(classify_launch_entry_args(published, kDescriptor, data, 3, 2), LaunchEntryArgsVerdict::SourceMismatch);
     EXPECT_EQ(
-        classify_launch_entry_args(published, kEnvelope, offset + 1, 3, 2), LaunchEntryArgsVerdict::UnexpectedOffset
+        classify_launch_entry_args(published, kEnvelope, nullptr, 3, 2), LaunchEntryArgsVerdict::MissingHostInput
     );
     EXPECT_EQ(
-        classify_launch_entry_args(published, kEnvelope, offset, CHIP_MAX_TENSOR_ARGS + 1, 2),
+        classify_launch_entry_args(published, kEnvelope, data, CHIP_MAX_TENSOR_ARGS + 1, 2),
         LaunchEntryArgsVerdict::CountsPastCapacity
     );
     EXPECT_EQ(
-        classify_launch_entry_args(published, kEnvelope, offset, 3, CHIP_MAX_SCALAR_ARGS + 1),
+        classify_launch_entry_args(published, kEnvelope, data, 3, CHIP_MAX_SCALAR_ARGS + 1),
         LaunchEntryArgsVerdict::CountsPastCapacity
     );
-    EXPECT_EQ(classify_launch_entry_args(published, kEnvelope, offset, 4, 2), LaunchEntryArgsVerdict::CountsMismatch);
-    EXPECT_EQ(classify_launch_entry_args(published, kEnvelope, offset, 3, 1), LaunchEntryArgsVerdict::CountsMismatch);
+    EXPECT_EQ(classify_launch_entry_args(published, kEnvelope, data, 4, 2), LaunchEntryArgsVerdict::CountsMismatch);
+    EXPECT_EQ(classify_launch_entry_args(published, kEnvelope, data, 3, 1), LaunchEntryArgsVerdict::CountsMismatch);
 }
 
 // A descriptor-route run's header says so on both sides, so the AICPU adopts
@@ -776,8 +795,8 @@ TEST_F(LaunchEntryArgs, KernelAdmissionRejectsNonFullMaintenanceBeforePacketCons
     ASSERT_EQ(helper.prepare_kernel_invocation({3, 7, 0, 1}), 0);
     ASSERT_EQ(publish(true), 0);
     PlatformEntryArgs view{
-        helper.launch_payload(), LAUNCH_ENVELOPE_HEADER_BYTES, 0, 1,
-        static_cast<uint32_t>(EntryArgsSource::KernelInvocation)
+        helper.launch_payload(), static_cast<const std::byte *>(helper.launch_payload()) + LAUNCH_ENVELOPE_HEADER_BYTES,
+        0, 1, static_cast<uint32_t>(EntryArgsSource::KernelInvocation)
     };
     const auto *resident = reinterpret_cast<const Runtime *>(slot.runtime_args);
     simpler::tmr::EntryArgsStorage output{};

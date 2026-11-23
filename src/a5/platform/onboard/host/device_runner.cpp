@@ -740,7 +740,8 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
             int launch_rc = launch_aicpu_payload(
                 streams.aicpu, prepared.kernel_args.launch_payload(), prepared.kernel_args.launch_payload_bytes(),
-                host::KernelNames::RunName, aicpu_launch_n
+                host::KernelNames::RunName, aicpu_launch_n,
+                prepared.kernel_args.args.entry_args_source != static_cast<uint32_t>(EntryArgsSource::Descriptor)
             );
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicpu_payload (main) failed: %d", launch_rc);

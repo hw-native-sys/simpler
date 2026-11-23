@@ -65,8 +65,8 @@ enum class GraphSectionSource : uint32_t {
 /**
  * Byte offset of the entry payload inside an AICPU launch package.
  *
- * One value for every architecture, so the payload's own offset is not a
- * per-arch quantity a decoder has to look up: it is a cache line multiple at or
+ * The host supplies this offset as RTS hostInputInfo.dataOffset for TMR;
+ * device TMR code consumes the relocated pointer. It is a cache line multiple at or
  * above every arch's `sizeof(KernelArgs)` (each arch static_asserts its own
  * header fits). Cache-line aligned because the payload leads with tensor
  * descriptors whose type is 64-byte aligned — the copy target is what carries

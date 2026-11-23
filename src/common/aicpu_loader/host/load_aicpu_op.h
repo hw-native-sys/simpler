@@ -178,9 +178,14 @@ public:
      * @param args_size    Size of the payload in bytes
      * @param aicpu_num    Number of AICPU threads
      * @param func_name    Lookup key in func_handles_ (KernelNames::*)
+     * @param host_inputs  RTS relocation records for inputs inside the payload
+     * @param host_input_count Number of relocation records
      * @return 0 on success, error code on failure
      */
-    int LaunchBuiltInOp(rtStream_t stream, void *args, size_t args_size, int aicpu_num, const std::string &func_name);
+    int LaunchBuiltInOp(
+        rtStream_t stream, void *args, size_t args_size, int aicpu_num, const std::string &func_name,
+        rtHostInputInfo_t *host_inputs = nullptr, uint16_t host_input_count = 0
+    );
 
 private:
     void *binary_handle_ = nullptr;
@@ -207,7 +212,10 @@ private:
     std::vector<std::string> kernel_symbols_;
 
     bool GenerateAicpuOpJson(const std::string &json_path, const std::string &kernel_so);
-    int AicpuKernelLaunch(rtFuncHandle func_handle, rtStream_t stream, void *args, size_t args_size, int aicpu_num);
+    int AicpuKernelLaunch(
+        rtFuncHandle func_handle, rtStream_t stream, void *args, size_t args_size, int aicpu_num,
+        rtHostInputInfo_t *host_inputs, uint16_t host_input_count
+    );
 };
 
 // Runtime SO's actual exported symbol name. Looked up via the runtime SO's

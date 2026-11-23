@@ -14,6 +14,10 @@
 using rtStream_t = void *;
 using rtFuncHandle = void *;
 using rtError_t = int32_t;
+struct rtHostInputInfo_t {
+    uint32_t addrOffset;
+    uint32_t dataOffset;
+};
 constexpr int RT_ERROR_NONE = 0;
 constexpr int RT_MEMORY_HBM = 0;
 constexpr int RT_DEV_BINARY_MAGIC_ELF = 0;

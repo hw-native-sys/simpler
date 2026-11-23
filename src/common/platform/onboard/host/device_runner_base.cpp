@@ -3194,13 +3194,18 @@ void DeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeline_
 // =============================================================================
 
 int DeviceRunnerBase::launch_aicpu_payload(
-    rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num
+    rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num, bool host_entry_input
 ) {
     // For the run entry, kernel_name is host::KernelNames::RunName — the runtime
     // SO's actual exported symbol (simpler_aicpu_exec). LaunchBuiltInOp
     // dispatches via rtsLaunchCpuKernel on the cached rtFuncHandle resolved by
     // LoadAicpuOp::Init at first-time bootstrap.
-    return load_aicpu_op_.LaunchBuiltInOp(stream, args, args_size, aicpu_num, kernel_name);
+    // RTS patches the pointer to the payload in its own argument allocation.
+    // Both ordinary TMR inputs and KernelInvocation packets start here.
+    rtHostInputInfo_t input{offsetof(KernelArgs, entry_args_data), LAUNCH_ENVELOPE_HEADER_BYTES};
+    return load_aicpu_op_.LaunchBuiltInOp(
+        stream, args, args_size, aicpu_num, kernel_name, host_entry_input ? &input : nullptr, host_entry_input ? 1 : 0
+    );
 }
 
 int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
