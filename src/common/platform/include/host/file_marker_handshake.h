@@ -34,6 +34,9 @@ enum class Stage {
     ARRIVAL_WAIT,
     DEPARTURE_PUBLISH,
     DEPARTURE_WAIT,
+    CONFIRMATION_PUBLISH,
+    CONFIRMATION_WAIT,
+    CONFIRMATION_REMOVE,
     CLEANUP,
     RELEASE_PUBLISH,
     RELEASE_WAIT,
@@ -75,6 +78,12 @@ inline const char *stage_name(Stage stage) {
         return "departure publish";
     case Stage::DEPARTURE_WAIT:
         return "departure wait";
+    case Stage::CONFIRMATION_PUBLISH:
+        return "confirmation publish";
+    case Stage::CONFIRMATION_WAIT:
+        return "confirmation wait";
+    case Stage::CONFIRMATION_REMOVE:
+        return "confirmation remove";
     case Stage::CLEANUP:
         return "cleanup";
     case Stage::RELEASE_PUBLISH:
@@ -225,6 +234,53 @@ destroy_barrier(const std::string &rootinfo_path, int rank, int nranks, uint64_t
         );
         if (!result.ok()) return result;
     }
+    return {};
+}
+
+inline std::string confirmation_directory(const std::string &rootinfo_path, uint64_t run_token) {
+    return rootinfo_path + ".destroy_confirmed." + run_token_hex(run_token);
+}
+
+inline Result destroy_barrier_confirmed(
+    const std::string &rootinfo_path, int rank, int nranks, uint64_t run_token, WaitOptions options = {}
+) {
+    const auto deadline = std::chrono::steady_clock::now() + options.timeout;
+    const auto handshake = destroy_barrier(rootinfo_path, rank, nranks, run_token, options);
+    if (!handshake.ok() || nranks < 2) return handshake;
+
+    // The directory rename commits all follower confirmations atomically.
+    // Its files survive cleanup() until each follower consumes its own entry.
+    const auto directory = confirmation_directory(rootinfo_path, run_token);
+    if (rank == 0) {
+        const auto prepared = directory + ".tmp";
+        std::error_code ec;
+        if (!std::filesystem::create_directory(prepared, ec))
+            return {Error::MARKER_WRITE_FAILED, Stage::CONFIRMATION_PUBLISH, rank};
+        Result result;
+        for (int follower = 1; follower < nranks; ++follower) {
+            if (!publish_marker(prepared + "/" + std::to_string(follower))) {
+                result = {Error::MARKER_WRITE_FAILED, Stage::CONFIRMATION_PUBLISH, follower};
+                break;
+            }
+        }
+        if (result.ok()) {
+            std::filesystem::rename(prepared, directory, ec);
+            if (ec) result = {Error::MARKER_WRITE_FAILED, Stage::CONFIRMATION_PUBLISH, rank};
+        }
+        if (!result.ok()) std::filesystem::remove_all(prepared, ec);
+        return result;
+    }
+
+    const auto path = directory + "/" + std::to_string(rank);
+    const auto confirmation =
+        wait_for_path(path, Stage::CONFIRMATION_WAIT, rank, deadline, options.poll_interval, options.abort_path);
+    if (!confirmation.ok()) return confirmation;
+    std::error_code ec;
+    if (!std::filesystem::remove(path, ec) || ec)
+        return {Error::MARKER_REMOVE_FAILED, Stage::CONFIRMATION_REMOVE, rank};
+    std::filesystem::remove(directory, ec);
+    if (ec && ec != std::errc::directory_not_empty)
+        return {Error::MARKER_REMOVE_FAILED, Stage::CONFIRMATION_REMOVE, rank};
     return {};
 }
 

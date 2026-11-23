@@ -90,6 +90,64 @@ TEST(FileMarkerHandshakeTest, RankZeroWaitsForFollowerDepartureBeforeCleanup) {
     EXPECT_FALSE(std::filesystem::exists(follower_departure));
 }
 
+TEST(FileMarkerHandshakeTest, RootConfirmationsSurviveCleanupAndNextGenerationSweep) {
+    HandshakeDirectory directory;
+    const auto root = directory.rootinfo_path();
+    constexpr uint64_t token = 17;
+    for (int follower = 1; follower < 3; ++follower) {
+        ASSERT_TRUE(
+            file_marker_handshake::publish_marker(file_marker_handshake::marker_path(root, token, "destroy", follower))
+        );
+        ASSERT_TRUE(
+            file_marker_handshake::publish_marker(
+                file_marker_handshake::marker_path(root, token, "destroy_departed", follower)
+            )
+        );
+    }
+    ASSERT_TRUE(file_marker_handshake::destroy_barrier_confirmed(root, 0, 3, token).ok());
+    ASSERT_TRUE(file_marker_handshake::cleanup(root).ok());
+    { std::ofstream(root) << "next generation"; }
+    ASSERT_TRUE(file_marker_handshake::cleanup(root).ok());
+    const auto confirmed = file_marker_handshake::confirmation_directory(root, token);
+    EXPECT_TRUE(std::filesystem::is_regular_file(confirmed + "/1"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(confirmed + "/2"));
+    EXPECT_FALSE(std::filesystem::exists(confirmed + ".tmp"));
+}
+
+TEST(FileMarkerHandshakeTest, RootConfirmationPublishFailureExposesNoFollowerEntry) {
+    for (const bool fail_rename : {false, true}) {
+        SCOPED_TRACE(fail_rename);
+        HandshakeDirectory directory;
+        const auto root = directory.rootinfo_path();
+        constexpr uint64_t token = 17;
+        for (int follower = 1; follower < 3; ++follower) {
+            ASSERT_TRUE(
+                file_marker_handshake::publish_marker(
+                    file_marker_handshake::marker_path(root, token, "destroy", follower)
+                )
+            );
+            ASSERT_TRUE(
+                file_marker_handshake::publish_marker(
+                    file_marker_handshake::marker_path(root, token, "destroy_departed", follower)
+                )
+            );
+        }
+        const auto confirmed = file_marker_handshake::confirmation_directory(root, token);
+        if (fail_rename) {
+            ASSERT_TRUE(std::filesystem::create_directory(confirmed));
+            ASSERT_TRUE(file_marker_handshake::publish_marker(confirmed + "/keep"));
+        } else {
+            ASSERT_TRUE(file_marker_handshake::publish_marker(confirmed + ".tmp"));
+        }
+        const auto result = file_marker_handshake::destroy_barrier_confirmed(root, 0, 3, token);
+        EXPECT_EQ(result.error, file_marker_handshake::Error::MARKER_WRITE_FAILED);
+        EXPECT_EQ(result.stage, file_marker_handshake::Stage::CONFIRMATION_PUBLISH);
+        EXPECT_FALSE(std::filesystem::exists(confirmed + "/1"));
+        EXPECT_FALSE(std::filesystem::exists(confirmed + "/2"));
+        if (fail_rename) EXPECT_FALSE(std::filesystem::exists(confirmed + ".tmp"));
+    }
+}
+
 TEST(FileMarkerHandshakeTest, FollowerReturnsOnlyAfterRootinfoRetirement) {
     HandshakeDirectory directory;
     constexpr uint64_t kRunToken = 0x1234;

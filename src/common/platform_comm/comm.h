@@ -436,6 +436,11 @@ int comm_global_domain_release(uint64_t domain_id);
  * Synchronize all ranks.
  *
  * Blocks until every rank in the communicator has called comm_barrier().
+ * Onboard backends restore the caller's ACL context and confirm stream completion
+ * before returning success. A context-restore or stream-sync failure returns
+ * COMM_RECLAMATION_UNCONFIRMED, retaining the communicator. The caller must keep
+ * its stream, device context, and runtime library alive; comm_destroy() also
+ * returns COMM_RECLAMATION_UNCONFIRMED in that state.
  *
  * @param h  Handle from comm_init().
  * @return 0 on success, non-zero on failure.
@@ -446,7 +451,8 @@ int comm_barrier(CommHandle h);
  * Destroy the communicator and release all resources.
  *
  * The handle is consumed except when COMM_RECLAMATION_UNCONFIRMED is returned.
- * That result retains the owner and its dependent stream/device environment.
+ * That result retains the communicator. The caller must keep its stream,
+ * device context, and runtime library alive instead of cleaning them up.
  *
  * @param h  Handle from comm_init().
  * @return 0 on success, non-zero on failure.

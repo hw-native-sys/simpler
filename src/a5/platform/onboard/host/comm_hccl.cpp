@@ -1998,6 +1998,7 @@ extern "C" int comm_derive_context(
     size_t window_size, uint64_t *device_ctx_out
 ) try {
     if (!h || !rank_ids || !device_ctx_out) return -1;
+    if (h->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
     if (h->host_ctx.rankNum == 0) {
         LOG_ERROR("[comm rank %d] comm_derive_context: base windows are not allocated", h->rank);
         return -1;
@@ -2062,6 +2063,15 @@ extern "C" int comm_derive_context(
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
     if (h->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
+    RuntimeTimeoutConfig timeouts{};
+    try {
+        timeouts = resolve_runtime_timeout_config(
+            {PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS}
+        );
+    } catch (...) {
+        LOG_ERROR("[comm rank %d] resolving barrier timeouts failed", h->rank);
+        return -1;
+    }
     aclrtContext caller_context = nullptr;
     aclError rc = aclrtGetCurrentContext(&caller_context);
     if (rc != ACL_SUCCESS) return rc;
@@ -2072,20 +2082,18 @@ extern "C" int comm_barrier(CommHandle h) {
         h->cleanup_failed = true;
         publish_host_cleanup_failure(h);
         LOG_ERROR("[comm rank %d] restoring barrier context failed: %d", h->rank, static_cast<int>(rc));
-        return rc;
+        return COMM_RECLAMATION_UNCONFIRMED;
     }
     if (hret != HCCL_SUCCESS) {
         LOG_ERROR("[comm rank %d] HcclBarrier failed: %d", h->rank, static_cast<int>(hret));
         return static_cast<int>(hret);
     }
-    const auto timeouts = resolve_runtime_timeout_config(
-        {PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS}
-    );
     rc = aclrtSynchronizeStreamWithTimeout(h->stream, timeouts.stream_sync_timeout_ms);
     if (rc != ACL_SUCCESS) {
         h->cleanup_failed = true;
         publish_host_cleanup_failure(h);
         LOG_ERROR("[comm rank %d] barrier stream completion is unconfirmed: %d", h->rank, static_cast<int>(rc));
+        return COMM_RECLAMATION_UNCONFIRMED;
     }
     return rc;
 }

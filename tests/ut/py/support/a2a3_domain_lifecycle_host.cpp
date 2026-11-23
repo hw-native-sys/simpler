@@ -10,6 +10,7 @@
  */
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 
 #include <cassert>
 #include <array>
@@ -19,6 +20,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "comm_barrier_alloc_failure.h"
 
 namespace {
 bool fail_host_unlink = false;
@@ -76,6 +79,18 @@ int peer_import_calls = 0;
 int injected_peer_failures = 0;
 std::unordered_set<aclrtDrvMemHandle> imported_handles;
 std::unordered_set<void *> peer_mappings;
+aclrtContext barrier_context = reinterpret_cast<aclrtContext>(0x101);
+const aclrtContext barrier_caller_context = barrier_context;
+bool barrier_pending = false;
+bool barrier_switch_context = true;
+int barrier_get_context_rc = 0;
+int barrier_restore_context_rc = 0;
+int barrier_submit_rc = 0;
+int barrier_sync_rc = 0;
+int barrier_sync_calls = 0;
+int barrier_submit_calls = 0;
+int comm_destroy_calls = 0;
+constexpr int32_t barrier_timeout_ms = 61234;
 
 aclError map_buffer(void **out, size_t bytes) {
     static uintptr_t hint = UINT64_C(0x1000000000);
@@ -113,6 +128,29 @@ extern "C" aclError aclrtGetDevice(int32_t *id) {
     if (fail_get_device && device_calls == (fabric_supported ? 1 : 2)) return 1;
     *id = 0;
     return ACL_SUCCESS;
+}
+extern "C" aclError aclrtGetCurrentContext(aclrtContext *context) {
+    if (barrier_get_context_rc != 0) return barrier_get_context_rc;
+    *context = barrier_context;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtSetCurrentContext(aclrtContext context) {
+    if (barrier_restore_context_rc != 0) return barrier_restore_context_rc;
+    barrier_context = context;
+    return ACL_SUCCESS;
+}
+extern "C" HcclResult HcclBarrier(HcclComm, aclrtStream) {
+    ++barrier_submit_calls;
+    if (barrier_switch_context) barrier_context = reinterpret_cast<aclrtContext>(0x202);
+    barrier_pending = barrier_submit_rc == 0;
+    return static_cast<HcclResult>(barrier_submit_rc);
+}
+extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t timeout) {
+    assert(stream == reinterpret_cast<aclrtStream>(0x303));
+    assert(timeout == barrier_timeout_ms && barrier_context == barrier_caller_context);
+    ++barrier_sync_calls;
+    if (barrier_sync_rc == 0) barrier_pending = false;
+    return barrier_sync_rc;
 }
 extern "C" aclError aclrtHostMemMapCapabilities(uint32_t, aclrtHacType engine, aclrtHostMemMapCapability *capability) {
     ++host_capability_calls;
@@ -232,7 +270,10 @@ aclrtMemImportFromShareableHandleV2(void *in, aclrtMemSharedHandleType, uint64_t
     std::memcpy(&token, in, sizeof(token));
     return aclrtMemImportFromShareableHandle(token, 0, out);
 }
-extern "C" HcclResult HcclCommDestroy(HcclComm) { return HCCL_SUCCESS; }
+extern "C" HcclResult HcclCommDestroy(HcclComm) {
+    ++comm_destroy_calls;
+    return HCCL_SUCCESS;
+}
 
 static void prepare_peer(CommHandle h, uint64_t id, bool release_marker) {
     aclrtMemFabricHandle fabric{};
@@ -454,11 +495,194 @@ static void test_host_cleanup_failure_notifies_peer(const std::string &scenario)
     assert(file_marker_handshake::cleanup(root).ok() && rmdir(folder.c_str()) == 0);
 }
 
+static void test_barrier_completion(const std::string &scenario) {
+    assert(setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", "61234", 1) == 0);
+    char folder[] = "/tmp/simpler-a2a3-barrier-XXXXXX";
+    assert(mkdtemp(folder));
+    CommHandle_ handle{};
+    handle.rank = 0;
+    handle.nranks = 2;
+    handle.run_token = 17;
+    handle.rootinfo_path = std::string(folder) + "/root";
+    handle.hccl_comm = reinterpret_cast<HcclComm>(0x404);
+    handle.stream = reinterpret_cast<aclrtStream>(0x303);
+    barrier_switch_context = scenario != "barrier_same_context";
+    barrier_get_context_rc = scenario == "barrier_context_error" ? ACL_ERROR_FAILURE : 0;
+    barrier_restore_context_rc = scenario == "barrier_restore_error" ? ACL_ERROR_FAILURE : 0;
+    barrier_submit_rc = scenario == "barrier_submit_error" ? HCCL_E_INTERNAL : 0;
+    barrier_sync_rc = scenario == "barrier_sync_error" ? ACL_ERROR_FAILURE : 0;
+    if (scenario == "barrier_timeout_error") {
+        const std::string oversized_timeout(128, '7');
+        assert(setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", oversized_timeout.c_str(), 1) == 0);
+        barrier_fixture::fail_next_allocation = true;
+    }
+    const int rc = comm_barrier(&handle);
+    const auto failure_path = host_cleanup_failure_path(&handle);
+    if (scenario == "barrier_timeout_error") {
+        assert(rc == -1 && !barrier_fixture::fail_next_allocation);
+        assert(barrier_submit_calls == 0 && barrier_sync_calls == 0);
+    } else if (barrier_get_context_rc != 0) {
+        assert(rc == barrier_get_context_rc && barrier_submit_calls == 0 && barrier_sync_calls == 0);
+    } else if (barrier_restore_context_rc != 0 || barrier_sync_rc != 0) {
+        assert(rc == COMM_RECLAMATION_UNCONFIRMED);
+        assert(barrier_sync_calls == (barrier_restore_context_rc == 0 ? 1 : 0));
+        assert(barrier_pending && std::filesystem::is_regular_file(failure_path));
+        assert(comm_destroy(&handle) == COMM_RECLAMATION_UNCONFIRMED);
+        handle.host_ctx.rankNum = 2;
+        handle.host_ctx.winSize = 4096;
+        const uint32_t ranks[] = {0, 1};
+        uint64_t context = 0;
+        assert(comm_derive_context(&handle, ranks, 2, 0, 0, 4096, &context) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(context == 0 && mappings.empty() && comm_destroy_calls == 0);
+        assert(std::filesystem::remove(failure_path));
+        assert(comm_barrier(&handle) == COMM_RECLAMATION_UNCONFIRMED && barrier_submit_calls == 1);
+        assert(comm_destroy(&handle) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(std::filesystem::remove(failure_path));
+    } else {
+        assert(barrier_context == barrier_caller_context);
+        if (barrier_submit_rc != 0) {
+            assert(rc == barrier_submit_rc && barrier_sync_calls == 0);
+        } else {
+            assert(rc == 0 && !barrier_pending && barrier_submit_calls == 1 && barrier_sync_calls == 1);
+        }
+    }
+    assert(!std::filesystem::exists(failure_path) && rmdir(folder) == 0);
+}
+
+static void test_destroy_failure_retains_communicator(const std::string &scenario) {
+    char folder[] = "/tmp/simpler-a2a3-destroy-timeout-XXXXXX";
+    assert(mkdtemp(folder));
+    CommHandle_ handle{};
+    handle.rank = 0;
+    handle.nranks = 2;
+    handle.run_token = 17;
+    handle.rootinfo_path = std::string(folder) + "/root";
+    handle.hccl_comm = reinterpret_cast<HcclComm>(0x404);
+    assert(
+        aclrtMalloc(reinterpret_cast<void **>(&handle.device_ctx), sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST) ==
+        ACL_SUCCESS
+    );
+    handle.owns_device_ctx = true;
+    file_marker_handshake::WaitOptions options;
+    options.timeout = std::chrono::milliseconds(0);
+    if (scenario == "destroy_exception") barrier_fixture::fail_next_allocation = true;
+    assert(comm_destroy_impl(&handle, options) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(!barrier_fixture::fail_next_allocation);
+    assert(comm_destroy_calls == 0 && mappings.count(handle.device_ctx) == 1);
+    assert(host_cleanup_failed(&handle));
+    assert(comm_destroy(&handle) == COMM_RECLAMATION_UNCONFIRMED && comm_destroy_calls == 0);
+    assert(aclrtFree(handle.device_ctx) == ACL_SUCCESS);
+    handle.device_ctx = nullptr;
+    assert(std::filesystem::remove(host_cleanup_failure_path(&handle)));
+    assert(file_marker_handshake::cleanup(handle.rootinfo_path).ok() && rmdir(folder) == 0);
+}
+
+static void test_destroy_pair(const std::string &scenario) {
+    char folder[] = "/tmp/simpler-a2a3-destroy-pair-XXXXXX";
+    assert(mkdtemp(folder));
+    const std::string root = std::string(folder) + "/root";
+    constexpr uint64_t token = 17;
+    for (int rank = 0; rank < 2; ++rank)
+        assert(file_marker_handshake::publish_marker(file_marker_handshake::marker_path(root, token, "destroy", rank)));
+    const bool success = scenario == "destroy_pair_success";
+    if (scenario == "destroy_root_departure_failure")
+        assert(
+            std::filesystem::create_directory(file_marker_handshake::marker_path(root, token, "destroy_departed", 0))
+        );
+    if (scenario == "destroy_root_confirmation_failure")
+        assert(
+            file_marker_handshake::publish_marker(file_marker_handshake::confirmation_directory(root, token) + ".tmp")
+        );
+
+    struct Outcome {
+        int rc;
+        int destroy_calls;
+        bool context_retained;
+    };
+    const auto destroy_rank = [&](int rank) {
+        auto *handle = new CommHandle_{};
+        handle->rank = rank;
+        handle->nranks = 2;
+        handle->run_token = token;
+        handle->rootinfo_path = root;
+        handle->hccl_comm = reinterpret_cast<HcclComm>(0x404);
+        assert(
+            aclrtMalloc(
+                reinterpret_cast<void **>(&handle->device_ctx), sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST
+            ) == ACL_SUCCESS
+        );
+        handle->owns_device_ctx = true;
+        void *context = handle->device_ctx;
+        const int rc = comm_destroy_impl(handle, {std::chrono::seconds(2), std::chrono::milliseconds(1)});
+        const Outcome outcome{rc, comm_destroy_calls, mappings.count(context) == 1};
+        if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            assert(aclrtFree(context) == ACL_SUCCESS);
+            handle->device_ctx = nullptr;
+            delete handle;
+        }
+        return outcome;
+    };
+
+    int result_pipe[2];
+    assert(pipe(result_pipe) == 0);
+    const pid_t follower = fork();
+    assert(follower >= 0);
+    if (follower == 0) {
+        close(result_pipe[0]);
+        const auto result = destroy_rank(1);
+        assert(write(result_pipe[1], &result, sizeof(result)) == sizeof(result));
+        std::_Exit(0);
+    }
+    close(result_pipe[1]);
+    const auto departure = file_marker_handshake::marker_path(root, token, "destroy_departed", 1);
+    assert(
+        file_marker_handshake::wait_for_path(
+            departure, file_marker_handshake::Stage::DEPARTURE_WAIT, 1,
+            std::chrono::steady_clock::now() + std::chrono::seconds(2), std::chrono::milliseconds(1)
+        )
+            .ok()
+    );
+    const auto root_result = destroy_rank(0);
+    Outcome follower_result{};
+    assert(read(result_pipe[0], &follower_result, sizeof(follower_result)) == sizeof(follower_result));
+    close(result_pipe[0]);
+    int status = 0;
+    assert(waitpid(follower, &status, 0) == follower && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    fprintf(
+        stderr, "destroy pair: root rc=%d calls=%d retained=%d; follower rc=%d calls=%d retained=%d\n", root_result.rc,
+        root_result.destroy_calls, root_result.context_retained, follower_result.rc, follower_result.destroy_calls,
+        follower_result.context_retained
+    );
+    for (const auto &result : {root_result, follower_result}) {
+        assert(result.rc == (success ? 0 : COMM_RECLAMATION_UNCONFIRMED));
+        assert(result.destroy_calls == (success ? 1 : 0));
+        assert(result.context_retained == !success);
+    }
+    if (success) {
+        assert(rmdir(folder) == 0);
+    } else {
+        std::filesystem::remove_all(folder);
+    }
+}
+
 int main(int argc, char **argv) {
     assert(argc == 3);
     fabric_supported = std::string(argv[1]) == "fabric";
     reject_explicit_access = std::string(argv[2]) == "map_grants_access";
     const std::string scenario = reject_explicit_access ? "success" : argv[2];
+    if (scenario == "destroy_root_departure_failure" || scenario == "destroy_root_confirmation_failure" ||
+        scenario == "destroy_pair_success") {
+        test_destroy_pair(scenario);
+        return 0;
+    }
+    if (scenario == "destroy_timeout" || scenario == "destroy_exception") {
+        test_destroy_failure_retains_communicator(scenario);
+        return 0;
+    }
+    if (scenario.find("barrier_") == 0) {
+        test_barrier_completion(scenario);
+        return 0;
+    }
     if (scenario == "host_notify_release" || scenario == "host_notify_abort" || scenario == "host_notify_destroy") {
         test_host_cleanup_failure_notifies_peer(scenario);
         return 0;

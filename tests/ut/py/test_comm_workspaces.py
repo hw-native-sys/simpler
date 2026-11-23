@@ -265,6 +265,7 @@ def test_basic_window_issues_no_explicit_access(host_resource_binary):
         "barrier_restore_error",
         "barrier_submit_error",
         "barrier_sync_error",
+        "barrier_timeout_error",
     ],
 )
 def test_barrier_restores_caller_context_and_confirms_stream_completion(host_resource_binary, scenario):

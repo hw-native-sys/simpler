@@ -82,6 +82,34 @@ def test_a2a3_domain_lifecycle(a2a3_lifecycle_binary, transport, scenario):
     subprocess.run([str(a2a3_lifecycle_binary), transport, scenario], check=True, timeout=5)
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "barrier_complete",
+        "barrier_same_context",
+        "barrier_context_error",
+        "barrier_restore_error",
+        "barrier_submit_error",
+        "barrier_sync_error",
+        "barrier_timeout_error",
+    ],
+)
+def test_a2a3_barrier_restores_context_and_confirms_completion(a2a3_lifecycle_binary, scenario):
+    subprocess.run([str(a2a3_lifecycle_binary), "fabric", scenario], check=True, timeout=5)
+
+
+@pytest.mark.parametrize("scenario", ["destroy_timeout", "destroy_exception"])
+def test_a2a3_destroy_failure_retains_communicator(a2a3_lifecycle_binary, scenario):
+    subprocess.run([str(a2a3_lifecycle_binary), "fabric", scenario], check=True, timeout=5)
+
+
+@pytest.mark.parametrize(
+    "scenario", ["destroy_root_departure_failure", "destroy_root_confirmation_failure", "destroy_pair_success"]
+)
+def test_a2a3_destroy_pair_waits_for_root_confirmation(a2a3_lifecycle_binary, scenario):
+    subprocess.run([str(a2a3_lifecycle_binary), "fabric", scenario], check=True, timeout=5)
+
+
 def test_a2a3_fallback_stops_when_cleanup_reports_an_error_after_consumption(a2a3_lifecycle_binary):
     subprocess.run([str(a2a3_lifecycle_binary), "ipc", "fallback_cleanup"], check=True, timeout=5)
 

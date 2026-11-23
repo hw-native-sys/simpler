@@ -26,7 +26,9 @@
 #include "runtime_c_api.h"
 
 #include "common/unified_log.h"
+#include "common/platform_config.h"
 #include "host/file_marker_handshake.h"
+#include "host/runtime_timeout_config.h"
 
 #include <cerrno>
 #include <chrono>
@@ -116,6 +118,7 @@ struct CommHandle_ {
     int nranks;
     std::string rootinfo_path;
     uint64_t run_token = 0;
+    bool cleanup_failed = false;
 
     // Caller-owned: supplied to comm_init, never created or destroyed here.
     aclrtStream stream = nullptr;
@@ -1187,6 +1190,7 @@ static std::string host_cleanup_failure_path(CommHandle h) {
 }
 
 static bool host_cleanup_failed(CommHandle h) {
+    if (h->cleanup_failed) return true;
     const auto path = host_cleanup_failure_path(h);
     return !path.empty() && std::ifstream(path).good();
 }
@@ -1424,6 +1428,7 @@ extern "C" int comm_derive_context(
     size_t window_size, uint64_t *device_ctx_out
 ) try {
     if (!h || !rank_ids || !device_ctx_out) return -1;
+    if (h->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
     if (h->host_ctx.rankNum == 0) {
         LOG_ERROR("[comm rank %d] comm_derive_context: base windows are not allocated", h->rank);
         return -1;
@@ -1487,16 +1492,40 @@ extern "C" int comm_derive_context(
 
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
-    // HcclBarrier is synchronous — it blocks until all ranks arrive.
-    // Do NOT call aclrtSynchronizeStream after it: HcclBarrier internally
-    // switches the thread's ACL context, which invalidates the caller-owned
-    // stream for context-checked ACL calls (error 507018).
+    if (h->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
+    RuntimeTimeoutConfig timeouts{};
+    try {
+        timeouts = resolve_runtime_timeout_config(
+            {PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS}
+        );
+    } catch (...) {
+        LOG_ERROR("[comm rank %d] resolving barrier timeouts failed", h->rank);
+        return -1;
+    }
+    aclrtContext caller_context = nullptr;
+    aclError rc = aclrtGetCurrentContext(&caller_context);
+    if (rc != ACL_SUCCESS) return rc;
     HcclResult hret = hccl_barrier(h->hccl_comm, h->stream);
+    // HCCL may change the calling thread's context; the stream belongs to its caller.
+    rc = aclrtSetCurrentContext(caller_context);
+    if (rc != ACL_SUCCESS) {
+        h->cleanup_failed = true;
+        publish_host_cleanup_failure(h);
+        LOG_ERROR("[comm rank %d] restoring barrier context failed: %d", h->rank, static_cast<int>(rc));
+        return COMM_RECLAMATION_UNCONFIRMED;
+    }
     if (hret != HCCL_SUCCESS) {
         LOG_ERROR("[comm rank %d] HcclBarrier failed: %d", h->rank, static_cast<int>(hret));
         return static_cast<int>(hret);
     }
-    return 0;
+    rc = aclrtSynchronizeStreamWithTimeout(h->stream, timeouts.stream_sync_timeout_ms);
+    if (rc != ACL_SUCCESS) {
+        h->cleanup_failed = true;
+        publish_host_cleanup_failure(h);
+        LOG_ERROR("[comm rank %d] barrier stream completion is unconfirmed: %d", h->rank, static_cast<int>(rc));
+        return COMM_RECLAMATION_UNCONFIRMED;
+    }
+    return rc;
 }
 
 extern "C" int comm_alloc_domain_windows(
@@ -2004,8 +2033,14 @@ extern "C" int comm_global_domain_release(uint64_t domain_id) try {
     return -1;
 }
 
-extern "C" int comm_destroy(CommHandle h) try {
+static int comm_destroy_impl(CommHandle h, file_marker_handshake::WaitOptions options) try {
     if (!h) return -1;
+
+    if (host_cleanup_failed(h)) {
+        h->cleanup_failed = true;
+        publish_host_cleanup_failure(h);
+        return COMM_RECLAMATION_UNCONFIRMED;
+    }
 
     // Keep registration owners and the runtime alive if retirement is unconfirmed.
     for (auto it = h->domain_allocations.begin(); it != h->domain_allocations.end();) {
@@ -2019,23 +2054,18 @@ extern "C" int comm_destroy(CommHandle h) try {
         it = h->domain_allocations.erase(it);
     }
 
-    // Final barrier is best-effort: if a peer already crashed we still need to
-    // release the local resources we own, so timeout just logs and proceeds.
     int rc = 0;
-    file_marker_handshake::WaitOptions options;
     options.abort_path = host_cleanup_failure_path(h);
     const auto destroy_handshake =
-        file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token, options);
+        file_marker_handshake::destroy_barrier_confirmed(h->rootinfo_path, h->rank, h->nranks, h->run_token, options);
     if (!destroy_handshake.ok()) {
-        if (destroy_handshake.error == file_marker_handshake::Error::ABORTED || host_cleanup_failed(h)) {
-            LOG_WARN("[comm rank %d] comm_destroy: peer Host cleanup failed; retaining communicator", h->rank);
-            return COMM_RECLAMATION_UNCONFIRMED;
-        }
+        h->cleanup_failed = true;
+        publish_host_cleanup_failure(h);
         LOG_WARN(
-            "[comm rank %d] comm_destroy: final barrier failed during %s for rank %d; releasing local state anyway",
-            h->rank, file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank
+            "[comm rank %d] comm_destroy: final barrier failed during %s for rank %d; retaining communicator", h->rank,
+            file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank
         );
-        rc = -1;
+        return COMM_RECLAMATION_UNCONFIRMED;
     }
 
     if (h->owns_device_ctx && h->device_ctx) {
@@ -2096,10 +2126,18 @@ extern "C" int comm_destroy(CommHandle h) try {
     return rc;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] comm_destroy: exception: %s", e.what());
-    if (h) delete h;
-    return -1;
+    if (h) {
+        h->cleanup_failed = true;
+        publish_host_cleanup_failure(h);
+    }
+    return COMM_RECLAMATION_UNCONFIRMED;
 } catch (...) {
     LOG_ERROR("[comm] comm_destroy: unknown exception");
-    if (h) delete h;
-    return -1;
+    if (h) {
+        h->cleanup_failed = true;
+        publish_host_cleanup_failure(h);
+    }
+    return COMM_RECLAMATION_UNCONFIRMED;
 }
+
+extern "C" int comm_destroy(CommHandle h) { return comm_destroy_impl(h, {}); }

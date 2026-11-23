@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "comm_barrier_alloc_failure.h"
 #include "comm_workspace_managers.h"
 #include "comm_hccl.cpp"
 
@@ -67,6 +68,7 @@ int barrier_submit_rc = 0;
 int barrier_sync_rc = 0;
 int barrier_sync_calls = 0;
 int barrier_submit_calls = 0;
+constexpr int32_t barrier_timeout_ms = 61234;
 bool fail_context_upload = false;
 bool fail_dbcos_read = false;
 bool fail_host_register = false;
@@ -172,7 +174,7 @@ extern "C" HcclResult HcclBarrier(HcclComm, aclrtStream) {
 }
 extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t timeout) {
     assert(stream == reinterpret_cast<aclrtStream>(0x303));
-    assert(timeout > 0 && barrier_context == barrier_caller_context);
+    assert(timeout == barrier_timeout_ms && barrier_context == barrier_caller_context);
     ++barrier_sync_calls;
     if (barrier_sync_rc == 0) barrier_pending = false;
     return barrier_sync_rc;
@@ -960,7 +962,18 @@ static void test_basic_window() {
 #include "comm_ccu_failure.h"
 #endif
 
+static void assert_barrier_cleanup_retained(CommHandle_ &handle) {
+    assert(comm_destroy(&handle) == COMM_RECLAMATION_UNCONFIRMED);
+    handle.host_ctx.rankNum = 2;
+    handle.host_ctx.winSize = 4096;
+    const uint32_t ranks[] = {0, 1};
+    uint64_t context = 0;
+    assert(comm_derive_context(&handle, ranks, 2, 0, 0, 4096, &context) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(context == 0 && mappings.empty());
+}
+
 static void test_barrier_completion(const std::string &scenario) {
+    assert(setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", "61234", 1) == 0);
     CommHandle_ handle{};
     handle.hccl_comm = reinterpret_cast<HcclComm>(0x404);
     handle.stream = reinterpret_cast<aclrtStream>(0x303);
@@ -969,15 +982,25 @@ static void test_barrier_completion(const std::string &scenario) {
     barrier_restore_context_rc = scenario == "barrier_restore_error" ? ACL_ERROR_FAILURE : 0;
     barrier_submit_rc = scenario == "barrier_submit_error" ? HCCL_E_INTERNAL : 0;
     barrier_sync_rc = scenario == "barrier_sync_error" ? ACL_ERROR_FAILURE : 0;
+    if (scenario == "barrier_timeout_error") {
+        const std::string oversized_timeout(128, '7');
+        assert(setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", oversized_timeout.c_str(), 1) == 0);
+        barrier_fixture::fail_next_allocation = true;
+    }
     const int rc = comm_barrier(&handle);
+    if (scenario == "barrier_timeout_error") {
+        assert(rc == -1 && !barrier_fixture::fail_next_allocation);
+        assert(barrier_submit_calls == 0 && barrier_sync_calls == 0 && !handle.cleanup_failed);
+        return;
+    }
     if (barrier_get_context_rc != 0) {
         assert(rc == barrier_get_context_rc && barrier_submit_calls == 0 && barrier_sync_calls == 0);
         assert(!handle.cleanup_failed);
         return;
     }
     if (barrier_restore_context_rc != 0) {
-        assert(rc == barrier_restore_context_rc && barrier_sync_calls == 0 && handle.cleanup_failed);
-        assert(comm_destroy(&handle) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(rc == COMM_RECLAMATION_UNCONFIRMED && barrier_sync_calls == 0 && handle.cleanup_failed);
+        assert_barrier_cleanup_retained(handle);
         assert(comm_barrier(&handle) == COMM_RECLAMATION_UNCONFIRMED && barrier_submit_calls == 1);
         return;
     }
@@ -985,12 +1008,12 @@ static void test_barrier_completion(const std::string &scenario) {
     if (barrier_submit_rc != 0) {
         assert(rc == barrier_submit_rc && barrier_sync_calls == 0);
     } else if (barrier_sync_rc != 0) {
-        assert(rc == barrier_sync_rc && barrier_pending && barrier_sync_calls == 1);
+        assert(rc == COMM_RECLAMATION_UNCONFIRMED && barrier_pending && barrier_sync_calls == 1);
         assert(handle.cleanup_failed);
-        assert(comm_destroy(&handle) == COMM_RECLAMATION_UNCONFIRMED);
+        assert_barrier_cleanup_retained(handle);
         assert(comm_barrier(&handle) == COMM_RECLAMATION_UNCONFIRMED && barrier_submit_calls == 1);
     } else {
-        assert(rc == 0 && !barrier_pending && barrier_sync_calls == 1);
+        assert(rc == 0 && !barrier_pending && barrier_submit_calls == 1 && barrier_sync_calls == 1);
         assert(!handle.cleanup_failed);
     }
 }

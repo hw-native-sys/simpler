@@ -3160,6 +3160,7 @@ void ChipWorker::comm_global_domain_release(uint64_t domain_id) {
 void ChipWorker::comm_barrier(uint64_t comm_handle) {
     require_comm_cleanup_confirmed();
     int rc = comm_barrier_fn_(reinterpret_cast<void *>(comm_handle));
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
     if (rc != 0) {
         throw std::runtime_error("comm_barrier failed with code " + std::to_string(rc));
     }

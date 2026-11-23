@@ -114,6 +114,8 @@ std::vector<uint64_t> g_waited_epochs;
 
 int validate_context(void *) { return g_context_rc; }
 int g_comm_rc = 0;
+int g_comm_barrier_calls = 0;
+int g_comm_derive_calls = 0;
 int g_comm_stream_free_calls = 0;
 int g_comm_stream_rc = 0;
 int g_comm_alloc_calls = 0;
@@ -300,6 +302,8 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     g_per_run_wait_rc.clear();
     g_waited_epochs.clear();
     g_comm_rc = 0;
+    g_comm_barrier_calls = 0;
+    g_comm_derive_calls = 0;
     g_comm_stream_free_calls = 0;
     g_comm_stream_rc = 0;
     g_comm_alloc_calls = 0;
@@ -1338,6 +1342,54 @@ TEST(NativeRunOperationLeaseTest, DomainAllocationFailurePublishesCleanupOwnersh
             EXPECT_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0), std::runtime_error);
             EXPECT_EQ(g_comm_abort_calls, 0);
             EXPECT_THROW(worker.finalize(), std::runtime_error);
+        }
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, UnconfirmedBarrierBlocksDerivationAndEnvironmentCleanup) {
+    const int results[] = {0, 17, COMM_RECLAMATION_UNCONFIRMED};
+    for (int rc : results) {
+        SCOPED_TRACE(rc);
+        ChipWorker worker;
+        prime(worker);
+        worker.finalize_device_fn_ = stub_finalize_device;
+        worker.comm_destroy_fn_ = stub_destroy_comm;
+        worker.comm_barrier_fn_ = [](void *) {
+            ++g_comm_barrier_calls;
+            return g_comm_rc;
+        };
+        worker.comm_derive_context_fn_ = [](void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *out) {
+            ++g_comm_derive_calls;
+            *out = 0x100;
+            return 0;
+        };
+        int comm_placeholder = 0;
+        const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+        ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+        g_comm_rc = rc;
+        if (rc == 0) {
+            EXPECT_NO_THROW(worker.comm_barrier(comm));
+        } else {
+            EXPECT_THROW(worker.comm_barrier(comm), std::runtime_error);
+        }
+        EXPECT_EQ(g_comm_barrier_calls, 1);
+        EXPECT_EQ(worker.comm_cleanup_unconfirmed_, rc == COMM_RECLAMATION_UNCONFIRMED);
+        g_comm_rc = 0;
+        if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            EXPECT_THROW(worker.comm_derive_context(comm, {0}, 0, 0, 4096), std::runtime_error);
+            EXPECT_THROW(worker.comm_barrier(comm), std::runtime_error);
+            EXPECT_EQ(g_comm_barrier_calls, 1);
+            EXPECT_EQ(g_comm_derive_calls, 0);
+            EXPECT_THROW(worker.finalize(), std::runtime_error);
+            EXPECT_EQ(g_comm_free_calls, 0);
+            EXPECT_EQ(g_device_finalize_calls, 0);
+            EXPECT_EQ(g_destroy_context_calls, 0);
+            ASSERT_NE(worker.runtime_module_, nullptr);
+            EXPECT_FALSE(worker.runtime_module_->unload_allowed_);
+        } else {
+            EXPECT_EQ(worker.comm_derive_context(comm, {0}, 0, 0, 4096), 0x100u);
+            EXPECT_EQ(g_comm_derive_calls, 1);
+            EXPECT_NO_THROW(worker.finalize());
         }
     }
 }
