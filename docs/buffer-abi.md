@@ -322,6 +322,23 @@ independently of the consumer address. Forked chip children retain `FORK_SHM` fo
 and wraps the pointer; its `.base` is the device pointer (the `orch.copy_to`
 destination), and a tensor over it must be dispatched only to that worker.
 
+### Owner-local service registrations
+
+An L3 Worker may receive `chip_service_factories={rank: factory}` before
+`init()`. A factory runs after that chip's initialization, before READY, and
+returns an object with `close()`. Services own their IPC and progress threads;
+the runtime does not dispatch service operations through the compute mailbox.
+
+For existing, non-exportable DEVICE_MALLOC buffers, `token, descriptor = worker.retain_service_buffer(buffer)`
+retains the canonical allocation. The service resolves it with
+`context.pin(token, descriptor)` and removes that chip-local pin with
+`context.unpin(token)`. Only after native unregister completes may the caller
+invoke `worker.release_service_buffer(token)`. Retains reject free/close;
+they do not serialize computation. The caller owns page-level read/write
+ordering. Unknown native completion must keep the registration and retain.
+This path supports local L3 device malloc only, not arbitrary imported buffers
+or a general service/RPC system. Without factories, no service is started.
+
 ## Naming a view
 
 `Tensor(buffer, shapes=..., dtype=...)` names a view over the backing:

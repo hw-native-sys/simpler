@@ -325,7 +325,7 @@ def _controlled_stream_fault_case(
     monkeypatch,
     tmp_path,
     *,
-    alter_log=None,
+    keep_log_line=None,
     alter_error=None,
     wrong_success_output=False,
     copied_failed_output=False,
@@ -361,8 +361,9 @@ def _controlled_stream_fault_case(
         return (1, index + 1, index if wide else index % 2, 1, index + 1, index + 1)
 
     def append(text):
-        with log.open("a") as stream:
-            stream.write(text + "\n")
+        if keep_log_line is None or keep_log_line(text):
+            with log.open("a") as stream:
+                stream.write(text + "\n")
 
     def span(index, name, attrs):
         return f"[STRACE] v=1 pid={pid} tid={pid} inv={100 + index} hid=abc depth=0 name={name} ts=100 dur=1 {attrs}"
@@ -399,11 +400,8 @@ def _controlled_stream_fault_case(
                 )
             if copied_failed_output:
                 module.torch.frombuffer(self.buffers[2].shm.buf, dtype=module.torch.float32)[-1] = 1
-            if self.index == count - 1:
-                if alter_log is not None:
-                    log.write_text(alter_log(log.read_text()))
-                if fatal_succeeds:
-                    return
+            if self.index == count - 1 and fatal_succeeds:
+                return
             raise RuntimeError(error() if alter_error is None else alter_error(error()))
 
     original_trackers = module._CaseRuns
@@ -559,10 +557,7 @@ def test_queued_fault_uses_owned_native_error_without_device_timing(scene, monke
         scene,
         monkeypatch,
         tmp_path,
-        alter_log=lambda text: "\n".join(
-            line for line in text.splitlines() if "name=chip.run.runner_run.device_boundaries " not in line
-        )
-        + "\n",
+        keep_log_line=lambda line: "name=chip.run.runner_run.device_boundaries " not in line,
     )
     controlled.invoke()
     assert controlled.waited == list(range(controlled.count))
@@ -607,10 +602,7 @@ def test_queued_stream_error_still_requires_this_exact_pair_to_have_joined(scene
         scene,
         monkeypatch,
         tmp_path,
-        alter_log=lambda text: "\n".join(
-            line for line in text.splitlines() if "name=chip.run.joined_launch " not in line
-        )
-        + "\n",
+        keep_log_line=lambda line: "name=chip.run.joined_launch " not in line,
     )
     with pytest.raises(AssertionError, match="never recorded"):
         controlled.invoke()

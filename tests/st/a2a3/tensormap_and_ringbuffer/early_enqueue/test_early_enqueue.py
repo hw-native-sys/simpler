@@ -1337,6 +1337,7 @@ class TestA2a3TmrEarlyEnqueueErrorAttribution(_A2a3TmrEarlyEnqueueBase):
             "is still executing rather than after it has retired"
         )
         trace = _RunTrace(st_worker)
+        records: list[dict] = []
         stop = threading.Event()
         pid = self._endpoint_pid(st_worker)
         with _frame_views(st_worker) as frames:
@@ -1370,6 +1371,14 @@ class TestA2a3TmrEarlyEnqueueErrorAttribution(_A2a3TmrEarlyEnqueueBase):
                         failing_handle = self._submit_vector(
                             st_worker, failing_group, output_prefix, callable_name="reported_fatal"
                         )
+                        # submit() can return before activation. Waiting on the predecessor can
+                        # block the chip child while it still needs to activate the successor.
+                        _await_records(
+                            trace,
+                            records,
+                            _EVIDENCE_BUDGET_S,
+                            lambda seen: bool(_established_pairs(seen, case_runs, pid)),
+                        )
                     finally:
                         # Keep both observations even if the predecessor sees the successor's
                         # queued stream fault. Neither accepted handle may be abandoned.
@@ -1401,7 +1410,6 @@ class TestA2a3TmrEarlyEnqueueErrorAttribution(_A2a3TmrEarlyEnqueueBase):
             f"to this good/fatal pair"
         )
         predecessor, successor = observed[0], observed[1]
-        records: list[dict] = []
         _assert_stream_observations(
             trace,
             pid,
