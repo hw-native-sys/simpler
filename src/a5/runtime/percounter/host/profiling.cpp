@@ -51,8 +51,12 @@ bool publish(const ProfileOwner &owner, ChipSwimlaneExtensionSection section, co
 
 const char *task_event_name(PercounterTaskEventKind kind) {
     switch (kind) {
-    case PercounterTaskEventKind::Claim:
-        return "claim";
+    case PercounterTaskEventKind::RowBegin:
+        return "row_begin";
+    case PercounterTaskEventKind::InputsReady:
+        return "inputs_ready";
+    case PercounterTaskEventKind::MixReleaseObserved:
+        return "mix_release_observed";
     case PercounterTaskEventKind::Ready:
         return "ready";
     case PercounterTaskEventKind::CompletionIssue:
@@ -61,16 +65,20 @@ const char *task_event_name(PercounterTaskEventKind kind) {
         return "defer_registered";
     case PercounterTaskEventKind::DeferredCompletionIssue:
         return "deferred_completion_issue";
-    case PercounterTaskEventKind::MixPublished:
-        return "mix_publish";
-    case PercounterTaskEventKind::InputsPending:
-        return "inputs_pending";
-    case PercounterTaskEventKind::InputsReady:
-        return "inputs_ready";
-    case PercounterTaskEventKind::EntryCommitted:
-        return "entry_commit";
+    case PercounterTaskEventKind::LocalRetired:
+        return "local_retired";
+    case PercounterTaskEventKind::DeferPollBegin:
+        return "defer_poll_begin";
+    case PercounterTaskEventKind::DeferSignalReady:
+        return "defer_signal_ready";
     case PercounterTaskEventKind::KernelEnd:
         return "kernel_end";
+    case PercounterTaskEventKind::RangeEnterBegin:
+        return "range_enter_begin";
+    case PercounterTaskEventKind::GraphReadyObserved:
+        return "graph_ready_observed";
+    case PercounterTaskEventKind::RangeEntered:
+        return "range_entered";
     }
     throw std::runtime_error("invalid percounter task event kind");
 }
@@ -87,52 +95,50 @@ bool export_profile(const ProfileOwner &owner) {
     });
     std::ostringstream tasks, kernels, streams, task_events;
     task_events << "{\"records\":[";
-    bool first_event = true;
+    std::ostringstream range_events;
+    bool first_event = true, first_range = true;
     uint64_t dropped_events = 0;
-    std::unordered_map<uint64_t, uint64_t> deferred_entries;
+    std::unordered_map<uint64_t, std::pair<uint64_t, size_t>> deferred_entries;
     std::vector<std::pair<size_t, PercounterTaskEvent>> deferred_updates;
     kernels << "[";
     tasks << "{\"producer\":\"aicore\",\"records\":[";
     streams << "{\"streams\":[";
     bool first_task = true, first_stream = true;
     const auto epoch = owner.api->run_epoch();
+    const auto task_token = [&](uint64_t id) {
+        if (id >= layout.task_count) throw std::runtime_error("invalid percounter task id");
+        if (id < layout.table_task_count) return TaskId::make_global(static_cast<int32_t>(id));
+        auto invocation =
+            std::upper_bound(invocations.begin(), invocations.end(), id, [](uint64_t task, const auto &record) {
+                return task < record.body_base;
+            });
+        if (invocation == invocations.begin()) throw std::runtime_error("percounter task has no Graph");
+        --invocation;
+        return TaskId::make_sub_task(invocation->shell_task_id, id - invocation->body_base);
+    };
     const auto emit_task_event = [&](size_t worker, const PercounterTaskEvent &event,
-                                     const PercounterTaskTiming *timing = nullptr) {
+                                     const PercounterTaskTiming *timing = nullptr, size_t source_worker = SIZE_MAX) {
         const auto &header = headers[worker];
         const uint64_t id = percounter_order_task_id(event.entry);
         const auto block = percounter_order_block_idx(event.entry);
         const auto blocks = percounter_order_block_num(event.entry);
         if (event.cycles == 0 || id >= layout.task_count || block >= blocks)
             throw std::runtime_error("invalid percounter task event");
-        TaskId token = TaskId::make_global(static_cast<int32_t>(id));
-        if (id >= layout.table_task_count) {
-            auto invocation =
-                std::upper_bound(invocations.begin(), invocations.end(), id, [](uint64_t task, const auto &record) {
-                    return task < record.body_base;
-                });
-            if (invocation == invocations.begin()) throw std::runtime_error("percounter task event has no Graph");
-            --invocation;
-            token = TaskId::make_sub_task(invocation->shell_task_id, id - invocation->body_base);
-        }
+        const auto token = task_token(id);
         if (!first_event) task_events << ',';
         first_event = false;
         task_events << "\n{\"kind\":\"" << task_event_name(event.kind) << "\",\"cycles\":" << event.cycles
                     << ",\"run_epoch\":" << epoch << ",\"task_id\":" << TaskId::to_uint64(token)
                     << ",\"block_index\":" << block << ",\"block_count\":" << blocks << ",\"worker_id\":" << worker
                     << ",\"cluster_index\":" << header.cluster_index << ",\"cluster_lane\":" << header.cluster_lane;
-        if (event.kind == PercounterTaskEventKind::Claim) task_events << ",\"claim_start_cycles\":" << event.detail;
-        if (layout.profiling_level == 2 && event.kind == PercounterTaskEventKind::Claim)
-            task_events << ",\"slot\":" << event.slot
-                        << ",\"participant_mask\":" << static_cast<unsigned>(event.participant_mask)
-                        << ",\"mix\":" << (event.mix ? "true" : "false");
-        if (layout.profiling_level == 2 && timing != nullptr)
-            task_events << ",\"dispatch_cycles\":" << timing->dispatch << ",\"finish_cycles\":" << timing->finish;
-        if (event.kind == PercounterTaskEventKind::KernelEnd)
-            task_events << ",\"kernel_start_cycles\":" << event.detail;
+        if (timing != nullptr) {
+            task_events << ",\"dispatch_cycles\":" << timing->dispatch << ",\"kernel_start_cycles\":" << timing->start
+                        << ",\"finish_cycles\":" << timing->finish;
+        }
         if (event.kind == PercounterTaskEventKind::CompletionIssue) task_events << ",\"contribution\":" << event.detail;
-        if (event.kind == PercounterTaskEventKind::DeferRegistered ||
-            event.kind == PercounterTaskEventKind::DeferredCompletionIssue)
+        if (event.kind == PercounterTaskEventKind::DeferRegistered || source_worker != SIZE_MAX)
             task_events << ",\"deferred_group\":" << event.detail;
+        if (source_worker != SIZE_MAX) task_events << ",\"source_worker_id\":" << source_worker;
         if (event.kind == PercounterTaskEventKind::DeferredCompletionIssue) task_events << ",\"contribution\":1";
         task_events << '}';
     };
@@ -155,17 +161,15 @@ bool export_profile(const ProfileOwner &owner) {
                 kernels << ',';
             }
             first_task = false;
-            // L2 reports pickup and fence on the scheduling tracks. Its Worker View row spans only the kernel.
-            const bool kernel_only = layout.profiling_level == 2;
             kernels << '[' << worker << ',' << TaskId::to_uint64(task.task_token) << ',' << registration << ','
-                    << task.start << ',' << (kernel_only ? task.kernel_end : task.finish) << ','
-                    << (kernel_only ? 0 : task.start - task.dispatch) << ',' << epoch << ']';
+                    << task.start << ',' << task.kernel_end << ",0," << epoch << ','
+                    << percounter_order_block_idx(task.entry) << ',' << percounter_order_block_num(task.entry) << ']';
             tasks << '[' << worker << ',' << registration << ',' << task.dispatch << ',' << task.finish << ',' << epoch
                   << ']';
             if (task.kernel_end < task.start || task.kernel_end > task.finish)
                 throw std::runtime_error("invalid percounter kernel return timestamp");
             emit_task_event(
-                worker, {task.kernel_end, task.entry, task.start, PercounterTaskEventKind::KernelEnd, 0, 0, 0}, &task
+                worker, {task.kernel_end, task.entry, task.start, PercounterTaskEventKind::KernelEnd, 0}, &task
             );
         }
         const auto event_offset =
@@ -175,12 +179,31 @@ bool export_profile(const ProfileOwner &owner) {
             throw std::runtime_error("invalid percounter task event header");
         dropped_events += header.event_dropped;
         for (const auto &event : read_records<PercounterTaskEvent>(owner, event_offset, header.event_committed)) {
-            if (event.kind == PercounterTaskEventKind::DeferredCompletionIssue) {
+            if (event.kind == PercounterTaskEventKind::RangeEnterBegin ||
+                event.kind == PercounterTaskEventKind::GraphReadyObserved ||
+                event.kind == PercounterTaskEventKind::RangeEntered) {
+                if (!first_range) range_events << ',';
+                first_range = false;
+                range_events << "{\"kind\":\"" << task_event_name(event.kind) << "\",\"cycles\":" << event.cycles
+                             << ",\"run_epoch\":" << epoch << ",\"worker_id\":" << worker
+                             << ",\"cluster_index\":" << header.cluster_index
+                             << ",\"cluster_lane\":" << header.cluster_lane
+                             << ",\"range_index\":" << static_cast<uint32_t>(event.entry);
+                const auto shell = event.entry >> 32;
+                if (shell != UINT32_MAX) range_events << ",\"graph_shell_id\":" << shell;
+                if (event.kind == PercounterTaskEventKind::GraphReadyObserved)
+                    range_events << ",\"watermark\":" << event.detail;
+                range_events << '}';
+                continue;
+            }
+            if (event.kind == PercounterTaskEventKind::DeferredCompletionIssue ||
+                event.kind == PercounterTaskEventKind::DeferPollBegin ||
+                event.kind == PercounterTaskEventKind::DeferSignalReady) {
                 deferred_updates.emplace_back(worker, event);
                 continue;
             }
             if (event.kind == PercounterTaskEventKind::DeferRegistered &&
-                !deferred_entries.emplace(event.detail, event.entry).second)
+                !deferred_entries.emplace(event.detail, std::pair{event.entry, worker}).second)
                 throw std::runtime_error("duplicate percounter deferred group");
             emit_task_event(worker, event);
         }
@@ -197,8 +220,8 @@ bool export_profile(const ProfileOwner &owner) {
             if (!percounter_decode_scalar_storage(
                     slots.data(), slots.size(), cursor, header.scalar_window_start, record
                 ) ||
-                (record.kind & 0xffffU) > static_cast<uint32_t>(ProfilePhase::DsbDdr) || record.start_time == 0 ||
-                record.end_time < record.start_time)
+                (record.kind & 0xffffU) > static_cast<uint32_t>(ProfilePhase::CntNotifyDeferIssue) ||
+                record.start_time == 0 || record.end_time < record.start_time)
                 throw std::runtime_error("invalid percounter scalar interval");
             records.push_back(record);
         }
@@ -222,14 +245,32 @@ bool export_profile(const ProfileOwner &owner) {
             streams << "\n{\"start_cycles\":" << record.start_time << ",\"end_cycles\":" << record.end_time
                     << ",\"run_epoch\":" << epoch << ",\"loop_iter\":0,\"kind\":\""
                     << profile_phase_name(static_cast<ProfilePhase>(record.kind & 0xffffU))
-                    << "\",\"tasks_processed\":0,\"task_id\":null}";
+                    << "\",\"tasks_processed\":0,\"task_id\":";
+            const auto phase = static_cast<ProfilePhase>(record.kind & 0xffffU);
+            if (record.task_ref == -1 || percounter_profile_is_notify(phase)) streams << "null";
+            else
+                streams << TaskId::to_uint64(
+                    task_token(percounter_order_task_id(static_cast<uint64_t>(record.task_ref)))
+                );
+            streams << '}';
         }
         streams << "],\"metrics\":[";
         for (size_t index = 0; index < records.size(); ++index) {
             const auto &record = records[index];
             if (index) streams << ',';
-            streams << "{\"record_index\":" << index << ",\"scalar_calls\":" << record.count
+            const auto phase = static_cast<ProfilePhase>(record.kind & 0xffffU);
+            const bool notify = percounter_profile_is_notify(phase);
+            streams << "{\"record_index\":" << index << ",\"scalar_calls\":" << (notify ? 1 : record.count)
                     << ",\"scalar_depth\":" << (record.kind >> 16);
+            if (notify) {
+                streams << ",\"memory_space\":\"CntNotify SRAM\",\"address\":" << static_cast<uint64_t>(record.task_ref)
+                        << (phase == ProfilePhase::CntNotifyRead ? ",\"observed_value\":" : ",\"operand\":")
+                        << record.count;
+            } else if (record.task_ref != -1) {
+                const auto entry = static_cast<uint64_t>(record.task_ref);
+                streams << ",\"block_index\":" << percounter_order_block_idx(entry)
+                        << ",\"block_count\":" << percounter_order_block_num(entry);
+            }
             if ((record.kind & 0xffffU) == static_cast<uint32_t>(ProfilePhase::Window))
                 streams << ",\"batch_write_cycles\":" << header.scalar_write_cycles
                         << ",\"no_progress_loops\":" << header.scalar_poll_loops
@@ -252,12 +293,13 @@ bool export_profile(const ProfileOwner &owner) {
             ++unmatched_updates;
             continue;
         }
-        event.entry = match->second;
-        emit_task_event(worker, event);
+        event.entry = match->second.first;
+        emit_task_event(worker, event, nullptr, match->second.second);
     }
     if (unmatched_updates != 0 && dropped_events == 0)
         throw std::runtime_error("percounter deferred completion has no producer task");
-    task_events << "],\"dropped\":" << dropped_events << ",\"unmatched_deferred_updates\":" << unmatched_updates;
+    task_events << "],\"range_records\":[" << range_events.str() << "],\"dropped\":" << dropped_events
+                << ",\"unmatched_deferred_updates\":" << unmatched_updates;
     const auto emit_task_ids = [&](const char *name, const std::vector<int64_t> &indices) {
         task_events << ",\"" << name << "\":[";
         for (size_t i = 0; i < indices.size(); ++i) {
@@ -269,9 +311,51 @@ bool export_profile(const ProfileOwner &owner) {
     emit_task_ids("folded_task_ids", owner.folded_task_indices);
     emit_task_ids("inline_completed_task_ids", owner.inline_completed_task_indices);
     task_events << '}';
+    const auto aicpu =
+        read_records<PercounterAicpuTiming>(owner, layout.aicpu_profile_offset, PLATFORM_MAX_AICPU_THREADS);
+    std::ostringstream lifecycle;
+    lifecycle << '[';
+    bool first_lifecycle = true;
+    const auto begin_lifecycle = [&](size_t thread) {
+        if (!first_lifecycle) lifecycle << ',';
+        first_lifecycle = false;
+        lifecycle << "{\"aicpu_thread_id\":" << thread;
+    };
+    for (size_t thread = 0; thread < aicpu.size(); ++thread) {
+        const auto &timing = aicpu[thread];
+        if (timing.ready_publish_start_cycles == 0 && timing.observe_start_cycles == 0 &&
+            timing.shutdown_start_cycles == 0)
+            continue;
+        begin_lifecycle(thread);
+        lifecycle << ",\"ready_publish_start_cycles\":" << timing.ready_publish_start_cycles
+                  << ",\"ready_publish_end_cycles\":" << timing.ready_publish_end_cycles
+                  << ",\"observe_start_cycles\":" << timing.observe_start_cycles
+                  << ",\"sinks_observed_cycles\":" << timing.sinks_observed_cycles
+                  << ",\"observe_end_cycles\":" << timing.observe_end_cycles
+                  << ",\"shutdown_start_cycles\":" << timing.shutdown_start_cycles
+                  << ",\"shutdown_end_cycles\":" << timing.shutdown_end_cycles << '}';
+    }
+    for (const auto &graph : invocations) {
+        if (graph.materialize_start_cycles == 0 || graph.materialize_end_cycles == 0) continue;
+        begin_lifecycle(graph.materializer_thread_id);
+        lifecycle << ",\"graph_shell_id\":" << graph.shell_task_id
+                  << ",\"materialize_start_cycles\":" << graph.materialize_start_cycles
+                  << ",\"materialize_end_cycles\":" << graph.materialize_end_cycles << '}';
+        const uint64_t count = (graph.calendar_ready + PERCOUNTER_GRAPH_SLICE_TASKS - 1) / PERCOUNTER_GRAPH_SLICE_TASKS;
+        for (const auto &watermark :
+             read_records<PercounterGraphReadyTiming>(owner, graph.ready_timing_offset, count)) {
+            if (watermark.cycles == 0) throw std::runtime_error("missing percounter Graph ready timestamp");
+            begin_lifecycle(graph.materializer_thread_id);
+            lifecycle << ",\"graph_shell_id\":" << graph.shell_task_id
+                      << ",\"graph_watermark_published_cycles\":" << watermark.cycles
+                      << ",\"watermark\":" << watermark.watermark << '}';
+        }
+    }
+    lifecycle << ']';
     return publish(owner, ChipSwimlaneExtensionSection::AicoreTasks, kernels) &&
            publish(owner, ChipSwimlaneExtensionSection::SchedulerTasks, tasks) &&
            publish(owner, ChipSwimlaneExtensionSection::PercounterTaskEvents, task_events) &&
+           publish(owner, ChipSwimlaneExtensionSection::AicpuLifecycleRecords, lifecycle) &&
            (!capture_scalar || publish(owner, ChipSwimlaneExtensionSection::SchedulerRecords, streams));
 }
 }  // namespace

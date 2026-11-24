@@ -142,5 +142,42 @@ percounter_scalar_memory_result([[maybe_unused]] ProfilePhase kind, Operation op
     else return operation();
 }
 
+template <typename Operation>
+static inline __aicore__ __attribute__((always_inline)) uint32_t
+percounter_scalar_notify_read([[maybe_unused]] uint64_t address, Operation operation) {
+    if constexpr (profile_compiled) {
+        if (auto *trace = percounter_scalar_current(); trace != nullptr) {
+            const uint64_t begin = percounter_scalar_clock();
+            const uint32_t result = operation();
+            uint64_t end;
+#if defined(__CCE_AICORE__)
+            auto dependency = static_cast<uint64_t>(result);
+            asm volatile("MOV %0, %0\nMOV %1, SYS_CNT\n" : "+l"(dependency), "=&l"(end) : : "memory");
+#else
+            end = percounter_scalar_clock();
+#endif
+            trace->append(ProfilePhase::CntNotifyRead, begin, end, static_cast<int64_t>(address), 0, result);
+            return result;
+        }
+    }
+    return operation();
+}
+
+template <typename Operation>
+static inline __aicore__ __attribute__((always_inline)) void percounter_scalar_notify_issue(
+    [[maybe_unused]] ProfilePhase kind, [[maybe_unused]] uint64_t address, [[maybe_unused]] uint32_t operand,
+    Operation operation
+) {
+    if constexpr (profile_compiled) {
+        if (auto *trace = percounter_scalar_current(); trace != nullptr) {
+            const uint64_t begin = percounter_scalar_clock();
+            operation();
+            trace->append(kind, begin, percounter_scalar_clock(), static_cast<int64_t>(address), 0, operand);
+            return;
+        }
+    }
+    operation();
+}
+
 }  // namespace
 }  // namespace simpler::percounter

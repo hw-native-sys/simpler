@@ -83,13 +83,19 @@ foreach(SRC_FILE ${ALL_SOURCES})
     list(APPEND ALL_AIC_OBJECTS ${OBJ_AIC})
     list(APPEND ALL_AIV_OBJECTS ${OBJ_AIV})
 
+    # Percounter's Cube calendar dispatch requires direct control flow.
+    set(AIC_SOURCE_FLAGS "")
+    if(SRC_NAME STREQUAL "task_profiled" AND SRC_FILE MATCHES "/percounter/aicore/")
+        list(APPEND AIC_SOURCE_FLAGS "-fno-jump-tables")
+    endif()
+
     # Each object's header set is whatever ccec reports it read. DEPENDS on the
     # source alone would leave the object stale after a header-only edit, and
     # the build would report success — so an A/B that changes a platform header
     # would run one binary in both arms.
     add_custom_command(
         OUTPUT ${OBJ_AIC}
-        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c310-cube
+        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${AIC_SOURCE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c310-cube
                 -MD -MF ${OBJ_AIC}.d -MT ${OBJ_AIC}
                 -o ${OBJ_AIC} ${SRC_FILE}
         DEPENDS ${SRC_FILE}

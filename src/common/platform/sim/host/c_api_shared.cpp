@@ -138,6 +138,8 @@ int publish_run_image_impl(Runtime *runtime, const HostApi *api);
 int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
 int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
 int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
+bool runtime_has_completion_feedback_impl(const Runtime *runtime) __attribute__((weak));
+void runtime_collect_completion_feedback_impl(const Runtime *runtime, const HostApi *api) __attribute__((weak));
 /**
  * Whether this runtime has a producer that reads a task's arguments at that
  * task's own boundaries.
@@ -353,14 +355,9 @@ acquire_run_image_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes
     }
 }
 
-static std::optional<HostCallableAsyncCapabilities>
-get_callable_async_capabilities(void *runner_ctx, int32_t callable_id) {
-    if (runner_ctx == nullptr) return std::nullopt;
-    HostCallableAsyncCapabilities view{};
-    if (!static_cast<SimDeviceRunnerBase *>(runner_ctx)
-             ->get_callable_async_capabilities(callable_id, &view.data, &view.count))
-        return std::nullopt;
-    return view;
+static std::shared_ptr<void>
+acquire_callable_calendar_cache(void *runner_ctx, int32_t callable_id, HostCalendarCacheFactory factory) {
+    return static_cast<SimDeviceRunnerBase *>(runner_ctx)->acquire_callable_calendar_cache(callable_id, factory);
 }
 
 static uint64_t upload_chip_callable_buffer_wrapper(void *runner_ctx, const void *callable) {
@@ -546,6 +543,29 @@ static int caller_device_span_written_by_other_run(void *runner_ctx, uint64_t ru
     }
 }
 
+// Match the A5 SET slot and its ADD alias. The simulated lane applies each
+// command atomically to the SET word.
+struct alignas(32) SimCalendarSlot {
+    uint32_t value{0};
+};
+
+static int acquire_scheduler_notifications(
+    void *, uint32_t, SchedulerNotificationPurpose purpose, size_t count, SchedulerDoneNotifications *out
+) {
+    if (purpose != SchedulerNotificationPurpose::CALENDAR_COUNTER) {
+        *out = {std::vector<uint64_t>(count), std::vector<uint64_t>(count), {}};
+        return 0;
+    }
+    auto slots = std::make_shared<std::vector<SimCalendarSlot>>(count);
+    SchedulerDoneNotifications lease{std::vector<uint64_t>(count), std::vector<uint64_t>(count), slots};
+    for (size_t index = 0; index < count; ++index) {
+        lease.addresses[index] = reinterpret_cast<uint64_t>(&(*slots)[index].value);
+        lease.add_addresses[index] = lease.addresses[index] + 8;
+    }
+    *out = std::move(lease);
+    return 0;
+}
+
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -587,7 +607,8 @@ static const HostApiOps g_host_api_ops = {
     .caller_device_span_written_by_other_run = caller_device_span_written_by_other_run,
     .get_orchestration_scratch = get_orchestration_scratch,
     .set_orchestration_scratch = set_orchestration_scratch,
-    .get_callable_async_capabilities = get_callable_async_capabilities,
+    .acquire_scheduler_notifications = acquire_scheduler_notifications,
+    .acquire_callable_calendar_cache = acquire_callable_calendar_cache,
 };
 
 /* ===========================================================================
@@ -1285,6 +1306,23 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return 0;
 }
 
+static void collect_completion_feedback(SimNativeRunContext *state) {
+    if (!state->physical_complete || state->completion_rc != 0 || state->completion_feedback_attempted ||
+        state->runtime == nullptr || runtime_has_completion_feedback_impl == nullptr ||
+        runtime_collect_completion_feedback_impl == nullptr ||
+        !runtime_has_completion_feedback_impl(state->runtime.get()))
+        return;
+    state->completion_feedback_attempted = true;
+    const auto slot = state->descriptor.pipeline_slot;
+    const auto epoch = state->descriptor.run_epoch;
+    try {
+        if (state->runner->device_run_terminal(slot, epoch).state == DeviceRunTerminalState::Succeeded)
+            runtime_collect_completion_feedback_impl(state->runtime.get(), &state->host_api);
+    } catch (...) {
+        LOG_WARN("Completion feedback could not be collected (%s)", state->trace_attrs);
+    }
+}
+
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     try {
         SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
@@ -1334,6 +1372,7 @@ int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) 
         // must still own the original slot staging and execution claim.
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
         emit_native_run_runner_wall(state);
+        collect_completion_feedback(state);
         emit_device_phase_markers(state->runner);
         state->clock_alignment_log_required =
             state->runner->host_clock_alignment_log_required(state->descriptor.pipeline_slot);
@@ -1409,8 +1448,9 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     if (state->completion_rc == 0) state->completion_rc = drain.combined();
     state->result_observed = true;
     state->physical_complete = drain.physical_complete;
-    if (state->physical_complete) state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     emit_native_run_runner_wall(state);
+    collect_completion_feedback(state);
+    if (state->physical_complete) state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     return state->completion_rc;
 }
 
@@ -1475,6 +1515,7 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
         if (attach_rc == 0) {
+            if (launched) collect_completion_feedback(state);
             {
                 STRACE("chip.run.validate");
                 const DeviceRunTerminal terminal =

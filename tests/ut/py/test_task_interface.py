@@ -239,7 +239,7 @@ class TestCcuCallableModules:
     def test_from_bytes_rejects_unknown_wire_version(self):
         callable_obj = ChipCallable.build(signature=[], func_name="orch", binary=b"x", children=[])
         raw = bytearray(ctypes.string_at(callable_obj.buffer_ptr(), callable_obj.buffer_size()))
-        struct.pack_into("<I", raw, 17556, 2)
+        struct.pack_into("<I", raw, 17556, 0)
 
         with pytest.raises(ValueError, match="wire version"):
             ChipCallable.from_bytes(bytes(raw))
@@ -1544,7 +1544,6 @@ class TestCoreCallable:
         cc = CoreCallable.build(
             signature=sig,
             binary=binary,
-            async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
         )
         assert cc.sig_count == 3
         assert cc.sig(0) == ArgDirection.IN
@@ -1552,64 +1551,10 @@ class TestCoreCallable:
         assert cc.sig(2) == ArgDirection.SCALAR
         assert cc.binary_size == 4
 
-    @pytest.mark.parametrize("mode,count,types", [("SYNCHRONOUS", 0, 0), ("DEFERRED", 64, 3)])
-    def test_async_capability_survives_chip_serialization(self, mode, count, types):
-        capability = {"version": 1, "mode": mode, "max_conditions": count, "condition_types": types}
-        child = CoreCallable.build(signature=[], binary=b"kernel", async_capability=capability)
-        chip = ChipCallable.build(signature=[], func_name="orch", binary=b"orch", children=[(7, child)])
-        raw = ctypes.string_at(chip.buffer_ptr(), chip.buffer_size())
-        restored = ChipCallable.from_bytes(raw)
-        assert restored.child(0).async_capability == capability
-        assert restored.child(0).binary_size == 6
-
-    def test_unknown_async_capability_is_conservatively_deferred(self):
-        deferred = {"version": 1, "mode": "DEFERRED", "max_conditions": 64, "condition_types": 3}
-        assert CoreCallable.build(signature=[], binary=b"kernel").async_capability == deferred
-        for value in (None, {"version": 1, "mode": "UNKNOWN", "max_conditions": 0, "condition_types": 0}):
-            child = CoreCallable.build(signature=[], binary=b"kernel", async_capability=value)
-            assert child.async_capability == deferred
-
-    @pytest.mark.parametrize("version", [0, 1])
-    def test_unknown_wire_is_normalized_in_owned_copy(self, version):
-        import struct
-
-        deferred = {"version": 1, "mode": "DEFERRED", "max_conditions": 64, "condition_types": 3}
-        child = CoreCallable.build(signature=[], binary=b"kernel", async_capability=deferred)
-        chip = ChipCallable.build(signature=[], func_name="orch", binary=b"orch", children=[(7, child)])
-        canonical = ctypes.string_at(chip.buffer_ptr(), chip.buffer_size())
-        raw = bytearray(canonical)
-        # The public wire keeps the eight-byte capability at offset 144 of
-        # each 192-byte child header; locate the header from its binary tail.
-        child_start = len(raw) - child.buffer_size()
-        struct.pack_into("<IBBBB", raw, child_start + 144, version, 0, 0, 0, 0)
-        unchanged = bytes(raw)
-        restored = ChipCallable.from_bytes(unchanged)
-        assert restored.child(0).async_capability == deferred
-        assert ctypes.string_at(restored.buffer_ptr(), restored.buffer_size()) == canonical
-        assert bytes(raw) == unchanged
-
-    @pytest.mark.parametrize(
-        "change",
-        [
-            {"version": 0},
-            {"version": True},
-            {"mode": "INVALID"},
-            {"mode": "UNKNOWN", "max_conditions": 1},
-            {"max_conditions": 1},
-            {"condition_types": 1},
-            {"extra": 0},
-        ],
-    )
-    def test_invalid_async_capability_is_rejected(self, change):
-        value = {"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0} | change
-        with pytest.raises(ValueError, match="async_capability"):
-            CoreCallable.build(signature=[], binary=b"kernel", async_capability=value)
-
     def test_empty_signature(self):
         cc = CoreCallable.build(
             signature=[],
             binary=b"\xab",
-            async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
         )
         assert cc.sig_count == 0
         assert cc.binary_size == 1
@@ -1619,7 +1564,6 @@ class TestCoreCallable:
         cc = CoreCallable.build(
             signature=[ArgDirection.IN],
             binary=binary,
-            async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
         )
         assert cc.binary_size == 10240
 
@@ -1627,7 +1571,6 @@ class TestCoreCallable:
         cc = CoreCallable.build(
             signature=[ArgDirection.IN, ArgDirection.OUT],
             binary=b"",
-            async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
         )
         assert cc.sig_count == 2
         assert cc.binary_size == 0
@@ -1636,7 +1579,6 @@ class TestCoreCallable:
         cc = CoreCallable.build(
             signature=[ArgDirection.IN],
             binary=b"\x00" * 100,
-            async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
         )
         assert cc.buffer_ptr() != 0
         assert cc.buffer_size() > 100
@@ -1645,7 +1587,6 @@ class TestCoreCallable:
         cc = CoreCallable.build(
             signature=[ArgDirection.IN],
             binary=b"\x00",
-            async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
         )
         with pytest.raises((IndexError, RuntimeError)):
             cc.sig(1)
@@ -1656,7 +1597,6 @@ class TestCoreCallable:
         cc = CoreCallable.build(
             signature=[ArgDirection.IN, ArgDirection.OUT],
             binary=b"\x00" * 8,
-            async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
         )
         r = repr(cc)
         assert "CoreCallable" in r
@@ -1674,7 +1614,6 @@ class TestChipCallable:
         return CoreCallable.build(
             signature=sig,
             binary=binary,
-            async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
         )
 
     @pytest.mark.parametrize("child_count", [1025, 1427, ChipCallable.MAX_CHILDREN - 1, ChipCallable.MAX_CHILDREN])

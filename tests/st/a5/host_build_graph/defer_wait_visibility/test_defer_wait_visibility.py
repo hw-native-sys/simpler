@@ -79,7 +79,6 @@ class TestDeferWaitVisibility(SceneTestCase):
                 "source": "kernels/aiv/tail.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
-                "async_capability": {"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
             },
         ],
     }

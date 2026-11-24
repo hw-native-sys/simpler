@@ -33,7 +33,7 @@
 struct ChipCallableLayout {
     size_t header_size;          // offsetof(ChipCallable, storage_)
     size_t total_size;           // header_size + storage_used
-    uint64_t content_hash;       // FNV-1a 64 over the normalized callable image
+    uint64_t content_hash;       // FNV-1a 64 over the callable image
     uint64_t aicore_image_hash;  // FNV-1a 64 over func ids and child binaries
 };
 
@@ -69,21 +69,7 @@ inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *calla
         if (ccu_end > storage_used) storage_used = ccu_end;
     }
     const size_t total_size = kHeaderSize + storage_used;
-    // Identity must agree before upload, after deserialization, and in the
-    // retained registration. Hash normalized metadata without mutating input.
-    const auto *bytes = reinterpret_cast<const uint8_t *>(callable);
-    uint64_t hash = simpler::common::utils::fnv1a_64(bytes, 0);
-    size_t cursor = 0;
-    for (int32_t i = 0; i < child_count; ++i) {
-        const size_t offset = kHeaderSize + callable->child_offset(i) + offsetof(CoreCallable, async_capability_);
-        if (offset < cursor || offset > total_size || sizeof(CoreAsyncCapability) > total_size - offset)
-            throw std::invalid_argument("invalid CoreCallable capability range");
-        const auto capability = normalize_core_async_capability(callable->child(i).async_capability());
-        hash = simpler::common::utils::fnv1a_64_append(hash, bytes + cursor, offset - cursor);
-        hash = simpler::common::utils::fnv1a_64_append(hash, &capability, sizeof(capability));
-        cursor = offset + sizeof(capability);
-    }
-    hash = simpler::common::utils::fnv1a_64_append(hash, bytes + cursor, total_size - cursor);
+    const uint64_t hash = simpler::common::utils::fnv1a_64(callable, total_size);
     return ChipCallableLayout{kHeaderSize, total_size, hash, aicore_image_hash};
 }
 

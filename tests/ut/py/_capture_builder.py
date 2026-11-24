@@ -217,7 +217,10 @@ class Capture:
         reg = self._next_reg_task_id if reg_task_id is None else reg_task_id
         if reg_task_id is None:
             self._next_reg_task_id += 1
-        self._aicore_rows.append([core_id, task_id, reg, start, end, receive_to_start, run_epoch])
+        row = [core_id, task_id, reg, start, end, receive_to_start, run_epoch]
+        if self.runtime == "percounter":
+            row.extend((0, 1))
+        self._aicore_rows.append(row)
         return self
 
     def scheduler_task(self, *, core_id=0, reg_task_id, dispatch, finish, run_epoch=0):

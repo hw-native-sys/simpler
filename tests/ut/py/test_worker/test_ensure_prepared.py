@@ -83,9 +83,11 @@ def test_a5_worker_register_enriches_only_the_uploaded_copy(monkeypatch):
     upload = chip_worker.register_callable.call_args.args[1]
     assert upload is not target
     assert ctypes.string_at(target.buffer_ptr(), target.buffer_size()) == original
+    expected_child = CoreCallable.build(signature=[], binary=code + footer)
+    expected = ctypes.string_at(expected_child.buffer_ptr(), expected_child.buffer_size())
     for index in range(2):
         child = upload.child(index)
-        assert ctypes.string_at(child.buffer_ptr(), child.buffer_size())[-len(footer + code) :] == footer + code
+        assert ctypes.string_at(child.buffer_ptr(), child.buffer_size()) == expected
 
 
 @pytest.mark.parametrize(

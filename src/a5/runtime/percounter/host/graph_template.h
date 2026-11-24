@@ -8,18 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * Host-side Graph templates: what percounter keeps of one Graph Definition.
- *
- * A template is built once per Definition per bind, however many invocations
- * share it, and holds only what a lane needs to schedule the body: each task's
- * subtask total, its fanin rows, and the body's tasks in order. Materializing a
- * task -- its kernel ids, arguments and predicate -- stays with upstream, which
- * the AICPU calls per invocation.
- *
- * The Definition is read through upstream's own decoders over the bind's
- * staging block, the bytes the device later receives as its Definition section.
- */
+/** Read each Graph body shape and its dependency DAG from the recorded Graph. */
 
 #pragma once
 
@@ -57,17 +46,6 @@ struct TemplateResult {
     int32_t body_index{-1};
 };
 
-/**
- * Build a template from the body's shapes and fanin rows.
- *
- * Body tasks use a virtual ready/resource schedule, with b-level priority among
- * ready tasks. Every producer precedes its consumers. The body is
- * one range in each list, so this order and the outer graph's decide the whole
- * schedule; see build_tables for the outer half.
- *
- * An SPMD body task takes one boundary entry. Its private claim counter
- * allocates blocks independently of fanin readiness.
- */
 inline TemplateResult build_graph_template(
     const BodyTaskShape *shapes, int32_t task_count, const int32_t *fanin_offsets, const int32_t *fanin_indices,
     int32_t edge_count, uint64_t worker_count, HostGraphTemplate *out
@@ -78,6 +56,8 @@ inline TemplateResult build_graph_template(
     if (out == nullptr || shapes == nullptr || fanin_offsets == nullptr || task_count <= 0 || edge_count < 0 ||
         (edge_count != 0 && fanin_indices == nullptr))
         return fail(TemplateStatus::MALFORMED, "empty or null body", -1);
+    if (worker_count == 0 || worker_count % PLATFORM_CORES_PER_BLOCKDIM != 0)
+        return fail(TemplateStatus::MALFORMED, "invalid worker topology", -1);
     if (fanin_offsets[0] != 0 || fanin_offsets[task_count] != edge_count)
         return fail(TemplateStatus::MALFORMED, "fanin rows do not cover the edges", -1);
 
@@ -85,13 +65,14 @@ inline TemplateResult build_graph_template(
     const size_t n = static_cast<size_t>(task_count);
     next.tasks.resize(n);
     next.fanin_offsets.assign(fanin_offsets, fanin_offsets + n + 1);
-    next.fanin_indices.assign(fanin_indices, fanin_indices + edge_count);
+    if (edge_count != 0) next.fanin_indices.assign(fanin_indices, fanin_indices + edge_count);
 
     std::vector<bool> has_consumer(n, false);
     for (int32_t i = 0; i < task_count; ++i) {
         const int32_t begin = fanin_offsets[i];
         const int32_t end = fanin_offsets[i + 1];
-        if (begin > end || end > edge_count) return fail(TemplateStatus::MALFORMED, "fanin row out of order", i);
+        if (begin < 0 || begin > end || end > edge_count)
+            return fail(TemplateStatus::MALFORMED, "fanin row out of order", i);
         for (int32_t e = begin; e < end; ++e) {
             const int32_t producer = fanin_indices[e];
             if (producer < 0 || producer >= i)
@@ -100,22 +81,17 @@ inline TemplateResult build_graph_template(
         }
     }
 
-    std::vector<int64_t> eligible[PERCOUNTER_LIST_COUNT];
     for (int32_t i = 0; i < task_count; ++i) {
         const BodyTaskShape &shape = shapes[i];
-        // A dependency-only task runs no kernel but still orders its consumers
-        // after its producers. It takes one entry in the AIV list, the list
-        // every vector lane draws, and counts as one subtask: the lane that
-        // reaches it publishes it once its producers have.
+        // A dependency-only task publishes one completion credit on an AIV lane.
         const bool dummy = shape.active_mask == 0;
         uint8_t core_type = 1;
         const TaskPlacement placement =
             dummy ? TaskPlacement::AIV : task_placement_from_active_mask(shape.active_mask, &core_type);
         if (placement == TaskPlacement::UNSUPPORTED)
             return fail(TemplateStatus::UNSUPPORTED, "an AIV1-only body task", i);
-        // A cohort of one would be released by its own claim, and the sync
-        // sentinel must stay a value no real block index takes.
-        if (shape.sync_start && (dummy || shape.block_num < 2 || shape.block_num >= PERCOUNTER_ORDER_BLOCK_IDX_SPMD))
+        if (shape.sync_start &&
+            (dummy || shape.block_num < 2 || static_cast<uint32_t>(shape.block_num) > PERCOUNTER_ORDER_BLOCK_MASK))
             return fail(TemplateStatus::MALFORMED, "a sync-start body task with an impossible block count", i);
         // A cohort wider than the lanes that can serve it never fills: each of
         // them takes a block and waits for one nobody is left to take. The
@@ -132,78 +108,18 @@ inline TemplateResult build_graph_template(
                     (shape.block_num < 1 || shape.block_num > UINT16_MAX / subtasks ||
                      shape.total_required_subtasks != shape.block_num * subtasks))
             return fail(TemplateStatus::MALFORMED, "inconsistent block and subtask counts", i);
-        // The same scope the task table has: a predicate on one block of one
-        // subtask, which is all the lane evaluates.
-        if (shape.has_predicate && (subtasks != 1 || shape.block_num != 1))
-            return fail(TemplateStatus::UNSUPPORTED, "a predicate on a multi-block or MIX body task", i);
-
         HostBodyTask &task = next.tasks[static_cast<size_t>(i)];
         task.subtask_total = static_cast<uint32_t>(shape.block_num * subtasks);
-        task.flags = 0;
-        task.metadata = {
-            0, static_cast<uint16_t>(shape.active_mask), static_cast<uint16_t>(shape.block_num),
-            shape.sync_start ? 0U : PERCOUNTER_NO_SYNC, PERCOUNTER_NO_BOUNDARY
-        };
-        if (fanin_offsets[i] == fanin_offsets[i + 1]) task.flags |= PERCOUNTER_BODY_ROOT;
-        if (!has_consumer[static_cast<size_t>(i)]) {
-            task.flags |= PERCOUNTER_BODY_SINK;
-            next.sink_subtask_total += task.subtask_total;
-        }
-        if (shape.has_predicate) {
-            task.flags |= PERCOUNTER_BODY_PREDICATE;
-            next.has_predicates = true;
-        }
-        next.executable_blocks += static_cast<uint64_t>(shape.block_num);
-        if (shape.block_num > 1 || placement == TaskPlacement::MIX) ++next.boundary_task_count;
-        if (shape.sync_start) {
-            ++next.sync_cohort_count;
-        }
-        if (placement == TaskPlacement::MIX) {
-            eligible[1].push_back(i);
-            ++next.mix_task_count;
-        } else {
-            eligible[core_type].push_back(i);
-        }
-    }
-
-    if (worker_count == 0 || worker_count % PLATFORM_CORES_PER_BLOCKDIM != 0 ||
-        worker_count / PLATFORM_CORES_PER_BLOCKDIM > UINT32_MAX)
-        return fail(TemplateStatus::MALFORMED, "invalid worker topology", -1);
-    std::vector<ResourceOrderTask> order_tasks(n);
-    for (int32_t i = 0; i < task_count; ++i) {
-        auto &node = order_tasks[static_cast<size_t>(i)];
-        node.active_mask = shapes[i].active_mask;
-        node.blocks = static_cast<uint32_t>(shapes[i].block_num);
-        node.sync = shapes[i].sync_start;
-        if (node.active_mask == 0) node.duration = 0;
-        for (int32_t e = fanin_offsets[i]; e < fanin_offsets[i + 1]; ++e)
-            node.predecessors.push_back(static_cast<uint32_t>(fanin_indices[e]));
-    }
-    const auto schedule =
-        make_resource_order(order_tasks, static_cast<uint32_t>(worker_count / PLATFORM_CORES_PER_BLOCKDIM));
-    if (!schedule) return fail(TemplateStatus::MALFORMED, "invalid resource schedule", -1);
-    next.depth = schedule->depth;
-    next.virtual_duration = schedule->duration;
-    next.active_mask = schedule->active_mask;
-    const auto &global_order = schedule->tasks;
-    std::vector<uint32_t> position(n);
-    for (uint32_t rank = 0; rank < n; ++rank)
-        position[global_order[rank]] = rank;
-    const auto by_schedule = [&position](int64_t a, int64_t b) {
-        return position[static_cast<size_t>(a)] < position[static_cast<size_t>(b)];
-    };
-    for (size_t rank = 0; rank < n; ++rank)
-        next.tasks[global_order[rank]].metadata.global_order_id = static_cast<uint32_t>(rank);
-    for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
-        std::stable_sort(eligible[l].begin(), eligible[l].end(), by_schedule);
-        for (int64_t i : eligible[l]) {
-            const int32_t blocks = shapes[i].block_num;
-            if (blocks > 1) {
-                next.orders[l].push_back(percounter_order_entry(i, PERCOUNTER_ORDER_BLOCK_IDX_SPMD, blocks));
-                continue;
-            }
-            next.orders[l].push_back(percounter_order_entry(i, 0, 1));
-        }
+        task.active_mask = shape.active_mask;
+        task.block_num = static_cast<uint32_t>(shape.block_num);
+        task.sync_start = shape.sync_start;
+        task.has_predicate = shape.has_predicate;
+        task.sink = !has_consumer[static_cast<size_t>(i)];
+        if (task.sink) next.sink_subtask_total += task.subtask_total;
+        if (!dummy) next.defer_rows += task.subtask_total;
+        next.executable_blocks += task.block_num;
+        next.sync_cohort_count += task.sync_start;
+        next.mix_task_count += placement == TaskPlacement::MIX;
     }
     *out = std::move(next);
     return TemplateResult{};

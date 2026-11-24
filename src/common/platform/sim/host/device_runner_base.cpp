@@ -1020,6 +1020,16 @@ int SimDeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool SimDeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
+std::shared_ptr<void>
+SimDeviceRunnerBase::acquire_callable_calendar_cache(int32_t callable_id, std::shared_ptr<void> (*factory)()) {
+    const std::lock_guard<std::mutex> lock(callable_registration_mu_);
+    auto it = callables_.find(callable_id);
+    if (it == callables_.end() || it->second.host_dlopen_handle == nullptr) return {};
+    auto &cache = it->second.calendar_cache;
+    if (cache == nullptr) cache = factory();
+    return cache;
+}
+
 // Per-run binding half, defined in each runtime's runtime_maker.cpp and linked
 // into this same sim runtime .so. Declared here (rather than only in
 // c_api_shared.cpp) so bind_callable_to_runtime can call it directly, keeping
@@ -1030,23 +1040,6 @@ extern "C" int bind_callable_to_runtime_impl(
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
     const uint64_t *ring_dep_pool
 );
-
-bool SimDeviceRunnerBase::get_callable_async_capabilities(
-    int32_t callable_id, const CoreAsyncCapability **data, uint32_t *count
-) const {
-    if (data == nullptr || count == nullptr) return false;
-    *data = nullptr;
-    *count = 0;
-    const auto state = callables_.find(callable_id);
-    if (state == callables_.end()) return false;
-    const auto block = chip_callable_buffers_.find(state->second.chip_buffer_hash);
-    if (block == chip_callable_buffers_.end()) return false;
-    const auto &tables = block->second;
-    if (tables.async_capabilities.size() != tables.table_len) return false;
-    *data = tables.async_capabilities.empty() ? nullptr : tables.async_capabilities.data();
-    *count = tables.table_len;
-    return true;
-}
 
 int SimDeviceRunnerBase::bind_callable_to_runtime(
     Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
@@ -1711,11 +1704,6 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
     // only raw resource it owns is created with nothing fallible left between
     // it and the guard that owns it. Filling these below allocates nothing.
     std::vector<uint64_t> object_table(table_len, 0);
-    std::vector<CoreAsyncCapability> async_capabilities(table_len);
-    for (int32_t index = 0; index < callable->child_count(); ++index) {
-        async_capabilities[callable->child_func_id(index)] =
-            normalize_core_async_capability(callable->child(index).async_capability());
-    }
     std::vector<uint64_t> entry_table;
     if (want_entry_table) entry_table.assign(table_len, 0);
     std::vector<void *> dlopen_handles;
@@ -1741,10 +1729,6 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
         delete[] scratch;
     });
     std::memcpy(scratch, callable, layout.total_size);
-    for (int32_t index = 0; index < callable->child_count(); ++index) {
-        auto *child = reinterpret_cast<CoreCallable *>(scratch + layout.header_size + callable->child_offset(index));
-        child->async_capability_ = async_capabilities[callable->child_func_id(index)];
-    }
 
     // Per-child dlopen + dlsym kernel_entry + register pto-sim hooks, then
     // patch the child's resolved_addr_ to the function pointer.
@@ -1839,7 +1823,6 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
     auto inserted = chip_callable_buffers_.emplace(layout.content_hash, std::move(retained));
     ChipCallableBuffer &owner = inserted.first->second;
     owner.object_table = std::move(object_table);
-    owner.async_capabilities = std::move(async_capabilities);
     owner.entry_table = std::move(entry_table);
     owner.dlopen_handles = std::move(dlopen_handles);
     published = true;

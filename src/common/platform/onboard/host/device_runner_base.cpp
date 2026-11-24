@@ -2545,12 +2545,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     // scratch fill, the patch, the table fill and the copy — allocates nothing.
     std::vector<uint8_t> scratch(alloc_size);
     std::vector<uint64_t> object_table(table_len, 0);
-    std::vector<CoreAsyncCapability> async_capabilities(table_len);
     auto input_cache_proofs = chip_callable_input_cache_proofs(callable, table_len);
-    for (int32_t index = 0; index < callable->child_count(); ++index) {
-        async_capabilities[callable->child_func_id(index)] =
-            normalize_core_async_capability(callable->child(index).async_capability());
-    }
     std::vector<uint64_t> entry_table;
     if (want_entry_table) entry_table.assign(table_len, 0);
 
@@ -2581,11 +2576,6 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     // path's `reinterpret_cast<CoreCallable*>(addr)->resolved_addr()` lands
     // on the right device offset).
     std::memcpy(scratch.data(), callable, layout.total_size);
-    for (int32_t index = 0; index < callable->child_count(); ++index) {
-        auto *child =
-            reinterpret_cast<CoreCallable *>(scratch.data() + layout.header_size + callable->child_offset(index));
-        child->async_capability_ = async_capabilities[callable->child_func_id(index)];
-    }
     patch_chip_callable_scratch_for_device(callable, layout, chip_dev, scratch.data());
 
     // The function tables go in the alignment-padded tail of that same scratch,
@@ -2639,7 +2629,6 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     }
     auto inserted = chip_callable_buffers_.emplace(layout.content_hash, std::move(retained));
     inserted.first->second.object_table = std::move(object_table);
-    inserted.first->second.async_capabilities = std::move(async_capabilities);
     inserted.first->second.input_cache_proofs = std::move(input_cache_proofs);
     published = true;
     LOG_DEBUG(
@@ -2938,6 +2927,16 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool DeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
+std::shared_ptr<void>
+DeviceRunnerBase::acquire_callable_calendar_cache(int32_t callable_id, std::shared_ptr<void> (*factory)()) {
+    const std::lock_guard<std::mutex> lock(callable_registration_mu_);
+    auto it = callables_.find(callable_id);
+    if (it == callables_.end() || it->second.host_dlopen_handle == nullptr) return {};
+    auto &cache = it->second.calendar_cache;
+    if (cache == nullptr) cache = factory();
+    return cache;
+}
+
 int DeviceRunnerBase::ensure_dma_workspace_provisioned() {
     if (dma_workspace_handle_ != nullptr) {
         return dma_workspace_failed_ ? COMM_RECLAMATION_UNCONFIRMED : 0;
@@ -3171,23 +3170,6 @@ int DeviceRunnerBase::validate_caller_submission_args(int32_t callable_id, const
         }
     }
     return 0;
-}
-
-bool DeviceRunnerBase::get_callable_async_capabilities(
-    int32_t callable_id, const CoreAsyncCapability **data, uint32_t *count
-) const {
-    if (data == nullptr || count == nullptr) return false;
-    *data = nullptr;
-    *count = 0;
-    const auto state = callables_.find(callable_id);
-    if (state == callables_.end()) return false;
-    const auto block = chip_callable_buffers_.find(state->second.chip_buffer_hash);
-    if (block == chip_callable_buffers_.end() || block->second.release_pending) return false;
-    const auto &tables = block->second;
-    if (tables.async_capabilities.size() != tables.table_len) return false;
-    *data = tables.async_capabilities.empty() ? nullptr : tables.async_capabilities.data();
-    *count = tables.table_len;
-    return true;
 }
 
 template <class RuntimeType>

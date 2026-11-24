@@ -45,320 +45,83 @@ constexpr uint32_t SCHEDULER_RUNTIME_MODE_PERCOUNTER = 5;
 
 namespace simpler::percounter {
 
-inline constexpr uint32_t PERCOUNTER_CORE_TYPE_COUNT = 2;  // 0 = AIC, 1 = AIV
-
-inline constexpr uint32_t PERCOUNTER_PENDING_CAPACITY = 1;
-static_assert(PERCOUNTER_PENDING_CAPACITY == 1 || PERCOUNTER_PENDING_CAPACITY == 2 || PERCOUNTER_PENDING_CAPACITY == 4);
-inline constexpr uint32_t PERCOUNTER_SLOT_MASK = (1U << PERCOUNTER_PENDING_CAPACITY) - 1;
 inline constexpr uint32_t PERCOUNTER_NO_SYNC = UINT32_MAX;
 
-// Payload and publication generation have one writer: the cluster's AIV0.
-// Each participant exclusively writes its own entry and idle tokens.
-struct alignas(64) PercounterMixSignal {
-    volatile uint64_t entry;
-    volatile uint32_t global_order_id;
-    volatile uint32_t active_mask;
-    volatile uint32_t generation;
-    volatile uint32_t fanin_ready;
-    volatile uint32_t enter_ready[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint32_t enter_idle[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint32_t sequence;
-    volatile uint32_t start_arrived;
-    volatile uint32_t fanin_cursor;
-    volatile uint32_t start_ready;  // Lowest active lane publishes global arrival through SSBUF.
-    volatile uint64_t fanin_address;
-    volatile int64_t fanin_body_base;
-    volatile uint32_t fanin_count;
-    volatile uint32_t fanin_body;
-    volatile uint32_t metadata_generation;
-    volatile uint32_t sync_index;
-    volatile uint64_t fanin_pending;
-    volatile uint64_t fanin_target;
+struct PercounterMixSignal {
+    volatile uint32_t arrive[PLATFORM_CORES_PER_BLOCKDIM];
+    volatile uint32_t release[PLATFORM_CORES_PER_BLOCKDIM];
 };
-static_assert(sizeof(PercounterMixSignal) == 128);
-static_assert(std::is_trivially_copyable_v<PercounterMixSignal> && std::is_standard_layout_v<PercounterMixSignal>);
-
-inline constexpr uint32_t PERCOUNTER_TERMINAL_MAX_STEPS = 6;
-inline constexpr uint32_t PERCOUNTER_TERMINAL_MAX_PREREQUISITES = 8;
 
 struct alignas(64) PercounterSsbufRegion {
-    PercounterMixSignal mix[PERCOUNTER_PENDING_CAPACITY];
-    volatile uint32_t mix_floor_rank;
-    volatile uint32_t publish_sequence;
-    volatile uint32_t publication_closed;
-    uint8_t reserved
-        [PERCOUNTER_CONTEXT_SSBUF_OFFSET - PERCOUNTER_SSBUF_REGION_OFFSET -
-         PERCOUNTER_PENDING_CAPACITY * sizeof(PercounterMixSignal) - 12];
+    PercounterMixSignal mix;
+    uint8_t reserved[PERCOUNTER_CONTEXT_SSBUF_OFFSET - PERCOUNTER_SSBUF_REGION_OFFSET - sizeof(PercounterMixSignal)];
     PercounterInvocationContextSlot contexts[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint32_t terminal_ready[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint32_t terminal_grant[PERCOUNTER_TERMINAL_MAX_STEPS];
-    uint8_t tail_reserved[64 - sizeof(terminal_ready) - sizeof(terminal_grant)];
 };
-static_assert(sizeof(PercounterSsbufRegion) == PERCOUNTER_SSBUF_REGION_SIZE);
+static_assert(sizeof(PercounterSsbufRegion) <= PERCOUNTER_SSBUF_REGION_SIZE);
 static_assert(
     offsetof(PercounterSsbufRegion, contexts) + PERCOUNTER_SSBUF_REGION_OFFSET == PERCOUNTER_CONTEXT_SSBUF_OFFSET
 );
-static_assert(std::is_trivially_copyable_v<PercounterSsbufRegion> && std::is_standard_layout_v<PercounterSsbufRegion>);
 
 inline __aicore__ PERCOUNTER_SSBUF PercounterSsbufRegion *percounter_ssbuf_region(uint64_t hardware_base) {
     return reinterpret_cast<PERCOUNTER_SSBUF PercounterSsbufRegion *>(hardware_base + PERCOUNTER_SSBUF_REGION_OFFSET);
 }
 
-inline __aicore__ void percounter_mix_signal_clear(PERCOUNTER_SSBUF PercounterMixSignal *signal) {
-    percounter_ssbuf_store_field(&signal->fanin_ready, uint32_t{0});
-    percounter_ssbuf_store_field(&signal->start_arrived, uint32_t{0});
-    percounter_ssbuf_store_field(&signal->start_ready, uint32_t{0});
-    percounter_ssbuf_store_field(&signal->metadata_generation, uint32_t{0});
-    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        percounter_ssbuf_store_field(&signal->enter_ready[lane], uint32_t{0});
-        percounter_ssbuf_store_field(&signal->enter_idle[lane], uint32_t{0});
-    }
-    percounter_ssbuf_store_release(&signal->generation, 0);
-}
-
-inline __aicore__ bool percounter_mix_armed(uint32_t generation) { return (generation & 1U) != 0; }
-
-/** Independent atomic groups occupy distinct 128-byte GM sectors.
- * Scalar DCache maintenance still operates on 64-byte lines.
- */
+// Each defer head owns its own GM atomic sector.
 struct alignas(128) PercounterCounter {
-    // 64-bit to match percounter_gm_fetch_add, the runtime's only atomic add.
-    uint64_t value;
-    // Graph body identity and fanin are immutable after metadata_ready.
-    uint64_t storage_address;  // the invocation's ChipTaskStorage array
-    uint32_t body_index;       // this task's index in it, and in its body
-    uint32_t flags;            // PERCOUNTER_BODY_*
-    uint32_t shell_task_id;
-    uint32_t fanin_count;
-    // Region offset of uint64 producer indices local to this Graph body.
-    // A root observes its shell's fanin instead.
-    uint64_t fanin_offset;
-    uint32_t invocation;
-    // Host prepares task-table arguments; AICPU prepares Graph body arguments.
-    uint32_t argument_counts;
+    uint64_t completion_notify_address;
+    uint64_t calendar_defer_head;
+    uint32_t completion_notify_target;
+    uint32_t calendar_defer_bit;
     uint64_t function_addresses[PLATFORM_CORES_PER_BLOCKDIM];
     uint64_t arguments_address;
-    uint64_t completion_notify_address;
-    uint32_t completion_notify_target;  // cumulative credits in the chain
-    uint8_t reserved[36];
+    uint64_t predicate_address;
 };
-static_assert(sizeof(PercounterCounter) == 128, "a counter owns one GM sector");
-static_assert(std::is_trivially_copyable_v<PercounterCounter> && std::is_standard_layout_v<PercounterCounter>);
-static_assert(alignof(PercounterCounter) == 128, "counters must not straddle lines");
-
-/**
- * A GM completion counter is published when it reads positive as a signed value.
- *
- * It starts at `1 - total_subtasks` and every subtask adds one, so the
- * value walks `1 - total .. 0` and lands on exactly 1.
- *
- * Signed `> 0` rather than `== 1`: an equality test would turn a counter that
- * overshot into a consumer that waits forever. With `> 0`, a defect that ran a
- * subtask twice shows up as a wrong result rather than as an op timeout.
- *
- * A task completed inline at bind is preset to 1 directly, the value it would
- * have reached.
- */
-inline constexpr uint64_t PERCOUNTER_COUNTER_PUBLISHED = 1;
-
-inline __aicore__ bool percounter_counter_published(uint64_t value) { return static_cast<int64_t>(value) > 0; }
-
-inline __aicore__ constexpr uint64_t percounter_counter_preset(int64_t total_subtasks) {
-    return static_cast<uint64_t>(static_cast<int64_t>(PERCOUNTER_COUNTER_PUBLISHED) - total_subtasks);
-}
-
-// Only the head has a threshold equal to its own credits. The primary GM
-// word of a mapped task retains its preset throughout the run.
-inline __aicore__ bool percounter_completion_notify_head(const PercounterCounter &counter, uint64_t preset) {
-    return counter.completion_notify_address != 0 &&
-           counter.completion_notify_target == PERCOUNTER_COUNTER_PUBLISHED - preset;
-}
-
-// Bit zero identifies a CntNotify descriptor before the first probe and
-// the cached SET/read address afterwards.
-inline constexpr uint64_t PERCOUNTER_COMPLETION_NOTIFY = 1;
+static_assert(sizeof(PercounterCounter) == 128);
 
 inline constexpr uint32_t PERCOUNTER_ASYNC_CAPACITY = 4;
 static_assert(PERCOUNTER_ASYNC_CAPACITY <= MAX_COMPLETIONS_PER_TASK);
 
 // One physical invocation can append at most one completion record.
-struct alignas(64) PercounterAsyncCompletion {
+struct alignas(128) PercounterAsyncCompletion {
+    uint64_t calendar_defer_owner;
     uint64_t next;
     uint64_t pending_mask;
-    uint64_t completion_address;
-    int64_t shell;
-    uint64_t sink;
-    uint64_t reserved[3];
-    DeferredCompletionEntry entries[PERCOUNTER_ASYNC_CAPACITY];
+    uint64_t completion_add_cmd;
+    uint64_t calendar_sample;
+    uint64_t calendar_shell_add_cmd;
+    alignas(64) DeferredCompletionEntry entries[PERCOUNTER_ASYNC_CAPACITY];
 };
-static_assert(sizeof(PercounterAsyncCompletion) == 192);
+static_assert(sizeof(PercounterAsyncCompletion) == 256);
+static_assert(offsetof(PercounterAsyncCompletion, calendar_defer_owner) == 0);
 static_assert(
     std::is_trivially_copyable_v<PercounterAsyncCompletion> && std::is_standard_layout_v<PercounterAsyncCompletion>
 );
 
-/** A ticket owns an atomic sector independently of other groups. */
-struct alignas(128) PercounterTicket {
-    uint64_t next;
-    uint8_t reserved[120];
-};
-static_assert(sizeof(PercounterTicket) == 128, "a ticket owns one GM sector");
-static_assert(std::is_trivially_copyable_v<PercounterTicket> && std::is_standard_layout_v<PercounterTicket>);
-
-// Arrival counts use the logical block index, independent of its claiming core.
-inline constexpr uint32_t PERCOUNTER_START_SECTOR_COUNT = 4;
-struct alignas(128) PercounterStartBarrier {
-    PercounterTicket sectors[PERCOUNTER_START_SECTOR_COUNT];
-};
-static_assert(sizeof(PercounterStartBarrier) == 128 * PERCOUNTER_START_SECTOR_COUNT);
-static_assert(
-    std::is_trivially_copyable_v<PercounterStartBarrier> && std::is_standard_layout_v<PercounterStartBarrier>
-);
-
-/**
- * A cohort's resolved CntNotify slot, or two zeros when it uses the GM arrival
- * sectors. The uploaded table carries only the SET/read address; a lane pairs
- * it with its ADD alias through `percounter_notify_add_address`, so the pair
- * costs one load rather than two and no lane invents an offset of its own.
- */
-struct PercounterSyncNotify {
-    uint64_t read_address;
-    uint64_t add_address;
-};
-
-/**
- * The ADD command register of a mapped slot. A5 CntNotify owns a 32-byte
- * register slot whose ADD alias sits 8 bytes above its SET/read base; the Host
- * publishes an address only when that alias is valid, so every nonzero entry
- * has one. This is the same rule `a5_cnt_notify_increment_address` applies on
- * the Host, which is why the table need not carry the result.
- */
+// The CntNotify ADD alias is eight bytes above SET.
 inline __aicore__ uint64_t percounter_notify_add_address(uint64_t read_address) {
     return read_address == 0 ? 0 : read_address + 8;
-}
-
-inline constexpr uint32_t PERCOUNTER_CLAIM_SECTOR_COUNT = 4;
-// `closed_sectors` is a bitmask, not a count. Bits below the publication flag
-// are owned one apiece by the owner that drew their sector's last ticket, so
-// each is added once and never carries into its neighbour. The flag names the
-// single owner that published the boundary's summary bit.
-inline constexpr uint64_t PERCOUNTER_CLAIM_SECTOR_MASK = (uint64_t{1} << PERCOUNTER_CLAIM_SECTOR_COUNT) - 1;
-inline constexpr uint64_t PERCOUNTER_CLAIM_SUMMARY_PUBLISHED = uint64_t{1} << PERCOUNTER_CLAIM_SECTOR_COUNT;
-static_assert(
-    PERCOUNTER_CLAIM_SECTOR_COUNT >= 2 && (PERCOUNTER_CLAIM_SECTOR_COUNT & (PERCOUNTER_CLAIM_SECTOR_COUNT - 1)) == 0
-);
-struct alignas(128) PercounterTaskClaim {
-    PercounterTicket sectors[PERCOUNTER_CLAIM_SECTOR_COUNT];
-    uint64_t closed_sectors;
-    uint8_t reserved[120];
-};
-static_assert(sizeof(PercounterTaskClaim) == 128 * (PERCOUNTER_CLAIM_SECTOR_COUNT + 1));
-static_assert(offsetof(PercounterTaskClaim, closed_sectors) % 128 == 0);
-static_assert(std::is_trivially_copyable_v<PercounterTaskClaim> && std::is_standard_layout_v<PercounterTaskClaim>);
-
-struct alignas(128) PercounterClaimSummary {
-    uint64_t closed;
-    uint8_t reserved[120];
-};
-static_assert(sizeof(PercounterClaimSummary) == 128);
-static_assert(
-    std::is_trivially_copyable_v<PercounterClaimSummary> && std::is_standard_layout_v<PercounterClaimSummary>
-);
-
-inline constexpr uint32_t PERCOUNTER_NO_BOUNDARY = UINT32_MAX;
-
-struct alignas(8) PercounterTaskMetadata {
-    uint32_t global_order_id;
-    uint16_t active_mask;
-    uint16_t block_num;
-    uint32_t sync_index;
-    uint32_t next_boundary_segment;
-};
-static_assert(sizeof(PercounterTaskMetadata) == 16);
-static_assert(
-    std::is_trivially_copyable_v<PercounterTaskMetadata> && std::is_standard_layout_v<PercounterTaskMetadata>
-);
-
-// [begin, end) contains ordinary single-block tasks. Each following MIX or
-// SPMD task uses a private counter; no ticket is reset during a run.
-struct PercounterSegment {
-    uint64_t task_shape;
-    uint32_t begin;
-    uint32_t end;
-    uint64_t ticket_begin;
-};
-static_assert(sizeof(PercounterSegment) == 24);
-static_assert(std::is_trivially_copyable_v<PercounterSegment> && std::is_standard_layout_v<PercounterSegment>);
-
-// Zero denotes a tail interval. Every boundary task has at least one block.
-inline constexpr uint64_t percounter_claim_shape(uint32_t task, uint32_t blocks, uint32_t mask, bool sync) {
-    return uint64_t{task} | (uint64_t{mask | (sync ? 8U : 0U)} << 32) | (uint64_t{blocks} << 48);
 }
 
 inline bool percounter_sync_widths_fit(const uint64_t *widths, uint64_t clusters, uint64_t aivs_per_cluster) {
     return widths[0] <= clusters && widths[1] <= clusters * aivs_per_cluster && widths[2] <= clusters;
 }
 
-/**
- * AIC and vector-domain lists. The vector list contains ordinary AIV and MIX.
- * Indexes the per-list arrays of the two records below.
- */
-inline constexpr uint32_t PERCOUNTER_LIST_COUNT = PERCOUNTER_CORE_TYPE_COUNT;
-inline constexpr uint32_t PERCOUNTER_SYNC_DOMAIN_COUNT = 3;  // AIC, ordinary AIV, MIX
-
-/** One body task of a Graph template. */
-struct PercounterBodyTask {
-    // Subtasks the task runs in all, `block_num * popcount(active_mask)`: what
-    // its counter is preset against.
-    uint32_t subtask_total;
-    uint32_t flags;  // PERCOUNTER_BODY_*
-};
-static_assert(sizeof(PercounterBodyTask) == 8, "percounter body task is a wire struct");
-static_assert(std::is_trivially_copyable_v<PercounterBodyTask> && std::is_standard_layout_v<PercounterBodyTask>);
-
-// No producer inside the body: it waits on the shell's own fanin instead.
-inline constexpr uint32_t PERCOUNTER_BODY_ROOT = 1U << 0;
-// No consumer inside the body: each of its subtasks also counts toward the shell.
-inline constexpr uint32_t PERCOUNTER_BODY_SINK = 1U << 1;
-inline constexpr uint32_t PERCOUNTER_BODY_PREDICATE = 1U << 2;
-
-/**
- * What percounter keeps of one Graph Definition, built once per Definition per
- * bind and shared by every invocation of it.
- *
- * The body's tasks are numbered 0..task_count-1 as in the Definition. The order
- * entries carry those body indices as their task id; an invocation's entries are
- * the same words with the invocation's first percounter id added.
- *
- * Every `*_offset` is from the region base.
- */
 struct alignas(64) PercounterGraphTemplate {
     uint64_t task_count;
-    uint64_t edge_count;
-    uint64_t tasks_offset;
-    uint64_t fanin_offsets_offset;
-    // Each reference is (body producer index << 1) | completion-pair bit.
-    uint64_t fanin_indices_offset;
 };
-static_assert(sizeof(PercounterGraphTemplate) == 64, "percounter graph template is a wire struct");
-static_assert(
-    std::is_trivially_copyable_v<PercounterGraphTemplate> && std::is_standard_layout_v<PercounterGraphTemplate>
-);
 
-/**
- * One Graph invocation: an outer task of kind GRAPH and the body it runs.
- *
- * The host writes everything but `storage_address`, which exists only once the
- * AICPU has localized the invocation: the body's ChipTaskStorage array sits in
- * the shell's heap, and the host never sees that heap's real address.
- */
+// Each invocation owns its publication cache line.
 struct alignas(64) PercounterGraphInvocation {
     uint64_t template_offset;
-    // The shell's percounter id, which is also its task-table id. Its fanin is
-    // what the body's roots wait on, and its counter is what the sinks publish.
+    // The body sinks contribute to this top-level task's counter.
     uint64_t shell_task_id;
     // Percounter id of body task 0; body task i is `body_base + i`.
     uint64_t body_base;
-    uint64_t storage_address;
+    uint64_t calendar_ready;
+    uint64_t materialize_start_cycles;
+    uint64_t ready_timing_offset;
+    uint64_t materialize_end_cycles;
+    uint64_t materializer_thread_id;
 };
 static_assert(sizeof(PercounterGraphInvocation) == 64, "a graph invocation owns exactly one cache line");
 static_assert(
@@ -394,35 +157,22 @@ static_assert(
  */
 inline constexpr int32_t PERCOUNTER_GRAPH_SLICE_TASKS = 16;
 
-/** Where a task's producers live in the flat fanin-address array. */
-struct PercounterFanin {
-    int32_t count;
-    int32_t begin;
+struct PercounterGraphReadyTiming {
+    uint64_t cycles;
+    uint64_t watermark;
 };
-static_assert(sizeof(PercounterFanin) == 8, "percounter fanin record is a wire struct");
-static_assert(std::is_trivially_copyable_v<PercounterFanin> && std::is_standard_layout_v<PercounterFanin>);
 
-/**
- * An order-list entry names one task. An owned entry identifies its claimed
- * block using the same encoding:
- *
- *   bits  0..31  task id
- *   bits 32..47  block index
- *   bits 48..63  block count
- *
- * Each task has one order-list entry. An SPMD entry has a sentinel block index;
- * a successful claim replaces it with the actual block index in the owned slot.
- *
- * The block count is carried here because the descriptor a lane can reach holds
- * the task id and the kernel ids only, and `logical_block_num` lives on the
- * AICPU-side slot state, which an AICore should not read by offset. For a
- * single-slot task the block count is also the subtask total the counter is
- * preset against.
- *
- * The orchestrator refuses any task whose `block_num * popcount(active_mask)`
- * exceeds INT16_MAX, so both halves fit 16 bits unsigned, and a task id is
- * non-negative and bounded by the graph's task count.
- */
+struct alignas(64) PercounterAicpuTiming {
+    uint64_t ready_publish_start_cycles;
+    uint64_t ready_publish_end_cycles;
+    uint64_t observe_start_cycles;
+    uint64_t sinks_observed_cycles;
+    uint64_t observe_end_cycles;
+    uint64_t shutdown_start_cycles;
+    uint64_t shutdown_end_cycles;
+};
+
+// Calendar plan and DFX key: [block count:16, block index:16, task ID:32].
 inline constexpr uint32_t PERCOUNTER_ORDER_BLOCK_IDX_SHIFT = 32;
 inline constexpr uint32_t PERCOUNTER_ORDER_BLOCK_NUM_SHIFT = 48;
 inline constexpr uint64_t PERCOUNTER_ORDER_TASK_MASK = 0xffffffffULL;
@@ -446,55 +196,22 @@ inline __aicore__ int32_t percounter_order_block_num(uint64_t entry) {
     return static_cast<int32_t>((entry >> PERCOUNTER_ORDER_BLOCK_NUM_SHIFT) & PERCOUNTER_ORDER_BLOCK_MASK);
 }
 
-// An SPMD boundary names a task; its blocks come from its private claim counter.
-inline constexpr int32_t PERCOUNTER_ORDER_BLOCK_IDX_SPMD = 0xffff;
-inline __aicore__ bool percounter_order_is_spmd(uint64_t entry) {
-    return percounter_order_block_idx(entry) == PERCOUNTER_ORDER_BLOCK_IDX_SPMD;
-}
-
-struct PercounterTerminalPlan {
-    uint32_t step_count;
-    uint32_t steps[PERCOUNTER_TERMINAL_MAX_STEPS];
-    uint32_t prerequisite_count;
-    uint32_t prerequisites[PERCOUNTER_TERMINAL_MAX_PREREQUISITES];
-};
-
-/**
- * The device-visible header locates each segment and records list and cohort sizes.
- */
 struct alignas(128) PercounterControl {
     uint64_t task_count;
     // Top-level sinks: the tasks no task in the table consumes. Every task
     // reaches one along consumer edges, so their completion covers the graph.
     uint64_t sink_count;
     uint64_t sinks_offset;
-    uint64_t edge_count;
-    uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT];
-    uint64_t orders_offset[PERCOUNTER_CORE_TYPE_COUNT];
-    uint64_t tickets_offset;
     uint64_t mix_task_count;
-    uint64_t boundary_task_count;
-    uint64_t task_claims_offset;
-    uint64_t claim_summary_offset;
     uint64_t sync_cohort_count;
-    uint64_t sync_arrivals_offset;
-    // One CntNotify SET/read address per cohort, parallel to the arrival
-    // barriers; zero where that cohort uses the GM sectors.
+    // One CntNotify SET address per explicit START cohort.
     uint64_t sync_notify_offset;
-    uint64_t metadata_offset;
-    uint64_t metadata_ready_offset;
-    uint64_t segments_offset;
-    uint64_t segment_begin[PERCOUNTER_LIST_COUNT];
-    uint64_t segment_count[PERCOUNTER_LIST_COUNT];
-    uint64_t max_sync_blocks[PERCOUNTER_SYNC_DOMAIN_COUNT];
-    uint64_t has_predicates;
+    uint64_t max_sync_blocks[3];
     uint64_t table_task_count;
     uint64_t graph_invocation_count;
     uint64_t graph_invocations_offset;
     uint64_t graph_prepare_offset;
     uint64_t mix_signal_ready_offset;
-    uint64_t fanin_offset;
-    uint64_t fanin_addr_offset;
     uint64_t counters_offset;
     uint64_t cluster_count;
     uint64_t aiv_per_cluster;
@@ -503,14 +220,13 @@ struct alignas(128) PercounterControl {
     uint64_t graph_storage_count;
     uint64_t callable_addresses_address;
     uint64_t callable_addresses_count;
-    uint64_t arguments_address;
+    uint64_t calendar_offset;
     uint64_t image_bytes;
     // One deferred-completion registration scratch per physical lane. The condition
     // cap is one record's, and the epoch is what tells a record of this run
     // from one the retained storage still held.
     uint64_t async_groups_offset;
     uint64_t async_entries_offset;
-    uint64_t async_capacity;
     uint64_t async_run_epoch;
     uint64_t async_completions_offset;
     uint64_t async_completion_capacity;
@@ -520,16 +236,13 @@ struct alignas(128) PercounterControl {
     uint64_t lane_error_claim;
     uint64_t lane_error_task;
     uint64_t lane_error_detail;
-    uint32_t first_boundary_segment[PERCOUNTER_SYNC_DOMAIN_COUNT];
 
     // Allocation precedes the corresponding block's completed publication.
     // Both counters are monotone; equality after all blocks ran permits exit.
     alignas(128) uint64_t async_registered;
     uint64_t async_settled;
-    PercounterTerminalPlan terminal;
-    uint8_t async_reserved[112 - sizeof(PercounterTerminalPlan)];
+    uint64_t aicpu_profile_offset;
 };
-static_assert(sizeof(PercounterControl) == 640);
 static_assert(
     offsetof(PercounterControl, async_registered) % 128 == 0,
     "the deferred-group counts are the atomics lanes write; they must start a cache line, or every reader of "

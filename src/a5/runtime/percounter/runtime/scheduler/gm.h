@@ -150,13 +150,11 @@ static inline __aicore__ uint64_t percounter_gm_read_immutable_word(const __gm__
  * several observers see the same value. Neither access may be widened into a
  * neighbouring register, and the mapping never takes cache maintenance.
  *
- * Both are device MMIO rather than GM, so concurrent access to one address
- * does not serialize the way a GM atomic does. A zero address selects this
- * runtime's GM protocol instead.
+ * These commands access CntNotify SRAM through device MMIO.
  */
 static inline __aicore__ uint32_t percounter_notify_query(__gm__ volatile uint32_t &value) {
-    return simpler::percounter::percounter_scalar_memory_result(
-        simpler::percounter::ProfilePhase::BypassLoad, [&value]() __aicore__ {
+    return simpler::percounter::percounter_scalar_notify_read(
+        reinterpret_cast<uint64_t>(&value), [&value]() __aicore__ {
 #if defined(__CCE_AICORE__)
             return static_cast<uint32_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint32_t *>(&value), 0));
 #else
@@ -169,8 +167,9 @@ static inline __aicore__ uint32_t percounter_notify_query(__gm__ volatile uint32
 /** Command one increments once: a payload of two does not add two. */
 static inline __aicore__ void percounter_notify_add(__gm__ volatile uint32_t &value, uint32_t credits) {
     for (uint32_t credit = 0; credit < credits; ++credit) {
-        simpler::percounter::percounter_scalar_memory_issue(
-            simpler::percounter::ProfilePhase::BypassStoreIssue, 1, [&value]() __aicore__ {
+        simpler::percounter::percounter_scalar_notify_issue(
+            simpler::percounter::ProfilePhase::CntNotifyAddIssue, reinterpret_cast<uint64_t>(&value), 1,
+            [&value]() __aicore__ {
 #if defined(__CCE_AICORE__)
                 __builtin_cce_st_dev(UINT32_C(1), const_cast<__gm__ uint32_t *>(&value), 0);
 #else

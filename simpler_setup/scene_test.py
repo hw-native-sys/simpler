@@ -1791,25 +1791,6 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
 
     orch = spec["orchestration"]
     incores = spec["incores"]
-    capability_keys = []
-    capabilities = []
-    for kernel in incores:
-        # Validate before cache lookup or compilation through the same public
-        # constructor that owns the serialized declaration contract.
-        capability = CoreCallable.build(
-            signature=[], binary=b"", async_capability=kernel.get("async_capability")
-        ).async_capability
-        capabilities.append(capability)
-        capability_keys.append(
-            (
-                kernel["func_id"],
-                capability["version"],
-                capability["mode"],
-                capability["max_conditions"],
-                capability["condition_types"],
-            )
-        )
-    cache_key = (cache_key, tuple(capability_keys))
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
 
@@ -1846,10 +1827,6 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
                 include_dirs,
             )
         )
-    if not (len(incores) == len(resolved_extra_dirs) == len(incore_artifact_keys) == len(capabilities)):
-        raise ValueError(
-            "incore specifications, include paths, artifact keys, and capabilities must have equal lengths"
-        )
     compiler_token = kc.compile_cache_token(runtime, [k["core_type"] for k in incores])
     artifact_key = compile_artifact_key(
         {
@@ -1870,10 +1847,9 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
                     "func_id": k["func_id"],
                     "core_type": k["core_type"],
                     "signature": k.get("signature", []),
-                    "async_capability": capability,
                     "artifact_key": incore_artifact_key,
                 }
-                for k, incore_artifact_key, capability in zip(incores, incore_artifact_keys, capabilities)
+                for k, incore_artifact_key in zip(incores, incore_artifact_keys)
             ],
         },
         orchestration_units,
@@ -1913,17 +1889,16 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
             orch_binary = orch_future.result()
             incores_binary = [future.result() for future in incore_futures]
 
-        if not (len(incores_binary) == len(incores) == len(capabilities)):
+        if not (len(incores_binary) == len(incores)):
             raise AssertionError("compiled incore binaries must match the incore specification")
         kernel_binaries = []
-        for k, incore, capability in zip(incores, incores_binary, capabilities):
+        for k, incore in zip(incores, incores_binary):
             kernel_binaries.append(
                 (
                     k["func_id"],
                     CoreCallable.build(
                         signature=k.get("signature", []),
                         binary=incore,
-                        async_capability=capability,
                     ),
                 )
             )

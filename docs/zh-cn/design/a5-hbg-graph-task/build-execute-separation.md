@@ -694,24 +694,11 @@ Host 根据折叠控制节点、展开 Graph 后的实际依赖找出全部设�
 
 当前组的条件条目由本核登记和封口。检查时读取真实通知地址。CCU 的读清顺序、SDMA 的阈值语义以及消费者获取输入的可见性边界照常生效。
 
-### 按 lane 分类完成能力
+### Deferred completion 登记
 
-`async_capability` 是 kernel 的静态完成合同，随 CoreCallable 保存并进入缓存身份。当前兼容阶段在注册入口把缺失声明、`None`、条件字段为零的显式 `UNKNOWN`，以及旧序列化格式的全零声明，统一转换为 `DEFERRED(max_conditions=64, condition_types=3)`。不得把未知能力当作同步，也不能由某次运行没有登记条件推断为同步。转换在持有的副本上完成，缓存身份使用转换后的声明，不修改调用者的原始缓冲区。非法类型、版本、字段及边界仍报错；显式 UNKNOWN 携带非零条件字段也不接受。
+Host 为每个参与 kernel 的 block 和 lane 准备完成记录。每条记录最多登记 64 个条件。设备在 kernel 返回时读取本次实际登记。没有登记时提交执行和完成两个信用。有登记时提交执行信用，等实际信号满足后再提交完成信用。一个 1C2V block 的目标是六个信用。
 
-公共 `set_callable_tables()` 保持四参数接口。A5 HBG 在准备阶段通过 HostApi，按当前 callable ID 借用注册器持有的只读能力表，并校验其长度与函数表一致；重新绑定或查询失败都会清除旧能力引用。能力表随 callable 注册生命周期保留，不在每次准备时复制。TMR 不获取该视图，也不参与能力表绑定。
-
-Host 和 Device 内部只保留 `SYNCHRONOUS`、`DEFERRED` 两态，不恢复 UNKNOWN 调度分支。注册入口验证并归一化每个 kernel，包括本次未使用的入口。Host 在 Graph 展开后只按本次实际可执行的 leaf kernel、每个活动 lane 选择容量；未使用的合法 DEFERRED 声明不会给纯同步图增加异步布局。补齐上游准确声明仍有价值：未知入口按最大容量保留异步上下文和 P/Q 完成协议，只有显式 SYNCHRONOUS 才能享受零布局和同步快速路径。
-
-- `SYNCHRONOUS` 任务在 kernel 返回时完成，可以向其他 rank 发信号。需要等待其他 rank 信号的 kernel 必须声明为 `DEFERRED` 并登记完成条件。本核流水线同步和同卡 `sync_start` 组内协作仍按各自协议执行。Host 为同步任务分配零条件容量，Device 只提交物理完成 P。
-- `DEFERRED`：Host 按已验证的条件上界和类型声明分配；Device 返回时提交 P，空登记或最终 CHECK 提交 Q。
-
-纯同步图的 async layout 大小为零，不准备异步上下文，不探测 activity，也不运行 CHECK 服务。混合图只为可能异步的 lane 保留资源；同步 lane 不因同 task 或同图中其他 lane 的能力而分配异步组。预备 context 明确写入零 async 字段和无效 group 索引，重放不能沿用先前执行的登记状态。
-
-CntNotify 每任务目标贡献为 `block_num × (active_lane_count + possible_async_lane_count)`。同步普通执行返回仅写一次 INC；可能异步的普通执行零登记时可合并提交 P/Q 两个信用。有异步登记时，P/Q 分开提交。MIX 的 Q 只由具有异步组的 lane 提交，每个活动 lane 在自己的成功返回路径提交一份 P。例：AIC 同步、两个 AIV 可能异步，每 block 为 P3+Q2，共5，不是6。
-
-SYNCHRONOUS 只描述自身完成语义，不表示前驱数据已经可见。前驱逻辑 DONE、正常依赖获取和必要的缓存/顺序操作仍然成立。Host 沿真实依赖传播 DEFERRED 祖先信息，只对确有此类祖先的任务设置输入获取标记；其他任务不查询全图 activity。所有执行计划都必须基于入口归一化后的能力完成这个计算，内部缺失或无效能力仍拒绝准备。带标记的消费者保留实际执行核上的获取。不能因为消费者自身同步就删除异步前驱的数据可见性保证。
-
-验证关注纯同步图零布局、混 lane 信用总数、DEFERRED 的零登记/实际 CHECK、UNKNOWN 和旧调用归一化、无效声明被拒绝和重放。未知入口即使本次没有实际登记也走空 seal；真实登记仍等待 CHECK 提交 Q，不能提前发布 DONE。性能仍使用同一份业务二进制与注册元数据，对照 7 组 AICore L0 wall；声明来源和实际生效覆盖需要一并记录，不把未传入 runtime 的源码分类当成优化已生效。
+Host 沿展开后的依赖传播输入可见性要求。后继观察到前驱逻辑完成后，仍在实际执行核上获取输入。
 
 ### CntNotify 资源复用与控制状态选型
 

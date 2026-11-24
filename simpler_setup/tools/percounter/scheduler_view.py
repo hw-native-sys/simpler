@@ -9,39 +9,38 @@
 """Task/block timing lanes for device-side Percounter scheduling."""
 
 from collections import defaultdict
-from heapq import heappop, heappush
 
 _LABELS = {
-    "claim": "Claim",
+    "row_begin": "Calendar row begins",
+    "inputs_ready": "Inputs satisfied",
+    "mix_release_observed": "Observe local MIX release",
     "ready": "Ready",
-    "kernel_end": "Kernel end",
-    "completion_issue": "Completion issued",
-    "defer_registered": "Defer registered",
-    "deferred_completion_issue": "Deferred completion issued",
+    "kernel_end": "Kernel return",
+    "completion_issue": "DONE issued",
+    "local_retired": "Row retired",
+    "defer_registered": "Defer flag issued",
+    "defer_poll_begin": "First defer poll",
+    "defer_signal_ready": "Defer signal observed",
+    "deferred_completion_issue": "Deferred DONE issued",
 }
 
+_RANGE_LABELS = {
+    "range_enter_begin": "Wait for range",
+    "graph_ready_observed": "Graph watermark observed",
+    "range_entered": "Range entered",
+}
 
-_CHECKPOINTS = {"inputs_pending", "inputs_ready", "mix_publish", "entry_commit"}
+_DEFER_EVENTS = {
+    "defer_registered",
+    "defer_poll_begin",
+    "defer_signal_ready",
+    "deferred_completion_issue",
+}
+_ROLES = ("C", "V0", "V1")
 
 
-def _validate_l2_checkpoints(row):
-    if row["kind"] == "claim" and "slot" in row:
-        if (
-            type(row["slot"]) is not int
-            or row["slot"] < 0
-            or type(row.get("mix")) is not bool
-            or type(row.get("participant_mask")) is not int
-            or not 0 <= row["participant_mask"] <= 7
-        ):
-            raise ValueError("invalid percounter claim location")
-    if row["kind"] == "kernel_end" and ("dispatch_cycles" in row or "finish_cycles" in row):
-        dispatch, finish = row.get("dispatch_cycles"), row.get("finish_cycles")
-        if (
-            type(dispatch) is not int
-            or type(finish) is not int
-            or not 0 < dispatch <= row["kernel_start_cycles"] <= row["cycles"] <= finish
-        ):
-            raise ValueError("invalid percounter execution checkpoints")
+def worker_lane(cluster, role):
+    return f"Cluster {cluster:02d} · {_ROLES[role]}", cluster * len(_ROLES) + role
 
 
 def parse_capture(section):
@@ -56,15 +55,26 @@ def parse_capture(section):
             raise ValueError(f"invalid percounter_task_events.{field}")
     for row in section["records"]:
         _validate_task_event(row)
+    ranges = section.get("range_records")
+    if not isinstance(ranges, list):
+        raise ValueError("percounter_task_events must contain a range_records array")
+    for row in ranges:
+        if not isinstance(row, dict) or row.get("kind") not in _RANGE_LABELS:
+            raise ValueError("invalid percounter range event kind")
+        for field in ("cycles", "run_epoch", "worker_id", "cluster_index", "cluster_lane", "range_index"):
+            if type(row.get(field)) is not int or row[field] < 0:
+                raise ValueError(f"invalid percounter range event {field}")
+        if not 0 <= row["cluster_lane"] < len(_ROLES) or row["cycles"] == 0:
+            raise ValueError("invalid percounter range coordinates or timestamp")
+        if row["kind"] == "graph_ready_observed" and (
+            type(row.get("graph_shell_id")) is not int or type(row.get("watermark")) is not int
+        ):
+            raise ValueError("invalid percounter Graph watermark event")
     return section
 
 
 def _validate_task_event(row):
-    if (
-        not isinstance(row, dict)
-        or not isinstance(row.get("kind"), str)
-        or (row["kind"] not in _LABELS and row["kind"] not in _CHECKPOINTS)
-    ):
+    if not isinstance(row, dict) or not isinstance(row.get("kind"), str) or row["kind"] not in _LABELS:
         raise ValueError("invalid percounter task event kind")
     for field in (
         "cycles",
@@ -80,15 +90,25 @@ def _validate_task_event(row):
             raise ValueError(f"invalid percounter task event {field}")
     if not 0 <= row["block_index"] < row["block_count"] or row["cluster_lane"] >= 3 or row["cycles"] == 0:
         raise ValueError("invalid percounter task event coordinates or timestamp")
-    if row["kind"] == "claim":
-        start = row.get("claim_start_cycles")
-        if type(start) is not int or not 0 < start <= row["cycles"]:
-            raise ValueError("invalid percounter claim interval")
     if row["kind"] == "kernel_end":
-        start = row.get("kernel_start_cycles")
-        if type(start) is not int or not 0 < start <= row["cycles"]:
-            raise ValueError("invalid percounter kernel interval")
-    _validate_l2_checkpoints(row)
+        dispatch, start, finish = (
+            row.get(name) for name in ("dispatch_cycles", "kernel_start_cycles", "finish_cycles")
+        )
+        if (
+            type(dispatch) is not int
+            or type(start) is not int
+            or type(finish) is not int
+            or not 0 < dispatch <= start <= row["cycles"] <= finish
+        ):
+            raise ValueError("invalid percounter execution checkpoints")
+    if row["kind"] in _DEFER_EVENTS:
+        group = row.get("deferred_group")
+        if type(group) is not int or group <= 0:
+            raise ValueError("invalid percounter deferred group")
+        if row["kind"] != "defer_registered":
+            source = row.get("source_worker_id")
+            if type(source) is not int or source < 0:
+                raise ValueError("invalid percounter deferred producer")
     if row["kind"] in ("completion_issue", "deferred_completion_issue"):
         contribution = row.get("contribution")
         if type(contribution) is not int or contribution != 1:
@@ -98,6 +118,7 @@ def _validate_task_event(row):
 def decode_capture(section, to_us):
     return {
         **section,
+        "range_records": [{**row, "time_us": to_us(row["cycles"])} for row in section["range_records"]],
         "records": [
             {
                 **row,
@@ -107,7 +128,6 @@ def decode_capture(section, to_us):
                     if "dispatch_cycles" in row
                     else {}
                 ),
-                **({"claim_start_us": to_us(row["claim_start_cycles"])} if row["kind"] == "claim" else {}),
                 **({"kernel_start_us": to_us(row["kernel_start_cycles"])} if row["kind"] == "kernel_end" else {}),
             }
             for row in section["records"]
@@ -207,204 +227,8 @@ def control_completions(capture, kernel_ids, block_counts):
                 yield row
 
 
-def _milestones(rows, ideal_ready, include_kernel_execution):
-    """Use recorded endpoints for every span, including in partial captures."""
-    by_kind = defaultdict(list)
-    for row in rows:
-        by_kind[row["kind"]].append(row)
-    ticks = [row["time_us"] for row in rows]
-    starts = [row["kernel_start_us"] for row in by_kind["kernel_end"]]
-    completion = by_kind["completion_issue"] + by_kind["deferred_completion_issue"]
-    spans = []
-    claim = by_kind["claim"][0] if by_kind["claim"] else None
-    if claim:
-        ticks.append(claim["claim_start_us"])
-        spans.append(("Claim start → claim", claim["claim_start_us"], claim["time_us"], "thread_state_running"))
-    if claim and by_kind["ready"]:
-        claimed, ready = claim["time_us"], by_kind["ready"][0]["time_us"]
-        if ideal_ready is not None and ideal_ready <= ready:
-            ticks.append(ideal_ready)
-            if ideal_ready < claimed:
-                spans.append(("Claim → ready (dependencies already ready)", claimed, ready, "thread_state_runnable"))
-            else:
-                spans.append(("Claim → ideal ready", claimed, ideal_ready, "thread_state_iowait"))
-                spans.append(("Ideal ready → ready", ideal_ready, ready, "thread_state_runnable"))
-        else:
-            ideal_ready = None
-            spans.append(("Claim → ready", claimed, ready, "thread_state_runnable"))
-    else:
-        ideal_ready = None
-    if starts:
-        start, end = min(starts), by_kind["kernel_end"][-1]["time_us"]
-        if by_kind["ready"]:
-            spans.append(("Ready → kernel start", by_kind["ready"][0]["time_us"], start, "thread_state_iowait"))
-        if include_kernel_execution:
-            spans.append(("Kernel execution", start, end, "good"))
-        if completion:
-            spans.append(
-                (
-                    "Kernel end → completion issue",
-                    end,
-                    max(r["time_us"] for r in completion),
-                    "thread_state_uninterruptible",
-                )
-            )
-    return min(ticks + starts), max(ticks), spans, ideal_ready
-
-
-def _block_events(rows, pid, tid, name, spans, ideal_ready, prefix):
-    block = rows[0]
-    args = {key: block[key] for key in ("run_epoch", "task_id", "block_index", "block_count")}
-
-    def stage_name(stage):
-        return f"{prefix}-{stage}" if prefix is not None else f"{stage} · {name}"
-
-    if prefix is not None:
-        args["kernel_slice_label"] = name
-    location = {"pid": pid, "tid": tid, "cat": "percounter_task_timing"}
-    if ideal_ready is not None:
-        args["ideal_ready_us"] = ideal_ready
-        args["ideal_ready_source"] = "predecessor_completion_issue"
-    for label, start, end, color in spans:
-        if start < end:
-            yield {
-                **location,
-                "ph": "X",
-                "ts": start,
-                "dur": end - start,
-                "name": stage_name(label),
-                "cname": color,
-                "args": args,
-            }
-    if ideal_ready is not None:
-        yield {
-            **location,
-            "ph": "i",
-            "s": "t",
-            "ts": ideal_ready,
-            "name": stage_name("Ideal ready (estimated)"),
-            "args": {**args, "kind": "ideal_ready"},
-        }
-    for row in rows:
-        label = _LABELS[row["kind"]]
-        role = ("C", "V0", "V1")[row["cluster_lane"]]
-        if row["kind"] in ("ready", "kernel_end"):
-            label += f" ({role})"
-        if "contribution" in row:
-            label += f" {row['contribution']:+d}"
-        row_args = {
-            key: value for key, value in row.items() if key not in ("time_us", "claim_start_us", "kernel_start_us")
-        }
-        row_args["worker_role"] = role
-        if prefix is not None:
-            row_args["kernel_slice_label"] = name
-        if row["kind"] == "claim":
-            yield {
-                **location,
-                "ph": "i",
-                "s": "t",
-                "ts": row["claim_start_us"],
-                "name": stage_name("Claim start"),
-                "args": {**row_args, "kind": "claim_start", "cycles": row["claim_start_cycles"]},
-            }
-        yield {
-            **location,
-            "ph": "i",
-            "s": "t",
-            "ts": row["time_us"],
-            "name": stage_name(label),
-            "args": row_args,
-        }
-
-
-def _execution_predecessors(deps_edges, folded_task_ids, inline_completed_task_ids):
-    predecessors = defaultdict(set)
-    completed = set(inline_completed_task_ids)
-    for pred, successors in deps_edges.items():
-        if pred in completed:
-            continue
-        for succ in successors:
-            predecessors[succ].add(pred)
-
-    folded = set(folded_task_ids)
-    for task_id, parents in predecessors.items():
-        if task_id in folded:
-            continue
-        pending = parents & folded
-        seen = set(pending)
-        while pending:
-            for pred in predecessors.get(pending.pop(), ()):
-                if pred not in folded:
-                    parents.add(pred)
-                elif pred not in seen:
-                    pending.add(pred)
-                    seen.add(pred)
-        parents.difference_update(folded)
-    return predecessors
-
-
-def trace_events(
-    capture,
-    pid,
-    task_name,
-    *,
-    include_kernel_execution=True,
-    l2_task_display=None,
-    deps_edges=None,
-    deps_kernel_map=None,
-    deps_block_map=None,
-):
-    blocks = defaultdict(list)
-    for row in capture["records"]:
-        if row["kind"] not in _CHECKPOINTS:
-            blocks[row["run_epoch"], row["task_id"], row["block_index"]].append(row)
-
-    issues = _task_completion_issues(capture, blocks, deps_edges, deps_kernel_map, deps_block_map)
-    predecessors = (
-        _execution_predecessors(deps_edges, capture["folded_task_ids"], capture["inline_completed_task_ids"])
-        if issues
-        else {}
-    )
-
-    by_cluster = defaultdict(list)
-    for (epoch, task_id, block), rows in blocks.items():
-        rows.sort(key=lambda row: row["time_us"])
-        placement = next((row for row in rows if row["kind"] == "claim"), rows[0])
-        preds = predecessors.get(task_id, ())
-        times = [ts for pred in preds if (ts := issues.get((epoch, pred))) is not None]
-        ideal_ready = max(times) if times and len(times) == len(preds) else None
-        start, end, spans, ideal_ready = _milestones(rows, ideal_ready, include_kernel_execution)
-        by_cluster[placement["cluster_index"]].append((start, end, epoch, task_id, block, spans, rows, ideal_ready))
-
-    yield _meta(pid, "process_name", {"name": "Scheduler View"})
-    yield _meta(pid, "process_sort_index", {"sort_index": 3})
-    next_tid = 1
-    for cluster, entries in sorted(by_cluster.items()):
-        lanes = []
-        lane_count = 0
-        for start, end, _epoch, task_id, block, spans, rows, ideal_ready in sorted(
-            entries, key=lambda entry: entry[:5]
-        ):
-            if lanes and lanes[0][0] < start:
-                _, tid = heappop(lanes)
-            else:
-                tid = next_tid
-                next_tid += 1
-                lane_count += 1
-                name = f"Cluster {cluster:02d}"
-                if lane_count > 1:
-                    name += f" / {lane_count}"
-                yield _meta(pid, "thread_name", {"name": name}, tid)
-                yield _meta(pid, "thread_sort_index", {"sort_index": tid}, tid)
-            heappush(lanes, (end, tid))
-            name = f"{task_name(task_id)} [block {block}/{rows[0]['block_count']}]"
-            prefix = f"{l2_task_display(task_id)}-b{block}" if l2_task_display is not None else None
-            yield from _block_events(rows, pid, tid, name, spans, ideal_ready, prefix)
-    yield from capture_status(capture, pid)
-
-
 def capture_status(capture, pid):
-    if capture["dropped"]:
+    if capture["dropped"] or capture["unmatched_deferred_updates"]:
         yield _meta(pid, "thread_name", {"name": "Capture status"}, 0)
         yield {
             "pid": pid,
@@ -416,3 +240,133 @@ def capture_status(capture, pid):
             "ts": min((row["time_us"] for row in capture["records"]), default=0),
             "args": {key: capture[key] for key in ("dropped", "unmatched_deferred_updates")},
         }
+
+
+def _row_spans(rows):
+    """Measured intervals within one physical lane's calendar row."""
+    timestamps = {row["kind"]: row["time_us"] for row in rows}
+    kernel = next((row for row in rows if row["kind"] == "kernel_end"), None)
+    if kernel is not None:
+        timestamps["kernel_start"] = kernel["kernel_start_us"]
+        timestamps["fence_end"] = kernel["finish_us"]
+    stages = (
+        ("row_begin", "inputs_ready", "Read row and wait for inputs"),
+        ("inputs_ready", "ready", "Wait for start permission"),
+        ("row_begin", "mix_release_observed", "Read row and wait for local MIX release"),
+        ("ready", "kernel_start", "Prepare kernel entry"),
+        ("kernel_end", "fence_end", "Output fence"),
+    )
+    for begin, end, label in stages:
+        if begin in timestamps and end in timestamps and timestamps[begin] < timestamps[end]:
+            yield label, timestamps[begin], timestamps[end]
+    finish = timestamps.get("fence_end", timestamps.get("ready"))
+    retired = timestamps.get("local_retired")
+    if finish is not None and retired is not None and finish < retired:
+        label = "Retire row"
+        if "defer_registered" in timestamps:
+            label = "Publish defer and retire"
+        elif "completion_issue" in timestamps:
+            label = "Issue DONE and retire"
+        yield label, finish, retired
+
+
+def trace_events(capture, pid, task_name):
+    """Draw calendar transitions on the cores executing them."""
+    yield _meta(pid, "process_name", {"name": "Scheduler View"})
+    yield _meta(pid, "process_sort_index", {"sort_index": 3})
+    lanes = {}
+    ranges = capture.get("range_records", [])
+    for row in capture["records"] + ranges:
+        worker = row["worker_id"]
+        if worker not in lanes:
+            name, order = worker_lane(row["cluster_index"], row["cluster_lane"])
+            lanes[worker] = {"pid": pid, "tid": order + 1}
+            yield _meta(pid, "thread_name", {"name": name}, order + 1)
+            yield _meta(pid, "thread_sort_index", {"sort_index": order}, order + 1)
+    yield from _range_events(ranges, lanes)
+    rows_by_execution = defaultdict(list)
+    deferred_by_group = defaultdict(dict)
+    for row in capture["records"]:
+        worker = row["worker_id"]
+        kind = row["kind"]
+        if kind in _DEFER_EVENTS:
+            deferred_by_group[row["run_epoch"], row["deferred_group"]][kind] = row
+        if kind not in _DEFER_EVENTS or kind == "defer_registered":
+            rows_by_execution[row["run_epoch"], row["task_id"], row["block_index"], worker].append(row)
+        yield {
+            **lanes[worker],
+            "cat": "percounter_task_timing",
+            "ph": "i",
+            "s": "t",
+            "ts": row["time_us"],
+            "name": f"{task_name(row['task_id'])} [{row['block_index']}] · {_LABELS[kind]}",
+            "args": {**row, "role": _ROLES[row["cluster_lane"]]},
+            **({"id": _defer_marker_id(row)} if kind in _DEFER_EVENTS else {}),
+        }
+    for rows in rows_by_execution.values():
+        row = rows[0]
+        args = {key: row[key] for key in ("run_epoch", "task_id", "block_index", "block_count", "worker_id")}
+        args["role"] = _ROLES[row["cluster_lane"]]
+        for label, start, end in _row_spans(rows):
+            yield {
+                **lanes[row["worker_id"]],
+                "cat": "percounter_task_timing",
+                "ph": "X",
+                "ts": start,
+                "dur": end - start,
+                "name": f"{task_name(row['task_id'])} [{row['block_index']}] · {label}",
+                "args": args,
+            }
+    for (epoch, group), stages in deferred_by_group.items():
+        registered = stages.get("defer_registered")
+        first_poll = stages.get("defer_poll_begin")
+        if registered is None or first_poll is None or first_poll["time_us"] < registered["time_us"]:
+            continue
+        for row, phase in ((registered, "s"), (first_poll, "f")):
+            yield {
+                **lanes[row["worker_id"]],
+                "cat": "percounter_defer",
+                "ph": phase,
+                "ts": row["time_us"],
+                "name": "Deferred completion ownership",
+                "id": f"percounter-defer/{epoch}/{group}",
+                "bind_id": _defer_marker_id(row),
+                **({"bp": "e"} if phase == "f" else {}),
+                "args": {"run_epoch": epoch, "deferred_group": group},
+            }
+    if capture.get("dropped") or capture.get("unmatched_deferred_updates"):
+        yield from capture_status(capture, pid)
+
+
+def _defer_marker_id(row):
+    return f"percounter-defer/{row['run_epoch']}/{row['deferred_group']}/{row['kind']}"
+
+
+def _range_events(rows, lanes):
+    ranges = defaultdict(dict)
+    for row in rows:
+        worker, index, kind = row["worker_id"], row["range_index"], row["kind"]
+        ranges[row["run_epoch"], worker, index][kind] = row
+        graph = row.get("graph_shell_id")
+        label = f"Graph {graph} · " if graph is not None else ""
+        yield {
+            **lanes[worker],
+            "cat": "percounter_range",
+            "ph": "i",
+            "s": "t",
+            "ts": row["time_us"],
+            "name": label + _RANGE_LABELS[kind],
+            "args": row,
+        }
+    for (_epoch, worker, _index), stages in ranges.items():
+        begin, end = stages.get("range_enter_begin"), stages.get("range_entered")
+        if begin is not None and end is not None and begin["time_us"] < end["time_us"]:
+            yield {
+                **lanes[worker],
+                "cat": "percounter_range",
+                "ph": "X",
+                "ts": begin["time_us"],
+                "dur": end["time_us"] - begin["time_us"],
+                "name": "Range entry",
+                "args": begin,
+            }

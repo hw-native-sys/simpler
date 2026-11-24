@@ -58,7 +58,7 @@ public:
             check(aclrtCntNotifyGetId(notification.handle, &notification.mapping.resId), "get id");
             map(notification.mapping, notification.address, notification.mapped);
             if (required_ && a5_cnt_notify_increment_address(notification.address) == 0)
-                throw std::runtime_error("HBG requires an aligned CntNotify SET slot");
+                throw std::runtime_error("scheduler requires an aligned CntNotify SET slot");
             if (counter_) {
                 // A5 CntNotify owns a 32-byte register slot. Its ADD register
                 // is offset 8 from the mapped SET/read base and shares the SET

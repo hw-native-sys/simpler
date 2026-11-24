@@ -94,6 +94,7 @@ struct NativeRunContext {
     bool result_observed{false};
     bool physical_complete{false};
     bool execution_retired{false};
+    bool completion_feedback_attempted{false};
     // Captured while the actual arguments exist, before physical retirement
     // releases their Runtime. HOST views never acquire this entitlement.
     bool framework_transfer_eligible{false};

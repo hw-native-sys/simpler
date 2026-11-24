@@ -59,32 +59,6 @@ const AsyncGroupData &group_at(const Image &image, const AsyncCompletionHostPlan
     return *scheduler_state_at<AsyncGroupData>(image.base, group_offset(plan, index));
 }
 
-TEST(HbgAsyncPlan, DeclaredLeafCapabilitiesPruneSyncAndRejectMissingContracts) {
-    auto input = task(0, 5, LaneMask::all());
-    const CoreAsyncCapability sync{1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0};
-    const CoreAsyncCapability deferred{1, CoreAsyncMode::DEFERRED, 7, 3, 0};
-    ASSERT_TRUE(async_task_apply_capabilities(&input, {sync, sync, deferred}));
-    EXPECT_EQ(input.capacities, (std::array<uint16_t, 3>{0, 0, 7}));
-    AsyncCompletionHostPlan plan;
-    std::string error;
-    ASSERT_TRUE(plan_async_completion(kPrefix, 2, 1, {input}, &plan, &error));
-    EXPECT_EQ(plan.layout.group_count, 5u);
-    EXPECT_EQ(plan.tasks[0].data.async_mask, LaneMask(false, false, true));
-    Image image(plan.total_bytes);
-    ASSERT_TRUE(initialize_async_completion(image.base, plan.total_bytes, plan));
-    EXPECT_EQ(scheduler_async_task_lanes(image.base, plan.layout_offset, 0), LaneMask(false, false, true));
-    ASSERT_TRUE(async_task_apply_capabilities(&input, {sync, sync, sync}));
-    ASSERT_TRUE(plan_async_completion(kPrefix, 3, 1, {input}, &plan, &error));
-    EXPECT_EQ(plan.layout_offset, 0u);
-    EXPECT_EQ(plan.layout.group_count, 0u);
-    EXPECT_EQ(plan.total_bytes, kPrefix);
-    EXPECT_EQ(scheduler_async_task_lanes(image.base, 0, 0), LaneMask::none());
-    EXPECT_FALSE(async_task_apply_capabilities(&input, {}));
-    auto invalid = sync;
-    invalid.mode = static_cast<CoreAsyncMode>(3);
-    EXPECT_FALSE(async_task_apply_capabilities(&input, {sync, invalid, deferred}));
-}
-
 TEST(HbgAsyncPlan, InputVisibilityUsesRealAncestorsIncludingControlNodes) {
     std::vector<SchedulerTaskMetadata> metadata(5);
     for (uint32_t task = 0; task < 5; ++task)

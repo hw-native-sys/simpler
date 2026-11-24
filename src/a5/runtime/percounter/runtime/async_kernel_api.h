@@ -91,6 +91,8 @@ inline __aicore__ void defer_flush(AsyncCtx &ctx) {
 }  // namespace pto2::detail
 
 inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
+    // Mark before validation: failed or unfinished registration still needs sealing.
+    simpler::percounter::percounter_current_context()->async_touched = 1;
     AsyncCtx ctx{};
     const GlobalContext global = load_global_context(args);
     ctx.resident_enabled = global.async_present;
