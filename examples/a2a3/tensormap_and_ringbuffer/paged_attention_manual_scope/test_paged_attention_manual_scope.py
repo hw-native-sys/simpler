@@ -64,6 +64,7 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             # Long-context cases submit >16384 in-flight tasks into a single
             # MANUAL scope; the default per-ring task window (16384) can fill
             # before the oldest task retires and wedge the orchestrator

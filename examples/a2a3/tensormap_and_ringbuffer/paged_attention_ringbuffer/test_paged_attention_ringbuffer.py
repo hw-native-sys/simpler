@@ -69,6 +69,7 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
         {
             "name": "ringbuffer_stress",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             # ring_heap is bytes per ring. Non power-of-2 sizes are accepted,
             # but 4 MiB keeps the small-ring stress intent compact.
             "config": {

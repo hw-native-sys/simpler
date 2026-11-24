@@ -352,8 +352,40 @@ The A5 resident-failure PR-sized sweep retains the slot-1 shape for each timeout
 mode; Daily also exercises the all-lane shape.
 The A5 onboard `/run-a5` sweep uses the bounded PR-sized selection;
 Daily covers the remaining mask and failed-lane combinations.
-The two-rank onboard non-Sum Allreduce variants remain in Per-PR: each class
-takes only a few seconds, and its algorithm path is distinct.
+The A2/A3 onboard Per-PR main sweep keeps small paged-attention and batch-attention
+cases, basic compute and SPMD, depth-two early enqueue, result dependencies,
+outstanding-close and lifetime checks, prepared-callable and stream-reuse contracts.
+Daily adds the benchmark BGEMM, large attention and unroll shapes, ringbuffer and
+sync-start stress, concurrent-prepare stress, wider early-enqueue capacities and
+its diagnostic variants. Softmax preparation keeps four boundary shapes in Per-PR;
+Daily runs the full matrix.
+The existing TMR TPUSH/TPOP attention and 4D unroll cases retain their
+Per-PR selection, as does the dependency-chain test. The dependency-chain main
+sweep checks compute results; exported-edge validation requires `--enable-dep-gen`.
+Timing and strace markers, joined-launch attribution, diagnostic export and
+collector checks also run in Daily on A2/A3 onboard. L3 callable isolation keeps
+same-callable reuse and alternating callables in Per-PR; Daily adds the single,
+two-callable, short redispatch and fresh-worker sequences. The dual-domain
+overlap, domain rank-map, FFN tensor-parallel and expert-dispatch/combine examples
+also run in Daily on A2/A3 onboard.
+
+For A2/A3 native Kernel tests, Per-PR keeps every existing functional capture,
+replay and recovery scenario, including retained-heap refusal. Capture PMU,
+swimlane and args-dump combinations run in Daily.
+Validation keeps successful execution and error 105 on AIC and AIV,
+caller-stream success and error 106 in eager and capture modes, and error 106 for each complex
+dispatch mode. Other error-code combinations run in Daily. Runtime-fatal coverage
+keeps explicit-fatal and tensor-wait-timeout cases in Per-PR.
+The failed-run diagnostic-export check runs in Daily on A2/A3 onboard.
+
+Collective algorithms, non-Sum operations and rejection variants retain their
+existing Per-PR coverage. A5 and simulation selections retain their existing scope.
+All of these deferrals use platform-scoped `manual` declarations; the Daily
+`include` selection retains the complete corpus. Qwen and the dedicated DeepSeek
+job keep their existing selection and compilation. Dedicated onboard DFX
+smokes retain their existing Per-PR and Daily coverage, with dependency capture,
+chip swimlane, PMU and args-dump enabled. SDMA and SDMA fault-recovery steps
+also retain their existing coverage.
 
 A sweep's budget follows what it selects, so `manual_mode` is not the only
 input a Daily caller sets. `_st-npu-a5.yml` takes `session_timeout_seconds`

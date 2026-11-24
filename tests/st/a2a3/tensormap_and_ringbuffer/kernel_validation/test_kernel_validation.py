@@ -36,7 +36,15 @@ pytestmark = [
 
 
 @pytest.mark.parametrize("core_type", ["aic", "aiv"])
-@pytest.mark.parametrize("code", [0, 105, 106, 107])
+@pytest.mark.parametrize(
+    "code",
+    [
+        0,
+        105,
+        pytest.param(106, marks=pytest.mark.manual(["a2a3"])),
+        pytest.param(107, marks=pytest.mark.manual(["a2a3"])),
+    ],
+)
 def test_kernel_validation(st_platform, st_device_ids, tmp_path, capfd, core_type, code):
     configure_logging("error")
     compiler = KernelCompiler(st_platform)

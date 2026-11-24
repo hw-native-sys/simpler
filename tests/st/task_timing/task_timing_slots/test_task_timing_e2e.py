@@ -154,7 +154,7 @@ def _drive(
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
-@pytest.mark.manual(["a2a3sim", "a5sim"])
+@pytest.mark.manual(["a2a3", "a2a3sim", "a5sim"])
 def test_distinct_slots_emit_markers(st_platform, st_device_ids, capfd, drain_host_log):
     # Two-task chain: t0 -> slot 0, t1 -> slot 1. out = a + 2b.
     _drive(st_platform, int(st_device_ids[0]), "task_timing_orchestration", 2)
@@ -175,7 +175,7 @@ def test_distinct_slots_emit_markers(st_platform, st_device_ids, capfd, drain_ho
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
-@pytest.mark.manual(["a2a3sim", "a5sim"])
+@pytest.mark.manual(["a2a3", "a2a3sim", "a5sim"])
 def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd, drain_host_log):
     dev = int(st_device_ids[0])
 
@@ -206,7 +206,7 @@ def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd, drain_h
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)
-@pytest.mark.manual(["a2a3sim", "a5sim"])
+@pytest.mark.manual(["a2a3", "a2a3sim", "a5sim"])
 def test_hbg_distinct_slots_emit_markers(st_platform, st_device_ids, capfd, drain_host_log):
     # Same two-task chain as test_distinct_slots_emit_markers, on the hbg path.
     _drive(st_platform, int(st_device_ids[0]), "task_timing_orchestration", 2, runtime="host_build_graph")
@@ -227,7 +227,7 @@ def test_hbg_distinct_slots_emit_markers(st_platform, st_device_ids, capfd, drai
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)
-@pytest.mark.manual(["a2a3sim", "a5sim"])
+@pytest.mark.manual(["a2a3", "a2a3sim", "a5sim"])
 def test_hbg_duplicate_slot_merges_window(st_platform, st_device_ids, capfd, drain_host_log):
     # Same 3-task same-slot merge as test_duplicate_slot_merges_window, on the hbg
     # path: min(dispatch)/max(finish) must fold into a single slot-0 window.
@@ -290,7 +290,7 @@ def _build_mix_chip_callable(platform: str) -> ChipCallable:
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
-@pytest.mark.manual(["a2a3sim"])
+@pytest.mark.manual(["a2a3", "a2a3sim"])
 def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd, drain_host_log):
     # One MIX task (AIC matmul + AIV0 add + AIV1 mul) tagged slot 0. All three
     # subtasks fold their dispatch/finish into slot 0 -> one complete window.
@@ -358,7 +358,7 @@ def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd, 
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
-@pytest.mark.manual(["a2a3sim", "a5sim"])
+@pytest.mark.manual(["a2a3", "a2a3sim", "a5sim"])
 def test_spmd_task_aggregates_across_threads(st_platform, st_device_ids, capfd, drain_host_log):
     # One SPMD task (block_num=8) tagged slot 0; blocks dispatch across multiple
     # scheduler threads and must reduce to one complete slot. out = a + b.

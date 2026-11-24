@@ -1259,6 +1259,7 @@ class TestEarlyEnqueueDepthTwoSwimlane(_EarlyEnqueueBase):
         {
             "name": "early_enqueue_swimlane",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {"device_count": 1, "num_sub_workers": 0, "launch_depth": 2},
             "params": {},
         },
@@ -1338,6 +1339,7 @@ class TestEarlyEnqueueDepthTwoSwimlaneLevelOne(TestEarlyEnqueueDepthTwoSwimlane)
         {
             "name": "early_enqueue_swimlane_level_one",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {"device_count": 1, "num_sub_workers": 0, "launch_depth": 2},
             "params": {},
         },
@@ -1363,6 +1365,7 @@ class TestEarlyEnqueueDepthOneControl(_EarlyEnqueueBase):
         {
             "name": "serial_control",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {"device_count": 1, "num_sub_workers": 0},
             "params": {},
         },
@@ -1596,6 +1599,7 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
         {
             "name": "three_run_capacity",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,
@@ -1911,6 +1915,7 @@ class TestThreeRunCapacitySwimlane(TestThreeRunCapacity):
         {
             "name": "three_run_capacity_swimlane",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,
@@ -1938,6 +1943,7 @@ class TestThreeRunCapacitySwimlaneLevelOne(TestThreeRunCapacitySwimlane):
         {
             "name": "three_run_capacity_swimlane_level_one",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,
@@ -2256,6 +2262,7 @@ class TestRunCapacityBeyondTheOldCeiling(_EarlyEnqueueBase):
         {
             "name": "capacity_beyond_the_old_ceiling",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,
@@ -2422,6 +2429,7 @@ class TestWorkedCapacityExample(_EarlyEnqueueBase):
         {
             "name": "worked_capacity_example",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,

@@ -104,6 +104,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         {
             "name": "overlap_stress",
             "platforms": _PLATFORMS,
+            "manual": ["a2a3"],
             # Consumed by the framework's default test_run (a plain blocking run);
             # the overlap loop below builds its own per-iteration params.
             "params": {"a": 2.0, "b": 3.0},

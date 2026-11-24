@@ -537,6 +537,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         {
             "name": "agreeing_pair",
             "platforms": ["a2a3sim", "a2a3"],
+            "manual": ["a2a3"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,

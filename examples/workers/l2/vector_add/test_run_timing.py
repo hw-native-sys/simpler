@@ -102,7 +102,7 @@ def _drive_one_run(platform: str, device_id: int, *, enable_chip_swimlane: bool 
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
-@pytest.mark.manual(["a2a3sim"])
+@pytest.mark.manual(["a2a3sim", "a2a3"])
 def test_simpler_run_emits_strace_markers(st_platform, st_device_ids, capfd, drain_host_log):
     _drive_one_run(st_platform, int(st_device_ids[0]))
     err = drain_host_log(capfd)

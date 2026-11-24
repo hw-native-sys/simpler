@@ -328,7 +328,15 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(90)  # hang cases hold a core ~15-20 s; bound a wedge
-@pytest.mark.parametrize("case_name", list(CASES))
+@pytest.mark.parametrize(
+    "case_name",
+    [
+        pytest.param(
+            name, marks=[] if name in ("explicit_fatal", "tensor_wait_timeout") else pytest.mark.manual(["a2a3"])
+        )
+        for name in CASES
+    ],
+)
 def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_name, monkeypatch, capfd, drain_host_log):
     """onboard: the watchdog may mask the code as 507xxx, but the device class still reaches the host log."""
     # warning, not error: the run-result fallback asserted below is a LOG_WARN.
@@ -367,6 +375,7 @@ _DFX_ON_FAILURE_CASE = "scope_deadlock"
 @pytest.mark.platforms(["a5sim", "a2a3sim", "a2a3"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
+@pytest.mark.manual(["a2a3"])
 def test_failed_run_exports_its_diagnostics(st_platform, st_device_ids, monkeypatch, tmp_path):
     """A run that fails still exports the collectors it armed."""
     configure_logging("error")
