@@ -279,7 +279,13 @@ def test_environment_callers_keep_trigger_and_device_contracts():
 
     ci, daily, comment = (workflow(name) for name in ("ci", "daily", "ci-a5-comment"))
     assert ci["on"] == {"pull_request": {"branches": ["main"]}}
-    assert "st-onboard-a5" not in ci["jobs"] and "st-framework-a5" not in ci["jobs"]
+    assert "st-onboard-a5" not in ci["jobs"]
+    framework = ci["jobs"]["st-framework-a5"]
+    assert framework["needs"] == ["detect-changes", "pre-commit"]
+    assert framework["if"] == (
+        "needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'"
+    )
+    assert "st-framework-a5" not in comment["jobs"]
     for family in ("onboard", "framework"):
         job = ci["jobs"][f"st-{family}-a2a3"]
         assert job["needs"] == ["detect-changes", "pre-commit"]
@@ -289,7 +295,8 @@ def test_environment_callers_keep_trigger_and_device_contracts():
         assert job["with"].get("manual_mode", "exclude") == "exclude"
         for platform in ("a2a3", "a5"):
             assert daily["jobs"][f"st-{family}-{platform}"]["with"]["manual_mode"] == "include"
-        assert comment["jobs"][f"st-{family}-a5"]["needs"] == ["gate-and-resolve"]
+        if family == "onboard":
+            assert comment["jobs"][f"st-{family}-a5"]["needs"] == ["gate-and-resolve"]
     for name in ("ci", "daily", "ci-a5-comment"):
         callers = workflow(name)["jobs"]
         suites = [job for job in callers.values() if job.get("uses") == "./.github/workflows/_st-framework.yml"]

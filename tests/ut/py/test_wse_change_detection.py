@@ -114,6 +114,23 @@ def _selected_jobs(flags):
 
 
 @pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        ("docs/ci.md", False),
+        ("src/a2a3/runtime/host_build_graph/runtime.h", False),
+        ("src/wse/platform/sim/host/device_runner.cpp", False),
+        ("src/a5/runtime/host_build_graph/runtime.h", True),
+        ("simpler_setup/test_environments.py", True),
+        ("tests/ut/cpp/a5/test_runtime.cpp", False),
+        ("tests/st/a5/host_build_graph/test_scene.py", True),
+    ],
+)
+def test_automatic_a5_framework_uses_actual_architecture_and_scene_flags(tmp_path, files, expected):
+    flags, _ = _detect(tmp_path, files)
+    assert ("st-framework-a5" in _selected_jobs(flags)) == expected
+
+
+@pytest.mark.parametrize(
     ("other", "arches", "categories"),
     [
         ("src/a5/runtime/host_build_graph/runtime.h", (False, True, False), (True, True)),
