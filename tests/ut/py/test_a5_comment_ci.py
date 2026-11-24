@@ -116,9 +116,17 @@ def _execute(job, fixture, workflow="ci-a5-comment", step_index=0):
     return json.loads(result.stdout)
 
 
-def test_framework_is_automatic_and_remaining_a5_suites_are_comment_triggered():
+def test_a5_ut_and_framework_run_automatically_only_for_affected_changes():
     ci = _workflow("ci")["jobs"]
-    assert all(name not in ci for name in _SUITES)
+    job = ci["ut-a5"]
+    assert job["needs"] == ["detect-changes", "pre-commit"]
+    assert job["if"] == (
+        "needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.ut_affected == 'true'"
+    )
+    assert job["uses"] == "./.github/workflows/_ut-npu-a5.yml"
+    assert json.loads(job["with"]["runs_on"]) == ["self-hosted", "a5"]
+    assert job["with"]["include_cann_examples"] == "true"
+    assert "st-onboard-a5" not in ci
     framework = ci["st-framework-a5"]
     assert framework["needs"] == ["detect-changes", "pre-commit"]
     assert framework["if"] == (

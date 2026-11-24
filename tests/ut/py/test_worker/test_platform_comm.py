@@ -418,6 +418,8 @@ def _run_rank_processes(bins, device_ids, rootinfo_path):
 @pytest.mark.requires_hardware
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(2)
+# A5 barrier stream completion times out in CI: https://github.com/hw-native-sys/simpler/issues/3232
+@pytest.mark.manual(["a5"])
 def test_two_rank_comm_lifecycle(st_platform, st_device_ids, tmp_path):
     """End-to-end 2-rank hardware smoke test for ChipWorker.comm_* wrappers."""
     from simpler_setup.runtime_builder import RuntimeBuilder
