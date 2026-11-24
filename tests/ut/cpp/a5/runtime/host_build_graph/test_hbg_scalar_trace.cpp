@@ -238,7 +238,9 @@ TEST(HbgScalarTrace, MixPublicationAndAccountingAreAttributedOnlyToLiveWork) {
     trace.buffer = buffer.get();
     trace.records = records.get();
     bool armed = false;
-    ASSERT_TRUE(fixture.ordinary_arm(0, 0, &armed));
+    ASSERT_TRUE(
+        scheduler_claim_for_execute(fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &armed)
+    );
     ASSERT_TRUE(armed);
     for (uint32_t pass = 0; pass < 3; ++pass)
         for (uint32_t lane = 0; lane < 3; ++lane)
@@ -257,7 +259,7 @@ TEST(HbgScalarTrace, MixPublicationAndAccountingAreAttributedOnlyToLiveWork) {
     uint32_t accounting_polls = 0;
     const auto rows = decode(trace);
     for (uint32_t i = 0; i < rows.size(); ++i) {
-        if (kind(rows[i]) == static_cast<uint32_t>(SchedPhaseKind::ScalarBuildPayload)) {
+        if (kind(rows[i]) == static_cast<uint32_t>(SchedPhaseKind::ScalarMixNotifyMembers)) {
             EXPECT_EQ(rows[i].task_ref, 0);
             ++builds;
         }
@@ -741,7 +743,7 @@ TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     local.profiling = &profile;
     local.profiling->activity_buffers_offset = contexts[0].activity_buffers_offset;
     local.config.self_lane = 0;
-    local.config.worker_ids[0] = SCHEDULER_WORKER_CAPACITY - 1;
+    local.config.worker_index = SCHEDULER_WORKER_CAPACITY - 1;
     local.profiling->loop_iter = 17;
     SchedulerActivityBuffer &buffer = buffers[SCHEDULER_WORKER_CAPACITY - 1];
     buffer.committed = SCHEDULER_ACTIVITY_CAPACITY - 1;

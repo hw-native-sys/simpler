@@ -121,12 +121,12 @@ public:
 
 #define scheduler_invalidate_cache_line observe_receive_cache_line
 #define scheduler_gm_compare_exchange observe_prepared_cas
+#define scheduler_cache_barrier observe_writeback_barrier
+#define scheduler_writeback_cache_line observe_binding_writeback
 #include "scheduler/scheduler_prepared_execution.h"
 #undef scheduler_gm_compare_exchange
 #undef scheduler_invalidate_cache_line
 
-#define scheduler_cache_barrier observe_writeback_barrier
-#define scheduler_writeback_cache_line observe_binding_writeback
 #define scheduler_gm_query observe_query
 #define scheduler_notify_query observe_notify_query
 #define scheduler_cycles() issue_ticks
@@ -179,16 +179,16 @@ struct RefillFixture {
         ));
         ASSERT_LT(token->block_idx, blocks);
         token->task_ref = task;
+        token->metadata = storage.metadata[task];
         token->subtask_slot = 0;
-        token->phase = SchedulerExecutionTokenPhase::TICKETED;
-        token->state = SchedulerDispatchSlotState::FILLING;
+        token->state = SchedulerDispatchSlotState::TICKETED;
         ASSERT_EQ(scheduler_node_fanin_view(graph.graph(), task, &token->fanin), SchedulerGraphResult::OK);
         ASSERT_TRUE(scheduler_bind_ticketed_execution(graph.graph(), base(), owner, storage.run_control, *token, 0));
     }
     void own(uint32_t task) {
         auto entry =
             std::find_if(std::begin(local->execution_tokens), std::end(local->execution_tokens), [](auto &token) {
-                return token.phase == SchedulerExecutionTokenPhase::EMPTY;
+                return token.state == SchedulerDispatchSlotState::FREE;
             });
         ASSERT_NE(entry, std::end(local->execution_tokens));
         ASSERT_NO_FATAL_FAILURE(reserve(task, 0, entry));
@@ -196,7 +196,7 @@ struct RefillFixture {
     std::set<int64_t> pending_tasks() const {
         std::set<int64_t> tasks;
         for (const auto &token : local->execution_tokens)
-            if (token.phase != SchedulerExecutionTokenPhase::EMPTY) tasks.insert(token.task_ref);
+            if (token.state != SchedulerDispatchSlotState::FREE) tasks.insert(token.task_ref);
         return tasks;
     }
     bool refill(bool *progress) {
@@ -208,14 +208,14 @@ struct RefillFixture {
              ++slice) {
             const auto before = pending_tasks();
             const auto head = local->issue_cursor;
-            const auto task = local->issue_task_ref;
-            const auto fanin = local->issue_next_fanin;
+            const auto task = local->issue_binding.task_ref;
+            const auto fanin = local->issue_binding.next_fanin;
             bool advanced = false;
             ASSERT_TRUE(refill(&advanced));
             ASSERT_TRUE(advanced);
             ASSERT_TRUE(
-                pending_tasks() != before || local->issue_cursor > head || local->issue_task_ref != task ||
-                local->issue_next_fanin > fanin
+                pending_tasks() != before || local->issue_cursor > head || local->issue_binding.task_ref != task ||
+                local->issue_binding.next_fanin > fanin
             );
         }
         ASSERT_EQ(scheduler_execution_token_count(local), count);
@@ -254,7 +254,7 @@ TEST(HbgExecutionOwnership, FreshTicketCannotBeConsumedTwiceAndBindingIsReceived
     ASSERT_TRUE(fixture.refill(&advanced));
     ASSERT_TRUE(advanced);
     auto &token = fixture.local->execution_tokens[0];
-    ASSERT_EQ(token.phase, SchedulerExecutionTokenPhase::WAIT_FANIN);
+    ASSERT_EQ(token.state, SchedulerDispatchSlotState::FILLING);
     ASSERT_TRUE(scheduler_bind_ticketed_execution(
         fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, token, 0
     ));
@@ -265,6 +265,86 @@ TEST(HbgExecutionOwnership, FreshTicketCannotBeConsumedTwiceAndBindingIsReceived
     EXPECT_FALSE(scheduler_claim_for_execution(fixture.base(), prepared, 3, 0, 0, 0, &duplicate));
     EXPECT_EQ(duplicate.claimed_state, 0u);
     EXPECT_EQ(scheduler_prepared_control_at(fixture.base(), prepared, 0)->state, claimed);
+}
+
+TEST(HbgExecutionOwnership, FlatSingleLaneCallUsesTheValidatedPrefixAndKeepsLargeLayoutsOnThePlan) {
+    RefillFixture fixture(3);
+    fixture.storage.metadata[1].logical_block_num = 2;
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    const auto *layout = fixture.local->config.prepared;
+    auto metadata = fixture.storage.metadata[1];
+    metadata.trace_index_base = 1;
+    SchedulerPreparedHandle handle{};
+    EXPECT_FALSE(scheduler_claim_for_execution(fixture.base(), layout, 0, 1, 1, 1, &handle, &metadata));
+    EXPECT_FALSE(scheduler_claim_for_execution(fixture.base(), layout, 0, 1, 2, 0, &handle, &metadata));
+    ASSERT_TRUE(scheduler_claim_for_execution(fixture.base(), layout, 0, 1, 1, 0, &handle, &metadata));
+    EXPECT_EQ(handle.execution_index, 2u);
+    ASSERT_TRUE(scheduler_claim_for_execution(fixture.base(), layout, 0, 1, 1, 0, &handle, &metadata));
+    metadata.trace_index_base = UINT32_MAX;
+    SchedulerPreparedHandle other{};
+    EXPECT_FALSE(scheduler_claim_for_execution(fixture.base(), layout, 0, 1, 0, 0, &other, &metadata));
+    auto wide = *layout;
+    wide.execution_count = UINT64_C(2) + UINT32_MAX;
+    ASSERT_TRUE(scheduler_claim_for_execution(fixture.base(), &wide, 0, 1, 0, 0, &other, &metadata));
+    EXPECT_EQ(other.execution_index, 1u);
+}
+
+TEST(HbgExecutionOwnership, EntryRefusesWorkerErrorAfterOrdinarySelection) {
+    RefillFixture fixture(1);
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    uint32_t selected = UINT32_MAX;
+    bool progress = false;
+    ASSERT_TRUE(scheduler_refill_execution_tokens(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, 0, &progress, nullptr,
+        &selected
+    ));
+    ASSERT_EQ(selected, 0u);
+    fixture.storage.run_control->worker_errors[fixture.local->worker_id()].status =
+        static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT);
+    EXPECT_FALSE(scheduler_validate_selected_entry(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, selected
+    ));
+}
+
+TEST(HbgExecutionOwnership, CountedReturnFencesTheOwnerWritebackBeforeCredit) {
+    RefillFixture fixture(1);
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    ASSERT_NO_FATAL_FAILURE(fixture.own(0));
+    auto *local = fixture.local;
+    uint32_t selected = UINT32_MAX;
+    ASSERT_TRUE(fixture.progress(&selected));
+    ASSERT_EQ(selected, 0u);
+    ASSERT_TRUE(hbg_test_begin_execution(local, selected));
+    auto &token = local->execution_tokens[0];
+    auto *control =
+        scheduler_prepared_control_at(fixture.base(), local->config.prepared, token.prepared.execution_index);
+    uint32_t credits = 0;
+    const auto address = reinterpret_cast<uint64_t>(&credits);
+    local->config.completion_counters_offset = fixture.storage.layout.completion_counters_offset;
+    *scheduler_state_at<SchedulerTaskCompletionCounter>(fixture.base(), local->config.completion_counters_offset) = {
+        address, address, 1, 1
+    };
+    bool cleaned = false;
+    std::vector<uint32_t> credits_at_fence;
+    ScopedWritebackObserver writes(
+        [&](void *line) {
+            if (line == control) cleaned = true;
+        },
+        [&] {
+            if (cleaned) credits_at_fence.push_back(credits);
+        }
+    );
+    ASSERT_TRUE(scheduler_return_prepared_execution<false>(fixture.base(), local->config.prepared, &token.prepared));
+    ASSERT_TRUE(cleaned);
+    EXPECT_TRUE(credits_at_fence.empty());
+    ASSERT_EQ(
+        scheduler_publish_fanout<false>(
+            fixture.graph.graph(), fixture.base(), local, fixture.storage.run_control, token, 0
+        ),
+        SchedulerSubtaskFinishResult::PARTIAL
+    );
+    EXPECT_EQ(credits_at_fence, (std::vector<uint32_t>{0}));
+    EXPECT_EQ(credits, 1u);
 }
 
 TEST(HbgExecutionOwnership, MixLaneReceivesBothWritableBindingLines) {
@@ -286,6 +366,7 @@ TEST(HbgExecutionOwnership, MixLaneReceivesBothWritableBindingLines) {
     });
     SchedulerPreparedHandle handle{};
     ASSERT_TRUE(scheduler_acquire_group_lane(fixture.base(), prepared, 2, 0, 0, 2, active.raw(), &handle));
+    EXPECT_EQ(handle.function_address, scheduler_prepared_call_at(fixture.base(), prepared, index)->function_bin_addr);
     EXPECT_EQ(handle.execution_index, index);
     EXPECT_EQ(received, (std::vector<void *>{&binding->local_context, &binding->global_context}));
 }
@@ -316,7 +397,7 @@ TEST(HbgExecutionOwnership, DispatchPublishesBothTraceLinesBeforeCompletionMarks
     ASSERT_LT(slot, SCHEDULER_EXECUTION_TOKEN_COUNT);
     EXPECT_EQ(trace->valid, 0u);
     bool permit = false;
-    ASSERT_TRUE(scheduler_check_entry_permit(
+    ASSERT_TRUE(hbg_test_check_ready_order(
         fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, slot, &permit
     ));
     ASSERT_TRUE(permit);
@@ -385,6 +466,33 @@ TEST(HbgExecutionOwnership, OnlyTheFixedOwnerCanCancelAnUnstartedExecution) {
     EXPECT_FALSE(scheduler_completion_done(fixture.control(0)->completion_state));
 }
 
+TEST(HbgExecutionRefill, FullOrdinarySectorReportsShareOneClosedValueWithoutGrantingDone) {
+    RefillFixture fixture(2);
+    fixture.storage.metadata[0].logical_block_num = 2;
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    uint32_t word = 1;
+    auto *control = fixture.control(0);
+    control->supply_address = reinterpret_cast<uint64_t>(&word);
+    control->supply_mask = 6;
+    auto *other = fixture.storage.local_context(&fixture.storage.contexts[3]);
+    auto report = [&](SchedulerLocalState *owner, uint32_t block) {
+        return scheduler_close_ordinary_supply(
+            fixture.graph.graph(), fixture.base(), owner, fixture.storage.run_control, 0, true, 2, block, true
+        );
+    };
+    ASSERT_TRUE(report(fixture.local, 0));
+    EXPECT_EQ(word, 3u);
+    EXPECT_EQ(control->claim_seal, 0u);
+    ASSERT_TRUE(report(other, 1));
+    ASSERT_TRUE(report(fixture.local, 0));
+    EXPECT_EQ(word, 7u);
+    EXPECT_EQ(control->next_block, 2u);
+    EXPECT_EQ(control->claim_seal, 2u);
+    EXPECT_FALSE(scheduler_completion_done(control->completion_state));
+    EXPECT_EQ(other->issue_cursor, 1u);
+    EXPECT_EQ(fixture.local->issue_cursor, 1u);
+}
+
 TEST(HbgExecutionRefill, ContinuationExhaustionIsReusedWithoutAdvancingAnUnsealedHead) {
     RefillFixture fixture(1);
     fixture.storage.metadata[0].logical_block_num = 2;
@@ -397,14 +505,14 @@ TEST(HbgExecutionRefill, ContinuationExhaustionIsReusedWithoutAdvancingAnUnseale
         fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, &head, &progress, &snapshot
     ));
     ASSERT_EQ(head, 0);
-    ASSERT_EQ(fixture.local->issue_task_ref, 0);
+    ASSERT_EQ(fixture.local->issue_binding.task_ref, 0);
     fixture.control(0)->next_block = 2;
     fixture.local->continuation_task_ref = 0;
     ScopedQueryObserver observer(&fixture.control(0)->next_block);
     ASSERT_TRUE(scheduler_refill_execution_tokens(
         fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, 0, &progress, &snapshot
     ));
-    EXPECT_TRUE(fixture.local->issue_ticket_exhausted);
+    EXPECT_TRUE(fixture.local->issue_binding.ticket_exhausted);
     EXPECT_EQ(query_count, 1u);
     ASSERT_TRUE(scheduler_refill_execution_tokens(
         fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, 0, &progress, &snapshot
@@ -422,14 +530,89 @@ TEST(HbgExecutionRefill, ContinuationExhaustionIsReusedWithoutAdvancingAnUnseale
     EXPECT_EQ(query_count, 1u);
 }
 
+TEST(HbgExecutionRefill, LaterClaimSkipsOnlyEarlierSealedOrdinaryTasksForAnIdleWorker) {
+    for (const uint16_t blocks : {1u, 2u}) {
+        for (const bool idle : {true, false}) {
+            RefillFixture fixture(4);
+            fixture.storage.metadata[2].logical_block_num = blocks;
+            ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+            auto &catalog = fixture.local->config.engine_catalog;
+            std::vector<SchedulerCatalogEntry> entries(catalog.entries, catalog.entries + catalog.count);
+            entries[0].third_task_blocks = blocks;
+            catalog.entries = entries.data();
+            fixture.control(0)->claim_seal = 1;
+            fixture.control(1)->claim_seal = 1;
+            auto *witness = fixture.control(2);
+            if (blocks == 1) witness->next_block = 1;
+            else witness->claim_sectors[0].next = 1;
+            if (!idle) fixture.local->execution_tokens[0].state = SchedulerDispatchSlotState::FILLING;
+            ScopedQueryObserver first_seal(&fixture.control(0)->claim_seal);
+            bool progress = false;
+            int64_t ref = SCHEDULER_TASK_REF_INVALID;
+            ASSERT_TRUE(scheduler_find_issuable_task(
+                fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, &ref, &progress
+            ));
+            EXPECT_TRUE(progress);
+            EXPECT_EQ(ref, idle ? 2 : SCHEDULER_TASK_REF_INVALID);
+            EXPECT_EQ(fixture.local->issue_cursor, idle ? 2u : 1u);
+            EXPECT_EQ(query_count, idle ? 0u : 1u);
+            EXPECT_EQ(witness->claim_seal, 0u);
+        }
+    }
+}
+
+TEST(HbgExecutionRefill, UnclaimedWitnessLeavesTheFirstDirectoryEntryAvailable) {
+    RefillFixture fixture(3);
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    auto &catalog = fixture.local->config.engine_catalog;
+    std::vector<SchedulerCatalogEntry> entries(catalog.entries, catalog.entries + catalog.count);
+    entries.front().third_task_blocks = 1;
+    catalog.entries = entries.data();
+    int64_t ref = SCHEDULER_TASK_REF_INVALID;
+    bool progress = false;
+    ASSERT_TRUE(scheduler_find_issuable_task(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, &ref, &progress
+    ));
+    EXPECT_EQ(ref, 0);
+    EXPECT_EQ(fixture.local->issue_cursor, 0u);
+}
+
+TEST(HbgExecutionRefill, ReusesTheOrderedEntryUntilTheDirectoryIndexChanges) {
+    RefillFixture fixture(3);
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    auto &catalog = fixture.local->config.engine_catalog;
+    std::vector<SchedulerCatalogEntry> entries(catalog.entries, catalog.entries + catalog.count);
+    std::swap(entries[0], entries[2]);
+    entries[0].supply_input = SCHEDULER_SUPPLY_STATIC;
+    catalog.entries = entries.data();
+    auto bind = [&](uint32_t index) {
+        return scheduler_bind_issue_entry(
+            fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, index
+        );
+    };
+    auto &binding = fixture.local->issue_binding;
+    ASSERT_TRUE(bind(0));
+    EXPECT_EQ(binding.task_ref, 2);
+    EXPECT_EQ(binding.supply_input, SCHEDULER_SUPPLY_STATIC);
+    binding.fanin_confirmed = true;
+    ASSERT_TRUE(bind(0));
+    EXPECT_TRUE(binding.fanin_confirmed);
+    ASSERT_TRUE(bind(1));
+    EXPECT_EQ(binding.task_ref, 1);
+    EXPECT_EQ(binding.supply_input, entries[1].supply_input);
+    EXPECT_FALSE(binding.fanin_confirmed);
+    EXPECT_FALSE(bind(UINT32_MAX));
+    EXPECT_EQ(binding.catalog_index, 1u);
+}
+
 TEST(HbgExecutionRefill, RechecksOpenSealAtDeadlineAndReadsNewHeadImmediately) {
     RefillFixture fixture(3);
     ASSERT_NO_FATAL_FAILURE(fixture.initialize());
     fixture.local->previous_round_idle = true;
     const auto graph = fixture.graph.graph();
     auto &binding = fixture.local->issue_binding;
-    auto bind = [&](int64_t ref) {
-        return scheduler_bind_issue_entry(graph, fixture.base(), fixture.local, fixture.storage.run_control, ref);
+    auto bind = [&](uint32_t index) {
+        return scheduler_bind_issue_entry(graph, fixture.base(), fixture.local, fixture.storage.run_control, index);
     };
     bool closed = false;
     auto poll = [&] {
@@ -577,7 +760,7 @@ TEST(HbgExecutionRefill, LastClaimOpensSuccessorPreparationBeforeReceivingItsPay
             if (address != &binding->local_context || observations != 0) return;
             ++observations;
             EXPECT_EQ(fixture.control(0)->claim_seal, 1u);
-            EXPECT_EQ(fixture.local->execution_tokens[0].phase, SchedulerExecutionTokenPhase::TICKETED);
+            EXPECT_EQ(fixture.local->execution_tokens[0].state, SchedulerDispatchSlotState::TICKETED);
             EXPECT_EQ(
                 scheduler_prepared_phase(fixture.local->execution_tokens[0].prepared.claimed_state),
                 SchedulerPreparedPhase::CLAIMED
@@ -589,7 +772,7 @@ TEST(HbgExecutionRefill, LastClaimOpensSuccessorPreparationBeforeReceivingItsPay
             EXPECT_TRUE(progress);
             EXPECT_EQ(fixture.control(1)->next_block, 1u);
             EXPECT_EQ(peer->execution_tokens[0].task_ref, 1);
-            EXPECT_EQ(peer->execution_tokens[0].phase, SchedulerExecutionTokenPhase::WAIT_FANIN);
+            EXPECT_EQ(peer->execution_tokens[0].state, SchedulerDispatchSlotState::FILLING);
             EXPECT_EQ(peer->execution_tokens[0].next_fanin, 0u);
             EXPECT_EQ(hbg_test_eligible_mask(peer), 0u);
             EXPECT_FALSE(scheduler_completion_done(fixture.control(0)->completion_state));

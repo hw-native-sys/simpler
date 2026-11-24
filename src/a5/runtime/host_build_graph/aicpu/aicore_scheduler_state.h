@@ -77,6 +77,16 @@ inline uint64_t aicpu_observe_gm(const volatile uint64_t &word) {
     return __atomic_load_n(&word, __ATOMIC_ACQUIRE);
 }
 
+inline uint64_t aicpu_claimed_supply(const SchedulerTaskControl &control, uint32_t blocks) {
+    if (control.supply_address == 0) return aicpu_observe_gm(control.next_block);
+    const uint32_t observed = *reinterpret_cast<const volatile uint32_t *>(control.supply_address);
+    const uint32_t sectors = (observed & control.supply_mask) >> __builtin_ctz(control.supply_mask);
+    uint64_t covered = 0;
+    for (uint32_t part = 0; part < SCHEDULER_CLAIM_SECTOR_COUNT; ++part)
+        if ((sectors & (1U << part)) != 0) covered += scheduler_sector_capacity(blocks, part);
+    return covered;
+}
+
 inline SchedulerGraphView aicore_scheduler_graph_view(const SchedulerWorkerContext &context) {
     return {
         context.graph_storage_address,

@@ -149,28 +149,6 @@ struct GmMixFixture {
         return scheduler_state_at<SchedulerTaskControl>(base(), storage.layout.task_controls_offset) + task;
     }
     SchedulerClusterSignal *signal(uint32_t cluster) { return &signals[cluster]; }
-    bool ordinary_arm(uint64_t task, uint32_t cluster, bool *published) {
-        *published = false;
-        auto *proxy = locals[cluster * 3 + 1];
-        const auto task_ref = static_cast<int64_t>(task);
-        bool progress = false;
-        if (scheduler_task_ref_is_null(proxy->cluster_pending.task_ref)) {
-            int64_t ref = SCHEDULER_TASK_REF_INVALID;
-            if (!scheduler_issue_head(graph.graph(), base(), proxy, run(), &ref, &progress)) return false;
-            if (ref != task_ref) return true;
-            if (!scheduler_claim_for_build(graph.graph(), base(), proxy, run(), ref, &progress)) return false;
-        }
-        uint32_t previous = 0;
-        for (const auto &group : signals[cluster].groups)
-            previous = std::max(previous, static_cast<uint32_t>(group.armed_generation));
-        if (!scheduler_progress_mix_publication(graph.graph(), base(), proxy, run(), &progress)) return false;
-        for (const auto &group : signals[cluster].groups) {
-            const uint32_t generation = group.armed_generation;
-            if (scheduler_cluster_mix_armed(generation) && generation > previous && group.task_ref == task_ref)
-                *published = true;
-        }
-        return true;
-    }
     bool ordinary_service(uint32_t worker, bool *progress, uint64_t profiling = 0) {
         *progress = false;
         return scheduler_progress_mix_groups(graph.graph(), base(), locals[worker], run(), profiling, progress);
@@ -181,27 +159,32 @@ struct GmMixFixture {
         auto *local = locals[worker];
         const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base(), local->config.task_catalog_offset);
         const auto catalog = scheduler_task_catalog(base(), *pool, local->config.self_core_type);
-        const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
-        if (entry == catalog.refs + catalog.count) return false;
+        const auto *entry =
+            std::find_if(catalog.entries, catalog.entries + catalog.count, [task](const SchedulerCatalogEntry &row) {
+                return row.ref == task;
+            });
+        if (entry == catalog.entries + catalog.count) return false;
         for (uint64_t slice = 0; slice <= catalog.count + 2 * graph.graph().task_count; ++slice) {
             const uint64_t head = local->issue_cursor;
-            const int64_t issue_task = local->issue_task_ref;
-            const uint32_t fanin = local->issue_next_fanin;
+            const int64_t issue_task = local->issue_binding.task_ref;
+            const uint32_t fanin = local->issue_binding.next_fanin;
             const uint32_t tokens = scheduler_execution_token_count(local);
             bool progress = false;
             if (!scheduler_refill_execution_tokens(graph.graph(), base(), local, run(), 0, &progress)) return false;
             if (std::any_of(
                     std::begin(local->execution_tokens), std::end(local->execution_tokens), [&](const auto &token) {
                         return token.task_ref == static_cast<int64_t>(task) &&
-                               token.phase == SchedulerExecutionTokenPhase::WAIT_FANIN &&
+                               (token.state == SchedulerDispatchSlotState::FILLING ||
+                                token.state == SchedulerDispatchSlotState::READY) &&
                                token.prepared.claimed_state != 0;
                     }
                 ))
                 return true;
             if (scheduler_execution_token_count(local) != tokens) return false;
-            if (local->issue_cursor == head && !(local->issue_next_fanin != 0 && (local->issue_task_ref != issue_task ||
-                                                                                  local->issue_next_fanin > fanin)))
-                return false;
+            const bool fanin_advanced =
+                local->issue_binding.next_fanin != 0 &&
+                (local->issue_binding.task_ref != issue_task || local->issue_binding.next_fanin > fanin);
+            if (local->issue_cursor == head && !fanin_advanced) return false;
         }
         return false;
     }
@@ -234,14 +217,13 @@ struct GmMixFixture {
             local->execution_at(slot).state != SchedulerDispatchSlotState::READY)
             return false;
         bool permit = false;
-        if (!scheduler_check_entry_permit(graph.graph(), base(), local, run(), slot, &permit)) return false;
+        if (!hbg_test_check_ready_order(graph.graph(), base(), local, run(), slot, &permit)) return false;
         if (!permit) return false;
         if (!hbg_test_begin_execution(local, slot)) return false;
         const auto index = local->execution_at(slot).prepared.execution_index;
         auto *call = scheduler_prepared_call_at(base(), local->config.prepared, index);
         auto *binding = scheduler_execution_binding_at(base(), local->config.prepared, index);
-        const auto address =
-            local->execution_at(slot).predicate == SchedulerPredicateState::FAIL ? 0 : call->function_bin_addr;
+        const auto address = local->execution_at(slot).skip_kernel ? 0 : call->function_bin_addr;
         const GmExecution entry = {
             local->execution_at(slot).task_ref,
             static_cast<uint32_t>(binding->local_context.block_idx),

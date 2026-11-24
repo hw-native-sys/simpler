@@ -29,10 +29,8 @@ public:
 
         sinks_ = table<uint32_t>(bytes, run.sinks_offset, count_);
         controls_ = table<SchedulerTaskControl>(bytes, context.task_controls_offset, tasks_);
-        notifications_ = table<uint64_t>(bytes, context.done_notifications_offset, tasks_);
         counters_ = table<SchedulerTaskCompletionCounter>(bytes, context.completion_counters_offset, tasks_);
         if (sinks_ == nullptr || controls_ == nullptr ||
-            (context.done_notifications_offset != 0 && notifications_ == nullptr) ||
             (context.completion_counters_offset != 0 && counters_ == nullptr))
             return false;
         cache_invalidate_range(sinks_, count_ * sizeof(*sinks_));
@@ -63,9 +61,12 @@ public:
             hash = (hash ^ value) * UINT64_C(0x100000001b3);
         };
         for (uint64_t task = 0; task < tasks_; ++task) {
-            mix(aicpu_observe_gm(controls_[task].next_block));
+            const auto &control = controls_[task];
+            if (control.supply_address != 0)
+                mix(*reinterpret_cast<const volatile uint32_t *>(control.supply_address) & control.supply_mask);
+            else mix(aicpu_observe_gm(control.next_block));
             mix(aicpu_observe_gm(controls_[task].completion_state));
-            if (counters_ != nullptr && counters_[task].add_address != 0 && counters_[task].read_address != 0)
+            if (counters_ != nullptr && counters_[task].read_address != 0)
                 mix(*reinterpret_cast<const volatile uint32_t *>(counters_[task].read_address));
         }
         const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base_, context.graph_summary_offset);
@@ -88,15 +89,11 @@ private:
     }
 
     int observe(uint32_t task) const {
-        if (counters_ != nullptr && counters_[task].add_address != 0) {
+        if (counters_ != nullptr && (counters_[task].add_address != 0 || counters_[task].read_address != 0)) {
             const auto &counter = counters_[task];
             if (counter.read_address == 0 || counter.threshold == 0 || counter.threshold > counter.limit) return -1;
             const uint32_t value = *reinterpret_cast<const volatile uint32_t *>(counter.read_address);
             return scheduler_classify_completion_counter(value, counter.threshold, counter.limit);
-        }
-        if (notifications_ != nullptr && notifications_[task] != 0) {
-            const uint32_t value = *reinterpret_cast<const volatile uint32_t *>(notifications_[task]);
-            return value <= 1 ? static_cast<int>(value) : -1;
         }
         const uint64_t state = aicpu_observe_gm(controls_[task].completion_state);
         if (!scheduler_completion_valid(state)) return -1;
@@ -109,6 +106,5 @@ private:
     uint64_t resolved_{};
     const uint32_t *sinks_{};
     const SchedulerTaskControl *controls_{};
-    const uint64_t *notifications_{};
     const SchedulerTaskCompletionCounter *counters_{};
 };

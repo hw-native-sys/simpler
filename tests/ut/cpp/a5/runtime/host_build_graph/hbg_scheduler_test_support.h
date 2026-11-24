@@ -51,6 +51,15 @@ inline bool scheduler_order_task_catalog(
            scheduler_order_task_catalog(rows, metadata, catalog, error);
 }
 
+inline uint32_t scheduler_execution_token_count(const SchedulerLocalState *local) {
+    return scheduler_has_execution_tokens(local) ? 1U : 0U;
+}
+
+inline bool scheduler_execution_token_has_task(const SchedulerLocalState *local, int64_t ref) {
+    const auto &token = local->execution_tokens[0];
+    return token.task_ref == ref && token.state != SchedulerDispatchSlotState::FREE;
+}
+
 namespace scheduler_test {
 
 inline void protocol_noop_kernel(__gm__ int64_t *) {}
@@ -213,7 +222,6 @@ struct FixtureStorage {
                 static_cast<int32_t>(worker % PLATFORM_CORES_PER_BLOCKDIM == 0 ? CoreType::AIC : CoreType::AIV);
             context.task_controls_offset = layout.task_controls_offset;
             context.task_metadata_offset = layout.task_metadata_offset;
-            context.done_notifications_offset = layout.done_notifications_offset;
 
             context.trace_cells_offset = layout.trace_cells_offset;
             context.worker_contexts_offset = layout.worker_contexts_offset;
@@ -367,7 +375,6 @@ struct FixtureStorage {
         config.graph = &graph;
         config.task_controls_offset = context->task_controls_offset;
         config.task_metadata_offset = context->task_metadata_offset;
-        config.done_notifications_offset = context->done_notifications_offset;
         config.completion_counters_offset = context->completion_counters_offset;
         config.task_catalog_offset = task_catalog_offset;
         local->profiling->trace_cells_offset = context->trace_cells_offset;
@@ -387,6 +394,7 @@ struct FixtureStorage {
             if (context->cluster_worker_ids[lane] == context->worker_index) config.self_lane = lane;
         }
         config.worker_ids[config.self_lane] = context->worker_index;
+        config.worker_index = static_cast<int16_t>(context->worker_index);
         config.cluster_count = static_cast<uint16_t>(context->cluster_count);
         config.cluster_index = static_cast<uint8_t>(context->cluster_index);
         return local;

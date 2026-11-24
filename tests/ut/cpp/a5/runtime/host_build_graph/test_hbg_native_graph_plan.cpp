@@ -704,6 +704,7 @@ SchedulerLocalState ready_worker(NativeViewFixture &view, uint32_t type, uint64_
     config.self_core_type = type;
     config.engine_catalog = scheduler_task_catalog(view.backing.get(), view.catalog_plan.header, config.self_core_type);
     const uint64_t cluster = type == 0 ? rank : rank / 2;
+    config.worker_index = static_cast<int16_t>(cluster * 3 + config.self_lane);
     for (uint32_t lane = 0; lane < 3; ++lane) {
         config.worker_ids[lane] = cluster * 3 + lane;
     }
@@ -800,7 +801,7 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
     const auto catalog = scheduler_task_catalog(view.backing.get(), view.catalog_plan.header, 0);
     ASSERT_EQ(catalog.count, 3u);
     for (int64_t expected : {1, 2, 3}) {
-        EXPECT_EQ(catalog.refs[expected - 1], expected);
+        EXPECT_EQ(catalog.entries[expected - 1].ref, expected);
         if (scheduler_execution_token_count(&consumer) == SCHEDULER_EXECUTION_TOKEN_COUNT) {
             uint32_t selected = UINT32_MAX;
             bool advanced = false;
@@ -808,13 +809,9 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
                 view.graph, view.backing.get(), &consumer, run, 0, &selected, &advanced
             ));
             ASSERT_LT(selected, SCHEDULER_EXECUTION_TOKEN_COUNT);
-            bool permitted = false;
             ASSERT_TRUE(
-                scheduler_check_entry_permit<false>(
-                    view.graph, view.backing.get(), &consumer, run, selected, &permitted
-                )
+                scheduler_validate_selected_entry<false>(view.graph, view.backing.get(), &consumer, run, selected)
             );
-            ASSERT_TRUE(permitted);
             consumer.execution_at(selected).state = SchedulerDispatchSlotState::EXECUTING;
             ASSERT_TRUE(
                 scheduler_complete_lane_execution<false>(view.graph, view.backing.get(), &consumer, run, selected, 0)
@@ -824,8 +821,8 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
              ++slice) {
             const uint64_t head = consumer.issue_cursor;
             const uint32_t count = scheduler_execution_token_count(&consumer);
-            const int64_t task = consumer.issue_task_ref;
-            const uint32_t fanin = consumer.issue_next_fanin;
+            const int64_t task = consumer.issue_binding.task_ref;
+            const uint32_t fanin = consumer.issue_binding.next_fanin;
             bool progress = false;
             ASSERT_TRUE(
                 scheduler_refill_execution_tokens(view.graph, view.backing.get(), &consumer, run, 0, &progress)
@@ -833,7 +830,7 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
             ASSERT_TRUE(progress);
             ASSERT_TRUE(
                 consumer.issue_cursor > head || scheduler_execution_token_count(&consumer) > count ||
-                consumer.issue_task_ref != task || consumer.issue_next_fanin > fanin
+                consumer.issue_binding.task_ref != task || consumer.issue_binding.next_fanin > fanin
             );
         }
         ASSERT_TRUE(scheduler_execution_token_has_task(&consumer, expected));
@@ -962,6 +959,7 @@ struct ControlFixture : NativeViewFixture {
             config.cluster_count = 1;
             config.self_lane = static_cast<uint8_t>(worker);
             config.self_core_type = worker == 0 ? 0 : 1;
+            config.worker_index = static_cast<int16_t>(worker);
             config.engine_catalog = scheduler_task_catalog(backing.get(), catalog_plan.header, config.self_core_type);
             config.worker_ids[0] = 0;
             config.worker_ids[1] = 1;
@@ -1337,6 +1335,7 @@ struct NativeMixFixture : NativeViewFixture {
             config.cluster_count = worker_count / 3;
             config.self_lane = self_lane;
             config.self_core_type = self_lane == 0 ? 0 : 1;
+            config.worker_index = static_cast<int16_t>(worker);
             config.engine_catalog = scheduler_task_catalog(backing.get(), catalog_plan.header, config.self_core_type);
             for (uint32_t lane = 0; lane < 3; ++lane)
                 config.worker_ids[lane] = cluster * 3 + lane;
@@ -1350,10 +1349,6 @@ struct NativeMixFixture : NativeViewFixture {
         bool progress = false;
         return scheduler_cluster_mix_discover_next(graph, backing.get(), &locals[1], run, &progress);
     }
-    bool publish() {
-        bool progress = false;
-        return scheduler_progress_mix_publication(graph, backing.get(), &locals[1], run, &progress);
-    }
 };
 }  // namespace
 
@@ -1365,14 +1360,12 @@ TEST(HbgNativeGraphPlan, HostArgumentsRemainBoundAsMixEntersAfterGraphEnter) {
     prepare_native_calls(view);
     // Discovery must not allocate a child whose ENTER is not complete.
     ASSERT_TRUE(view.discover());
-    EXPECT_EQ(view.locals[1].cluster_pending.task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(control->next_block, 0u);
     EXPECT_EQ(view.signals[0].groups[0].armed_generation, 0u);
     complete_native_entry(view);
     view.bound.scalar = 999;
     ASSERT_TRUE(view.discover());
-    ASSERT_EQ(view.locals[1].cluster_pending.task_ref, view.child());
-    ASSERT_TRUE(view.publish());
+    ASSERT_TRUE(scheduler_cluster_mix_armed(view.signals[0].groups[0].armed_generation));
     ASSERT_EQ(view.signals[0].groups[0].task_ref, view.child());
     const auto &plan = view.plan.definitions[0].children[0];
     const auto *scalars = reinterpret_cast<const uint64_t *>(view.bound.instance->args_base + plan.scalars_offset);
@@ -1403,7 +1396,7 @@ TEST(HbgNativeGraphPlan, NativeMixDistributesOnlyTheActualChildLanes) {
         prepare_native_calls(view);
         complete_native_entry(view);
         ASSERT_TRUE(view.discover());
-        ASSERT_TRUE(view.publish());
+        ASSERT_TRUE(scheduler_cluster_mix_armed(view.signals[0].groups[0].armed_generation));
         ASSERT_EQ(view.signals[0].groups[0].active_mask, mask.raw());
         for (uint32_t unit = 0; unit < 3; ++unit)
             for (uint32_t lane = 0; lane < 3; ++lane) {

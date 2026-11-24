@@ -30,6 +30,13 @@ SchedulerTaskMetadata physical(LaneMask lanes, uint16_t blocks = 1) {
     return result;
 }
 
+std::vector<int64_t> catalog_refs(const SchedulerTaskCatalog &catalog) {
+    std::vector<int64_t> refs;
+    for (uint32_t i = 0; i < catalog.count; ++i)
+        refs.push_back(catalog.entries[i].ref);
+    return refs;
+}
+
 struct CatalogImage {
     SchedulerTaskCatalogPlan plan;
     std::vector<uint8_t> storage;
@@ -113,8 +120,8 @@ TEST(HbgTaskCatalog, PhysicalTasksUseTwoEngineListsAndControlsRemainSeparate) {
     EXPECT_EQ(image.plan.header.control_count, 2u);
     const auto cubes = scheduler_task_catalog(image.base, image.plan.header, 0);
     const auto vectors = scheduler_task_catalog(image.base, image.plan.header, 1);
-    EXPECT_EQ(std::vector<int64_t>(cubes.refs, cubes.refs + cubes.count), (std::vector<int64_t>{0}));
-    EXPECT_EQ(std::vector<int64_t>(vectors.refs, vectors.refs + vectors.count), (std::vector<int64_t>{1, 2, 3}));
+    EXPECT_EQ(catalog_refs(cubes), (std::vector<int64_t>{0}));
+    EXPECT_EQ(catalog_refs(vectors), (std::vector<int64_t>{1, 2, 3}));
     EXPECT_FALSE(scheduler_task_catalog_valid(scheduler_task_catalog(image.base, image.plan.header, 2)));
     EXPECT_EQ(metadata[2].active_mask.raw(), 3u);
     EXPECT_EQ(metadata[3].active_mask.raw(), 6u);
@@ -134,6 +141,7 @@ TEST(HbgTaskCatalog, OppositeSourceThresholdsUsePhysicalMembersAndProxyDuty) {
         SCOPED_TRACE(ref);
         const auto &entry = scheduler_task_catalog_order(image.base, header, ref);
         EXPECT_EQ(entry.rank, ref);
+        EXPECT_EQ(entry.requires_peer_order != 0, ref == 2 || ref == 4);
         for (uint32_t lane = 0; lane < 3; ++lane)
             EXPECT_EQ(entry.required_floor[lane], required[ref][lane]);
     }
@@ -184,8 +192,8 @@ TEST(HbgTaskCatalog, TopologicalGenerationsExposeIndependentBranchesBeforeDeeper
     ASSERT_TRUE(image.valid());
     const auto cubes = scheduler_task_catalog(image.base, image.plan.header, 0);
     const auto vectors = scheduler_task_catalog(image.base, image.plan.header, 1);
-    EXPECT_EQ(std::vector<int64_t>(cubes.refs, cubes.refs + cubes.count), (std::vector<int64_t>{7, 2, 5}));
-    EXPECT_EQ(std::vector<int64_t>(vectors.refs, vectors.refs + vectors.count), (std::vector<int64_t>{0, 1, 3, 6, 4}));
+    EXPECT_EQ(catalog_refs(cubes), (std::vector<int64_t>{7, 2, 5}));
+    EXPECT_EQ(catalog_refs(vectors), (std::vector<int64_t>{0, 1, 3, 6, 4}));
     EXPECT_EQ(image.plan.task_order, (std::vector<int64_t>{0, 1, 7, 2, 5, 3, 6, 4}));
     EXPECT_EQ(image.plan.task_levels, (std::vector<uint32_t>{0, 0, 1, 2, 3, 1, 2, 0}));
     const auto &mixed = scheduler_task_catalog_order(image.base, image.plan.header, 4);
@@ -198,6 +206,70 @@ SchedulerTaskMetadata spmd(LaneMask lanes, uint16_t blocks, bool sync_start = fa
     task.flags |= SCHEDULER_TASK_SPMD;
     if (sync_start) task.flags |= SCHEDULER_TASK_SYNC_START;
     return task;
+}
+
+TEST(HbgTaskCatalog, DirectoryClaimWitnessStaysInsideDynamicOrdinaryRuns) {
+    std::vector<SchedulerTaskMetadata> tasks(11, physical(LaneMask::aiv0(), 3));
+    tasks[3] = spmd(LaneMask::aiv0(), 4, true);
+    tasks[5] = physical(LaneMask::all(), 2);
+    tasks[7].flags |= SCHEDULER_TASK_HAS_PREDICATE;
+    CatalogImage image(tasks);
+    SchedulerDependencyPlan deps;
+    deps.fanin.resize(tasks.size());
+    deps.host_done.resize(tasks.size());
+    scheduler_plan_static_supply(deps, tasks, image.plan);
+    EXPECT_EQ(image.plan.third_task_blocks, (std::vector<uint16_t>{3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0}));
+    tasks[9].flags |= SCHEDULER_TASK_FIXED_OWNER;
+    scheduler_plan_static_supply(deps, tasks, image.plan);
+    EXPECT_EQ(image.plan.third_task_blocks[8], 0u);
+}
+
+TEST(HbgTaskCatalog, KeepsOnlyDynamicCrossEngineInputsForIssue) {
+    std::vector<SchedulerTaskMetadata> tasks{
+        physical(LaneMask::aic()), physical(LaneMask::aiv0()), physical(LaneMask::aic()), physical(LaneMask::all())
+    };
+    CatalogImage image(tasks);
+    SchedulerDependencyPlan deps;
+    deps.fanin = {{}, {0}, {}, {0, 1, 2}};
+    deps.host_done.resize(tasks.size());
+    auto expect_inputs = [&](int32_t first, int32_t second) {
+        scheduler_plan_static_supply(deps, tasks, image.plan);
+        scheduler_init_task_catalog(image.base, image.plan);
+        ASSERT_TRUE(image.valid());
+        const auto vectors = scheduler_task_catalog(image.base, image.plan.header, 1);
+        ASSERT_EQ(vectors.count, 2u);
+        EXPECT_EQ(vectors.entries[0].supply_input, first);
+        EXPECT_EQ(vectors.entries[1].supply_input, second);
+    };
+    expect_inputs(0, SCHEDULER_SUPPLY_SCAN);
+    tasks[0].flags |= SCHEDULER_TASK_FIXED_OWNER;
+    expect_inputs(SCHEDULER_SUPPLY_STATIC, 2);
+    deps.host_done[2] = true;
+    expect_inputs(SCHEDULER_SUPPLY_STATIC, SCHEDULER_SUPPLY_STATIC);
+}
+
+TEST(HbgTaskCatalog, TerminalMixRequiresFixedOwnersAndProvenSupplyOnEveryIncomingEdge) {
+    std::vector<SchedulerTaskMetadata> tasks{
+        spmd(LaneMask::aic(), 2), spmd(LaneMask::aiv0(), 4), spmd(LaneMask::all(), 2), spmd(LaneMask::all(), 2, true)
+    };
+    for (auto &task : tasks)
+        task.flags |= SCHEDULER_TASK_FIXED_OWNER;
+    CatalogImage image(tasks);
+    SchedulerDependencyPlan deps;
+    deps.fanin = {{}, {}, {1}, {0, 2}};
+    deps.host_done.resize(tasks.size());
+    deps.collect_sinks();
+    EXPECT_EQ(scheduler_terminal_mix_begin(deps, tasks, image.plan), 1u);
+    tasks[0].flags &= ~SCHEDULER_TASK_FIXED_OWNER;
+    EXPECT_EQ(scheduler_terminal_mix_begin(deps, tasks, image.plan), UINT32_MAX);
+    tasks[0].flags |= SCHEDULER_TASK_FIXED_OWNER;
+    deps.fanin[3] = {0, 1};
+    deps.collect_sinks();
+    EXPECT_EQ(scheduler_terminal_mix_begin(deps, tasks, image.plan), UINT32_MAX);
+    deps.fanin[3] = {0, 2};
+    deps.collect_sinks();
+    tasks[2].flags &= ~SCHEDULER_TASK_FIXED_OWNER;
+    EXPECT_EQ(scheduler_terminal_mix_begin(deps, tasks, image.plan), UINT32_MAX);
 }
 
 TEST(HbgTaskCatalog, PrioritizesOrdinaryChainWithinTheDeferredTaskBoundary) {
@@ -293,6 +365,7 @@ TEST(HbgTaskCatalog, ElidesMixHandshakeOnlyForACompletedOrdinaryPrefix) {
         EXPECT_TRUE(scheduler_order_task_catalog(deps, metadata, &image.plan));
         EXPECT_NE(image.plan.order_rows[2].required_floor[0], 0u);
         scheduler_elide_proven_mix_floors(deps, metadata, async_lanes, image.plan);
+        EXPECT_EQ(image.plan.order_rows[2].requires_peer_order != 0, image.plan.order_rows[2].required_floor[0] != 0);
         return image.plan.order_rows[2].required_floor[0];
     };
     EXPECT_EQ(mix_floor(true, false, false), 0u);
@@ -568,7 +641,7 @@ TEST(HbgTaskCatalog, CompletedNodesDoNotReadStaleIncomingDependenciesDuringOrder
     EXPECT_EQ(image.plan.catalogs[0], (std::vector<int64_t>{0, 2, 1}));
     ASSERT_TRUE(prepare_ordinary(graph, {0})) << error;
     EXPECT_EQ(graph.payload(0).fanin_data()[0], INT32_MAX);
-    EXPECT_EQ(graph.payload(1).fanin_count, 2);
+    EXPECT_EQ(graph.payload(1).fanin_count, 0);
 }
 
 TEST(HbgTaskCatalog, ResidentFaninDropsOnlyPredecessorsProvenByAnotherLiveDependency) {
@@ -601,7 +674,8 @@ TEST(HbgTaskCatalog, HostCompletedNodeCannotProveItsHistoricalPredecessorDone) {
     graph.executable(1, 0, {0});
     graph.executable(2, 0, {0, 1});
     ASSERT_TRUE(prepare_ordinary(graph, {1}));
-    EXPECT_EQ(graph.payload(2).fanin_count, 2);
+    ASSERT_EQ(graph.payload(2).fanin_count, 1);
+    EXPECT_EQ(graph.payload(2).fanin_data()[0], 0);
 }
 
 TEST(HbgTaskCatalog, AliasedFaninRowsKeepEveryOriginalDependency) {
@@ -681,22 +755,22 @@ TEST(HbgTaskCatalog, RejectsFaninPastPoolEndBeforeReadingIt) {
 }
 
 TEST(HbgTaskCatalog, BoundedAncestryRetainsDistantEdgesAndValidatesBeforeMutation) {
-    scheduler_test::BasicGraphBuffer<128> graph(66);
-    for (int32_t ref = 0; ref < 66; ++ref) {
+    scheduler_test::BasicGraphBuffer<256> graph(130);
+    for (int32_t ref = 0; ref < 130; ++ref) {
         graph.executable(ref, 0);
     }
-    graph.executable(1, 0, {0});
-    graph.executable(64, 0, {0, 1});
-    graph.executable(65, 0, {0, 1, 64, 65});
+    graph.executable(64, 0, {0});
+    graph.executable(128, 0, {0, 64});
+    graph.executable(129, 0, {0, 64, 128, 129});
     EXPECT_FALSE(prepare_ordinary(graph));
-    EXPECT_EQ(graph.payload(64).fanin_count, 2);
-    graph.executable(65, 0, {0, 1, 64});
+    EXPECT_EQ(graph.payload(128).fanin_count, 2);
+    graph.executable(129, 0, {0, 64, 128});
     ASSERT_TRUE(prepare_ordinary(graph));
-    ASSERT_EQ(graph.payload(64).fanin_count, 1);
-    EXPECT_EQ(graph.payload(64).fanin_data()[0], 1);
-    ASSERT_EQ(graph.payload(65).fanin_count, 2);
-    EXPECT_EQ(graph.payload(65).fanin_data()[0], 0);
-    EXPECT_EQ(graph.payload(65).fanin_data()[1], 64);
+    ASSERT_EQ(graph.payload(128).fanin_count, 1);
+    EXPECT_EQ(graph.payload(128).fanin_data()[0], 64);
+    ASSERT_EQ(graph.payload(129).fanin_count, 2);
+    EXPECT_EQ(graph.payload(129).fanin_data()[0], 0);
+    EXPECT_EQ(graph.payload(129).fanin_data()[1], 128);
 }
 
 TEST(HbgTaskCatalog, CrossEnginePredecessorRequiresIssuedSupplyRatherThanLogicalCompletion) {
@@ -772,7 +846,7 @@ TEST(HbgTaskCatalog, MalformedImageCannotAuthorizeDescriptorAccess) {
     descriptors[0].entries_offset = image.plan.header_offset;
     EXPECT_FALSE(image.valid());
     descriptors[0] = image.plan.descriptors[0];
-    descriptors[0].capacity = UINT64_MAX;
+    descriptors[0].capacity = UINT32_MAX;
     EXPECT_FALSE(image.valid());
     descriptors[0] = image.plan.descriptors[0];
     header->first_mix_ref = static_cast<uint32_t>(header->task_count);

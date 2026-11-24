@@ -28,6 +28,8 @@ enum class SchedulerPreparedPhase : uint8_t {
     ENTERED = 5
 };
 
+// The low eight bits hold the phase and the next sixteen encode the owner.
+inline constexpr uint64_t SCHEDULER_PREPARED_PHASE_OWNER_MASK = (UINT64_C(1) << 24) - 1;
 inline constexpr uint64_t SCHEDULER_PREPARED_TICKET_OWNED = UINT64_C(1) << 25;
 inline constexpr uint64_t SCHEDULER_PREPARED_MIX_OWNED = UINT64_C(1) << 26;
 
@@ -96,6 +98,7 @@ struct alignas(64) SchedulerPreparedCall {
     uint16_t num_args;
     uint8_t subtask_slot;
     uint8_t input_cache_spans;  // FULL, SKIP, or the number of bound spans below.
+    uint16_t tensor_count;
     alignas(64) uint64_t args[DISPATCH_MAX_ARGS];
     SchedulerInputCacheSpan input_cache_lines[SCHEDULER_INPUT_CACHE_SPANS];
 };

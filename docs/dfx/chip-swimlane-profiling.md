@@ -153,6 +153,8 @@ predecessor in its details. A deferred task can complete logically later.
 
 At L2, Worker View labels HBG and Percounter execution slices as
 `<task-id>-<kernel>` (for example, `t7-proj_spmd`).
+L2 scheduling slices and block-view markers use `<task-id>-b<block-index>-<stage>`,
+for example `t8-b0-Claim and bind`.
 Both views use the logical SPMD task color and retain the original member
 label in the slice details. Each execution slice spans kernel entry to kernel return. Percounter records
 executor pickup and the completion fence on its scheduling track. The scheduling
@@ -171,6 +173,15 @@ descriptor preparation up to the point just before the release of its generation
 The next bar ends when the last captured member accepts the descriptor. Its
 details give the elapsed time for each observed member. A slot's wait can
 overlap execution on another slot. These intervals measure elapsed device time.
+Each MIX member shows one interval from observing satisfied inputs to executor
+pickup. Its details give the READY timestamp and the durations on either side
+of READY (order and arrival, then pickup).
+For a dynamic MIX block, the AIV0 dispatch lane times the successful ticket call
+and the interval from ticket return to descriptor preparation. When the publisher
+has retired a local execution since its previous publication, its slot also shows
+L2 trace writeback and retirement. The interval from that retirement to the
+successful claim attempt includes scheduler work and any earlier unsuccessful
+attempts. Fixed-owner blocks take their assigned index directly.
 Use L3 to attribute active Scalar work inside an interval.
 
 A5 `percounter` also exports **AICore Schedule (L2)** with physical cluster,
@@ -203,12 +214,38 @@ If dependencies were ready at claim time, the wait span begins at Claim.
 Worker View remains available. L3 adds nested AICore Scheduler function
 intervals, such as dependency checks, MIX
 rendezvous and completion publication. L4 adds individual memory operations and
-Host phases and retains all instrumented function intervals. See the [percounter
+Host phases and retains all instrumented function intervals. The Scalar lane includes
+nested kernel execution and uses the same exclusive-time accounting as HBG. See the [percounter
 profiling contract](../../src/a5/runtime/percounter/README.md#chip-swimlanes-l1l4)
 for timing boundaries, storage limits and truncation behavior.
 
 ### A5 HBG Scalar detail at Level 3
 
+The AICore Scheduler lane prefixes each measured operation with its business stage.
+Search for a prefix such as `CLAIM_EXECUTE ·` or filter by the matching Perfetto category.
+For source lookup, the display omits the common `scheduler_` prefix.
+
+| Stage | Device responsibility |
+| ----- | --------------------- |
+| `DISCOVER` | Find an issuable task and check predecessor supply. |
+| `CLAIM_EXECUTE` | An ordinary worker claims its execution. AIV0 claims one MIX block for its cluster when an SSBUF bank is available. |
+| `FANIN_WAIT` | Poll predecessor completion. Successive polls are separate intervals. |
+| `SELECT`, `ENTRY_PERMIT`, `ENTRY_PREP` | Select owned work, check local or MIX entry order, and prepare the actual kernel entry. |
+| `EXECUTE` | Run the named kernel. The label uses the Worker View registration, core and epoch, and includes the recorded block index when available. |
+| `FANOUT_PUBLISH` | Contribute a return or resolved condition to the completion source used by successors. A MIX group contributes after the required lane releases. |
+| `RETIRE` | Release an execution or recycle a group record. |
+
+Ordinary self-claimed work uses a Host-built Call and takes its execution ticket directly.
+For MIX, AIV0 records `claim_for_execute` and `notify_mix_members` as it publishes the execution ticket
+to SSBUF. Each active lane then records `acquire_group_lane` when it receives its Host-prepared Call. Match task, block and cluster across these intervals.
+`DISPATCH` and `COMPLETE` identify calls spanning multiple responsibilities;
+`MIX_SYNC` identifies cluster handshakes. At level 4, `CONTROL` identifies
+graph/run service and `TRACE` identifies recorder work. A shared ticket or memory primitive inherits a stage only when its
+immediate caller is recorded and identifies the responsibility. Otherwise its own
+category (such as `CLAIM` or `MEM`) and operation name remain visible.
+Stage labels preserve the recorded timestamps, nesting and gaps.
+
+Level 3 records ordinary function spans lasting at least 1 us and selected memory operations.
 L3 records `ld_dev` only during execution claims. The load wrapper identifies
 `ld_dev(GM)` for GM reads, including atomic-backed allocation words, and
 `ld_dev(CntNotify)` for reads from a mapped notification register. Each retained
@@ -216,10 +253,13 @@ load is exported as `CLAIM_EXECUTE` even when a short enclosing function was
 omitted. HBG L3 requires an explicit GM or CntNotify load source. Generic
 `ld_dev` records are valid at HBG L4. L3 takes no DCCI timestamps and keeps
 both DSB variants. L4 includes the cache-maintenance and out-of-claim load details.
-Level 3 omits TRACE and CONTROL Scalar intervals, including direct memory
-and state observations inside them. Nested business functions can still
-record their work and primitives. The window summary counts no-progress loops.
-Level 4 retains recorder and control details. The converter draws one nested lane per worker in
+Short direct calls to dispatch, check kernel entry and process completion are also retained.
+Level 3 omits TRACE and CONTROL Scalar intervals at the source, including their direct memory
+and state observations. A nested business function can still record its work and primitives.
+No-progress loop counts are available in the window summary.
+L3 also keeps the execution claims, MIX member notifications, Binding receipt,
+fanin polls, owned selection, fanout contributions and execution retirement.
+Level 4 also times pre-execution and pre-completion trace staging and retains all instrumented function spans. The converter draws one nested lane per worker in
 **AICore Scheduler**, labeled with its core type, worker ID and physical ID,
 for example `Cluster 00 / C / AIC_0 (physical 0)` or
 `Cluster 00 / V0 / AIV_32 (physical 18)`. AICore Scheduler and Worker View
@@ -233,11 +273,24 @@ Standard L3 export carries
 including workers with no kernel executions. Older captures can reuse their
 execution identities; absent or conflicting topology is left ungrouped rather
 than inferred from physical core numbers. Task IDs and timestamps stay intact.
-The detail lane preserves the phase hierarchy and original L1 kernel intervals. The coarse scheduler lane
-(including its `idle` bars) is omitted when Scalar detail is available.
+The detail lane preserves the phase hierarchy and original L1 kernel intervals.
+In HBG L3, the adjacent **Kernel gaps** track spans the return of one executed
+kernel to the start of the next on the same worker and run. Select a gap to see
+its `exclusive_us` breakdown by Scalar stage, including `UNATTRIBUTED`.
+Nested **No scheduler progress** slices show where the gap overlaps a recorded
+`idle` interval. Their duration overlaps the Scalar breakdown. A core can
+still poll during these intervals, and the raw record does not identify the
+condition it observed.
+
+With graph dependencies and execution identities, the gap details locate the
+last observed kernel return among the next task's direct predecessors. Logical
+completion can occur later. For a MIX task with a single recorded publication
+and a single execution group in its cluster and run, the details also locate
+the proxy worker's measured SSBUF publication scope and identify the block and
+generation. The checkpoints use the same timeline as the kernel slices.
 The outer `window` interval is used for accounting but is not drawn.
 
-`scheduler_fill_own_slots` expands into its actual callees. Ordinary work
+`scheduler_find_local_execution` expands into its actual callees. Ordinary work
 shows token discovery/refill, Claim and Call reception, incremental fanin
 observation and execution directly from the original record. Each cluster's AIV0
 publishes MIX groups. The trace names preparation, member arrival, execution,
@@ -350,7 +403,7 @@ before the stream can bind and final record publication after its window
 remain outside this detailed interval stream.
 
 Iterations without scheduling progress retain memory operations, backoff and
-functions meeting the duration threshold. The viewer uses function names; inline loop sections are
+functions meeting the duration threshold and the short dispatch steps described above. The viewer uses function names; inline loop sections are
 explicitly labeled as sections of `run_ready_dispatch_loop`. It does not
 replace those calls with an aggregated polling span.
 

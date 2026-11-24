@@ -72,6 +72,52 @@ TEST(HbgFixedOwnerWave, EachPositionExecutesItsOwnBlockEvenWhenAnotherClusterArr
     }
 }
 
+TEST(HbgFixedOwnerWave, CoordinatorHandsOffReadyOrdinaryHeadOnlyWhenMixMemberIsIdle) {
+    for (const auto phase : {SchedulerGmMixPhase::IDLE, SchedulerGmMixPhase::RELEASED}) {
+        GmMixFixture f({{4, LaneMask::aiv0()}, {1, LaneMask::all()}});
+        f.storage.metadata[0].flags |= SCHEDULER_TASK_FIXED_OWNER;
+        ASSERT_TRUE(f.prepare_calls());
+        auto *proxy = f.locals[1];
+        proxy->mix_groups[0].phase = phase;
+        uint32_t selected = UINT32_MAX;
+        // An ordinary return leaves a different ordinary head to the normal selector.
+        ASSERT_TRUE(
+            scheduler_continue_coordinator_head(f.graph.graph(), f.base(), proxy, f.run(), 0, false, &selected)
+        );
+        EXPECT_EQ(proxy->issue_cursor, 0u);
+        EXPECT_FALSE(scheduler_has_execution_tokens(proxy));
+        ASSERT_TRUE(scheduler_continue_coordinator_head(f.graph.graph(), f.base(), proxy, f.run(), 0, true, &selected));
+        EXPECT_EQ(proxy->issue_cursor, 1u);
+        EXPECT_EQ(scheduler_execution_token_count(proxy), 1u);
+        if (phase == SchedulerGmMixPhase::IDLE) {
+            ASSERT_LT(selected, SCHEDULER_EXECUTION_TOKEN_COUNT);
+            EXPECT_EQ(proxy->execution_at(selected).task_ref, 0);
+            EXPECT_EQ(proxy->execution_at(selected).state, SchedulerDispatchSlotState::READY);
+        } else {
+            EXPECT_EQ(selected, UINT32_MAX);
+        }
+    }
+}
+
+TEST(HbgClusterHandoff, IdleCoordinatorPublishesDynamicHeadUsingTheNormalTicket) {
+    for (const auto phase : {SchedulerGmMixPhase::IDLE, SchedulerGmMixPhase::RELEASED}) {
+        GmMixFixture f({{1, kAicAiv0}});
+        ASSERT_TRUE(f.prepare_calls());
+        auto *proxy = f.locals[1];
+        ASSERT_FALSE(scheduler_task_has_fixed_owners(f.storage.metadata[0].flags));
+        ASSERT_EQ(proxy->next_mix_ref, 0u);
+        proxy->mix_groups[0].phase = phase;
+        uint32_t selected = UINT32_MAX;
+        ASSERT_TRUE(
+            scheduler_continue_coordinator_head(f.graph.graph(), f.base(), proxy, f.run(), 0, false, &selected)
+        );
+        EXPECT_EQ(selected, UINT32_MAX);
+        const bool published = phase == SchedulerGmMixPhase::IDLE;
+        EXPECT_EQ(scheduler_cluster_mix_armed(proxy->cluster_signal->groups[0].armed_generation), published);
+        EXPECT_EQ(f.control(0)->claim_seal, published ? 1u : 0u);
+    }
+}
+
 TEST(HbgFixedOwnerWave, ConsumerCanBindBeforeEitherProducerBindsButCannotExecute) {
     GmMixFixture f({{2, LaneMask::aic()}, {1, LaneMask::aiv0()}});
     f.graph.executable(1, 1, {0});
@@ -112,20 +158,16 @@ TEST_P(HbgClusterOwnedGroups, ActualMembersCompleteWithoutASecondProxyVisit) {
         auto *proxy = locals[first + 1];
         auto &signal = signals[cluster];
         bool advanced = false;
-        ASSERT_TRUE(scheduler_claim_for_build(graph.graph(), base, proxy, storage.run_control, 0, &advanced));
+        ASSERT_TRUE(scheduler_claim_for_execute(graph.graph(), base, proxy, storage.run_control, 0, &advanced));
         ASSERT_TRUE(advanced);
-        const uint32_t block = proxy->cluster_pending.block_idx;
+        const uint32_t block = signal.groups[0].block_idx;
         ASSERT_LT(block, blocks);
         ASSERT_TRUE(tickets.insert(block).second);
-        ASSERT_TRUE(scheduler_progress_mix_publication(graph.graph(), base, proxy, storage.run_control, &advanced));
-        ASSERT_TRUE(advanced);
         const uint32_t generation = signal.groups[0].armed_generation;
         ASSERT_TRUE(scheduler_cluster_mix_armed(generation));
         ASSERT_EQ(signal.groups[0].active_mask, active.raw());
         const auto &context = *proxy->config.shared_context;
-        EXPECT_EQ(
-            context.mix_proxy_published[0], scheduler_mix_proxy_state(SchedulerMixProxyPhase::PUBLISHED, 0, block)
-        );
+        EXPECT_EQ(context.mix_proxy_published[0], scheduler_mix_proxy_publication(0, block));
         EXPECT_EQ(signal.groups[0].block_idx, block);
         // Deliberately withhold all noncomputing lanes, including the AIV0 publisher of an AIC+AIV1 group.
         for (uint32_t turn = 0; turn < 3; ++turn)
@@ -196,11 +238,12 @@ TEST_P(HbgClusterOwnedGroups, ActualMembersCompleteWithoutASecondProxyVisit) {
         ASSERT_EQ(signal.groups[0].accounted_generation, generation);
         EXPECT_EQ(scheduler_completion_count(control->completion_state), (round + 1) * active.count());
         EXPECT_EQ(signal.groups[0].armed_generation, generation);
-        ASSERT_TRUE(scheduler_progress_mix_publication(graph.graph(), base, proxy, storage.run_control, &advanced));
-        ASSERT_TRUE(advanced);
+        bool recycled = false;
+        ASSERT_TRUE(scheduler_cluster_mix_recycle(graph.graph(), proxy, storage.run_control, 0, generation, &recycled));
+        ASSERT_TRUE(recycled);
         EXPECT_EQ(signal.groups[0].armed_generation, generation + 1);
         if (sync && round == 0) {
-            ASSERT_TRUE(scheduler_claim_for_build(graph.graph(), base, proxy, storage.run_control, 0, &advanced));
+            ASSERT_TRUE(scheduler_claim_for_execute(graph.graph(), base, proxy, storage.run_control, 0, &advanced));
             EXPECT_FALSE(advanced);
             EXPECT_EQ(control->claim_seal, 0u);
             EXPECT_EQ(signals[1].groups[0].armed_generation, 0u);
@@ -224,7 +267,9 @@ TEST(HbgClusterOwnedGroups, ProxyReusesCountedBankOnlyAfterEveryNamedLaneReturns
     auto &bank = fixture.signal(0)->groups[0];
     for (uint32_t block = 0; block < 2; ++block) {
         bool published = false;
-        ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
+        ASSERT_TRUE(
+            scheduler_claim_for_execute(fixture.graph.graph(), fixture.base(), proxy, fixture.run(), 0, &published)
+        );
         ASSERT_TRUE(published);
         const uint32_t generation = bank.armed_generation;
         ASSERT_TRUE(fixture.service_cooperative(0));
@@ -236,16 +281,14 @@ TEST(HbgClusterOwnedGroups, ProxyReusesCountedBankOnlyAfterEveryNamedLaneReturns
         EXPECT_EQ(credits, block * 2 + 1);
         EXPECT_FALSE(scheduler_cluster_owes_before(fixture.locals[0], UINT32_MAX));
         EXPECT_TRUE(scheduler_cluster_owes_before(fixture.locals[2], UINT32_MAX));
-        ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
+        ASSERT_TRUE(
+            scheduler_claim_for_execute(fixture.graph.graph(), fixture.base(), proxy, fixture.run(), 0, &published)
+        );
         EXPECT_FALSE(published);
         EXPECT_EQ(bank.armed_generation, generation);
         ASSERT_TRUE(fixture.complete(last));
         EXPECT_EQ(credits, block * 2 + 2);
-        bool advanced = true;
-        ASSERT_TRUE(
-            scheduler_progress_mix_publication(fixture.graph.graph(), fixture.base(), proxy, fixture.run(), &advanced)
-        );
-        EXPECT_FALSE(advanced);
+        ASSERT_TRUE(fixture.service_cooperative(1));
         EXPECT_EQ(bank.armed_generation, generation);
         EXPECT_EQ(bank.accounted_generation, 0u);
     }
@@ -274,7 +317,7 @@ TEST(HbgClusterOwnedGroups, CompetingProxiesCanOnlyDistributeOneCopyOfTheSameMix
         selected.fetch_add(1, std::memory_order_acq_rel);
         while (selected.load(std::memory_order_acquire) < 2)
             std::this_thread::yield();
-        if (ok[cluster]) ok[cluster] = scheduler_claim_for_build(graph, base, proxy, run, head, &claimed[cluster]);
+        if (ok[cluster]) ok[cluster] = scheduler_claim_for_execute(graph, base, proxy, run, head, &claimed[cluster]);
     };
     std::thread peer(claim, 1);
     claim(0);
@@ -285,14 +328,7 @@ TEST(HbgClusterOwnedGroups, CompetingProxiesCanOnlyDistributeOneCopyOfTheSameMix
     const uint32_t other = 1 - winner;
     ASSERT_EQ(fixture.control(0)->next_block, 1u);
     ASSERT_EQ(fixture.control(0)->claim_seal, 1u);
-    ASSERT_EQ(fixture.locals[3 * winner + 1]->cluster_pending.block_idx, 0u);
-    ASSERT_EQ(fixture.locals[3 * other + 1]->cluster_pending.task_ref, SCHEDULER_TASK_REF_INVALID);
-
     bool progress = false;
-    for (uint32_t cluster : {other, winner}) {
-        ASSERT_TRUE(scheduler_progress_mix_publication(graph, base, fixture.locals[3 * cluster + 1], run, &progress));
-        ASSERT_EQ(progress, cluster == winner);
-    }
     const auto &descriptor = fixture.signal(winner)->groups[0];
     ASSERT_TRUE(scheduler_cluster_mix_armed(descriptor.armed_generation));
     ASSERT_EQ(descriptor.task_ref, 0);
@@ -342,11 +378,53 @@ TEST(HbgClusterOwnedGroups, CompetingProxiesCanOnlyDistributeOneCopyOfTheSameMix
     EXPECT_EQ(scheduler_read_error(run), 0u);
 }
 
+TEST(HbgClusterOrder, NoncomputingProxyTakesOneExecutionTicketWhenABankBecomesFree) {
+    const GmShape mix{1, kAicAiv1};
+    GmMixFixture fixture({mix, mix}, false, 1);
+    ASSERT_TRUE(fixture.prepare_calls());
+    auto &bank = fixture.signal(0)->groups[0];
+    for (uint32_t pass = 0; pass < 8; ++pass)
+        ASSERT_TRUE(fixture.fill(1));
+    ASSERT_TRUE(scheduler_cluster_mix_armed(bank.armed_generation));
+    ASSERT_EQ(bank.task_ref, 0);
+    const uint32_t first_generation = bank.armed_generation;
+    ASSERT_EQ(fixture.control(1)->next_block, 0u);
+    EXPECT_EQ(fixture.control(1)->claim_seal, 0u);
+    GmExecution entry{};
+    EXPECT_FALSE(fixture.begin(1, &entry));
+    for (uint32_t pass = 0; pass < 3; ++pass)
+        for (uint32_t member : {0u, 2u})
+            ASSERT_TRUE(fixture.service_cooperative(member));
+    for (uint32_t member : {2u, 0u}) {
+        ASSERT_TRUE(fixture.begin(member, &entry));
+        ASSERT_EQ(entry.task, 0);
+        ASSERT_TRUE(fixture.complete(entry));
+    }
+    ASSERT_TRUE(fixture.task_done(0));
+    ASSERT_EQ(bank.accounted_generation, first_generation);
+    ASSERT_TRUE(fixture.fill(1));
+    ASSERT_TRUE(scheduler_cluster_mix_armed(bank.armed_generation));
+    ASSERT_GT(bank.armed_generation, first_generation);
+    ASSERT_EQ(bank.task_ref, 1);
+    EXPECT_EQ(bank.block_idx, 0u);
+    const uint32_t published = bank.armed_generation;
+    for (uint32_t pass = 0; pass < 4; ++pass)
+        ASSERT_TRUE(fixture.fill(1));
+    EXPECT_EQ(bank.armed_generation, published);
+    EXPECT_EQ(fixture.storage.contexts[1].mix_proxy_published[0], scheduler_mix_proxy_publication(1, 0));
+    EXPECT_EQ(fixture.control(1)->next_block, 1u);
+    EXPECT_EQ(fixture.control(1)->claim_seal, 1u);
+    EXPECT_FALSE(fixture.begin(1, &entry));
+    EXPECT_EQ(fixture.run()->scheduler_error, 0u);
+}
+
 TEST(HbgClusterOrder, ProxyEntersConflictFreeBlockBeforeOtherMembersPoll) {
     GmMixFixture fixture({{1, LaneMask::all()}}, false, 1);
     ASSERT_TRUE(fixture.prepare_calls());
     bool published = false;
-    ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
+    ASSERT_TRUE(scheduler_claim_for_execute(
+        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &published
+    ));
     ASSERT_TRUE(published);
     ASSERT_TRUE(fixture.service_cooperative(1));
     GmExecution proxy{};
@@ -404,10 +482,15 @@ TEST(HbgClusterOrder, MixArrivalWaitsForAnEarlierTokenClaimedWhilePeersBecomeOrd
     ASSERT_TRUE(fixture.claim_ordinary(vector_sync, 1));
     ASSERT_TRUE(fixture.claim_ordinary(vector_sync, 2));
     bool published = false;
-    for (uint32_t pass = 0; pass < 3 && !published; ++pass)
-        ASSERT_TRUE(fixture.ordinary_arm(mix, 0, &published));
+    for (uint32_t pass = 0; pass < 3 && !published; ++pass) {
+        bool progress = false;
+        ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+            fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), &progress, nullptr, &published
+        ));
+    }
     ASSERT_TRUE(published);
     auto &group = fixture.signal(0)->groups[0];
+    ASSERT_EQ(group.task_ref, mix);
     const uint32_t generation = group.armed_generation;
     ASSERT_TRUE(scheduler_cluster_mix_armed(generation));
     ASSERT_TRUE(fixture.service_cooperative(1));
@@ -584,7 +667,7 @@ TEST_P(HbgEarlierProducer, OrdinaryProducerReleasesEarlierWorkWhileLaterMixWaits
     // Both groups need the AIC. AIV1 must run the producer before the earlier group can release the AIC to the later
     // group.
     ASSERT_TRUE(f.complete(running));
-    for (unsigned pass = 0; pass < 16 && !f.task_done(later); ++pass)
+    for (unsigned pass = 0; pass < 16 && !(f.task_done(first) && f.task_done(later)); ++pass)
         service(true);
     EXPECT_TRUE(f.task_done(producer));
     EXPECT_TRUE(f.task_done(first));
@@ -598,7 +681,7 @@ TEST(HbgClusterGroupOwnership, CancellingAnUnstartedMixMemberUsesOnlyTheCurrentL
     GmMixFixture f({{1, kAicAiv1}}, false, 1);
     ASSERT_TRUE(f.prepare_calls());
     bool published = false;
-    ASSERT_TRUE(f.ordinary_arm(0, 0, &published));
+    ASSERT_TRUE(scheduler_claim_for_execute(f.graph.graph(), f.base(), f.locals[1], f.run(), 0, &published));
     ASSERT_TRUE(published);
     ASSERT_TRUE(f.service_cooperative(2));
     auto *local = f.locals[2];
@@ -672,7 +755,9 @@ TEST(HbgClusterGroupOwnership, InvalidMemberCallFailsLocallyWithoutArriving) {
         GmMixFixture fixture({{1, LaneMask::all()}}, false, 1);
         ASSERT_TRUE(fixture.prepare_calls());
         bool published = false;
-        ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
+        ASSERT_TRUE(scheduler_claim_for_execute(
+            fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &published
+        ));
         ASSERT_TRUE(published);
         auto *member = fixture.locals[2];
         uint64_t index = UINT64_MAX;
@@ -706,7 +791,9 @@ TEST(HbgClusterGroupOwnership, InvalidPlanCannotClaimAnotherMembersPreparedRecor
         GmMixFixture fixture({{1, kAicAiv1}}, false, 1);
         ASSERT_TRUE(fixture.prepare_calls());
         bool published = false;
-        ASSERT_TRUE(fixture.ordinary_arm(0, 0, &published));
+        ASSERT_TRUE(scheduler_claim_for_execute(
+            fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &published
+        ));
         ASSERT_TRUE(published);
         auto *member = fixture.locals[2];
         const auto *prepared = member->config.prepared;
@@ -726,6 +813,36 @@ TEST(HbgClusterGroupOwnership, InvalidPlanCannotClaimAnotherMembersPreparedRecor
         EXPECT_EQ(fixture.signal(0)->groups[0].finished[2], 0u);
         EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 0u);
     }
+}
+
+TEST(HbgClusterOrder, LocalReceiptStopsAtTheNextPublication) {
+    GmMixFixture f({{1, kAicAiv0}, {1, LaneMask::all()}}, false, 1);
+    ASSERT_TRUE(f.prepare_calls());
+    const auto graph = f.graph.graph();
+    bool issued = false;
+    ASSERT_TRUE(scheduler_claim_for_execute(graph, f.base(), f.locals[1], f.run(), 0, &issued));
+    ASSERT_TRUE(issued);
+    const uint32_t first = f.signal(0)->groups[0].armed_generation;
+    for (uint32_t lane : {0u, 1u, 2u})
+        ASSERT_TRUE(f.service_cooperative(lane));
+    EXPECT_EQ(f.locals[2]->mix_groups[0].settled_generation, first);
+
+    GmExecution accountant{}, member{};
+    ASSERT_TRUE(f.begin(1, &accountant));
+    ASSERT_TRUE(f.complete(accountant));
+    EXPECT_NE(f.locals[1]->mix_groups[0].settled_generation, first);
+    EXPECT_TRUE(scheduler_cluster_owes_before(f.locals[1], UINT32_MAX));
+    ASSERT_TRUE(f.begin(0, &member));
+    ASSERT_TRUE(f.complete(member));
+    EXPECT_EQ(f.locals[0]->mix_groups[0].settled_generation, first);
+    ASSERT_TRUE(f.service_cooperative(1));
+    EXPECT_EQ(f.locals[1]->mix_groups[0].settled_generation, first);
+
+    ASSERT_TRUE(scheduler_claim_for_execute(graph, f.base(), f.locals[1], f.run(), 1, &issued));
+    ASSERT_TRUE(issued);
+    ASSERT_GT(f.signal(0)->groups[0].armed_generation, first);
+    for (uint32_t lane : {0u, 1u, 2u})
+        EXPECT_TRUE(scheduler_cluster_owes_before(f.locals[lane], UINT32_MAX));
 }
 
 TEST(HbgClusterOrder, ActualMemberFinAndAccountantReceiptProtectTheirOwnGeneration) {

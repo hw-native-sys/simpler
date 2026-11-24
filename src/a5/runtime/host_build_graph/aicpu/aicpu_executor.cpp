@@ -128,12 +128,15 @@ static void log_resident_task_catalog(void *base, const SchedulerWorkerContext &
         descriptors[queue] = shared_descriptors[queue];
         const auto &descriptor = descriptors[queue];
         if (descriptor.capacity > pool.task_count - entries || descriptor.entries_offset < cursor ||
-            !range_valid(descriptor.entries_offset, descriptor.capacity, sizeof(int64_t), alignof(int64_t), limit)) {
+            !range_valid(
+                descriptor.entries_offset, descriptor.capacity, sizeof(SchedulerCatalogEntry),
+                alignof(SchedulerCatalogEntry), limit
+            )) {
             LOG_ERROR("A5 HBG task catalog snapshot: invalid engine=%u descriptor", queue);
             return;
         }
         entries += descriptor.capacity;
-        cursor = descriptor.entries_offset + descriptor.capacity * sizeof(int64_t);
+        cursor = descriptor.entries_offset + descriptor.capacity * sizeof(SchedulerCatalogEntry);
     }
     if (entries != pool.entry_count) {
         LOG_ERROR("A5 HBG task catalog snapshot: inconsistent entry count");
@@ -141,11 +144,11 @@ static void log_resident_task_catalog(void *base, const SchedulerWorkerContext &
     }
     for (uint32_t engine = 0; engine < SCHEDULER_EXECUTION_ENGINE_COUNT; ++engine) {
         const auto &descriptor = descriptors[engine];
-        const auto *refs = scheduler_state_at<int64_t>(base, descriptor.entries_offset);
-        cache_invalidate_range(refs, descriptor.capacity * sizeof(int64_t));
+        const auto *refs = scheduler_state_at<SchedulerCatalogEntry>(base, descriptor.entries_offset);
+        cache_invalidate_range(refs, descriptor.capacity * sizeof(SchedulerCatalogEntry));
         rmb();
         for (uint64_t index = 0; index < descriptor.capacity; ++index) {
-            const int64_t ref = refs[index];
+            const int64_t ref = refs[index].ref;
             if (ref < 0 || static_cast<uint64_t>(ref) >= pool.task_count) {
                 LOG_ERROR("A5 HBG task catalog: invalid engine=%u index=%" PRIu64, engine, index);
                 return;
@@ -177,9 +180,7 @@ static void log_unfinished_tasks(Runtime *runtime) {
          !fits(
              context->completion_counters_offset, sizeof(SchedulerTaskCompletionCounter),
              alignof(SchedulerTaskCompletionCounter)
-         )) ||
-        (context->done_notifications_offset != 0 &&
-         !fits(context->done_notifications_offset, sizeof(uint64_t), alignof(uint64_t)))) {
+         ))) {
         LOG_ERROR("A5 HBG: unfinished-task snapshot unavailable for invalid table ranges");
         return;
     }
@@ -192,10 +193,6 @@ static void log_unfinished_tasks(Runtime *runtime) {
                                scheduler_state_at<SchedulerTaskCompletionCounter>(
                                    scheduler_state_base, context->completion_counters_offset
                                );
-    const auto *notifications =
-        context->done_notifications_offset == 0 ?
-            nullptr :
-            scheduler_state_at<uint64_t>(scheduler_state_base, context->done_notifications_offset);
     const auto graph = aicore_scheduler_graph_view(*context);
     struct TaskSnapshot {
         uint64_t task;
@@ -207,10 +204,10 @@ static void log_unfinished_tasks(Runtime *runtime) {
     auto snapshot_task = [&](uint64_t task) {
         const uint64_t completion = aicpu_observe_gm(controls[task].completion_state);
         TaskSnapshot snapshot{
-            task, completion, aicpu_observe_gm(controls[task].next_block), completion,
+            task, completion, aicpu_claimed_supply(controls[task], metadata[task].logical_block_num), completion,
             scheduler_completion_done(completion)
         };
-        if (counters != nullptr && counters[task].add_address != 0) {
+        if (counters != nullptr && (counters[task].add_address != 0 || counters[task].read_address != 0)) {
             const auto &counter = counters[task];
             snapshot.source_value = counter.read_address == 0 ?
                                         UINT64_MAX :
@@ -219,9 +216,6 @@ static void log_unfinished_tasks(Runtime *runtime) {
                             scheduler_classify_completion_counter(
                                 static_cast<uint32_t>(snapshot.source_value), counter.threshold, counter.limit
                             ) == 1;
-        } else if (notifications != nullptr && notifications[task] != 0) {
-            snapshot.source_value = *reinterpret_cast<const volatile uint32_t *>(notifications[task]);
-            snapshot.done = snapshot.source_value == 1;
         }
         return snapshot;
     };

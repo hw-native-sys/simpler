@@ -16,7 +16,7 @@ import pytest
 from _capture_builder import Capture
 from _native_protocol_builder import ProtocolBuilder
 
-from simpler_setup.tools.hbg.schedule_timing import _lane_name
+from simpler_setup.tools.hbg.schedule_timing import _lane_name, schedule_events
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
 
 
@@ -108,6 +108,9 @@ def test_l2_checkpoints_render_one_proxy_and_separate_member_slots(tmp_path):
         runtime_name="host_build_graph",
         scheduler_task_producer="aicore",
         chip_swimlane_level=2,
+        deps_edges={2: [7]},
+        deps_kernel_map={7: [0, 1, -1]},
+        sources_by_consumer={7: {2: {"creator"}}},
     )
     events = json.loads(output.read_bytes())["traceEvents"]
     schedule = [event for event in events if event.get("cat") == "HBG L2"]
@@ -115,23 +118,37 @@ def test_l2_checkpoints_render_one_proxy_and_separate_member_slots(tmp_path):
     assert set(labels.values()) == {"C00 / MIX0/AIC", "C00 / MIX0/AIV0", "C00 / MIX0 (AIV0 proxy)"}
     assert all("tid" not in e and e["pid"] == 3 for e in schedule)
     starts = [e for e in schedule if e["ph"] == "b"]
-    (handoff,) = [e for e in starts if e["name"].startswith("SSBUF arm")]
+    assert not any(e["name"].endswith(("-MIX order and arrival", "-READY to executor pickup")) for e in starts)
+    pickups = [e for e in starts if e["name"] == "t7-b0-MIX inputs observed to executor pickup"]
+    assert len(pickups) == 2
+    for event in pickups:
+        args = event["args"]
+        row = next(r for r in rows if r["core_id"] == args["worker_id"])
+        end = schedule[schedule.index(event) + 1]
+        assert end["ph"] == "e" and end["id2"] == event["id2"]
+        assert event["ts"] == row["schedule_checkpoints"][2]
+        assert end["ts"] == row["receive_time_us"]
+        assert args["ready_time_us"] == row["dispatch_time_us"]
+        assert args["order_and_arrival_us"] == pytest.approx(args["ready_time_us"] - event["ts"])
+        assert args["ready_to_pickup_us"] == pytest.approx(end["ts"] - args["ready_time_us"])
+    (handoff,) = [e for e in starts if e["name"] == "t7-b0-SSBUF arm to last observed member"]
     assert set(handoff["args"]["member_observation_us_after_arm"]) == {"AIC", "AIV0"}
     end = next(e for e in schedule[schedule.index(handoff) + 1 :] if e["id2"] == handoff["id2"])
     assert end["ph"] == "e"
     assert end["ts"] - handoff["ts"] == pytest.approx(
         rows[1]["schedule_checkpoints"][0] - rows[1]["mix_proxy_timing"][1]
     )
-    assert not any(e["name"].startswith(("EXECUTE", "Kernel execution")) for e in starts)
+    assert all(e["name"].startswith("t7-b0-") and "Kernel execution" not in e["name"] for e in starts)
     workers = [e for e in events if e["pid"] == 4 and e["ph"] == "X"]
     assert len(workers) == 2
     assert {e["name"] for e in workers} == {"t7-proj"}
     assert {e["args"]["correlation_id"] for e in workers} == {"spmd/7"}
     assert {e["args"]["kernel_slice_label"] for e in workers} == {"proj_aic(t7)", "proj_aiv(t7)"}
-    binds = [e for e in starts if e["name"].startswith("MIX member bind")]
+    binds = [e for e in starts if e["name"] == "t7-b0-MIX member bind"]
     assert {labels[e["id2"]["local"]] for e in binds} == {"C00 / MIX0/AIC", "C00 / MIX0/AIV0"}
-    (wait,) = [e for e in starts if e["name"].startswith("Predecessor pending")]
+    (wait,) = [e for e in starts if e["name"] == "t7-b0-Predecessor pending to inputs observed"]
     assert wait["args"]["first_pending_task_id"] == 2
+    assert wait["args"]["fanin-sources"] == "t2 (creator)"
     assert [e["dur"] for e in events if e["pid"] == 4 and e["ph"] == "X"] == pytest.approx(
         [r["duration_us"] for r in rows]
     )
@@ -593,3 +610,39 @@ def test_native_l2_counter_arguments_keep_independent_numeric_series():
         if p.track_event.type == proto.TrackEvent.TYPE_COUNTER
     ]
     assert sorted(samples) == [("depth.AIC", 4000, 2, 0.0), ("depth.AIC", 5000, 0, 0.0), ("depth.AIV", 4000, 0, 1.5)]
+
+
+def test_dynamic_mix_claim_joins_the_publishers_last_retirement(tmp_path):
+    raw = capture()
+    section = raw["aicore_execution_identities"]
+    section["version"] = 3
+    previous, mix = section["records"]
+    previous["schedule_cycles"] = [80, 82, 84, 121]
+    mix.update(group_kind=2, group_seq=1, pending_slot=4, schedule_cycles=[126, 127, 128, 155, 125, 126])
+    mix["mix_claim_cycles"] = [121, 122, 123, 124]
+    for i, row in enumerate(raw["scheduler_tasks"]["records"]):
+        row[2] = (85, 129)[i]
+    for row in raw["aicore_tasks"]:
+        row[5] = 0
+    rows = read(tmp_path, raw)
+    events = schedule_events(rows, lambda t: f"t{t}")
+    stages = [(a["name"], a["ts"], b["ts"]) for a, b in zip(events, events[1:]) if a["ph"] == "b"]
+    expected = [
+        "t7-b0-L2 trace writeback and retire",
+        "t7-b1-Dispatch to MIX claim",
+        "t7-b1-MIX block claim",
+        "t7-b1-Claim to descriptor preparation",
+    ]
+    lookup = {n: (s, e) for n, s, e in stages}
+    bounds = [lookup[n] for n in expected]
+    assert all(a < b for a, b in bounds)
+    assert [b for _, b in bounds[:-1]] == [a for a, _ in bounds[1:]]
+    assert bounds[-1][1] == rows[1]["mix_proxy_timing"][0]
+
+    mix["mix_claim_cycles"] = [0, 0, 123, 124]
+    names = [e.get("name") for e in schedule_events(read(tmp_path, raw), str)]
+    assert not any(n and "Dispatch to MIX claim" in n for n in names)
+    assert any(n and "MIX block claim" in n for n in names)
+    mix["mix_claim_cycles"] = [121, 122, 127, 124]
+    with pytest.raises(ValueError, match="MIX claim checkpoints"):
+        read(tmp_path, raw)

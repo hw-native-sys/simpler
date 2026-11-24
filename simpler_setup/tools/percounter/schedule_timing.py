@@ -106,10 +106,10 @@ def schedule_events(capture, pid, task_name):
     deferred = defaultdict(list)
     for (epoch, task, block), rows in blocks.items():
         args = {"run_epoch": epoch, "task_id": task, "block_index": block}
-        suffix = f"{task_name(task)} b{block}"
+        prefix = f"{task_name(task)}-b{block}"
         for track, label, start, end, actor in _block_spans(rows):
             if start < end:
-                tracks[track].append((start, end, f"{label} · {suffix}", {**args, **actor}))
+                tracks[track].append((start, end, f"{prefix}-{label}", {**args, **actor}))
         registrations = {r["deferred_group"]: r for r in rows if r["kind"] == "defer_registered"}
         for row in rows:
             if row["kind"] != "deferred_completion_issue":
@@ -120,7 +120,7 @@ def schedule_events(capture, pid, task_name):
                     (
                         begin["time_us"],
                         row["time_us"],
-                        f"Defer registration → settlement issue · {suffix}",
+                        f"{prefix}-Defer registration → settlement issue",
                         {
                             **args,
                             "group": row["deferred_group"],

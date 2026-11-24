@@ -622,6 +622,10 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             if (trace.l2_proxy_begin_cycles != 0)
                 identities_json << "," << trace.l2_proxy_begin_cycles << "," << trace.l2_proxy_arm_cycles;
             identities_json << "]";
+            if (trace.l2_claim_begin_cycles != 0)
+                identities_json << ",\"mix_claim_cycles\":[" << trace.l2_previous_complete_cycles << ","
+                                << trace.l2_previous_retired_cycles << "," << trace.l2_claim_begin_cycles << ","
+                                << trace.l2_claim_end_cycles << "]";
             if (trace.l2_first_pending_cycles != 0)
                 identities_json << ",\"pending_fanin\":[" << public_id(trace.l2_first_predecessor) << ","
                                 << trace.l2_first_pending_cycles << "]";
@@ -893,7 +897,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             if (!first_proxy) scheduler_json << ',';
             scheduler_json << '[' << worker << ',' << context.physical_core_id << ',' << context.cluster_index << ','
                            << bank << ',' << ref << ',' << public_id(ref) << ',' << scheduler_mix_proxy_block_idx(state)
-                           << ",\"" << scheduler_mix_proxy_phase_name(scheduler_mix_proxy_phase(state)) << "\"]";
+                           << ",\"published\"]";
             first_proxy = false;
         });
     }
@@ -1337,11 +1341,17 @@ bool prepare_scheduler_calls(
         }
     }
     const auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
+    const bool flat_index =
+        native_plan.instances.empty() && layout.prepared.execution_count <= UINT64_C(1) + UINT32_MAX;
     uint64_t prepared_count = 0;
     uint64_t skip_cache = 0, range_cache = 0, full_cache = 0;
     for (uint64_t ref = 0; ref < layout.task_count; ++ref) {
         const auto &meta = metadata[ref];
         if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
+        if (flat_index && meta.trace_index_base != prepared_count) {
+            LOG_ERROR("A5 HBG: flat Call prefix disagrees with trace index at node=%" PRIu64, ref);
+            return false;
+        }
         uint64_t functions[SUBTASK_SLOT_COUNT]{};
         for (uint8_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane)
             if (meta.active_mask.has(static_cast<SubtaskSlot>(lane)))
@@ -1927,10 +1937,14 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: ordinary fanin preparation failed: %s", task_order_error.c_str());
         return false;
     }
-    if (!native_graph)
+    if (!native_graph) {
+        scheduler_plan_static_supply(dependencies, task_metadata, task_catalog_plan);
         scheduler_elide_proven_mix_floors(dependencies, task_metadata, possible_async_lanes, task_catalog_plan);
-    if (!native_graph && async_plan.layout.group_count == 0)
-        scheduler_plan_terminal_mix_calls(dependencies, task_metadata, task_catalog_plan);
+        task_catalog_plan.header.terminal_mix_begin =
+            scheduler_terminal_mix_begin(dependencies, task_metadata, task_catalog_plan);
+        if (async_plan.layout.group_count == 0)
+            scheduler_plan_terminal_mix_calls(dependencies, task_metadata, task_catalog_plan);
+    }
     std::vector<uint32_t> counter_credits(node_count, 0);
     for (uint64_t ref = 0; ref < node_count; ++ref) {
         const auto &metadata = task_metadata[ref];
@@ -1972,7 +1986,9 @@ bool create_scheduler_state(
                 throw std::runtime_error("incomplete CntNotify allocation");
             if (onboard) {
                 for (size_t i = 0; i < count; ++i) {
+                    if (purpose == SchedulerNotificationPurpose::BOOTSTRAP_ARRIVAL && out.addresses[i] == 0) continue;
                     const uint64_t increment = a5_cnt_notify_increment_address(out.addresses[i]);
+                    if (purpose == SchedulerNotificationPurpose::CLAIM_SUPPLY && out.addresses[i] == 0) continue;
                     if (increment == 0 || (purpose == SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER &&
                                            out.add_addresses[i] != increment))
                         throw std::runtime_error("missing or invalid CntNotify slot at index " + std::to_string(i));
@@ -2013,9 +2029,8 @@ bool create_scheduler_state(
             SchedulerNotificationPurpose::HBG_REQUIRED_TASK_STATE, legacy_done_refs.size(), notifications
         ))
         return false;
-    auto *notification_addresses = scheduler_state_at<uint64_t>(host_base, layout.done_notifications_offset);
     for (size_t index = 0; index < legacy_done_refs.size(); ++index)
-        notification_addresses[legacy_done_refs[index]] = notifications.addresses[index];
+        counter_descriptors[legacy_done_refs[index]] = scheduler_set_completion_source(notifications.addresses[index]);
     const size_t eligible_counter_tasks =
         std::count_if(counter_credits.begin(), counter_credits.end(), [](uint32_t credits) {
             return credits != 0;
@@ -2068,6 +2083,38 @@ bool create_scheduler_state(
     scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset)->task_catalog_offset =
         task_catalog_plan.header_offset;
     auto *task_controls = scheduler_state_at<SchedulerTaskControl>(host_base, layout.task_controls_offset);
+    // A word is shared by independent tasks but each bit has a single lifetime
+    // between bootstrap and resident exit. Bound optional leases for large graphs.
+    if (onboard && !native_graph) {
+        constexpr size_t max_supply_words = 16;
+        struct SupplyField {
+            uint32_t task;
+            uint32_t word;
+            uint32_t mask;
+        };
+        std::vector<SupplyField> fields;
+        uint32_t bit = 0;
+        for (uint32_t ref = 0; ref < node_count; ++ref) {
+            const auto &task = task_metadata[ref];
+            const auto flags = task.flags;
+            if (!scheduler_task_is_executable(flags) || scheduler_task_is_inline(flags) ||
+                scheduler_task_has_fixed_owners(flags) || scheduler_task_has_predicate(flags) ||
+                dependencies.host_done[ref] || task.logical_block_num < 2)
+                continue;
+            const uint32_t width = std::min<uint32_t>(task.logical_block_num, SCHEDULER_CLAIM_SECTOR_COUNT);
+            if (bit % 32 + width > 32) bit += 32 - bit % 32;
+            if (bit / 32 == max_supply_words) break;
+            fields.push_back({ref, bit / 32, ((1U << width) - 1) << (bit % 32)});
+            bit += width;
+        }
+        SchedulerDoneNotifications supply;
+        if (!acquire_notifications(SchedulerNotificationPurpose::CLAIM_SUPPLY, (bit + 31) / 32, supply)) return false;
+        for (const auto &field : fields) {
+            auto &control = task_controls[field.task];
+            control.supply_address = supply.addresses[field.word];
+            control.supply_mask = field.mask;
+        }
+    }
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
     std::copy(task_metadata.begin(), task_metadata.end(), metadata);
     if (!scheduler_init_spmd_task_records(host_base, layout, api->run_epoch())) {
@@ -2086,6 +2133,22 @@ bool create_scheduler_state(
 
     const uint64_t device_sm_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
     auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, layout.run_control_offset);
+    uint64_t context_ready_address = 0;
+    if (onboard && spmd.cluster_count > 0 && spmd.cluster_count <= 32) {
+        SchedulerDoneNotifications arrival;
+        const bool uses_ssbuf = spmd.mix_task_count != 0;
+        if (!acquire_notifications(SchedulerNotificationPurpose::BOOTSTRAP_ARRIVAL, uses_ssbuf ? 3 : 2, arrival))
+            return false;
+        context_ready_address = arrival.addresses.back();
+        run_control->bootstrap_arrival_address = arrival.addresses.front();
+        if (uses_ssbuf && arrival.addresses[1] != 0) {
+            run_control->bootstrap_init_address = arrival.addresses[1];
+            // Peers wait for INIT in SRAM. Seed the GM DONE accumulator at its existing base.
+            auto *gates = scheduler_state_at<SchedulerBootstrapCluster>(host_base, layout.bootstrap_clusters_offset);
+            for (uint32_t cluster = 0; cluster < spmd.cluster_count; ++cluster)
+                gates[cluster].state = SCHEDULER_BOOTSTRAP_CLUSTER_INIT;
+        }
+    }
     run_control->sink_count = dependencies.sinks.size();
     auto *sinks = scheduler_state_at<uint32_t>(host_base, layout.sinks_offset);
     std::copy(dependencies.sinks.begin(), dependencies.sinks.end(), sinks);
@@ -2110,7 +2173,6 @@ bool create_scheduler_state(
         context.run_control_offset = layout.run_control_offset;
         context.task_controls_offset = layout.task_controls_offset;
         context.task_metadata_offset = layout.task_metadata_offset;
-        context.done_notifications_offset = layout.done_notifications_offset;
         context.completion_counters_offset = mapped_counter_tasks == 0 ? 0 : layout.completion_counters_offset;
         context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
@@ -2140,7 +2202,7 @@ bool create_scheduler_state(
                 return false;
     }
     runtime->publish_scheduler_bootstrap(
-        SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, aligned_address + layout.worker_contexts_offset
+        SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, aligned_address + layout.worker_contexts_offset, context_ready_address
     );
     api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
     {

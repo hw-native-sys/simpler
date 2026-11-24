@@ -15,7 +15,13 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <utility>
+
+class SchedulerNotificationQuotaExceeded : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class SchedulerNotificationStorage {
 public:
@@ -68,7 +74,20 @@ public:
             bank.push_back(selected);
         }
         try {
-            auto result = selected->prepare(count);
+            SchedulerDoneNotifications result;
+            try {
+                result = selected->prepare(count);
+            } catch (const SchedulerNotificationQuotaExceeded &) {
+                if (!scheduler_notification_is_required(purpose)) throw;
+                bool reclaimed = false;
+                const int rc = release_idle_optional(context, reclaimed);
+                if (rc != 0) {
+                    selected->retiring = true;
+                    return rc;
+                }
+                if (!reclaimed) throw;
+                result = selected->prepare(count);
+            }
             result.owner = selected;
             *out = std::move(result);
             return 0;
@@ -113,6 +132,26 @@ public:
     }
 
 private:
+    // Called under mutex_. The cache is the sole owner only after all run and replay leases expire.
+    int release_idle_optional(void *context, bool &reclaimed) {
+        for (auto &[key, bank] : pools_) {
+            if (scheduler_notification_is_required(key.second)) continue;
+            for (auto it = bank.begin(); it != bank.end();) {
+                auto &pool = *it;
+                if (pool->context != context || pool.use_count() != 1 || pool->capacity() == 0) {
+                    ++it;
+                    continue;
+                }
+                pool->retiring = true;
+                const int rc = pool->release();
+                if (rc != 0) return rc;
+                reclaimed = true;
+                it = bank.erase(it);
+            }
+        }
+        return 0;
+    }
+
     std::mutex mutex_;
     std::map<
         std::pair<uint32_t, SchedulerNotificationPurpose>, std::vector<std::shared_ptr<SchedulerNotificationStorage>>>

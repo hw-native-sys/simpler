@@ -48,6 +48,10 @@ struct SchedulerClusterSignal {
     struct {
         volatile uint64_t prepare_cycles;
         volatile uint64_t arm_cycles;
+        volatile uint64_t previous_complete_cycles;
+        volatile uint64_t previous_retired_cycles;
+        volatile uint64_t claim_begin_cycles;
+        volatile uint64_t claim_end_cycles;
     } l2_proxy[SCHEDULER_MIX_MEMBER_COUNT];
 };
 static_assert(sizeof(SchedulerClusterSignal) <= SCHEDULER_CLUSTER_REGION_BYTES);

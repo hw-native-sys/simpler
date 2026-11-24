@@ -48,6 +48,23 @@ def attach_checkpoints(task, identity, cycles, to_us):
         ):
             raise ValueError("invalid HBG L2 pending predecessor observation")
         task["first_pending_fanin"] = (miss[0], to_us(miss[1]))
+    if identity["cluster_lane"] == 1:
+        task["coordinator_complete_cycles"] = cycles[3]
+    if "mix_claim_cycles" in identity:
+        stamps = identity["mix_claim_cycles"]
+        if (
+            not proxy
+            or not isinstance(stamps, list)
+            or len(stamps) != 4
+            or any(type(v) is not int or not 0 <= v < 1 << 64 for v in stamps)
+        ):
+            raise ValueError("invalid HBG L2 MIX claim checkpoints")
+        previous, released, claim, claimed = stamps
+        if not (
+            bool(previous) == bool(released) and previous <= released <= claim and 0 < claim <= claimed <= cycles[4]
+        ):
+            raise ValueError("out-of-order HBG L2 MIX claim checkpoints")
+        task["mix_claim_timing"] = (previous, to_us(released) if released else None, to_us(claim), to_us(claimed))
     if proxy:
         task["mix_proxy_timing"] = tuple(proxy)
 
@@ -56,6 +73,8 @@ def _lane_name(track):
     cluster, role, slot = track
     member = ("AIC", "AIV0", "AIV1", "AIV0 proxy")[role]
     prefix = f"C{cluster:02d} / "
+    if role == 3 and slot == 0:
+        return f"{prefix}AIV0 dispatch"
     if slot < 4:
         return f"{prefix}{member} slot{slot}"
     # Perfetto sorts JSON tracks by lower(name). Group by MIX bank, with its
@@ -72,10 +91,29 @@ def schedule_events(tasks, display):
     ]
     intervals = defaultdict(list)
     groups = defaultdict(list)
+    coordinator_completions = {}
 
     def span(track, name, start, end, args):
         if start < end:
-            intervals[track].append((start, end, f"{name} · {args['task']} b{args['block_idx']}", args))
+            intervals[track].append((start, end, f"{args['task']}-b{args['block_idx']}-{name}", args))
+
+    def pickup_spans(track, mix, fanin, ready, picked, args):
+        if mix:
+            span(
+                track,
+                "MIX inputs observed to executor pickup",
+                fanin,
+                picked,
+                {
+                    **args,
+                    "ready_time_us": ready,
+                    "order_and_arrival_us": ready - fanin,
+                    "ready_to_pickup_us": picked - ready,
+                },
+            )
+        else:
+            span(track, "Predicate and READY publication", fanin, ready, args)
+            span(track, "READY to executor pickup", ready, picked, args)
 
     for task in tasks:
         if "schedule_checkpoints" not in task:
@@ -93,6 +131,9 @@ def schedule_events(tasks, display):
             "run_epoch": task["run_epoch"],
             "pending_slot": slot,
         }
+        if "coordinator_complete_cycles" in task:
+            key = (task["run_epoch"], cluster, task["coordinator_complete_cycles"])
+            coordinator_completions[key] = (track, retired, args)
         if mix:
             groups[(task["run_epoch"], task["task_id"], task["block_idx"])].append(task)
         ready, picked = task["dispatch_time_us"], task["receive_time_us"]
@@ -109,8 +150,7 @@ def schedule_events(tasks, display):
             )
         else:
             span(track, "Bound to predecessors observed", bound, fanin, args)
-        span(track, "MIX order and arrival" if mix else "Predicate and READY publication", fanin, ready, args)
-        span(track, "READY to executor pickup", ready, picked, args)
+        pickup_spans(track, mix, fanin, ready, picked, args)
         span(track, "Kernel entry preparation", picked, task["start_time_us"], args)
         span(track, "Kernel return to completion observation", task["end_time_us"], task["finish_time_us"], args)
         span(track, "Local completion and release", task["finish_time_us"], retired, args)
@@ -135,6 +175,17 @@ def schedule_events(tasks, display):
             "generation": owner["group_seq"],
             "member_observation_us_after_arm": {("AIC", "AIV0", "AIV1")[k]: v - arm for k, v in observed.items()},
         }
+        if "mix_claim_timing" in owner:
+            previous, released, claim, claimed = owner["mix_claim_timing"]
+            dispatch = (owner["cluster_index"], 3, 0)
+            if released is not None:
+                prior = coordinator_completions.get((epoch, owner["cluster_index"], previous))
+                if prior is not None:
+                    prior_track, complete, prior_args = prior
+                    span(prior_track, "L2 trace writeback and retire", complete, released, prior_args)
+                span(dispatch, "Dispatch to MIX claim", released, claim, args)
+            span(dispatch, "MIX block claim", claim, claimed, args)
+            span(dispatch, "Claim to descriptor preparation", claimed, start, args)
         span(track, "MIX descriptor preparation", start, arm, args)
         span(track, "SSBUF arm to last observed member", arm, max(observed.values()), args)
 

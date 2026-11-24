@@ -33,24 +33,32 @@ static inline __aicore__ bool scheduler_issue_fail(
     return false;
 }
 
-// Only immutable catalog facts persist across fills. Supply and completion
-// observations retain their independent freshness and lifetime contracts.
+// The cursor owns one bound entry. Its progress and immutable metadata change identity together.
 static inline __aicore__ bool scheduler_bind_issue_entry(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref
+    uint32_t index
 ) {
     auto &binding = local->issue_binding;
-    if (binding.task_ref == ref) return true;
+    const auto &catalog = local->config.engine_catalog;
+    if (index >= catalog.count) return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
+    if (binding.catalog_index == index) return true;
+    const auto &entry = catalog.entries[index];
+    const int64_t ref = entry.ref;
     if (!scheduler_task_ref_valid(graph, ref)) return scheduler_issue_fail(graph, local, run, ref);
-    const auto metadata = scheduler_load_dispatch_metadata(base, local, ref, 0);
+    const auto metadata = scheduler_load_dispatch_metadata(base, local, ref);
     if (!scheduler_task_is_executable(metadata.flags) || scheduler_task_is_inline(metadata.flags) ||
         scheduler_task_execution_engine(metadata.flags, scheduler_task_lanes(metadata)) != local->config.self_core_type)
         return scheduler_issue_fail(graph, local, run, ref);
     binding.metadata = metadata;
     binding.control = scheduler_task_control_at(base, local, ref);
+    binding.next_fanin = 0;
+    binding.fanin_confirmed = false;
+    binding.ticket_exhausted = false;
     binding.fanin_bound = false;
     binding.last_open_seal_ticks = 0;
     binding.task_ref = ref;
+    binding.supply_input = entry.supply_input;
+    binding.catalog_index = index;
     return true;
 }
 
@@ -87,7 +95,8 @@ static inline __aicore__ bool scheduler_task_supply_closed(
     }
     if (executable && blocks == 0) return scheduler_issue_fail(graph, local, run, ref);
     // In flat graphs, the final valid claim seals supply for both ordinary and MIX tasks without predicates.
-    const bool always_seals = graph.native_header_offset == 0 && executable && !scheduler_task_has_predicate(flags);
+    const bool always_seals =
+        !scheduler_resident_graph_is_native(graph) && executable && !scheduler_task_has_predicate(flags);
     if (!always_seals) {
         const auto completion = scheduler_observe_cached_completion(base, local, ref);
         if (completion == SchedulerCompletionObservation::INVALID) return scheduler_issue_fail(graph, local, run, ref);
@@ -116,8 +125,8 @@ static inline __aicore__ bool scheduler_task_supply_closed(
 }
 
 // Each sector contains block indices part + 4*k. Its final valid claimant
-// contributes that sector's capacity once; excess claims never roll back or
-// contribute. A total of N therefore proves all N blocks have fixed owners.
+// reports that sector once. The GM backend adds its capacity; a packed SRAM
+// reporter sets its assigned bit after binding. Excess claims do neither.
 static inline __aicore__ bool scheduler_claim_ticket(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t ref, uint32_t blocks, uint32_t *block, bool *closes_supply, bool execution_claim = true
@@ -150,6 +159,10 @@ static inline __aicore__ bool scheduler_claim_ticket(
         if (ticket >= capacity) continue;
         *block = part + static_cast<uint32_t>(ticket) * SCHEDULER_CLAIM_SECTOR_COUNT;
         if (ticket + 1 == capacity) {
+            if (control->supply_address != 0) {
+                *closes_supply = true;  // Report this completed sector after binding or SSBUF publication.
+                return true;
+            }
             const uint64_t covered = scheduler_gm_fetch_add(control->next_block, static_cast<uint64_t>(capacity));
             if (covered > blocks - capacity) return scheduler_issue_fail(graph, local, run, ref);
             *closes_supply = covered + capacity == blocks;
@@ -159,18 +172,36 @@ static inline __aicore__ bool scheduler_claim_ticket(
     return true;
 }
 
-// Only the claimant that completes the final sector reaches this publication.
+// A full sector mask certifies ownership. All directory observers use the same GM seal.
 // Other owners may still receive Calls; their block assignments cannot move.
 static inline __aicore__ bool scheduler_close_ordinary_supply(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, bool closes_supply, uint32_t blocks, uint32_t block
+    int64_t ref, bool closes_supply, uint32_t blocks, uint32_t block, bool ordinary_nonsync = false
 ) {
     if (!closes_supply) return true;
     auto *control = scheduler_task_control_at(base, local, ref);
+    const uint64_t address = control->supply_address;
+    if (address != 0) {
+        auto &word = *reinterpret_cast<__gm__ volatile uint32_t *>(address);
+        const uint32_t mask = control->supply_mask;
+        const uint32_t bit = (mask & (0U - mask)) << (block % SCHEDULER_CLAIM_SECTOR_COUNT);
+        scheduler_notify_set_bits(word, bit);
+        scheduler_cache_barrier();
+        if ((scheduler_notify_query(word) & mask) != mask) return true;
+        if (ordinary_nonsync) {
+            // Sector tickets are permanent. Every full-mask observer publishes the same terminal value.
+            scheduler_store_signal(control->next_block, static_cast<uint64_t>(blocks));
+        } else {
+            const uint64_t prior =
+                scheduler_gm_compare_exchange(control->next_block, UINT64_C(0), static_cast<uint64_t>(blocks));
+            if (prior == blocks) return true;
+            if (prior != 0) return scheduler_issue_fail(graph, local, run, ref);
+        }
+    }
     const bool trace = scheduler_protocol_enabled(local);
-    const bool cooperative =
-        trace && (scheduler_task_is_mix(scheduler_task_metadata_at(base, local, ref)->flags) ||
-                  scheduler_task_requires_sync_start(scheduler_task_metadata_at(base, local, ref)->flags));
+    const bool cooperative = !ordinary_nonsync && trace &&
+                             (scheduler_task_is_mix(scheduler_task_metadata_at(base, local, ref)->flags) ||
+                              scheduler_task_requires_sync_start(scheduler_task_metadata_at(base, local, ref)->flags));
     if (__builtin_expect(cooperative, false)) scheduler_protocol_claim_seal(base, local, ref, block, true, blocks);
     scheduler_cache_barrier();
     scheduler_store_signal(control->claim_seal, static_cast<uint64_t>(blocks));
@@ -179,7 +210,7 @@ static inline __aicore__ bool scheduler_close_ordinary_supply(
     if (!scheduler_task_catalog_valid(catalog)) return scheduler_issue_fail(graph, local, run, ref);
     scheduler_remember_task_proof(local, ref, SchedulerTaskProof::SUPPLY_CLOSED);
     const uint64_t head = local->issue_cursor;
-    if (head < catalog.count && catalog.refs[head] == ref) {
+    if (head < catalog.count && catalog.entries[head].ref == ref) {
         local->issue_cursor = head + 1;
     }
     return true;
@@ -187,49 +218,42 @@ static inline __aicore__ bool scheduler_close_ordinary_supply(
 
 // Private ownership only: this chooses a recheck boundary, never grants entry.
 inline __aicore__ bool scheduler_issue_needs_execution_recheck(const SchedulerLocalState *local) {
-    if (!scheduler_task_ref_is_null(scheduler_unretired_mix_task(*local))) return true;
-    for (const auto &token : local->execution_tokens)
-        if (token.phase != SchedulerExecutionTokenPhase::EMPTY) return true;
-    return false;
+    return !scheduler_task_ref_is_null(scheduler_unretired_mix_task(*local)) || scheduler_has_execution_tokens(local);
 }
 
 // Both engine catalogs are projections of the same validated topological order.
 // Cross-engine predecessors must also have owners before a consumer takes space.
 static inline __aicore__ bool scheduler_check_predecessor_supply(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, bool *ready
+    int32_t supply_input, bool *ready
 ) {
-    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarTaskIssueFanin, ref);
-    *ready = false;
-    if (local->issue_task_ref != ref) {
-        local->issue_task_ref = ref;
-        local->issue_next_fanin = 0;
-        local->issue_fanin_confirmed = false;
-        local->issue_ticket_exhausted = false;
-    }
-    // Topology is immutable for this run, and a predecessor's issued supply
-    // cannot reopen. This certificate grants issuance, never kernel entry.
-    if (local->issue_fanin_confirmed) {
-        *ready = true;
-        return true;
-    }
-    if (!scheduler_bind_issue_entry(graph, base, local, run, ref)) return false;
     auto &binding = local->issue_binding;
+    const int64_t ref = binding.task_ref;
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarTaskIssueFanin, ref);
+    *ready = binding.fanin_confirmed;
+    if (*ready) return true;
     if (!binding.fanin_bound) {
         const auto view_status = scheduler_profiled_node_fanin_view(graph, ref, &binding.fanin);
         if (view_status != SchedulerGraphResult::OK)
             return scheduler_issue_fail(graph, local, run, ref, view_status, SchedulerErrorSite::ROUTE_INVALID_STATE);
         binding.fanin_bound = true;
     }
+    if (supply_input != SCHEDULER_SUPPLY_SCAN) {
+        bool closed = supply_input == SCHEDULER_SUPPLY_STATIC;
+        if (!closed && !scheduler_task_supply_closed(graph, base, local, run, supply_input, &closed)) return false;
+        binding.fanin_confirmed = closed;
+        *ready = closed;
+        return true;
+    }
     const auto &fanin = binding.fanin;
-    if (local->issue_next_fanin > fanin.count)
+    if (binding.next_fanin > fanin.count)
         return scheduler_issue_fail(
             graph, local, run, ref, SchedulerGraphResult::INVALID_FANIN_COUNT, SchedulerErrorSite::ROUTE_INVALID_STATE
         );
     const bool recheck_execution = scheduler_issue_needs_execution_recheck(local);
-    while (local->issue_next_fanin < fanin.count) {
+    while (binding.next_fanin < fanin.count) {
         int64_t predecessor = SCHEDULER_TASK_REF_INVALID;
-        const auto status = scheduler_fanin_ref(fanin, ref, local->issue_next_fanin, &predecessor);
+        const auto status = scheduler_fanin_ref(fanin, ref, binding.next_fanin, &predecessor);
         if (status != SchedulerGraphResult::OK)
             return scheduler_issue_fail(graph, local, run, ref, status, SchedulerErrorSite::ROUTE_INVALID_STATE);
         const auto &metadata = *scheduler_task_metadata_at(base, local, predecessor);
@@ -244,12 +268,11 @@ static inline __aicore__ bool scheduler_check_predecessor_supply(
             if (!scheduler_task_supply_closed(graph, base, local, run, predecessor, &closed)) return false;
             if (!closed) return true;
         }
-        ++local->issue_next_fanin;
-        if (local->issue_next_fanin % 32 == 0 && scheduler_read_worker_error(run, local->worker_id()) != 0)
-            return false;
-        if (recheck_execution && local->issue_next_fanin < fanin.count) return true;
+        ++binding.next_fanin;
+        if (binding.next_fanin % 32 == 0 && scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+        if (recheck_execution && binding.next_fanin < fanin.count) return true;
     }
-    local->issue_fanin_confirmed = true;
+    binding.fanin_confirmed = true;
     *ready = true;
     return true;
 }
@@ -270,9 +293,25 @@ static inline __aicore__ bool scheduler_find_issuable_task(
     uint64_t head = local->issue_cursor;
     if (head > catalog.count) return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
     for (uint32_t visited = 0; visited < 8 && head < catalog.count; ++visited) {
-        const int64_t task_ref = catalog.refs[head];
-        if (!scheduler_task_ref_valid(graph, task_ref)) return scheduler_issue_fail(graph, local, run, task_ref);
-        if (!scheduler_bind_issue_entry(graph, base, local, run, task_ref)) return false;
+        const auto &entry = catalog.entries[head];
+        if (local->issue_binding.catalog_index != head && entry.third_task_blocks != 0 && visited <= 6 &&
+            !scheduler_issue_needs_execution_recheck(local)) {
+            if (catalog.count - head < 3) return scheduler_issue_fail(graph, local, run, entry.ref);
+            const int64_t witness = catalog.entries[head + 2].ref;
+            if (!scheduler_task_ref_valid(graph, witness)) return scheduler_issue_fail(graph, local, run, witness);
+            auto *control = scheduler_task_control_at(base, local, witness);
+            auto &ticket = entry.third_task_blocks == 1 ? control->next_block : control->claim_sectors[0].next;
+            // The first claim on this later row proves earlier rows were sealed. It grants no ticket on this row.
+            if (scheduler_gm_query(ticket) != 0) {
+                head += 2;
+                local->issue_cursor = head;
+                ++visited;
+                *progress = true;
+                continue;
+            }
+        }
+        if (!scheduler_bind_issue_entry(graph, base, local, run, static_cast<uint32_t>(head))) return false;
+        const int64_t task_ref = local->issue_binding.task_ref;
         bool closed = false;
         const auto flags = local->issue_binding.metadata.flags;
         if (scheduler_task_has_fixed_owners(flags)) {
@@ -285,12 +324,11 @@ static inline __aicore__ bool scheduler_find_issuable_task(
             if (scheduler_issue_needs_execution_recheck(local)) return true;
             continue;
         }
-        const int64_t previous_task = local->issue_task_ref;
-        const uint32_t previous_fanin = local->issue_next_fanin;
+        const uint32_t previous_fanin = local->issue_binding.next_fanin;
         bool ready = false;
-        if (!scheduler_check_predecessor_supply(graph, base, local, run, task_ref, &ready)) return false;
-        const uint32_t confirmed_before = local->issue_task_ref == previous_task ? previous_fanin : 0;
-        *progress = *progress || local->issue_next_fanin > confirmed_before;
+        if (!scheduler_check_predecessor_supply(graph, base, local, run, local->issue_binding.supply_input, &ready))
+            return false;
+        *progress = *progress || local->issue_binding.next_fanin > previous_fanin;
         if (ready) *ref = task_ref;
         return true;
     }

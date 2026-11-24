@@ -82,6 +82,8 @@ that ...".
 
 ## Index
 
+- [A5 HBG ordinary entry with a MIX completion proof](2026-11-a5-hbg-ordinary-entry-floor.md) increased the seven-case L0 sum by 0.528%.
+
 Newest first.
 
 - [2026-11 — CntNotify ADD completion chains and SET-slot access](2026-11-a5-hbg-cnt-notify-add-deferred.md) — withdrawal history retained; SET-slot +0x08 access was subsequently verified and authorized for re-enablement without a driver update.

@@ -153,6 +153,7 @@ inline bool scheduler_prepare_host_calls(
             call.task_ref = task_ref;
             call.block_idx = block;
             call.num_args = static_cast<uint16_t>(tensor_count + scalar_count);
+            call.tensor_count = static_cast<uint16_t>(tensor_count);
             call.subtask_slot = lane;
             if (input_cache != nullptr) {
                 const auto &plan = input_cache[lane];

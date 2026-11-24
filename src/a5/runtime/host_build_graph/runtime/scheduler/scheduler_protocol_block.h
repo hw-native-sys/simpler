@@ -67,7 +67,8 @@ static inline __aicore__ void scheduler_protocol_block_claim(
     scheduler_protocol_publish_record(owner);
     auto *claim = &record->claim;
     scheduler_protocol_observe_record(claim);
-    claim->confirmed_count = confirmed_count;
+    // Bitmap reporters discover the unique publisher after the owner has bound its execution.
+    claim->confirmed_count = scheduler_task_control_at(base, local, task)->supply_address == 0 ? confirmed_count : 0;
     claim->worker_index = owner->worker_index;
     claim->block_idx = block;
     claim->run_epoch = layout->run_epoch;
@@ -94,6 +95,7 @@ static inline __aicore__ void scheduler_protocol_claim_seal(
     claim->run_epoch = layout->run_epoch;
     claim->worker_index = static_cast<uint32_t>(local->worker_id());
     claim->block_idx = block;
+    claim->confirmed_count = value;
     claim->seal_value = value;
     scheduler_protocol_publish_record(claim);
 }

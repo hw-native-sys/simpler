@@ -184,6 +184,7 @@ def test_percounter_control_completion_flow(tmp_path, dropped, expected):
     events = [e for e in trace["traceEvents"] if e["pid"] == 4]
     bars = {e["id"]: e["args"]["taskId"] for e in events if e["ph"] == "X"}
     for marker in (e for e in events if e["ph"] == "i"):
+        assert marker["name"] == "t27-Control completion"
         assert (marker["ts"], marker["args"]["evidence"]) == (23, "completion_issue")
         bars[marker["id"]] = marker["args"]["task_id"]
     starts = {e["id"]: bars[e["bind_id"]] for e in events if e["ph"] == "s"}

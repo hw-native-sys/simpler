@@ -169,8 +169,8 @@ static_assert(
 );
 
 enum class SchedulerDispatchSlotState : uint8_t {
-    EMPTY = 0,
-    FREE = 1,
+    FREE = 0,
+    TICKETED = 1,
     FILLING = 2,
     READY = 3,
     EXECUTING = 4,
@@ -211,13 +211,16 @@ constexpr int32_t SCHEDULER_TASK_TIMING_SLOT_COUNT = 16;
 
 // Immutable task view of a shared monotonic CntNotify ADD chain. Strict DAG
 // ancestors precede descendants; count >= threshold stays true for this run.
-// Zero ADD address selects the established GM completion protocol.
+// SET-only tasks use a read address with threshold and limit one. Without a read address, DONE lives in GM.
 struct SchedulerTaskCompletionCounter {
     uint64_t read_address;
     uint64_t add_address;
     uint32_t threshold;
     uint32_t limit;
 };
+inline constexpr SchedulerTaskCompletionCounter scheduler_set_completion_source(uint64_t address) {
+    return {address, 0, 1, 1};
+}
 static_assert(sizeof(SchedulerTaskCompletionCounter) == 24);
 static_assert(
     std::is_trivially_copyable_v<SchedulerTaskCompletionCounter> &&
@@ -448,11 +451,18 @@ struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
     // The last valid claim publishes the block count to certify that supply is closed.
     // Its isolated region has no concurrent RMW or cached writeback.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t claim_seal;
+    // Immutable address and sector bits in a per-run supply bitmap. Zero address selects GM.
+    uint64_t supply_address;
+    uint32_t supply_mask;
 
     // Ordinary block ownership is distributed over independent L2 sectors.
     // Excess reservations stay monotonic and never return a valid block.
     SchedulerClaimSector claim_sectors[SCHEDULER_CLAIM_SECTOR_COUNT];
 };
+
+inline __aicore__ uint32_t scheduler_sector_capacity(uint32_t blocks, uint32_t part) {
+    return blocks / SCHEDULER_CLAIM_SECTOR_COUNT + (part < blocks % SCHEDULER_CLAIM_SECTOR_COUNT);
+}
 
 inline constexpr uint64_t SCHEDULER_BOOTSTRAP_CLUSTER_INIT = 1;
 inline constexpr uint64_t SCHEDULER_BOOTSTRAP_AIC_DONE = 2;
@@ -569,6 +579,9 @@ struct alignas(64) SchedulerRunControl {
     volatile uint64_t chip_swimlane_level;
     volatile uint64_t sampled_task_timing_enabled;
 
+    // A unique bit per cluster, reset before publishing any worker context.
+    uint64_t bootstrap_arrival_address;
+    uint64_t bootstrap_init_address;
     alignas(64) volatile uint64_t bootstrap_arrived_count;
     volatile uint64_t bootstrap_complete;
 
@@ -613,36 +626,17 @@ struct alignas(64) AicpuThreadLifecycleTrace {
     uint64_t exit_wait_end_cycles;
 };
 
-enum class SchedulerMixProxyPhase : uint8_t { IDLE = 0, PENDING = 1, PUBLISHED = 2, CANCELLED = 3 };
-
-// A valid MIX ticket names a 32-bit graph ref and a block within a 16-bit plan.
-inline __aicore__ constexpr uint64_t
-scheduler_mix_proxy_state(SchedulerMixProxyPhase phase, uint32_t task_ref, uint32_t block_idx) {
-    return phase == SchedulerMixProxyPhase::IDLE ?
-               0 :
-               (static_cast<uint64_t>(task_ref) << 32) | (static_cast<uint64_t>(block_idx) << 2) |
-                   static_cast<uint64_t>(phase);
+// Zero denotes an unused bank. A published MIX block fits in the 16-bit plan.
+inline __aicore__ constexpr uint64_t scheduler_mix_proxy_publication(uint32_t task_ref, uint32_t block_idx) {
+    return (static_cast<uint64_t>(task_ref) << 32) | (static_cast<uint64_t>(block_idx) + 1);
 }
 
-inline __aicore__ constexpr SchedulerMixProxyPhase scheduler_mix_proxy_phase(uint64_t state) {
-    return static_cast<SchedulerMixProxyPhase>(state & 3);
+inline __aicore__ constexpr uint32_t scheduler_mix_proxy_task_ref(uint64_t publication) {
+    return static_cast<uint32_t>(publication >> 32);
 }
 
-inline __aicore__ constexpr uint32_t scheduler_mix_proxy_task_ref(uint64_t state) {
-    return static_cast<uint32_t>(state >> 32);
-}
-
-inline __aicore__ constexpr uint32_t scheduler_mix_proxy_block_idx(uint64_t state) {
-    return static_cast<uint32_t>(state) >> 2;
-}
-
-inline constexpr uint64_t
-scheduler_mix_proxy_snapshot(uint64_t acquired, uint64_t published0, uint64_t published1, uint64_t cancelled) {
-    if (acquired == 0) return 0;
-    const uint64_t identity = acquired & ~UINT64_C(3);
-    const uint64_t published = identity | static_cast<uint64_t>(SchedulerMixProxyPhase::PUBLISHED);
-    if (published == published0 || published == published1) return published;
-    return cancelled == (identity | static_cast<uint64_t>(SchedulerMixProxyPhase::CANCELLED)) ? cancelled : acquired;
+inline __aicore__ constexpr uint32_t scheduler_mix_proxy_block_idx(uint64_t publication) {
+    return static_cast<uint32_t>(publication) - 1;
 }
 
 struct alignas(64) SchedulerWorkerContext {
@@ -678,7 +672,6 @@ struct alignas(64) SchedulerWorkerContext {
     uint64_t activity_buffers_offset;
     uint64_t pmu_cells_offset;
     uint64_t args_dump_address;
-    uint64_t done_notifications_offset;
     uint64_t completion_counters_offset;
     uint64_t native_graph_address;
     uint64_t native_graph_bytes;
@@ -687,9 +680,7 @@ struct alignas(64) SchedulerWorkerContext {
     alignas(64) uint64_t bootstrap_task_count;
     uint64_t bootstrap_start_cycles;
     uint64_t target_bootstrap_end_cycles;
-    volatile uint64_t mix_proxy_acquired;
     volatile uint64_t mix_proxy_published[SCHEDULER_MIX_MEMBER_COUNT];
-    volatile uint64_t mix_proxy_cancelled;
 };
 
 enum SchedulerExecutionIdentityFlags : uint32_t {
@@ -717,6 +708,9 @@ struct alignas(64) SchedulerTaskTrace {
     uint64_t ready_observe_cycles;
     uint64_t l2_first_pending_cycles;
     int64_t l2_first_predecessor;
+    uint64_t l2_previous_complete_cycles;
+    uint64_t l2_previous_retired_cycles;
+    uint64_t l2_claim_begin_cycles;
 
     alignas(64) uint64_t dispatch_start_cycles;
     uint64_t dispatch_end_cycles;
@@ -724,6 +718,7 @@ struct alignas(64) SchedulerTaskTrace {
     uint64_t complete_start_cycles;
     uint64_t complete_end_cycles;
     uint64_t complete_loop_iter;
+    uint64_t l2_claim_end_cycles;
 
     alignas(64) uint64_t execution_run_epoch;
     uint64_t execution_order_key;
@@ -804,8 +799,8 @@ static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 120, "di
 static_assert(offsetof(SchedulerWorkerContext, cluster_count) == 136, "topology configuration offset changed");
 static_assert(offsetof(SchedulerWorkerContext, trace_cells_offset) == 184, "diagnostic offsets changed");
 static_assert(offsetof(SchedulerWorkerContext, args_dump_address) == 208, "argument capture address changed");
-static_assert(offsetof(SchedulerWorkerContext, native_graph_address) == 232);
-static_assert(offsetof(SchedulerWorkerContext, native_graph_bytes) == 240);
+static_assert(offsetof(SchedulerWorkerContext, native_graph_address) == 224);
+static_assert(offsetof(SchedulerWorkerContext, native_graph_bytes) == 232);
 static_assert(offsetof(SchedulerWorkerContext, prepared_layout_offset) == 40, "prepared execution address changed");
 static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 256, "worker diagnostics need an owned line");
 static_assert(sizeof(SchedulerTaskTrace) == 256, "task trace layout changed");
@@ -827,34 +822,12 @@ inline __aicore__ __gm__ T *scheduler_state_at(__gm__ void *base, uint64_t offse
 
 #if !defined(__CCE_AICORE__)
 #include <type_traits>
-// A bank retains its last publication through FIN. A pending ticket can
-// coexist with an occupied bank while the proxy waits for the bank to retire.
+// Each bank retains its most recent publication for post-run and failure diagnostics.
 template <typename Visitor>
 inline void scheduler_visit_mix_proxy_records(const SchedulerWorkerContext &context, Visitor visit) {
-    static_assert(SCHEDULER_MIX_MEMBER_COUNT >= 1 && SCHEDULER_MIX_MEMBER_COUNT <= 2);
-    const uint64_t acquired = __atomic_load_n(&context.mix_proxy_acquired, __ATOMIC_ACQUIRE);
-    // The snapshot treats a disabled bank as having no publication.
-    uint64_t published[2]{};
-    for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank)
-        published[bank] = __atomic_load_n(&context.mix_proxy_published[bank], __ATOMIC_ACQUIRE);
-    const uint64_t cancelled = __atomic_load_n(&context.mix_proxy_cancelled, __ATOMIC_ACQUIRE);
-    for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank)
-        if (published[bank] != 0) visit(static_cast<int32_t>(bank), published[bank]);
-    const uint64_t latest = scheduler_mix_proxy_snapshot(acquired, published[0], published[1], cancelled);
-    const auto phase = scheduler_mix_proxy_phase(latest);
-    if (phase == SchedulerMixProxyPhase::PENDING || phase == SchedulerMixProxyPhase::CANCELLED) visit(-1, latest);
-}
-
-inline const char *scheduler_mix_proxy_phase_name(SchedulerMixProxyPhase phase) {
-    switch (phase) {
-    case SchedulerMixProxyPhase::PENDING:
-        return "pending";
-    case SchedulerMixProxyPhase::PUBLISHED:
-        return "published";
-    case SchedulerMixProxyPhase::CANCELLED:
-        return "cancelled";
-    default:
-        return "idle";
+    for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank) {
+        const uint64_t published = __atomic_load_n(&context.mix_proxy_published[bank], __ATOMIC_ACQUIRE);
+        if (published != 0) visit(static_cast<int32_t>(bank), published);
     }
 }
 
@@ -1007,7 +980,6 @@ inline bool scheduler_plan_layout(
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerWorkerContext, worker_contexts_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, uint32_t, sinks_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(task_count, uint64_t, done_notifications_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskCompletionCounter, completion_counters_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
         !scheduler_layout_reserve(

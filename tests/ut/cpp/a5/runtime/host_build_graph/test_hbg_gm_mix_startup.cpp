@@ -164,7 +164,7 @@ struct StartupFixture {
                 ASSERT_FALSE(failed);
                 if (id == UINT32_MAX) continue;
                 bool permit = false;
-                ASSERT_TRUE(scheduler_check_entry_permit(graph_view, base(), &local, run, id, &permit));
+                ASSERT_TRUE(hbg_test_check_ready_order(graph_view, base(), &local, run, id, &permit));
                 if (!permit) continue;
                 ASSERT_TRUE(hbg_test_begin_execution(&local, id));
                 const auto index = local.execution_at(id).prepared.execution_index;
@@ -273,6 +273,24 @@ INSTANTIATE_TEST_SUITE_P(
     )
 );
 
+TEST(HbgGmMixStartupExit, PeerWaitsForItsOwnInitBitEvenWithAPreseededGmGate) {
+    StartupFixture fixture({LaneMask::all(), LaneMask::all()});
+    auto *run = fixture.storage.run_control;
+    uint32_t init = 1U;  // Only cluster 0 is initialized.
+    run->bootstrap_init_address = reinterpret_cast<uint64_t>(&init);
+    run->scheduler_timeout_cycles = 1;
+    auto *gates =
+        scheduler_state_at<SchedulerBootstrapCluster>(fixture.base(), fixture.storage.layout.bootstrap_clusters_offset);
+    gates[1].state = SCHEDULER_BOOTSTRAP_CLUSTER_INIT;
+    auto *peer = fixture.storage.local_context(&fixture.storage.contexts[3]);
+    peer->cluster_signal = scheduler_cluster_signal_at(reinterpret_cast<uint64_t>(fixture.cluster_storage[1].data()));
+    ScopedStartupRegisterObserver observer([] {});
+    SchedulerWorkerStats stats{};
+    EXPECT_FALSE((bootstrap_ready_graph<false, false>(fixture.graph_view, fixture.base(), peer, run, 9, &stats, 0)));
+    EXPECT_EQ(run->error_site, static_cast<uint64_t>(SchedulerErrorSite::BOOTSTRAP_CLUSTER_INIT_TIMEOUT));
+    EXPECT_EQ(gates[1].state, SCHEDULER_BOOTSTRAP_CLUSTER_INIT);
+}
+
 TEST(HbgProtocolStartupExit, FailedBootstrapAndExitLeaveAClosedMixPrefixUnpublished) {
     StartupFixture fixture({LaneMask::both_aiv(), LaneMask::both_aiv()}, true);
     ASSERT_NO_FATAL_FAILURE(fixture.finish_both_tasks_on_early_clusters());
@@ -315,7 +333,9 @@ TEST(HbgResidentArgsDump, FinalMixReturnHoldsCompletionAndItsSuccessorUntilTheAc
     uint32_t after_polls = 0;
     for (uint32_t block = 0; block < 3; ++block) {
         bool armed = false;
-        ASSERT_TRUE(fixture.ordinary_arm(0, 0, &armed));
+        ASSERT_TRUE(scheduler_claim_for_execute(
+            fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &armed
+        ));
         ASSERT_TRUE(armed);
         for (uint32_t pass = 0; pass < 3; ++pass)
             for (uint32_t worker = 0; worker < 3; ++worker)
@@ -410,6 +430,8 @@ TEST(HbgScalarObserverLifetime, BootstrapPreservesTheResidentBinding) {
     auto *local = storage.local_context(&storage.contexts[1]);
 
     storage.run_control->scheduler_timeout_cycles = PLATFORM_PROF_SYS_CNT_FREQ;
+    uint32_t arrivals = 0;
+    storage.run_control->bootstrap_arrival_address = reinterpret_cast<uint64_t>(&arrivals);
     storage.test_graphs[1] = graph.graph();
     auto buffer = std::make_unique<SchedulerActivityBuffer>();
     auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
@@ -439,8 +461,9 @@ TEST(HbgScalarObserverLifetime, BootstrapPreservesTheResidentBinding) {
             (bootstrap_ready_graph<false, true>(graph.graph(), base, local, storage.run_control, 3, &stats, 3))
         );
         EXPECT_EQ(gates[0].state, SCHEDULER_BOOTSTRAP_CLUSTER_DONE);
-        EXPECT_EQ(storage.run_control->bootstrap_arrived_count, 3u);
-        EXPECT_EQ(storage.run_control->bootstrap_complete, 1u);
+        EXPECT_EQ(arrivals, 1u);
+        EXPECT_EQ(storage.run_control->bootstrap_arrived_count, 0u);
+        EXPECT_EQ(storage.run_control->bootstrap_complete, 0u);
         EXPECT_EQ(scheduler_scalar_current(), &trace);
         EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarAtomicFetchAdd), 0u);
         EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarGmLoad), 0u);
@@ -535,7 +558,7 @@ TEST(HbgExecutionIdentityEntryL0, MixMemberPublishesOnlyItsPhysicalReturn) {
             call->args[1] = reinterpret_cast<uint64_t>(&seen_in_kernel);
 
             bool published = false;
-            ASSERT_TRUE(f.ordinary_arm(0, 0, &published));
+            ASSERT_TRUE(scheduler_claim_for_execute(f.graph.graph(), f.base(), f.locals[1], f.run(), 0, &published));
             ASSERT_TRUE(published);
             for (uint32_t pass = 0; pass < 3; ++pass)
                 for (uint32_t lane : {0u, 2u})
@@ -599,7 +622,9 @@ TEST(HbgExecutionIdentityEntryL3, OrderedMixMemberSeesItsFullIdentityBeforeChang
     ASSERT_TRUE(fixture.prepare_calls());
     auto *member = fixture.locals[5];
     bool published = false;
-    ASSERT_TRUE(fixture.ordinary_arm(1, 1, &published));
+    ASSERT_TRUE(scheduler_claim_for_execute(
+        fixture.graph.graph(), fixture.base(), fixture.locals[4], fixture.run(), 1, &published
+    ));
     ASSERT_TRUE(published);
     auto &descriptor = fixture.signal(1)->groups[0];
     const auto block = static_cast<uint32_t>(descriptor.block_idx);

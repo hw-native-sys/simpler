@@ -76,7 +76,7 @@ completion_state 编码 total/remaining_compute/debt；具体有效性和 DONE �
 WorkerContext 首行是 core_type/physical_core_id/type_rank、run_control/task_controls/state base/
 prepared layout、worker_index/worker_contexts_offset；第二行保存完整 graph view 和 summary offset。
 metadata offset 位于 120，runtime_worker_count 位于 128，cluster 信息从 136 开始。
-trace/activity/PMU offsets 分别位于 184/192/200，args_dump_address 位于 208，done_notifications_offset 位于 216。
+trace/activity/PMU offsets 分别位于 184/192/200，args_dump_address 位于 208，completion_counters_offset 位于 216，逐任务描述 ADD 链、独立 SET 通知或 GM 完成状态。
 核内 SchedulerLocalConfig 为 96 B；每份 SchedulerFaninWait 保存 canonical control 与通知地址，共 40 B。
 最后一行从 256 开始，保存 bootstrap 统计。
 所有核都自行调度，结构中没有另一个 scheduler 角色、索引或数量。

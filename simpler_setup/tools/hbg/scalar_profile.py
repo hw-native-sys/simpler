@@ -18,14 +18,11 @@ SCALAR_OPERATIONS = {
     "scalar_task_issue_head": ("DISCOVER", "scheduler_find_issuable_task"),
     "scalar_task_issue_fanin": ("DISCOVER", "scheduler_check_predecessor_supply"),
     "scalar_task_supply_closed": ("DISCOVER", "scheduler_task_supply_closed"),
-    "scalar_cluster_mix_discover_task": ("CLAIM_BUILD", "scheduler_claim_for_build"),
-    "scalar_prepared_receive": ("BUILD", "scheduler_receive_payload"),
-    "scalar_prepared_observe": ("BUILD", "scheduler_observe_prepared_call"),
-    "scalar_prepared_validate": ("BUILD", "scheduler_prepared_call_valid"),
-    "scalar_build_payload": ("BUILD", "scheduler_build_payload"),
-    "scalar_publish_built": ("BUILD", "scheduler_publish_built"),
-    "scalar_cache_publish": ("BUILD", "scheduler_publish_dispatch_slot: payload writeback"),
-    "scalar_dispatch_metadata": ("BUILD", "scheduler_load_dispatch_metadata"),
+    "scalar_prepared_receive": ("ENTRY_PREP", "scheduler_receive_payload"),
+    "scalar_prepared_validate": ("ENTRY_PREP", "scheduler_prepared_function_address"),
+    "scalar_dispatch_metadata": ("DISPATCH", "scheduler_load_dispatch_metadata"),
+    "scalar_mix_claim_for_execution": ("CLAIM_EXECUTE", "scheduler_claim_for_execute"),
+    "scalar_mix_notify_members": ("DISPATCH", "scheduler_notify_mix_members"),
     "scalar_prepared_claim": ("CLAIM_EXECUTE", "scheduler_claim_for_execution"),
     "scalar_execution_token_fanin": ("FANIN_WAIT", "scheduler_poll_fanin"),
     "scalar_fanin_observe": ("FANIN_WAIT", "scheduler_observe_fanin_prefix"),
@@ -35,11 +32,11 @@ SCALAR_OPERATIONS = {
     "scalar_returns_contribute": ("FANOUT_PUBLISH", "scheduler_contribute_returns"),
     "scalar_counter_condition_publish": ("FANOUT_PUBLISH", "scheduler_counter_publish_condition"),
     "scalar_async_finish": ("FANOUT_PUBLISH", "scheduler_async_complete_task"),
-    "scalar_can_enter_execution": ("ENTRY_PERMIT", "scheduler_check_entry_permit"),
+    "scalar_can_enter_execution": ("ENTRY_PERMIT", "scheduler_validate_selected_entry"),
     "scalar_self_order_ready": ("ENTRY_PERMIT", "scheduler_self_order_ready"),
     "scalar_mix_lane_order_ready": ("ENTRY_PERMIT", "scheduler_mix_lane_order_ready"),
     "scalar_cluster_owes_before": ("ENTRY_PERMIT", "scheduler_cluster_owes_before"),
-    "scalar_cluster_mix_enter": ("ENTRY_PERMIT", "scheduler_cluster_mix_can_enter"),
+    "scalar_cluster_mix_enter": ("ENTRY_PERMIT", "scheduler_validate_mix_entry"),
     "scalar_prepare": ("ENTRY_PREP", "prepare_kernel_entry"),
     "scalar_cache_observe": ("ENTRY_PREP", "scheduler_observe_data_cache"),
     "scalar_async_begin_prebound": ("ENTRY_PREP", "scheduler_async_begin_prebound_execution"),
@@ -70,7 +67,6 @@ SCALAR_OPERATIONS = {
     "scalar_fill_own_slots": ("DISPATCH", "scheduler_find_local_execution"),
     "scalar_cluster_mix_service": ("DISPATCH", "scheduler_cluster_mix_service"),
     "scalar_cluster_mix_discover_next": ("DISPATCH", "scheduler_cluster_mix_discover_next"),
-    "scalar_cluster_mix_pending": ("DISPATCH", "scheduler_progress_mix_publication"),
     "scalar_cluster_mix_prepare_member": ("DISPATCH", "scheduler_prepare_mix_lane"),
     "scalar_group_acquire": ("DISPATCH", "scheduler_acquire_group_lane"),
     "scalar_execution_continuation": ("DISPATCH", "scheduler_continue_same_task"),
@@ -119,8 +115,6 @@ SCALAR_FUNCTIONS = {kind: operation for kind, (_, operation) in SCALAR_OPERATION
 
 STAGE_COLORS = {
     "DISCOVER": "thread_state_runnable",
-    "CLAIM_BUILD": "rail_load",
-    "BUILD": "rail_animation",
     "CLAIM_EXECUTE": "rail_response",
     "FANIN_WAIT": "thread_state_iowait",
     "EXECUTE": "good",
@@ -230,6 +224,8 @@ def partition(records, kernels, *, nested_kernels=False):
                         **({"hbg_stage": node["hbg_stage"]} if "hbg_stage" in node else {}),
                     }
                 )
+                if not nested_kernels and kind != "scalar_unattributed":
+                    segments[-1]["hbg_stage"] = node.get("hbg_stage") or _business_stage(kind)
                 totals[kind] += child["start_cycles"] - cursor
             cursor = child["end_cycles"]
     window = root["end_cycles"] - root["start_cycles"]
@@ -318,9 +314,11 @@ def _business_stage(kind, caller=None, caller_stage=None):
         return "SKIP"
     stage = SCALAR_OPERATIONS[kind][0]
     if kind == "scalar_ordinary_block_claim":
-        if caller == "scalar_cluster_mix_discover_task":
-            return "CLAIM_BUILD"
-        if caller in ("scalar_execution_token_refill", "scalar_execution_continuation"):
+        if caller in (
+            "scalar_mix_claim_for_execution",
+            "scalar_execution_token_refill",
+            "scalar_execution_continuation",
+        ):
             return "CLAIM_EXECUTE"
     if stage in ("MEM", "OBSERVE") and caller_stage not in (None, "DISPATCH", "MEM", "OBSERVE", "CLAIM"):
         return caller_stage

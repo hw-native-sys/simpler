@@ -153,7 +153,7 @@ struct OrderedFixture {
         const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base(), local->config.task_catalog_offset);
         const auto catalog = scheduler_task_catalog(base(), pool, local->config.self_core_type);
         for (uint64_t index = 0; index < catalog.count; ++index) {
-            if (catalog.refs[index] != static_cast<int64_t>(task)) continue;
+            if (catalog.entries[index].ref != static_cast<int64_t>(task)) continue;
             for (uint64_t visit = 0; visit <= catalog.count; ++visit) {
                 bool progress = false;
                 if (!scheduler_refill_execution_tokens(graph.graph(), base(), local, run(), profiling, &progress))
@@ -198,13 +198,12 @@ struct OrderedFixture {
         uint32_t slot = UINT32_MAX;
         if (!hbg_test_find_eligible(local, &slot)) return false;
         bool permit = false;
-        if (!scheduler_check_entry_permit(graph.graph(), base(), local, run(), slot, &permit) || !permit) return false;
+        if (!hbg_test_check_ready_order(graph.graph(), base(), local, run(), slot, &permit) || !permit) return false;
         if (!hbg_test_begin_execution(local, slot)) return false;
         const auto index = local->execution_at(slot).prepared.execution_index;
         auto *call = scheduler_prepared_call_at(base(), local->config.prepared, index);
         auto *binding = scheduler_execution_binding_at(base(), local->config.prepared, index);
-        const uint64_t function =
-            local->execution_at(slot).predicate == SchedulerPredicateState::FAIL ? 0 : call->function_bin_addr;
+        const uint64_t function = local->execution_at(slot).skip_kernel ? 0 : call->function_bin_addr;
         *execution = {
             local->execution_at(slot).task_ref,
             static_cast<uint32_t>(binding->local_context.block_idx),
@@ -244,7 +243,7 @@ class HbgOrderedSharedOrdinaryWork : public ::testing::TestWithParam<LaneMask> {
 class HbgOrderedWithoutSsbuf : public ::testing::TestWithParam<LaneMask> {};
 class HbgOrdinaryTokenProbe : public ::testing::TestWithParam<std::tuple<LaneMask, LaneMask>> {};
 
-TEST(HbgOrderedControl, NotifyBeforeAccountingStillCountsExactlyOnceAndRejectsInvalidGate) {
+TEST(HbgOrderedControl, DedicatedNotifyCompletesWithoutGmAccountingAndRejectsInvalidGate) {
     using scheduler_test::gm_mix::GmMixFixture;
     using scheduler_test::gm_mix::GmShape;
     for (bool invalid : {false, true}) {
@@ -252,8 +251,11 @@ TEST(HbgOrderedControl, NotifyBeforeAccountingStillCountsExactlyOnceAndRejectsIn
         shape.inline_task = true;
         GmMixFixture fixture({shape}, false, 1);
         uint32_t notification = 0;
-        scheduler_state_at<uint64_t>(fixture.base(), fixture.storage.layout.done_notifications_offset)[0] =
-            reinterpret_cast<uint64_t>(&notification);
+        for (auto *local : fixture.locals)
+            local->config.completion_counters_offset = fixture.storage.layout.completion_counters_offset;
+        scheduler_state_at<SchedulerTaskCompletionCounter>(
+            fixture.base(), fixture.storage.layout.completion_counters_offset
+        )[0] = scheduler_set_completion_source(reinterpret_cast<uint64_t>(&notification));
         if (invalid) fixture.control(0)->completion_state = UINT64_MAX;
         bool progress = false;
         const bool succeeded = scheduler_progress_graph_controls(
@@ -261,13 +263,14 @@ TEST(HbgOrderedControl, NotifyBeforeAccountingStillCountsExactlyOnceAndRejectsIn
         );
         EXPECT_EQ(succeeded, !invalid);
         EXPECT_EQ(notification, invalid ? 0u : 1u);
-        EXPECT_EQ(fixture.storage.completed_gm_records(), invalid ? 0u : 1u);
+        EXPECT_EQ(fixture.storage.completed_gm_records(), 0u);
         if (invalid) continue;
         ASSERT_TRUE(scheduler_progress_graph_controls(
             fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &progress
         ));
-        EXPECT_EQ(fixture.storage.completed_gm_records(), 1u);
-        EXPECT_TRUE(scheduler_completion_done(fixture.control(0)->completion_state));
+        EXPECT_FALSE(progress);
+        EXPECT_EQ(notification, 1u);
+        EXPECT_EQ(fixture.control(0)->completion_state, scheduler_completion_initial_state(1));
     }
 }
 
@@ -440,6 +443,9 @@ TEST(HbgOrderedScalarDetail, NonAdmissionFillExposesClaimReceiveAndDirectTransfe
         SchedulerScalarBinding binding;
         binding.attach(&trace);
         ASSERT_TRUE(fixture.fill(0));
+        // The first fill claims the empty slot. The next selector pass progresses the owned slot.
+        ASSERT_NE(hbg_test_eligible_mask(fixture.locals[0]), 0u);
+        ASSERT_TRUE(fixture.fill(0));
     }
     EXPECT_NE(hbg_test_eligible_mask(fixture.locals[0]), 0u);
     EXPECT_EQ(trace.depth, 0u);
@@ -453,7 +459,6 @@ TEST(HbgOrderedScalarDetail, NonAdmissionFillExposesClaimReceiveAndDirectTransfe
           "scalar_execution_token_progress", "scalar_dispatch_metadata", "scalar_select_owned_execution"})
         EXPECT_NE(std::find(names.begin(), names.end(), name), names.end()) << name;
     EXPECT_EQ(std::find(names.begin(), names.end(), "scalar_fanin_observe"), names.end());
-    EXPECT_EQ(std::find(names.begin(), names.end(), "scalar_cache_publish"), names.end());
     EXPECT_EQ(std::find(names.begin(), names.end(), "scalar_ordered_fill"), names.end());
     EXPECT_EQ(buffer->scalar_dropped, 0u);
 }
@@ -623,7 +628,7 @@ TEST_P(HbgOrderedFirstReady, ExhaustedOrdinarySupplyStopsRetriesWithoutReplacing
     EXPECT_EQ(fixture.control(0)->claim_seal, 0u);
     EXPECT_EQ(local->issue_cursor, 0u);
     EXPECT_EQ(scheduler_cached_task_proof(local, 0), SchedulerTaskProof::NONE);
-    EXPECT_TRUE(local->issue_ticket_exhausted);
+    EXPECT_TRUE(local->issue_binding.ticket_exhausted);
     EXPECT_EQ(scheduler_execution_token_count(local), 0u);
     EXPECT_EQ(fixture.control(1)->next_block, 0u);
 
@@ -633,8 +638,8 @@ TEST_P(HbgOrderedFirstReady, ExhaustedOrdinarySupplyStopsRetriesWithoutReplacing
     );
     EXPECT_TRUE(progress);
     EXPECT_EQ(local->issue_cursor, 1u);
-    EXPECT_EQ(local->issue_task_ref, 1);
-    EXPECT_FALSE(local->issue_ticket_exhausted);
+    EXPECT_EQ(local->issue_binding.task_ref, 1);
+    EXPECT_FALSE(local->issue_binding.ticket_exhausted);
     EXPECT_EQ(fixture.control(1)->next_block, 1u);
     EXPECT_TRUE(scheduler_execution_token_has_task(local, 1));
     EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 0u);
@@ -829,10 +834,7 @@ TEST_P(HbgOrdinaryTokenProbe, OrdinaryTokenRecordsDiscoveryAndAcquireBeforeDispa
     EXPECT_GT(trace.dispatch_start_cycles, 0u);
     uint32_t owner = UINT32_MAX;
     ASSERT_TRUE(hbg_test_find_eligible(fixture.locals[worker], &owner));
-    EXPECT_EQ(
-        fixture.locals[worker]->execution_at(owner).rank,
-        scheduler_order_for(fixture.base(), fixture.locals[worker], 0).rank
-    );
+    EXPECT_EQ(fixture.locals[worker]->execution_at(owner).rank, scheduler_order_for(fixture.locals[worker], 0).rank);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
 }
 
@@ -894,9 +896,7 @@ TEST(HbgExecutionTokens, ClaimUnreadyBlocksOnceAndExecuteAfterTheDependencyGate)
         ));
         EXPECT_EQ(direct, UINT32_MAX);
         EXPECT_EQ(hbg_test_eligible_mask(local), 0u);
-        for (const auto &owned : local->execution_tokens)
-            if (owned.phase == SchedulerExecutionTokenPhase::WAIT_FANIN)
-                EXPECT_EQ(owned.state, SchedulerDispatchSlotState::FILLING);
+        EXPECT_EQ(local->execution_tokens[0].state, SchedulerDispatchSlotState::FILLING);
     }
     EXPECT_EQ(fixture.control(1)->next_block, 3u);
     EXPECT_NE(

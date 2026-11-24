@@ -170,8 +170,11 @@ run.
 
 Every AICore reports its physical identity and the current launch epoch before
 waiting for the AICPU. AICPU threads discover disjoint worker partitions; the
-leader checks topology and configures the per-worker contexts. GM READY publishes
-the contexts. Workers bootstrap their graph partitions while the execution gate
+leader checks topology and configures the per-worker contexts. With a leased
+CntNotify, each worker samples the READY word before reporting. After accepting
+all reports, the leader toggles that word once to publish the configured contexts.
+A worker observes the change before accessing its entry in the context array.
+Without the lease the AICPU publishes context addresses and READY per worker in GM. Workers bootstrap their graph partitions while the execution gate
 remains closed; AICPU opens the DATA_MAIN_BASE gate only after bootstrap succeeds.
 
 A5 HBG accepts only resident modes 1/2. An invalid mode, null or misaligned
@@ -385,13 +388,20 @@ each worker validates its context, graph view, epoch, prepared layout, immutable
 engine catalog and topology. No Graph child argument binding runs on the device:
 Host has already published those arguments and Calls.
 
-Each cluster has a run-initialized 128-byte atomic-only GM gate. When the graph
-uses MIX, AIV0 clears its cluster's SSBUF bank and publishes INIT. AIC
-and AIV1 confirm INIT before accessing the bank. Host seeds INIT for graphs
-without MIX. Each worker services bounded control-node scans and prepares its
+For MIX, AICPU clears a run-scoped INIT bitmap before publishing the worker
+contexts. After clearing its cluster's SSBUF and executing the publication
+barrier, AIV0 sets its cluster bit. AIC and AIV1 observe that bit and execute
+the receive barrier before using SSBUF. Each cluster's isolated 128-byte GM
+word tracks the subsequent DONE reports. Host seeds its INIT bit as the base
+for that accumulation. If the optional INIT bitmap is unavailable, AIV0
+publishes INIT through the GM word and its peers confirm it there. Graphs
+without MIX use the preseeded GM word. Each worker services bounded control-node scans and prepares its
 first execution. AIC and AIV1 then publish their respective DONE bits. Once
-AIV0 confirms both bits, it credits all three workers. The final cluster
-publishes `bootstrap_complete`; AICPU then opens the DMB launch gate. A failed
+AIV0 confirms both bits and completes its own fill, it sets its cluster bit in
+a run-scoped CntNotify. AICPU clears this word before publishing any worker
+context and opens the DMB launch gate after observing the full participation
+mask. Launches without a mapped word use the GM arrival count and final
+`bootstrap_complete` publication. A failed
 lane contributes no success, and no kernel may enter before this gate opens.
 
 ENTER, EXIT and inline control nodes use bounded scans rather than a ready inbox.
@@ -420,8 +430,7 @@ identifies the fixed owner and the execution phase. An ordinary block claim
 fixes the worker. For MIX, the proxy's block claim and stable SSBUF generation
 identify one worker per active lane. Each worker validates its Call and binding. The
 claim alone grants no permission to consume business input data.
-Call acquisition completes in the same bounded invocation; it has no pending-build
-result or separate binding-ready bit. Cooperative preparation requires an explicit
+The worker receives its Host-prepared Call in the same invocation. Cooperative preparation requires an explicit
 lane and rejects predicates; ordinary execution tokens retain predicate evaluation.
 
 When a MIX member first accepts a descriptor, it validates the task and caches
@@ -479,6 +488,19 @@ can advance the catalog without loading DONE. Native Graph nodes and
 predicated tasks still check logical completion, since they can finish without
 issuing every block. The consumer checks data dependencies before execution.
 
+For packed sectors, the final valid claimant from each sector reports its bit
+after binding. For an ordinary task without sync-start, every reporter that
+observes the full mask can store the same terminal block count and supply
+seal. Cooperative reporters elect a single publisher for the ordered seal.
+Both paths keep data completion separate from supply.
+
+For a flat graph, Host marks runs of three consecutive dynamic ordinary entries
+in each engine catalog. When an idle worker reaches a new run, a real claim on
+the third entry proves that an issuer already passed the first two supply seals.
+The worker can advance directly to the third entry and perform its own normal
+claim and data checks. Fixed owners, MIX, predicates and sync-start split runs.
+A worker that owes a local execution services it at the usual cursor boundary.
+
 For an exact wave, Host marks the expanded task with `SCHEDULER_TASK_FIXED_OWNER`.
 A pure AIC block maps to its cluster index, and a pure AIV block maps to twice
 its cluster index plus its vector lane (0 or 1). A 1C1V or 1C2V block maps to
@@ -496,20 +518,37 @@ Each core has one ordinary self-claim slot and one MIX member slot. An
 ordinary claim fixes the slot and owner for one block. A MIX member accepts
 the descriptor from its cluster's SSBUF bank into its MIX slot. Both slots
 retain their identity from preparation through physical return and retirement.
-Each slot retains its fanin cursor and the current pending predecessor’s
-reference and completion source while the scheduler services other work.
+Each slot checks the exact producer's run-local DONE proof before reading its
+metadata or binding its completion source. A supply-closed proof still
+requires observing completion. Each slot retains its fanin cursor and the
+current pending predecessor’s reference and completion source while the
+scheduler services other work.
 On retry, the worker checks for completion again. It clears the binding
 when the cursor advances or the slot is reused. The end of the fanin list
 indicates that all predecessors are ready.
 
+Before claiming an ordinary block and again after binding it, a non-publishing
+member checks its cluster's SSBUF generation. A new generation naming this
+lane gets the usual MIX dependency and order checks. A ready MIX is picked
+first. A blocked MIX leaves the ordinary slot available to run its predecessor.
+After binding, the ordinary slot keeps its ticket until it resumes. The MIX
+member records a dependent ordinary slot at descriptor receipt or when the
+ordinary slot first waits on it. While that member is published, its private
+flag ends the search after servicing the member. The ordinary slot checks its
+remaining dependencies after the member returns. The probe
+compares local state and SSBUF fields without polling GM.
+
 Once fanin completes, the worker publishes the payload in the same slot.
 A false predicate skips the function and retains its return obligations.
-Direct dispatch passes the selected slot index to the executor. Queued
-dispatch selects a slot from the local ready set. Both paths check the
-applicable epoch and cooperative entry conditions before invoking the Call. At MIX pickup the expected
-epoch comes from the validated run-local snapshot. Immediate picks reuse the
-worker's READY check; the generation acquire and owner check still gate entry.
-L2 profiling saves the trace index at READY for identity capture and retirement.
+Ordinary selection checks the applicable order before passing the slot to the
+executor. Each core keeps its worker ID from the validated run topology. Entry
+validates the READY state, the owner and the worker error word.
+A MIX member also acquires the SSBUF generation and verifies the run epoch.
+The selected worker then indexes the run's fixed Call and Binding tables and invokes the kernel.
+L1, L2 and L3 retain the trace cell resolved at READY through identity capture
+and retirement. Unsampled L0 sets READY in the private slot. A lane that
+has settled the same SSBUF generation can satisfy its own FIN check locally.
+An accountant settles only after it publishes the accounting receipt.
 When a kernel returns with outstanding deferred conditions, the registering worker
 retains its CHECK group and polls the pending entries from its local queue until they settle.
 
@@ -524,9 +563,9 @@ The consumer issues at most two single-line DCCI operations followed by one
 barrier. A larger footprint or an unproven access uses full-cache maintenance.
 A kernel proven to have no such accesses skips both operations.
 
-AIV0 claims the MIX block and release-publishes its task, block, rank and lane
-mask in a cluster SSBUF bank. Each named worker accepts a stable generation
-once and prepares its own Call. Execution still requires fanin, ordering and
+AIV0 selects an available cluster SSBUF bank, claims one MIX block for execution,
+and release-publishes its task, block, rank and lane mask in that bank in the same call. Each named worker accepts a stable generation
+once and receives its Host-prepared Call. Execution still requires fanin, ordering and
 the applicable sync-start permit. When a participating lane has an earlier
 conflicting pure sync-start cohort, every member publishes ARRIVED and waits
 for all active arrivals for this generation. Otherwise each member can enter
@@ -534,15 +573,12 @@ after its local arrival. Deferred dependencies gate consumers at fan-in, and the
 scheduler loop services outstanding async conditions. Each returning member publishes its generation-tagged FIN. When AIV0 needs
 the bank again, or drains the run, it checks FIN for every named member.
 Protocol capture additionally records an accountant receipt.
-The proxy records its latest claim, the last group published to the bank,
-and an unpublished cancellation. The published identity survives a subsequent
-claim waiting for the bank. At L0–L3 the member keeps CLAIMED and ENTERED in
-its handle and publishes RETURNED in GM on physical return. While the cell is
-BUILT, Host exports null for entry and ownership. With L4 protocol capture,
-the member also publishes CLAIMED on receipt and ENTERED at its kernel call
-boundary. A timeout can therefore distinguish a claimed member waiting for
-fan-in from a member that reached that boundary. Run errors identify the
-failing operation. Aborting an unpublished group leaves its members BUILT.
+The proxy records the last execution ticket published to each bank. At L0–L3 the member
+keeps CLAIMED and ENTERED in its handle and publishes RETURNED in GM on physical
+return. While the cell is BUILT, Host exports null for entry and ownership. With L4
+protocol capture, the member also publishes CLAIMED on receipt and ENTERED at its
+kernel call boundary. A timeout can distinguish a member waiting for fan-in from one
+that reached the call boundary. Run errors identify the failing operation.
 
 The final MIX entry permit reads the SSBUF generation with an acquire barrier.
 A synchronous member can enter the kernel directly after that acquire when
@@ -565,6 +601,10 @@ credit. Enqueuing another group or advancing the head invalidates the cached
 address. The resident loop continues its periodic error check between iterations.
 Consumers still consult the run-wide activation flag.
 
+When required CntNotify creation exhausts the device quota, the runner releases
+idle optional pools in the same context and retries once if it reclaimed capacity.
+Live run and capture/replay leases keep their pools throughout the retry.
+
 A5 Host requires all requested CntNotify
 slots to be mapped and 32-byte aligned before publishing the image. A missing
 slot or invalid mapping fails preparation. On CPU/sim the GM accountant waits for
@@ -572,6 +612,12 @@ every active member's successful FIN and contributes the active lane count in
 one update. Both paths retire the bank only after the successful FIN check.
 
 ### 7.3 Canonical Completion and Retirement
+
+On A5, an ordinary ticket owner cleans its RETURNED line on physical return.
+The fence before the CntNotify credit publishes that line with the kernel's writes.
+An error fences the return before releasing the lane. Protocol capture keeps its
+separate publication boundary. The unprofiled resident variant omits the timing
+bookkeeping at retirement. Sampled L0 and higher profiling levels retain it.
 
 On the GM path, `completion_state` encodes the immutable total in bits 63:48,
 remaining computation in bits 47:32 and debt in bits 31:0. The initial state

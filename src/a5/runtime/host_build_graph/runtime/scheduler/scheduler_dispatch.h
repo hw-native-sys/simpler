@@ -15,56 +15,58 @@
 #include "scheduler_execution_tokens.h"
 #include "scheduler_cluster_mix.h"
 
-// The returning coordinator can bind its fixed ordinary head or publish the next MIX.
-// An existing MIX reservation keeps publication priority.
+// An idle coordinator can give a waiting MIX head its ticket before re-entering the selector.
 static inline __aicore__ bool scheduler_continue_coordinator_head(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level
+    uint64_t profiling_level, bool returned_mix, uint32_t *selected
 ) {
-    bool progress = false;
-    if (scheduler_task_ref_is_null(local->cluster_pending.task_ref)) {
-        const auto &catalog = local->config.engine_catalog;
-        if (local->issue_cursor >= catalog.count || scheduler_has_execution_tokens(local)) return true;
-        const int64_t ref = catalog.refs[local->issue_cursor];
-        if (!scheduler_task_ref_valid(graph, ref)) return scheduler_issue_fail(graph, local, run, ref);
-        const auto flags = scheduler_task_metadata_at(base, local, ref)->flags;
-        if (!scheduler_task_has_fixed_owners(flags)) return true;
-        bool ready = false;
-        if (!scheduler_check_predecessor_supply(graph, base, local, run, ref, &ready)) return false;
-        if (!ready) return true;
-        if (scheduler_task_uses_execution_tokens(flags)) {
-            SchedulerIssueSnapshot head{ref, true};
-            return scheduler_refill_execution_tokens(graph, base, local, run, profiling_level, &progress, &head);
-        }
-        if (!scheduler_task_is_mix(flags)) return true;
-        if (!scheduler_claim_for_build(graph, base, local, run, ref, &progress)) return false;
-        if (!progress) return true;
+    const auto &catalog = local->config.engine_catalog;
+    if (local->issue_cursor >= catalog.count || scheduler_has_execution_tokens(local)) return true;
+    const bool ordinary_prefix = !returned_mix && local->issue_cursor < catalog.terminal_mix_begin;
+    const bool idle_proxy =
+        local->mix_groups[0].phase == SchedulerGmMixPhase::IDLE && local->next_mix_ref != UINT32_MAX;
+    if (ordinary_prefix && !idle_proxy) return true;
+    const auto &entry = catalog.entries[local->issue_cursor];
+    const int64_t ref = entry.ref;
+    const bool waiting_mix = idle_proxy && ref == local->next_mix_ref;
+    if (ordinary_prefix && !waiting_mix) return true;
+    if (!scheduler_task_ref_valid(graph, ref)) return scheduler_issue_fail(graph, local, run, ref);
+    const auto flags = scheduler_task_metadata_at(base, local, ref)->flags;
+    if (!scheduler_task_has_fixed_owners(flags)) {
+        if (!waiting_mix) return true;
+        bool progress = false;
+        return scheduler_cluster_mix_discover_next(graph, base, local, run, &progress);
     }
-    return scheduler_progress_mix_publication(graph, base, local, run, &progress);
+    if (!scheduler_task_is_mix(flags) || local->issue_cursor < catalog.terminal_mix_begin) {
+        if (!scheduler_bind_issue_entry(graph, base, local, run, static_cast<uint32_t>(local->issue_cursor)))
+            return false;
+        bool ready = false;
+        if (!scheduler_check_predecessor_supply(graph, base, local, run, local->issue_binding.supply_input, &ready))
+            return false;
+        if (!ready) return true;
+    }
+    bool progress = false;
+    if (scheduler_task_uses_execution_tokens(flags)) {
+        SchedulerIssueSnapshot head{ref, true};
+        static_assert(SCHEDULER_MIX_MEMBER_COUNT == 1);
+        if (local->mix_groups[0].phase != SchedulerGmMixPhase::IDLE) selected = nullptr;
+        return scheduler_refill_execution_tokens(graph, base, local, run, profiling_level, &progress, &head, selected);
+    }
+    if (!scheduler_task_is_mix(flags)) return true;
+    return scheduler_claim_for_execute(graph, base, local, run, ref, &progress);
 }
 
 template <bool RecordProtocol = true>
-static inline __aicore__ bool scheduler_check_entry_permit(
+static inline __aicore__ bool scheduler_validate_selected_entry(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint32_t index, bool *permit, bool selection_checked = false
+    uint32_t index
 ) {
-    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarCanEnterExecution);
-    *permit = false;
-    if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     const auto &owner = local->execution_at(index);
-    scope.set_task_ref(owner.task_ref);
-    if (owner.cluster_mix) {
-        if (!scheduler_cluster_mix_can_enter(graph, local, run, index, permit, selection_checked)) return false;
-    } else if (selection_checked) {
-        // Selection acquired the applicable MIX floor and discharged earlier obligations on this lane.
-        *permit = true;
-    } else if (!scheduler_self_order_ready(
-                   graph, base, local, run, owner.rank, owner.required_floor, owner.sync_start, permit
-               )) {
-        return false;
-    }
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarCanEnterExecution, owner.task_ref);
+    if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+    if (index >= SCHEDULER_CLUSTER_MIX_EXECUTION && !scheduler_validate_mix_entry(graph, local, run)) return false;
     if constexpr (RecordProtocol) {
-        if (*permit && scheduler_protocol_enabled(local)) {
+        if (scheduler_protocol_enabled(local)) {
             const uint32_t mix = !owner.cluster_mix && owner.required_floor != 0 ? local->observed_mix_floor : 0;
             const uint32_t self = owner.cluster_mix ? local->observed_self_floor : 0;
             scheduler_protocol_execution_permit(base, local, index, mix, self);
@@ -75,32 +77,23 @@ static inline __aicore__ bool scheduler_check_entry_permit(
 
 static inline __aicore__ bool scheduler_progress_mix_groups(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, bool *progress, uint32_t *selected = nullptr
+    uint64_t profiling_level, bool *progress
 ) {
     SchedulerScalarScope scope(local, SchedPhaseKind::ScalarServiceCooperativeSlots);
     if (local->cluster_signal == nullptr) return true;
-    const uint32_t previous_generation = local->last_mix_generation;
-    const uint32_t pending_rank = local->cluster_pending.rank;
     bool advanced = false;
-    if (!scheduler_progress_mix_publication(graph, base, local, run, &advanced)) return false;
-    *progress = *progress || advanced;
-    if (!scheduler_advance_mix_floor(graph, base, local, run, progress)) return false;
-    if (selected != nullptr && previous_generation != local->last_mix_generation) {
-        // A delayed publication can follow younger ordinary claims. Reuse the regular selection
-        // only if every bound ordinary block precedes the descriptor just released to the peers.
-        bool has_earlier = false;
-        for (const auto &token : local->execution_tokens) {
-            if (token.phase == SchedulerExecutionTokenPhase::EMPTY) continue;
-            has_earlier = token.rank < pending_rank;
-            if (!has_earlier) break;
-        }
-        if (has_earlier) {
-            if (!scheduler_progress_execution_tokens(graph, base, local, run, profiling_level, selected, &advanced))
+    if (local->is_mix_coordinator() &&
+        ((!SCHEDULER_REQUIRES_CNT_NOTIFY && local->config.completion_counters_offset == 0) ||
+         scheduler_protocol_enabled(local))) {
+        for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank) {
+            const uint32_t generation =
+                scheduler_cluster_load_field(&local->cluster_signal->groups[bank].armed_generation);
+            if (scheduler_cluster_mix_armed(generation) &&
+                !scheduler_cluster_mix_recycle(graph, local, run, bank, generation, progress))
                 return false;
-            *progress = *progress || advanced;
-            if (*selected != UINT32_MAX) return true;
         }
     }
+    if (!scheduler_advance_mix_floor(graph, base, local, run, progress)) return false;
     if (!scheduler_cluster_mix_service(graph, base, local, run, profiling_level, &advanced)) return false;
     *progress = *progress || advanced;
     return true;
@@ -116,21 +109,26 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_find_local_exe
     if (out == nullptr) out = &ignored;
     *out = UINT32_MAX;
     bool progress = false;
-    *failed = !scheduler_progress_mix_groups(graph, base, local, run, profiling_level, &progress, out);
-    if (*failed || *out != UINT32_MAX) return progress;
+    *failed = !scheduler_progress_mix_groups(graph, base, local, run, profiling_level, &progress);
+    if (*failed) return progress;
     *out = scheduler_cooperative_execution(local);
     if (*out != UINT32_MAX) return progress;
-    // This generation's fixed dependent cannot execute before our member returns.
-    // Its still-unclaimed head also proves the sole ordinary slot was empty.
+    // A fixed dependent head or an owned slot waiting on this MIX cannot
+    // advance until this member contributes. Its fanin and order were serviced above.
     const auto &member = local->mix_groups[0];
-    if (member.fixed_consumer_waits && member.phase == SchedulerGmMixPhase::PUBLISHED) return progress;
+    if (member.ordinary_consumer_waits && member.phase == SchedulerGmMixPhase::PUBLISHED) return progress;
     bool advanced = false;
-    *failed = !scheduler_progress_execution_tokens(graph, base, local, run, profiling_level, out, &advanced);
-    progress = progress || advanced;
-    if (*failed || *out != UINT32_MAX) return progress;
+    const auto &catalog = local->config.engine_catalog;
+    // An empty ordinary slot has no fanin or order to progress. Normal head discovery
+    // checks worker error before issuing work; terminal and drain paths keep the poll here.
+    const bool discover_head = local->issue_cursor < catalog.count && local->issue_cursor < catalog.terminal_mix_begin;
+    if (!discover_head || scheduler_has_execution_tokens(local)) {
+        *failed = !scheduler_progress_execution_tokens(graph, base, local, run, profiling_level, out, &advanced);
+        progress = progress || advanced;
+        if (*failed || *out != UINT32_MAX) return progress;
+    }
 
     // Always advance owned members and tickets. Exhausting the catalog only stops new claims.
-    const auto &catalog = local->config.engine_catalog;
     if (local->config.prepared != nullptr && local->issue_cursor == catalog.count) return progress;
 
     // A completed ordinary block proves fanin for another block in the same run.
@@ -139,41 +137,55 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_find_local_exe
     constexpr uint32_t kMaxConsecutiveContinuations = 3;
     const int64_t previous = local->continuation_task_ref;
     if (!scheduler_task_ref_is_null(previous) && local->continuation_streak < kMaxConsecutiveContinuations &&
-        previous == local->issue_task_ref && previous == local->issue_binding.task_ref &&
-        local->issue_fanin_confirmed && !local->issue_ticket_exhausted) {
-        if (local->issue_cursor < catalog.count && catalog.refs[local->issue_cursor] == previous) {
-            SchedulerIssueSnapshot continuation{previous, true};
-            *failed = !scheduler_refill_execution_tokens(
-                graph, base, local, run, profiling_level, &advanced, &continuation, out
-            );
-            progress = progress || advanced;
-            if (*failed) return progress;
-            if (advanced) {
-                ++local->continuation_streak;
-                return progress;
-            }
+        previous == local->issue_binding.task_ref && local->issue_cursor == local->issue_binding.catalog_index &&
+        local->issue_binding.fanin_confirmed && !local->issue_binding.ticket_exhausted) {
+        SchedulerIssueSnapshot continuation{previous, true};
+        *failed =
+            !scheduler_refill_execution_tokens(graph, base, local, run, profiling_level, &advanced, &continuation, out);
+        progress = progress || advanced;
+        if (*failed) return progress;
+        if (advanced) {
+            ++local->continuation_streak;
+            return progress;
         }
     }
     local->continuation_streak = 0;
     SchedulerIssueSnapshot head{};
+    const bool terminal = local->issue_cursor >= catalog.terminal_mix_begin && local->issue_cursor < catalog.count;
+    if (terminal && !local->is_mix_coordinator()) {
+        local->issue_cursor = catalog.count;
+        return true;
+    }
     if (local->is_mix_coordinator() && local->cluster_signal != nullptr) {
-        if (!scheduler_cluster_mix_discover_next(graph, base, local, run, &advanced, &head)) {
-            *failed = true;
-            return progress;
+        bool published = false;
+        if (terminal) {
+            *failed = !scheduler_claim_for_execute(
+                graph, base, local, run, catalog.entries[local->issue_cursor].ref, &published
+            );
+            progress = progress || published;
+        } else {
+            *failed = !scheduler_cluster_mix_discover_next(graph, base, local, run, &advanced, &head, &published);
+            progress = progress || advanced;
         }
-        progress = progress || advanced;
-        if (advanced && !scheduler_task_ref_is_null(local->cluster_pending.task_ref)) {
-            // Only a new group claim needs immediate service. Advancing the catalog cursor alone publishes no
-            // descriptor.
-            if (!scheduler_progress_mix_groups(graph, base, local, run, profiling_level, &progress, out)) {
+        if (*failed) return progress;
+        if (published) {
+            // Peers can receive the new descriptor immediately. This coordinator's owned ordinary
+            // blocks precede the published catalog head and may have become runnable during publication.
+            if (scheduler_has_execution_tokens(local)) {
+                *failed =
+                    !scheduler_progress_execution_tokens(graph, base, local, run, profiling_level, out, &advanced);
+                progress = progress || advanced;
+                if (*failed || *out != UINT32_MAX) return progress;
+            }
+            if (!scheduler_progress_mix_groups(graph, base, local, run, profiling_level, &progress)) {
                 *failed = true;
                 return progress;
             }
-            if (*out != UINT32_MAX) return progress;
             *out = scheduler_cooperative_execution(local);
             if (*out != UINT32_MAX) return progress;
         }
     }
+    if (terminal) return progress;
     if (!scheduler_refill_execution_tokens(graph, base, local, run, profiling_level, &advanced, &head, out)) {
         *failed = true;
         return progress;

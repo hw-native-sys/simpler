@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from _capture_builder import Capture
 
+from simpler_setup.tools.hbg.kernel_gaps import kernel_gap_events
 from simpler_setup.tools.hbg.phases import SCALAR_PHASES
 from simpler_setup.tools.hbg.scalar_profile import SCALAR_FUNCTIONS, analyze_streams, partition, trace_events
 from simpler_setup.tools.swimlane_converter import _atomic_json, generate_chrome_trace_json, read_perf_data
@@ -72,8 +73,8 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
     assert [(event["name"], event["dur"]) for event in events] == [
         ("DISPATCH · refill_execution_tokens(t7)", 8.0),
         ("DISPATCH · bind_ticketed_execution(t7)", 4.0),
-        ("BUILD · receive_payload(t7)", 2.0),
-        ("BUILD · DCCI: SINGLE CACHELINE_ALL issue", 0.1),
+        ("ENTRY_PREP · receive_payload(t7)", 2.0),
+        ("ENTRY_PREP · DCCI: SINGLE CACHELINE_ALL issue", 0.1),
         ("ENTRY_PERMIT · self_order_ready(t7)", 2.0),
     ]
     assert [event["args"]["scalar_depth"] for event in events] == [1, 2, 3, 4, 2]
@@ -81,10 +82,10 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
 
 
 @pytest.mark.parametrize(
-    ("caller", "expected"),
-    [("scalar_cluster_mix_discover_task", "CLAIM_BUILD"), ("scalar_execution_token_refill", "CLAIM_EXECUTE")],
+    "caller",
+    ["scalar_mix_claim_for_execution", "scalar_execution_token_refill"],
 )
-def test_ticket_and_primitive_inherit_only_direct_recorded_claim(caller, expected):
+def test_ticket_and_primitive_inherit_only_direct_recorded_claim(caller):
     records = [
         window() | {"function_min_cycles": 1},
         record(caller, 12, 50, 1),
@@ -93,8 +94,8 @@ def test_ticket_and_primitive_inherit_only_direct_recorded_claim(caller, expecte
         record("scalar_bypass_load", 25, 26, 4),
     ]
     rows = {row["kind"]: row for row in partition(records, [])["rows"]}
-    assert rows["scalar_ordinary_block_claim"]["hbg_stage"] == expected
-    assert rows["scalar_atomic_fetch_add"]["hbg_stage"] == expected
+    assert rows["scalar_ordinary_block_claim"]["hbg_stage"] == "CLAIM_EXECUTE"
+    assert rows["scalar_atomic_fetch_add"]["hbg_stage"] == "CLAIM_EXECUTE"
     assert "hbg_stage" not in rows["scalar_bypass_load"]
 
 
@@ -198,6 +199,32 @@ def test_kernel_join_is_scoped_to_worker_and_run():
     assert not partial["complete"]
     assert not partial["exclusive"]
     assert "exclusive_cycles" not in partial
+
+
+def test_kernel_gap_clips_idle_but_charges_overlapping_scalar_work_once(tmp_path):
+    capture = Capture(runtime="host_build_graph", level=3, clock_freq_hz=1_000_000)
+    capture.task(task_id=7, start=20, end=30).task(task_id=8, start=70, end=80, receive_to_start=5)
+    capture.aicore_sched_phase(
+        phase="scalar_window",
+        start=10,
+        end=90,
+        metrics={"scalar_depth": 0, "scalar_calls": 1, "function_min_cycles": 0},
+    )
+    capture.aicore_sched_phase(
+        phase="scalar_fill_own_slots", start=35, end=55, metrics={"scalar_depth": 1, "scalar_calls": 1}
+    )
+    capture.aicore_sched_phase(phase="idle", start=28, end=42)
+    capture.aicore_sched_phase(phase="idle", start=40, end=46)
+    source = tmp_path / "raw.json"
+    source.write_text(json.dumps(capture.build()))
+    data = read_perf_data(source)
+    events = kernel_gap_events(data["scalar_profiles"], data["scheduler_streams"], data["tasks"], {})
+    gap, idle = [event for event in events if event["ph"] == "X"]
+    assert gap["name"] == "KERNEL GAP · t7 → t8"
+    assert gap["dur"] == 40
+    assert gap["args"]["exclusive_us"] == {"DISPATCH": 20, "UNATTRIBUTED": 20}
+    assert idle["ts"] == gap["ts"]
+    assert gap["args"]["no_progress_us"] == idle["dur"] == 16
 
 
 @pytest.mark.parametrize("level", [3, 4])
@@ -311,13 +338,12 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_self_order_ready", "ENTRY_PERMIT · self_order_ready"),
         ("scalar_mix_lane_order_ready", "ENTRY_PERMIT · mix_lane_order_ready"),
         ("scalar_execution_token_refill", "DISPATCH · refill_execution_tokens"),
-        ("scalar_prepared_receive", "BUILD · receive_payload"),
+        ("scalar_prepared_receive", "ENTRY_PREP · receive_payload"),
+        ("scalar_mix_claim_for_execution", "CLAIM_EXECUTE · claim_for_execute"),
+        ("scalar_mix_notify_members", "DISPATCH · notify_mix_members"),
         ("scalar_prepared_claim", "CLAIM_EXECUTE · claim_for_execution"),
-        ("scalar_cluster_mix_discover_task", "CLAIM_BUILD · claim_for_build"),
-        ("scalar_build_payload", "BUILD · build_payload"),
-        ("scalar_publish_built", "BUILD · publish_built"),
         ("scalar_select_owned_execution", "SELECT · select_owned_execution"),
-        ("scalar_can_enter_execution", "ENTRY_PERMIT · check_entry_permit"),
+        ("scalar_can_enter_execution", "ENTRY_PERMIT · validate_selected_entry"),
         ("scalar_retire_execution", "RETIRE · retire_execution"),
         ("scalar_subtask_contribute", "FANOUT_PUBLISH · publish_fanout"),
         ("scalar_counter_accounting", "CONTROL · snapshot_counter_completions"),
@@ -325,7 +351,7 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_group_acquire", "DISPATCH · acquire_group_lane"),
         ("scalar_execution_continuation", "DISPATCH · continue_same_task"),
         ("scalar_execution_token_fanin", "FANIN_WAIT · poll_fanin"),
-        ("scalar_dispatch_metadata", "BUILD · load_dispatch_metadata"),
+        ("scalar_dispatch_metadata", "DISPATCH · load_dispatch_metadata"),
         ("scalar_dispatch_publish", "DISPATCH · publish_dispatch_slot"),
         ("scalar_trace_finish", "TRACE · SchedulerScalarTrace::finish"),
         ("scalar_trace_finish_barrier", "TRACE · SchedulerScalarTrace::finish: DSB"),

@@ -230,14 +230,13 @@ TEST(AicpuSinkObserver, AllSinksMustReachLogicalCompletionThroughTheirOwnSource)
     auto *refs = scheduler_state_at<uint32_t>(base, f.layout.sinks_offset);
     auto *counters = scheduler_state_at<SchedulerTaskCompletionCounter>(base, f.layout.completion_counters_offset);
     auto *controls = scheduler_state_at<SchedulerTaskControl>(base, f.layout.task_controls_offset);
-    auto *notifications = scheduler_state_at<uint64_t>(base, f.layout.done_notifications_offset);
     std::copy_n(std::array<uint32_t, 3>{0, 1, 2}.begin(), 3, refs);
     f.run_control->sink_count = 3;
     f.contexts[0].completion_counters_offset = f.layout.completion_counters_offset;
     uint32_t chain = 5;
     counters[0] = {reinterpret_cast<uint64_t>(&chain), reinterpret_cast<uint64_t>(&chain), 6, 12};
     uint32_t notification = 0;
-    notifications[1] = reinterpret_cast<uint64_t>(&notification);
+    counters[1] = scheduler_set_completion_source(reinterpret_cast<uint64_t>(&notification));
     controls[2].completion_state = scheduler_completion_encode(2, 0, 1);  // All physical returns, one async debt.
 
     AicpuSinkObserver sinks;
@@ -267,7 +266,8 @@ TEST(AicpuSinkObserver, MalformedReferenceSignalOrCounterCannotCompleteTheRun) {
     EXPECT_EQ(sinks.poll(), -1);
     *ref = 0;
     uint32_t word = 9;
-    *scheduler_state_at<uint64_t>(base, f.layout.done_notifications_offset) = reinterpret_cast<uint64_t>(&word);
+    *scheduler_state_at<SchedulerTaskCompletionCounter>(base, f.layout.completion_counters_offset) =
+        scheduler_set_completion_source(reinterpret_cast<uint64_t>(&word));
     EXPECT_EQ(sinks.poll(), -1);
     *scheduler_state_at<SchedulerTaskCompletionCounter>(base, f.layout.completion_counters_offset) = {
         reinterpret_cast<uint64_t>(&word), reinterpret_cast<uint64_t>(&word), 4, 8
@@ -638,9 +638,9 @@ TEST(SchedulerState, PlansAndInitializesTaskCatalogAndCompletionState) {
     EXPECT_TRUE(scheduler_task_catalog_validate(storage.base(), layout.total_size, ready_plan.header_offset, 5, 1));
     for (uint32_t type = 0; type < SCHEDULER_EXECUTION_ENGINE_COUNT; ++type) {
         const auto catalog = scheduler_task_catalog(storage.base(), pool, type);
-        EXPECT_EQ(reinterpret_cast<uintptr_t>(catalog.refs) % SCHEDULER_STATE_ALIGNMENT, 0u);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(catalog.entries) % SCHEDULER_STATE_ALIGNMENT, 0u);
         for (uint64_t entry = 0; entry < catalog.count; ++entry) {
-            const int64_t ref = catalog.refs[entry];
+            const int64_t ref = catalog.entries[entry].ref;
             ASSERT_GE(ref, 0);
             ASSERT_LT(ref, metadata.size());
             EXPECT_EQ(scheduler_task_execution_engine(metadata[ref].flags, metadata[ref].active_mask), type);

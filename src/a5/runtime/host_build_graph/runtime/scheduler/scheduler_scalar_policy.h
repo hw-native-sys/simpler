@@ -21,4 +21,11 @@ struct SchedulerScalarCompilation {
     static constexpr bool enabled = false;
 };
 
+// The ordinary resident is selected only for flat graphs. Host-side users and
+// native residents continue to decode both graph representations.
+template <typename = void>
+struct SchedulerResidentGraph {
+    static constexpr bool supports_native = true;
+};
+
 }  // namespace

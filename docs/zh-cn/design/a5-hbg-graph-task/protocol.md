@@ -27,10 +27,10 @@ Host 在 orchestration 完成后发布紧凑任务镜像、Graph readonly 计划
 
 1. AIC/AIV 报告物理身份与 run epoch。无效 descriptor 进入失败启动清退。
 2. AICPU 接收完整的 AIC/两 AIV cluster，校验拓扑及实际执行需求，填入每个 worker 的 context。
-3. AICPU 发布 context 地址和 READY。每个 worker acquire 后校验 view、epoch、extent、catalog、prepared layout 和 cluster peers。
-4. Worker 核对冻结目录和实际拓扑；每簇 AIV0 在首轮补给前初始化本簇 SSBUF。
+3. 有 READY CntNotify 时，每个 worker 在上报身份前先读取该寄存器。AICPU 接受本轮全部上报并配置 context 后，由一个线程翻转该值。worker 看到变化后按自己的索引读取 context。连续重放可复用同一寄存器，每轮只翻转一次。未取得寄存器时，AICPU 逐核在 GM 发布地址和 READY。每个 worker acquire 后校验 view、epoch、extent、catalog、prepared layout 和 cluster peers。
+4. Worker 核对冻结目录和实际拓扑；MIX 场景的 AIV0 初始化本簇 SSBUF，经发布屏障后在独立的 INIT CntNotify 中置本簇位。AIC 与 AIV1 观察本簇位并执行接收屏障，再使用 SSBUF。AICPU 在发布 context 之前清零 INIT 字；资源不足时使用已有的 GM INIT 协议。
 5. 各物理 lane 有界地准备首批工作，AIC 和 AIV1 分别报告自己的完成位。
-6. AIV0 完成自己的补给并观察到两个伙伴的完成位后，把本簇三个 worker 计入本轮总数。最后到达的簇发布 `bootstrap_complete`，任何首轮准备失败都走错误路径。
+6. AIV0 完成本簇补给并确认两个伙伴的完成位后，在本次运行专用的 32 位 CntNotify 中置本簇的位。AICPU 在发布 context 前清零，待所有参与簇位置齐后放行。缺少寄存器或簇数超过 32 时沿用 GM 到达计数及 `bootstrap_complete`。首轮准备失败走错误路径。
 7. AICPU 打开唯一 DMB launch gate。该 gate 打开前，已取得 Call 或 READY slot 的核也不能调用 kernel。
 
 READY 是配置发布点。它取代重复的角色标记，不能用零索引表示某个核尚未初始化。

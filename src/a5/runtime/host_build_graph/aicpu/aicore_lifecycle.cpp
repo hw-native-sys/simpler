@@ -196,21 +196,17 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
 
     auto *run_control = aicore_scheduler_run_control(bootstrap_context);
     if (scheduler_state_base == nullptr || run_control == nullptr) return -1;
-    // No AICore can observe READY yet. Replay resets the same owned registers
-    // before any publisher or waiter from this invocation can access them.
-    if (bootstrap_context->done_notifications_offset != 0) {
-        const auto *addresses =
-            scheduler_state_at<uint64_t>(scheduler_state_base, bootstrap_context->done_notifications_offset);
-        const auto *controls =
-            scheduler_state_at<SchedulerTaskControl>(scheduler_state_base, bootstrap_context->task_controls_offset);
-        for (uint64_t task = 0; task < bootstrap_context->graph_task_count; ++task) {
-            if (addresses[task] != 0)
-                *reinterpret_cast<volatile uint32_t *>(addresses[task]) =
-                    scheduler_completion_done(controls[task].completion_state) ? 1U : 0U;
-        }
+    if (run_control->bootstrap_arrival_address != 0) {
+        *reinterpret_cast<volatile uint32_t *>(run_control->bootstrap_arrival_address) = 0;
+        if (run_control->bootstrap_init_address != 0)
+            *reinterpret_cast<volatile uint32_t *>(run_control->bootstrap_init_address) = 0;
         wmb();
     }
+    // No AICore can observe READY yet. Replay resets the same owned registers
+    // before any publisher or waiter from this invocation can access them.
     if (bootstrap_context->completion_counters_offset != 0) {
+        const auto *controls =
+            scheduler_state_at<SchedulerTaskControl>(scheduler_state_base, bootstrap_context->task_controls_offset);
         const auto *counters = scheduler_state_at<SchedulerTaskCompletionCounter>(
             scheduler_state_base, bootstrap_context->completion_counters_offset
         );
@@ -220,7 +216,15 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
             scheduler_state_at<SchedulerGraphSummary>(scheduler_state_base, bootstrap_context->graph_summary_offset);
         for (uint64_t task = 0; task < bootstrap_context->graph_task_count; ++task) {
             const auto &counter = counters[task];
-            if (counter.add_address == 0) continue;
+            const auto &control = controls[task];
+            if (control.supply_address != 0 && (control.supply_mask & 1U) != 0)
+                *reinterpret_cast<volatile uint32_t *>(control.supply_address) = 0;
+            if (counter.add_address == 0) {
+                if (counter.read_address != 0)
+                    *reinterpret_cast<volatile uint32_t *>(counter.read_address) =
+                        scheduler_completion_done(control.completion_state) ? 1U : 0U;
+                continue;
+            }
             const auto async_lanes = scheduler_async_task_lanes(
                 scheduler_state_base, summary->async_layout_offset, static_cast<uint32_t>(task)
             );
@@ -368,6 +372,18 @@ void AicoreLifecycle::publish_context_partition(Runtime *runtime, int32_t thread
     if (bootstrap_context == nullptr) return;
     AicpuThreadLifecycleTrace *trace = thread_lifecycle_trace(thread_idx);
     if (trace != nullptr && lifecycle_timing_enabled()) trace->context_publish_start_cycles = get_sys_cnt_aicpu();
+    const uint64_t address = runtime->dev.scheduler_bootstrap.context_ready_address;
+    if (address != 0) {
+        if (thread_idx == 0) {
+            auto *ready = reinterpret_cast<volatile uint32_t *>(address);
+            wmb();
+            *ready = *ready ^ 1U;
+            wmb();
+        }
+        if (trace != nullptr && lifecycle_timing_enabled())
+            trace->context_publish_complete_cycles = get_sys_cnt_aicpu();
+        return;
+    }
     void *scheduler_state_base = aicore_scheduler_state_base(bootstrap_context);
     for (int32_t i = lo; i < hi; ++i) {
         // Reply only to a worker whose report this run accepted and configured.
@@ -405,9 +421,22 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
     if (run_control == nullptr) return -1;
     const uint64_t watchdog_start = get_sys_cnt_aicpu();
     const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
+    const auto *arrivals = reinterpret_cast<const volatile uint32_t *>(run_control->bootstrap_arrival_address);
+    const uint64_t clusters = run_control->active_worker_count / PLATFORM_CORES_PER_BLOCKDIM;
+    if (arrivals != nullptr && (clusters == 0 || clusters > 32)) return -1;
+    const uint32_t expected = arrivals == nullptr ? 0 : UINT32_MAX >> (32 - clusters);
+    uint32_t observed = 0;
     uint32_t error_poll_count = 0;
     while (true) {
-        if (aicpu_observe_gm(run_control->bootstrap_complete) != 0) break;
+        if (arrivals != nullptr) {
+            observed = *arrivals;
+            if (observed == expected) {
+                rmb();
+                break;
+            }
+        } else if (aicpu_observe_gm(run_control->bootstrap_complete) != 0) {
+            break;
+        }
         if (++error_poll_count == 64) {
             error_poll_count = 0;
             if (aicpu_observe_gm(run_control->scheduler_error) != 0) {
@@ -421,7 +450,10 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
                     " bootstrap_complete=%" PRIu64,
                     run_control->error_task_ref, run_control->scheduler_error, run_control->error_core_id,
                     run_control->error_core_type, run_control->error_site, run_control->active_worker_count,
-                    run_control->bootstrap_arrived_count, run_control->bootstrap_complete
+                    (arrivals == nullptr ?
+                         run_control->bootstrap_arrived_count :
+                         static_cast<uint64_t>(__builtin_popcount(observed)) * PLATFORM_CORES_PER_BLOCKDIM),
+                    run_control->bootstrap_complete
                 );
                 return -1;
             }
@@ -430,7 +462,11 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
             LOG_ERROR(
                 "A5 HBG AICore Scheduler bootstrap timeout: workers=%" PRIu64 " dispatch_arrived=%" PRIu64
                 " bootstrap_complete=%" PRIu64,
-                run_control->active_worker_count, run_control->bootstrap_arrived_count, run_control->bootstrap_complete
+                run_control->active_worker_count,
+                (arrivals == nullptr ?
+                     run_control->bootstrap_arrived_count :
+                     static_cast<uint64_t>(__builtin_popcount(observed)) * PLATFORM_CORES_PER_BLOCKDIM),
+                run_control->bootstrap_complete
             );
             record_lifecycle_timeout(runtime, SchedulerErrorSite::BOOTSTRAP_COMPLETE_TIMEOUT);
             return -1;

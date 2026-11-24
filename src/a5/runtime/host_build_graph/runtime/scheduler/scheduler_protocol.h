@@ -163,13 +163,17 @@ static inline __aicore__ bool scheduler_protocol_stamp(
 }
 
 template <typename Local>
-inline __aicore__ bool scheduler_protocol_enabled(const Local *local) {
+static inline __aicore__ bool scheduler_protocol_enabled(const Local *local) {
+#if defined(__CCE_AICORE__)
+    // The dispatcher routes protocol captures to the scalar-instrumented resident.
+    if constexpr (!kSchedulerScalarInstrumentation) return false;
+#endif
     return local != nullptr && __builtin_expect(local->profiling != nullptr, false) &&
            local->profiling->protocol_layout_offset != 0;
 }
 
 template <typename Local>
-inline __aicore__ uint64_t scheduler_protocol_cycles(const Local *local) {
+static inline __aicore__ uint64_t scheduler_protocol_cycles(const Local *local) {
     return scheduler_protocol_enabled(local) ? scheduler_cycles() : 0;
 }
 

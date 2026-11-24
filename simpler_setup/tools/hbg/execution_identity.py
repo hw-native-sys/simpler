@@ -41,8 +41,8 @@ def valid_source_index(index, group_kind):
 
 def _validate_record(record, *, legacy=False, checkpoints=False):
     expected = FIELDS | {"schedule_cycles"} if checkpoints else FIELDS
-    if checkpoints and isinstance(record, dict) and "pending_fanin" in record:
-        expected = expected | {"pending_fanin"}
+    if checkpoints and isinstance(record, dict):
+        expected = expected | ({"pending_fanin", "mix_claim_cycles"} & record.keys())
     if not isinstance(record, dict) or set(record) != expected:
         raise ValueError("execution identity has missing or unknown fields")
     for field in FIELDS - {"order_key", "group_seq", "executed"}:

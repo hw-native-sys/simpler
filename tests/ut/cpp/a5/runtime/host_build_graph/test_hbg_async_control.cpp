@@ -162,7 +162,8 @@ struct AsyncFixture {
         auto *state = local(worker);
         auto &token = state->execution_tokens[0];
         ASSERT_EQ(scheduler_gm_fetch_add(task_control(token.task_ref)->next_block, UINT64_C(1)), token.block_idx);
-        token.phase = SchedulerExecutionTokenPhase::TICKETED;
+        token.state = SchedulerDispatchSlotState::TICKETED;
+        token.metadata = storage.metadata[token.task_ref];
         token.closes_supply = token.block_idx + 1 == storage.metadata[token.task_ref].logical_block_num;
         ASSERT_TRUE(scheduler_bind_ticketed_execution(graph.graph(), base(), state, storage.run_control, token, 0));
     }
@@ -237,7 +238,7 @@ struct AsyncFixture {
         return progress;
     }
     bool service(bool &progress, uint32_t worker = 0) {
-        return scheduler_service_async_slice(graph.graph(), base(), local(worker), storage.run_control, 0, progress);
+        return scheduler_service_async_slice(graph.graph(), base(), local(worker), storage.run_control, progress);
     }
 
     SchedulerSubtaskFinishResult return_next(int64_t task, SchedulerLocalState *state, uint64_t *gate = nullptr) {
@@ -323,7 +324,7 @@ TEST(HbgCrossRankOrdering, DeferredPeerWaitLeavesCapacityForItsIndependentSignal
                 if (slot == UINT32_MAX) continue;
                 bool permit = false;
                 ASSERT_TRUE(
-                    scheduler_check_entry_permit(f.graph.graph(), f.base(), local, f.storage.run_control, slot, &permit)
+                    hbg_test_check_ready_order(f.graph.graph(), f.base(), local, f.storage.run_control, slot, &permit)
                 );
                 ASSERT_TRUE(permit);
                 ASSERT_TRUE(hbg_test_begin_execution(local, slot));
@@ -488,12 +489,11 @@ TEST(HbgAsyncControl, CapableZeroConditionGroupStillPublishesItsReservedQAtPhysi
     slot.block_idx = 0;
     slot.subtask_slot = 0;
     slot.state = SchedulerDispatchSlotState::EXECUTING;
-    slot.completion_credits = 2;  // Has a reserved group, but it sealed empty.
     f.bind_package();
 
-    ASSERT_TRUE(
-        (scheduler_complete_lane_execution<false>(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0))
-    );
+    ASSERT_TRUE((scheduler_complete_lane_execution<false>(
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, !deferred
+    )));
     EXPECT_EQ(count, 2u);
     EXPECT_EQ(scheduler_completion_counter_observe(counter[0]), 1);
     EXPECT_FALSE(f.check());
@@ -535,7 +535,6 @@ TEST(HbgAsyncControl, AddConditionsBeforeOrAfterPhysicalReturnNeedNoGlobalJoinOr
         slot.block_idx = 0;
         slot.subtask_slot = 0;
         slot.state = SchedulerDispatchSlotState::EXECUTING;
-        slot.completion_credits = 1;
         f.bind_package();
 
         const auto returned = slot.prepared;
@@ -821,9 +820,7 @@ TEST(HbgAsyncControl, ZeroWorkSkipsServiceAndActivationIsVisibleToOtherWorkers) 
     EXPECT_FALSE(scheduler_async_work_activated(&f.workers[1]));
     EXPECT_FALSE(scheduler_async_service_due(f.workers[1]));
     bool progress = true;
-    ASSERT_TRUE(
-        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, 0, progress)
-    );
+    ASSERT_TRUE(scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, progress));
     EXPECT_FALSE(progress);
     const auto writer = f.start();
     f.register_counter(writer);
@@ -841,9 +838,7 @@ TEST(HbgAsyncControl, NoActivityCannotMaskALocalRegistrationFailure) {
     f.workers[0].error_code = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
     EXPECT_TRUE(scheduler_async_service_due(f.workers[0]));
     bool progress = true;
-    EXPECT_FALSE(
-        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, progress)
-    );
+    EXPECT_FALSE(scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, progress));
     EXPECT_FALSE(progress);
     EXPECT_NE(scheduler_read_error(f.storage.run_control), 0u);
     EXPECT_EQ(f.storage.completed_gm_records(), 0u);
@@ -855,9 +850,7 @@ TEST(HbgAsyncControl, ContinuousBusinessReturnsServiceCheckAndFinishBeforeWorkRu
     ASSERT_NO_FATAL_FAILURE(f.run_single_block_producer());
     ASSERT_TRUE(scheduler_async_service_due(f.workers[0]));
     bool progress = false;
-    ASSERT_TRUE(
-        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, progress)
-    );
+    ASSERT_TRUE(scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, progress));
     EXPECT_TRUE(progress);
     EXPECT_FALSE(scheduler_async_service_due(f.workers[0]));
     int64_t consumer = SCHEDULER_TASK_REF_INVALID;
@@ -1203,7 +1196,7 @@ TEST(HbgAsyncControl, TwoWaitersReleaseTheirOwnersWhileProducersAwaitInput) {
 
     const auto begin = [&](SchedulerLocalState *local, uint32_t slot) {
         bool permit = false;
-        return scheduler_check_entry_permit(f.graph.graph(), f.base(), local, f.storage.run_control, slot, &permit) &&
+        return hbg_test_check_ready_order(f.graph.graph(), f.base(), local, f.storage.run_control, slot, &permit) &&
                permit && hbg_test_begin_execution(local, slot);
     };
     // Two independently schedulable AIVs own the data-producing input blocks.
@@ -1241,7 +1234,7 @@ TEST(HbgAsyncControl, TwoWaitersReleaseTheirOwnersWhileProducersAwaitInput) {
     ASSERT_EQ(slot, UINT32_MAX);
     EXPECT_EQ(scheduler_execution_token_count(f.local()), std::min(2u, SCHEDULER_EXECUTION_TOKEN_COUNT));
     const auto fixed = f.local()->execution_tokens[0].prepared;
-    EXPECT_EQ(f.local()->execution_tokens[0].phase, SchedulerExecutionTokenPhase::WAIT_FANIN);
+    EXPECT_EQ(f.local()->execution_tokens[0].state, SchedulerDispatchSlotState::FILLING);
     EXPECT_FALSE(f.check());
     EXPECT_FALSE(f.check());
 
@@ -1587,8 +1580,9 @@ TEST(HbgAsyncControl, OrdersFinalContributionBeforeClosureRmw) {
 TEST(HbgAsyncControl, JoinRmwOwnerCannotCompleteTwice) {
     AsyncFixture f(1);
     uint32_t notification = 0;
-    scheduler_state_at<uint64_t>(f.base(), f.storage.layout.done_notifications_offset)[0] =
-        reinterpret_cast<uint64_t>(&notification);
+    f.storage.contexts[2].completion_counters_offset = f.storage.layout.completion_counters_offset;
+    scheduler_state_at<SchedulerTaskCompletionCounter>(f.base(), f.storage.layout.completion_counters_offset)[0] =
+        scheduler_set_completion_source(reinterpret_cast<uint64_t>(&notification));
     f.register_counter(f.start(), 0);
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
     ASSERT_TRUE(f.check(0));
@@ -1645,16 +1639,12 @@ TEST(HbgAsyncControl, CheckCadenceAndBudgetRemainBoundedWhileItsOwnerFinishesInl
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
     ASSERT_TRUE(f.close());
     bool progress = false;
-    ASSERT_TRUE(
-        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, progress)
-    );
+    ASSERT_TRUE(scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, progress));
     EXPECT_TRUE(progress);
     EXPECT_EQ(__builtin_popcountll(f.workers[0].pending_mask), 1);
     EXPECT_FALSE(f.done());
     EXPECT_EQ(f.storage.completed_gm_records(), 0u);
-    ASSERT_TRUE(
-        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, progress)
-    );
+    ASSERT_TRUE(scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, progress));
     EXPECT_TRUE(progress);
     EXPECT_TRUE(f.done());
     EXPECT_EQ(f.storage.completed_gm_records(), 1u);
@@ -1670,9 +1660,7 @@ TEST(HbgAsyncControl, ObserverFailureLatchesRunErrorAndOtherCoresCannotFinishNor
         scheduler_state_at<DeferredCompletionEntry>(f.base(), pto2::resident::detail::group(writer)->entries_offset);
     entry->expected_value = UINT32_MAX;
     bool progress = false;
-    EXPECT_FALSE(
-        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(0), f.storage.run_control, 0, progress)
-    );
+    EXPECT_FALSE(scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(0), f.storage.run_control, progress));
     EXPECT_EQ(f.storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::ASYNC_CHECK_FAILED));
     EXPECT_NE(scheduler_read_error(f.storage.run_control), 0u);
     EXPECT_FALSE(f.done());
@@ -1706,9 +1694,7 @@ TEST(HbgAsyncControl, ConcurrentObserversAndBlockReleaseGrantOneFinish) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (!failed.load(std::memory_order_acquire) && !f.done()) {
                 bool progress = false;
-                if (!scheduler_service_async_slice(
-                        f.graph.graph(), f.base(), local, f.storage.run_control, 0, progress
-                    ) ||
+                if (!scheduler_service_async_slice(f.graph.graph(), f.base(), local, f.storage.run_control, progress) ||
                     std::chrono::steady_clock::now() >= deadline) {
                     failed.store(true, std::memory_order_release);
                     break;

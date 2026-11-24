@@ -131,7 +131,7 @@ void check_exit(uint32_t mode, BootstrapBase base, uint64_t epoch, CoreType type
 }
 // The first register read pauses the real Core after its first READY poll.
 // All test-side state changes happen while that Core is stopped at the seam.
-void check_ready_error_publication(bool publish_ready, bool stale_error) {
+void check_ready_error_publication(bool publish_ready, bool stale_error, bool notified = false) {
     auto runtime = std::make_unique<Runtime>();
     runtime->set_worker_count(1);
     SchedulerWorkerContext context{};
@@ -139,7 +139,11 @@ void check_ready_error_publication(bool publish_ready, bool stale_error) {
     context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&control);
     control.scheduler_timeout_cycles = 1;
     scheduler_publish_error(&control, stale_error ? 7 : 0);
-    runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(&context));
+    uint32_t phase = 1;  // Value left by an earlier use of this register.
+    runtime->publish_scheduler_bootstrap(
+        SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(&context),
+        notified ? reinterpret_cast<uint64_t>(&phase) : 0
+    );
     report_epoch = 42;
     registers.fill(0);
     first_read.store(false);
@@ -159,8 +163,12 @@ void check_ready_error_publication(bool publish_ready, bool stale_error) {
     if (control.scheduler_error != (stale_error ? 7u : 0u) || control.error_claimed != 0) std::_Exit(31);
     if (publish_ready) {
         scheduler_publish_error(&control, 0);
-        runtime->get_workers()[0].task = reinterpret_cast<uint64_t>(&context);
-        runtime->get_workers()[0].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
+        if (notified) {
+            __atomic_store_n(&phase, 0U, __ATOMIC_RELEASE);
+        } else {
+            runtime->get_workers()[0].task = reinterpret_cast<uint64_t>(&context);
+            runtime->get_workers()[0].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
+        }
     }
     resume_read.store(true, std::memory_order_release);
     if (publish_ready && !wait_until(
@@ -233,6 +241,11 @@ TEST(HbgNonceExitDeathTest, InvalidResidentBaseRetiresWithoutReadingSchedulerBac
                     EXPECT_EXIT(
                         check_exit(mode, base, epoch, type, AICORE_EXIT_NONCE_1), testing::ExitedWithCode(0), ""
                     );
+}
+
+TEST(HbgNonceExitDeathTest, ReusedReadyWordRequiresANewPublicationOrExit) {
+    EXPECT_EXIT(check_ready_error_publication(false, true, true), testing::ExitedWithCode(0), "");
+    EXPECT_EXIT(check_ready_error_publication(true, true, true), testing::ExitedWithCode(0), "");
 }
 
 TEST(HbgNonceExitDeathTest, ContextTimeoutDoesNotWriteBeforeReadyOrOnFailedInitExit) {

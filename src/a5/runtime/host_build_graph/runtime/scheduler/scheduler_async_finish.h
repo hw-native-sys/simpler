@@ -64,13 +64,13 @@ static inline __aicore__ bool scheduler_async_complete_task(
 
 static inline __aicore__ bool scheduler_service_async_slice(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, bool &made_progress
+    bool &made_progress
 ) {
-    (void)profiling_level;
     made_progress = false;
     if (local->async == nullptr) return true;
     auto &async = *local->async;
     if (!scheduler_async_service_due(async)) return true;
+    SchedulerScalarScope scalar_async(local, SchedPhaseKind::ScalarAsyncService);
     SchedulerScalarScope scalar_step(local, SchedPhaseKind::ScalarAsyncCheck);
     const bool retry = async.retry_counter_address != 0 && async.error_code == 0;
     // The resident loop also checks for errors periodically. Check again before
