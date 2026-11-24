@@ -247,6 +247,21 @@ TEST(CoreAsyncCapability, UsesExistingPaddingAndPreservesCodeIdentity) {
     EXPECT_EQ(std::memcmp(as_chip(original)->child(0).binary_data(), child.binary_data(), child.binary_size()), 0);
 }
 
+TEST(CoreAsyncCapability, IndependentProgressUsesSynchronousCapacityRules) {
+    EXPECT_TRUE(core_async_capability_valid({1, CoreAsyncMode::SYNCHRONOUS_INDEPENDENT, 0, 0, 0}));
+    EXPECT_FALSE(core_async_capability_valid({1, CoreAsyncMode::SYNCHRONOUS_INDEPENDENT, 1, 1, 0}));
+    EXPECT_FALSE(core_async_capability_valid({1, CoreAsyncMode::SYNCHRONOUS_INDEPENDENT, 0, 0, 1}));
+    auto bytes = make_chip_with_children({0});
+    auto *chip = reinterpret_cast<ChipCallable *>(bytes.data());
+    auto &callable = const_cast<CoreCallable &>(chip->child(0));
+    const auto before = compute_chip_callable_layout(chip);
+    callable.async_capability_ = {1, CoreAsyncMode::SYNCHRONOUS_INDEPENDENT, 0, 0, 0};
+    EXPECT_NO_THROW(validate_chip_callable_buffer(bytes.data(), bytes.size()));
+    const auto after = compute_chip_callable_layout(chip);
+    EXPECT_NE(before.content_hash, after.content_hash);
+    EXPECT_EQ(before.aicore_image_hash, after.aicore_image_hash);
+}
+
 TEST(CoreAsyncCapability, RejectsMalformedDeclaration) {
     EXPECT_FALSE(core_async_capability_valid({}));
     EXPECT_FALSE(core_async_capability_valid({1, static_cast<CoreAsyncMode>(0), 0, 0, 0}));

@@ -140,7 +140,9 @@ struct alignas(128) PercounterCounter {
     uint64_t arguments_address;
     uint64_t completion_notify_address;
     uint32_t completion_notify_target;  // cumulative credits in the chain
-    uint8_t reserved[36];
+    uint32_t reserved_before_fanin_proof;
+    uint64_t shared_fanin_proven;  // Zeroed in the uploaded image for each run.
+    uint8_t reserved[24];
 };
 static_assert(sizeof(PercounterCounter) == 128, "a counter owns one GM sector");
 static_assert(std::is_trivially_copyable_v<PercounterCounter> && std::is_standard_layout_v<PercounterCounter>);
@@ -457,6 +459,7 @@ struct PercounterTerminalPlan {
     uint32_t steps[PERCOUNTER_TERMINAL_MAX_STEPS];
     uint32_t prerequisite_count;
     uint32_t prerequisites[PERCOUNTER_TERMINAL_MAX_PREREQUISITES];
+    uint32_t frontier_includes_start;  // The first prerequisite counter includes group arrivals.
 };
 
 /**

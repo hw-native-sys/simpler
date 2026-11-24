@@ -27,7 +27,7 @@ struct AsyncTaskPlanInput {
 };
 
 // Every active leaf lane requires an explicit valid registration contract.
-// Zero capacity is the projection of SYNCHRONOUS, never a missing-capability fallback.
+// Valid synchronous registrations have zero capacity.
 inline bool
 async_task_apply_capabilities(AsyncTaskPlanInput *task, const std::array<CoreAsyncCapability, 3> &capabilities) {
     if (task == nullptr) return false;
@@ -37,10 +37,8 @@ async_task_apply_capabilities(AsyncTaskPlanInput *task, const std::array<CoreAsy
             continue;
         }
         const auto &capability = capabilities[lane];
-        if (!core_async_capability_valid(capability) ||
-            (capability.mode != CoreAsyncMode::SYNCHRONOUS && capability.mode != CoreAsyncMode::DEFERRED))
-            return false;
-        task->capacities[lane] = capability.mode == CoreAsyncMode::SYNCHRONOUS ? 0 : capability.max_conditions;
+        if (!core_async_capability_valid(capability)) return false;
+        task->capacities[lane] = capability.max_conditions;
     }
     return true;
 }

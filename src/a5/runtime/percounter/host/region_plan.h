@@ -177,6 +177,7 @@ struct ExternalAddresses {
     const SchedulerCompletionCounterPlan *completion_plan = nullptr;
     const uint64_t *completion_notify = nullptr;
     uint64_t completion_notify_count = 0;
+    uint32_t terminal_frontier_chain = UINT32_MAX;
 };
 
 /**
@@ -434,12 +435,14 @@ inline bool percounter_completion_notify_eligible(const TaskInput &task) {
 }
 
 inline bool plan_percounter_completion_counters(
-    const std::vector<TaskInput> &tasks, SchedulerCompletionCounterPlan *plan, std::string *error
+    const std::vector<TaskInput> &tasks, SchedulerCompletionCounterPlan *plan, std::string *error,
+    const std::vector<uint32_t> &terminal_frontier = {}, uint32_t frontier_arrivals = 0
 ) {
     std::vector<int64_t> order(tasks.size());
     std::iota(order.begin(), order.end(), int64_t{0});
     std::vector<std::vector<int64_t>> fanin(tasks.size());
     std::vector<uint32_t> credits(tasks.size(), 0);
+    uint64_t frontier_credits = 0;
     for (size_t id = 0; id < tasks.size(); ++id) {
         const auto &task = tasks[id];
         // A published node can satisfy its consumers without a device fanin probe.
@@ -449,15 +452,33 @@ inline bool plan_percounter_completion_counters(
             return false;
         }
         if (task.fanin_count != 0) fanin[id].assign(task.fanin_ids, task.fanin_ids + task.fanin_count);
-        if (!percounter_completion_notify_eligible(task)) continue;
+        const bool grouped =
+            std::find(terminal_frontier.begin(), terminal_frontier.end(), id) != terminal_frontier.end();
+        if (!grouped && !percounter_completion_notify_eligible(task)) continue;
         const int64_t contribution = static_cast<int64_t>(task.block_num) * task.subtask_count;
         if (contribution <= 0 || contribution > UINT32_MAX) {
             *error = "invalid completion credit count";
             return false;
         }
-        credits[id] = static_cast<uint32_t>(contribution);
+        if (grouped) frontier_credits += contribution;
+        else credits[id] = static_cast<uint32_t>(contribution);
     }
-    return scheduler_plan_completion_counters(fanin, order, credits, plan, error);
+    if (!scheduler_plan_completion_counters(fanin, order, credits, plan, error)) return false;
+    if (terminal_frontier.empty()) return true;
+    if (frontier_credits == 0 || frontier_arrivals == 0 || frontier_credits + frontier_arrivals > UINT32_MAX) {
+        *error = "invalid terminal frontier credit count";
+        return false;
+    }
+    // The frontier has no consumer in the ordinary prefix. Its members can
+    // add in any order because the terminal entry waits for all credits.
+    const uint32_t chain = static_cast<uint32_t>(plan->chains.size());
+    const uint32_t target = static_cast<uint32_t>(frontier_credits + frontier_arrivals);
+    for (const uint32_t id : terminal_frontier) {
+        plan->task_chains[id] = chain;
+        plan->thresholds[id] = target;
+    }
+    plan->chains.push_back({terminal_frontier.back(), target});
+    return true;
 }
 
 /** Why build_tables refused. Every one of these fails the bind. */
@@ -532,7 +553,8 @@ inline T *region_at(void *base, uint64_t offset) {
 inline bool build_tables(
     const TaskInput *tasks, uint64_t task_count, const PercounterLayout &layout, void *base, uint64_t device_base,
     uint32_t clusters, const ExternalAddresses &external = {}, BuildResult *result = nullptr,
-    const GraphPlanInput &graph = {}, bool enable_terminal = false, const std::function<bool(uint32_t)> &may_defer = {}
+    const GraphPlanInput &graph = {}, bool enable_terminal = false,
+    const std::function<bool(uint32_t)> &progress_independent = {}
 ) {
     const auto fail = [&](BuildStatus status, int64_t task_id, int32_t fanin_index) {
         if (result != nullptr) *result = BuildResult{status, task_id, fanin_index};
@@ -552,6 +574,7 @@ inline bool build_tables(
     auto *fanin = region_at<PercounterFanin>(base, layout.fanin_offset);
     auto *fanin_addr = region_at<uint64_t>(base, layout.fanin_addr_offset);
     auto *counters = region_at<PercounterCounter>(base, layout.counters_offset);
+    bool frontier_mapped = false;
     if (external.completion_plan != nullptr && external.completion_notify != nullptr) {
         const auto &plan = *external.completion_plan;
         for (uint64_t id = 0; id < task_count; ++id) {
@@ -561,6 +584,7 @@ inline bool build_tables(
             if (a5_cnt_notify_increment_address(set) == 0) continue;
             counters[id].completion_notify_address = set;
             counters[id].completion_notify_target = plan.thresholds[id];
+            frontier_mapped |= chain == external.terminal_frontier_chain;
         }
     }
     auto *metadata = region_at<PercounterTaskMetadata>(base, layout.metadata_offset);
@@ -720,8 +744,8 @@ inline bool build_tables(
         sinks[sink_count++] = id;
     }
 
-    if (enable_terminal && may_defer && graph.invocation_count == 0 && task_count > 0) {
-        const auto plan = plan_proven_terminal_pipeline(tasks, task_count, clusters, may_defer);
+    if (enable_terminal && graph.invocation_count == 0 && task_count > 0) {
+        const auto plan = plan_proven_terminal_pipeline(tasks, task_count, clusters, progress_independent);
         if (plan && plan->steps.size() <= std::size(control->terminal.steps) &&
             plan->prerequisites.size() <= std::size(control->terminal.prerequisites)) {
             auto &list = eligible[1];
@@ -741,8 +765,22 @@ inline bool build_tables(
             std::copy(plan->steps.begin(), plan->steps.end(), control->terminal.steps);
             control->terminal.prerequisite_count = static_cast<uint32_t>(plan->prerequisites.size());
             std::copy(plan->prerequisites.begin(), plan->prerequisites.end(), control->terminal.prerequisites);
+            if (frontier_mapped && !plan->prerequisites.empty() && tasks[plan->steps.front()].sync_start) {
+                const uint32_t head = plan->prerequisites.front();
+                if (!std::all_of(plan->prerequisites.begin(), plan->prerequisites.end(), [&](uint32_t id) {
+                        return external.completion_plan->task_chains[id] == external.terminal_frontier_chain;
+                    }))
+                    return fail(BuildStatus::INVALID_ARGUMENT, head, -1);
+                // AICPU clears a completion slot at its head. Only this
+                // counter's unused GM preset represents the whole frontier.
+                counters[head].value = percounter_counter_preset(counters[head].completion_notify_target);
+                control->terminal.prerequisite_count = 1;
+                control->terminal.frontier_includes_start = 1;
+                frontier_mapped = false;
+            }
         }
     }
+    if (frontier_mapped) return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
 
     std::vector<ResourceOrderTask> order_tasks(task_count);
     for (uint64_t id = 0; id < task_count; ++id) {
