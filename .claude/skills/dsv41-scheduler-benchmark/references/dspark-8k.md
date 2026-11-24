@@ -1,11 +1,12 @@
 # DSpark full decode at 8K
 
 This case measures one complete synthetic DSpark decode dispatch using
-PyPTO-Lib's V4.1 Flash target and drafter. Use the aligned fork branch
-[MaxwellF1/pypto-lib dev/hbg](https://github.com/MaxwellF1/pypto-lib/tree/dev/hbg)
-or a Lib checkout with the equivalent A5 runtime selection and model code.
-Record the Lib, PyPTO, Simpler and PTO ISA revisions and the PTOAS and CANN
-versions. Set up the selected PyPTO and Simpler in the active Python environment
+PyPTO-Lib's V4.1 Flash target and drafter. Use Lib main for current upstream
+measurements or the requested dev branch for branch comparisons. Verify that
+the Lib HBG selection resolves to A5 Percounter on the selected PyPTO checkout.
+Record the full Lib, PyPTO, loaded Simpler, and PTO ISA commits, any override of
+PyPTO's Simpler pin, and the PTOAS and CANN versions. Set up the selected PyPTO
+and Simpler in the active Python environment
 using the [multi-repo setup](../../multi-repo-setup/SKILL.md).
 
 - EP2 / TP2 uses `--ep 2 --dp 2 --lm-head-tp 2` and the reservation
@@ -82,3 +83,40 @@ as unavailable. Device wall is collected for the same dispatches and uses the
 same lowest-median rank aggregation, with its own metric name. The summary
 also reports the median of the per-round slowest-rank sum. This uses rank
 durations and does not require synchronized device clocks.
+
+## Capture and export Perfetto
+
+Reuse the prepared output for the same runtime, fixture and topology. Set
+`EP` to the prepared card count and retain the environment from the replay
+example. Within the card allowance, submit a separate trace run, then export
+on the experiment host after the reservation finishes.
+
+```bash
+LEVEL=2
+printf -v trace '%q ' "$PYTHON" "$SCRIPT" trace --lib "$LIB" --output "$OUT" --trace-level "$LEVEL"
+task-submit --device auto --device-num "$EP" --timeout 3600 --max-time 1800 \
+  "${env_args[@]}" --run "$trace"
+"$PYTHON" "$SCRIPT" export-trace --output "$OUT" --trace-level "$LEVEL"
+```
+
+L2 includes Worker View, Scheduler View, and AICPU Lifecycle. Use L3 for
+scalar scheduler phases or L4 for detailed CntNotify, GM, and SSBUF activity.
+See the [calendar DFX levels](../../../../docs/dfx/chip-swimlane-profiling.md#a5-percounter-calendar).
+Use the converter from the Simpler checkout that ran the capture. Trace replay
+uses PyPTO's own graph and timing passes and restores frozen InOut tensors
+before both dispatches, including the decode position and KV caches.
+
+Each trace run preserves the resulting `dfx_outputs` under `$OUT/traces/`.
+A partial capture left in the build directory after a failed replay can be
+archived separately before retrying. To convert existing recordings, pass
+`--trace-root` pointing to a tree containing the matching `rank*/d*/` records.
+Keep the records, dependency files and kernel name maps together.
+
+The exporter checks each candidate against its dependency graph for complete
+task and block coverage. It tries conversion in order of increasing Worker
+span and checks the converted Worker View against the source clock. The
+report records skipped candidates and their reasons. For L2 it writes
+`$OUT/swimlanes/fastest-l2.perfetto.json` and its source summary
+`fastest-l2.json` for L2. Report the exported span separately from the
+fastest fixed-rank median in the performance table. Keep the raw and
+converted files on the experiment host.
