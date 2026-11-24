@@ -13,14 +13,15 @@ Design principles:
 5. **Skip irrelevant platforms, and irrelevant suites** — `detect-changes` gates `st-sim-*` and `st-onboard-*` by platform, so a PR confined to one of A2/A3, A5 or WSE skips the other platforms' scene-test runs. **UT jobs are still not gated by platform** — unit tests cover shared contracts and the cost of a falsely-skipped regression outweighs the savings. They *are* gated by test category: a diff confined to `tests/st/` or `examples/` cannot break a unit test, and one confined to `tests/ut/` cannot break a scene test, because the two suites execute disjoint trees (`pytest examples tests/st` vs `pytest tests/ut` plus the C++ ctest) and no unit test reads `examples/` or `tests/st/`. Shared test infrastructure — the root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/` — belongs to neither category and runs both.
 6. **Non-code PRs automatically run pre-commit and docs, and nothing else** — `detect-changes` sets `non_code_only` when *no* changed file falls outside the `NON_CODE` set. Skipping the UT jobs is riskless there because nothing in that set can change what the code does, and each member already has its own gate: markdownlint inside `pre-commit` reads the markdown, `docs.yml` (unconditional on every PR) builds the site with `--strict`, and `pre-commit` itself is ungated so a `.pre-commit-config.yaml` change is fully exercised by it.
 
-A5 hardware validation for ordinary PRs is requested by a maintainer or admin with `/run-a5`.
-A5 simulation, CPU tests and profiling remain automatic under their existing
-change gates. Daily retains its A5 jobs. A2/A3 multi-machine Network1 validation
+A5 onboard ST runs automatically for PRs with `a5_changed && st_affected`,
+after change detection and pre-commit; no `/run-a5` comment is required.
+The main sweep excludes A5 manual cases; Daily includes them. A5 UT and
+framework validation remain available through the explicit command. A2/A3 multi-machine Network1 validation
 runs only in Daily, including manually dispatched Daily runs.
 
 ## Full Job Matrix
 
-The complete test-type × hardware-tier matrix across automatic CI, the A5 comment workflow and Daily. A5 hardware jobs in this table use `/run-a5` for ordinary PR validation.
+The complete test-type × hardware-tier matrix across automatic CI, the A5 comment workflow and Daily. A5 onboard ST is automatic for affected PRs; A5 UT and framework ST use `/run-a5`.
 
 | Category | CPU (no hardware) | a2a3 runner | a5 runner |
 | -------- | ----------------- | ----------- | --------- |
@@ -101,6 +102,7 @@ PullRequest
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── st-framework-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
+  ├── st-onboard-a5          (a5 self-hosted)        — a5_changed && st_affected
   └── st-deepseek-onboard-a2a3    (a2a3 self-hosted)      — a2a3_changed && st_affected
 
 Admin PR comment /run-a5
@@ -304,6 +306,20 @@ same DFX smoke steps used by Per-PR run once in each Daily platform job, and
 the A2/A3 `network1` corpus runs exclusively in Daily through the existing two-machine workflow. The
 main Per-PR scene-test steps keep the default `--manual exclude`, so moving an
 ordinary case to Daily does not require a second workflow exclusion list.
+
+A5 onboard Daily-only coverage includes the URMA deferred-completion demo,
+joined-launch diagnostic attribution, CCU real-window transfers and shared/subset
+window checks, and CCU native-domain mission-order/interleaved-association checks.
+Standalone tests use `@pytest.mark.manual(["a5"])`; scene-test classes use
+`CASES[*]["manual"] = ["a5"]`, which also governs their standalone entry points.
+The resident-failure `large_ticket_claim[7-1]` and `native_graph_failure[2-1]`
+parameter cases are also Daily-only on A5; other shapes keep their existing tiers.
+The two 64-run/eight-set worked-capacity suites are Daily-only on A5 as well.
+Focused two-/three-run concurrency, capacity admission, result chaining and
+failure-attribution checks stay in Per-PR. Daily selects all these cases with
+`--manual include`. A5 simulation selection is unchanged. Deferral is a coverage
+exception, not verification that earlier hardware failures are fixed.
+
 WSE runs its dependency-capture smoke; its legacy PMU, chip-swimlane,
 args-dump and scope-stats collectors are unsupported.
 The dedicated A2/A3 and A5 dep-gen, chip-swimlane, PMU, args-dump, and scope-stats steps
@@ -471,10 +487,10 @@ not need `--max-parallel` manually.
 
 - PR simulation and no-hardware unit tests run on the self-hosted CPU pool; Daily retains GitHub-hosted coverage.
 - Change detection and pre-commit start with 100 commits of checkout history. They use the admitted PR base SHA when available, fetching only a missing base commit. If the merge-base is outside the shallow history, they deepen the head and base histories in two bounded rounds of 100 and 400 commits, without fetching every branch or tag. Unresolved history makes the detector run the full matrix; pre-commit fails with an explicit error rather than emitting an empty base SHA.
-- `detect-changes` is implemented once in [`.github/workflows/_detect-changes.yml`](../.github/workflows/_detect-changes.yml) and computes four axes from the PR diff — non-code (`non_code_only`), architecture (`a2a3_changed` / `a5_changed` / `wse_changed`), test category (`st_affected` / `ut_affected`), and corpus (`examples_only` / `tests_only`) — **all of them derived from one `NON_CODE` set**: `docs/`, `.docs/`, `.claude/`, `mkdocs.yml`, `.github/workflows/docs.yml`, `.gitignore`, `.pre-commit-config.yaml`, and any `*.md` file anywhere. Membership follows a file's *effect*, not its path — `mkdocs.yml` and `docs.yml` are docs tooling that happens to live outside `docs/`. An arch flag is `false` only when every changed file is in the other platforms' trees (`src/{arch}/`, `examples/{arch}/`, `tests/{st,ut/cpp}/{arch}/`) or in `NON_CODE`. Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), shared test infra (`tests/ut/py/`, `tests/lint/`), tooling (`tools/`), or any CI implementation workflow (`.github/workflows/ci.yml`, `.github/workflows/_*.yml`) — flips all three architecture flags to `true`. CI implementation workflows are deliberately excluded from `NON_CODE`: a change to the gates or reusable job bodies must run the complete automatic matrix. Explicit `/run-a5` hardware suites remain manual.
+- `detect-changes` is implemented once in [`.github/workflows/_detect-changes.yml`](../.github/workflows/_detect-changes.yml) and computes four axes from the PR diff — non-code (`non_code_only`), architecture (`a2a3_changed` / `a5_changed` / `wse_changed`), test category (`st_affected` / `ut_affected`), and corpus (`examples_only` / `tests_only`) — **all of them derived from one `NON_CODE` set**: `docs/`, `.docs/`, `.claude/`, `mkdocs.yml`, `.github/workflows/docs.yml`, `.gitignore`, `.pre-commit-config.yaml`, and any `*.md` file anywhere. Membership follows a file's *effect*, not its path — `mkdocs.yml` and `docs.yml` are docs tooling that happens to live outside `docs/`. An arch flag is `false` only when every changed file is in the other platforms' trees (`src/{arch}/`, `examples/{arch}/`, `tests/{st,ut/cpp}/{arch}/`) or in `NON_CODE`. Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), shared test infra (`tests/ut/py/`, `tests/lint/`), tooling (`tools/`), or any CI implementation workflow (`.github/workflows/ci.yml`, `.github/workflows/_*.yml`) — flips all three architecture flags to `true`. CI implementation workflows are deliberately excluded from `NON_CODE`: a change to the gates or reusable job bodies must run the complete automatic matrix. A5 onboard ST is part of the automatic matrix.
 - **Test-category axis:** `ST_ONLY='^(tests/st/|examples/)'` and `UT_ONLY='^tests/ut/'`, applied in the same shape as the arch patterns — a category is unaffected only when *every* changed file is exclusively the other's. `st_affected` gates automatic scene-test jobs; `ut_affected` gates automatic `ut` and `ut-a2a3`. Explicit `/run-a5` requests run all three A5 hardware suites without change detection. Anything belonging to neither (root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/`) flips both, so shared infrastructure always runs both suites.
 - **Corpus axis:** `EXAMPLES_ONLY='^examples/'` and `TESTS_ONLY='^(tests/)'`, same shape again, one per side of the product jobs' payload. `packaging-matrix` and `profiling-flags-smoke` build and install the product and then exercise it with a fixed, tiny payload — one entry-point script (a `tests/st/` file) and one `vector_example` — so neither reads either suite as a corpus, and a diff confined to `examples/` or to `tests/` cannot reach them: `wheel.packages` is `["simpler_setup", "python/simpler"]`, so both partitions are provably absent from the product. A payload file changed under either is still exercised by the scene-test job that reads the same corpus.
-- **Gated jobs (scene tests):** automatic `st-sim-{a2a3,a5,wse}` and `st-onboard-a2a3` run iff their platform's flag **and** `st_affected` are `true`. Explicit `/run-a5` requests are not filtered by these gates.
+- **Gated jobs (scene tests):** automatic `st-sim-{a2a3,a5,wse}` and `st-onboard-{a2a3,a5}` run iff their platform's flag **and** `st_affected` are `true`. Explicit `/run-a5` requests are not filtered by these gates.
 - **Platform-independent jobs (UT + packaging):** automatic `ut`, `ut-a2a3` and `packaging-matrix` ignore the *platform* flags — unit tests exercise shared contracts (nanobind bindings, RuntimeBuilder, ring buffers, etc.) and the risk of silently skipping a regression outweighs the CI minutes saved. The `tests/ut/cpp/{arch}/` entry in the gating regex only *attributes* an arch-specific C++ UT change to that platform (so it does not spuriously flip the other platforms' scene-test flags); it does not gate the UT jobs themselves. The gated UT jobs do respect `ut_affected`, which is a statement about test category rather than silicon. `packaging-matrix` respects the corpus axis, which is a statement about which corpus a job reads: neither `examples/` nor `tests/` is in `wheel.packages`, so a diff confined to either partition cannot change what the packaging job builds.
 - **`non_code_only` is the same `NON_CODE` set, not a narrower one.** It is `true` when no changed file falls outside it. Nothing in the set can change what the code does, and no workflow consumes any of it beyond its own gate: `pre-commit` is ungated so it always exercises `.pre-commit-config.yaml`, `docs.yml` is unconditional on every PR so it always exercises `mkdocs.yml` / `docs/`, and **no workflow invokes anything under `.claude/`** (`grep -rn '\.claude' .github/workflows/` finds only comments). An **empty diff short-circuits the whole step**: attribution is impossible, so a single guard sets `non_code_only=false`, every arch and category flag `true`, and both corpus flags (`examples_only`, `tests_only`) `false`, then returns — running the full matrix, packaging and the profiling smoke included. That guard is deliberately one place; testing emptiness per flag is what previously left `non_code_only` false while the arch flags also came out false, running UT and packaging but skipping every scene test.
 
@@ -771,12 +787,12 @@ head predates their introduction. This qualifies integration with that base,
 not the standalone head. Non-PR comments and unverified or
 requests without maintain or admin access cannot schedule hardware work.
 
-Every admitted request runs `ut-a5` with CANN examples, `st-onboard-a5` with DFX
+Automatic A5 onboard ST requires no comment. Every admitted request runs `ut-a5` with CANN examples, `st-onboard-a5` with DFX
 smokes, and `st-framework-a5` through the existing reusable workflows.
 No change detector filters an explicit request, including a documentation-only
 PR. A new admitted request cancels the previous same-PR job for each suite;
-unmatched and denied comments cannot cancel admitted jobs. Pushes do not
-retrigger these suites; comment again to test a new head. The gate refuses any
+unmatched and denied comments cannot cancel admitted jobs. Pushes retrigger affected automatic onboard ST. Comment again to retest
+the explicitly requested suites on a new head. The gate refuses any
 run attempt after the first, so "Re-run all jobs" cannot admit a head the
 comment never saw; "Re-run failed jobs" keeps the original gate outputs and
 retests the admitted SHA. The gate and report jobs only call the GitHub API and

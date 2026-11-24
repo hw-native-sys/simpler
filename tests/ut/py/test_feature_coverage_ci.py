@@ -279,14 +279,15 @@ def test_environment_callers_keep_trigger_and_device_contracts():
 
     ci, daily, comment = (workflow(name) for name in ("ci", "daily", "ci-a5-comment"))
     assert ci["on"] == {"pull_request": {"branches": ["main"]}}
-    assert "st-onboard-a5" not in ci["jobs"] and "st-framework-a5" not in ci["jobs"]
     for family in ("onboard", "framework"):
-        job = ci["jobs"][f"st-{family}-a2a3"]
-        assert job["needs"] == ["detect-changes", "pre-commit"]
-        assert job["if"] == (
-            "needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'"
-        )
-        assert job["with"].get("manual_mode", "exclude") == "exclude"
+        for platform in ("a2a3", "a5") if family == "onboard" else ("a2a3",):
+            job = ci["jobs"][f"st-{family}-{platform}"]
+            assert job["needs"] == ["detect-changes", "pre-commit"]
+            assert job["if"] == (
+                f"needs.detect-changes.outputs.{platform}_changed == 'true' && "
+                "needs.detect-changes.outputs.st_affected == 'true'"
+            )
+            assert job["with"].get("manual_mode", "exclude") == "exclude"
         for platform in ("a2a3", "a5"):
             assert daily["jobs"][f"st-{family}-{platform}"]["with"]["manual_mode"] == "include"
         assert comment["jobs"][f"st-{family}-a5"]["needs"] == ["gate-and-resolve"]

@@ -14,6 +14,8 @@ import pytest
 from tests.st.a5.tensormap_and_ringbuffer.ccu_window_transfer.test_ccu_window_transfer import _exercise_window_transfer
 
 
+# A5 onboard failures remain covered by the Daily full sweep.
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(2)

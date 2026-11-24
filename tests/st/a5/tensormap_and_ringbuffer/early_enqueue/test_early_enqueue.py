@@ -2143,6 +2143,7 @@ class TestA5TmrWorkedCapacityExample(_A5TmrEarlyEnqueueBase):
     CASES = [
         {
             "name": "a5_tmr_worked_capacity_example",
+            "manual": ["a5"],
             "platforms": ["a5"],
             "config": {
                 "device_count": 1,

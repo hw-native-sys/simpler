@@ -2450,6 +2450,7 @@ class TestA5WorkedCapacityExample(_A5EarlyEnqueueBase):
     CASES = [
         {
             "name": "a5_worked_capacity_example",
+            "manual": ["a5"],
             "platforms": ["a5"],
             "config": {
                 "device_count": 1,

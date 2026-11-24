@@ -171,6 +171,8 @@ def test_unenabled_domain_rejects_ccu_registration(st_platform, st_device_ids, t
         worker.close()
 
 
+# A5 onboard failures remain covered by the Daily full sweep.
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
@@ -251,6 +253,8 @@ def test_two_missions_b_before_a(st_platform, st_device_ids, tmp_path, request, 
         worker.close()
 
 
+# A5 onboard failures remain covered by the Daily full sweep.
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)

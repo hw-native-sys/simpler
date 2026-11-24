@@ -117,9 +117,9 @@ def _execute(job, fixture, workflow="ci-a5-comment", step_index=0):
     return json.loads(result.stdout)
 
 
-def test_only_three_hardware_suites_move_from_automatic_ci():
+def test_a5_onboard_runs_automatically_and_comment_remains_optional():
     ci = _workflow("ci")["jobs"]
-    assert all(name not in ci for name in _SUITES)
+    assert "st-onboard-a5" in ci
     for name in ("ut", "packaging-matrix", "st-sim-a5", "profiling-flags-smoke", "ut-a2a3", "st-onboard-a2a3"):
         assert name in ci
     daily = _workflow("daily")["jobs"]

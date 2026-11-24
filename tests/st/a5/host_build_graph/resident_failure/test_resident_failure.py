@@ -58,14 +58,14 @@ def _onboard_shape_params(shapes):
     ]
 
 
-def _shape_params(shapes):
+def _shape_params(shapes, *, daily_onboard=()):
     params = []
     for mask, lane in shapes:
         marks = [] if (mask, lane) in _SIM_SHAPES else [pytest.mark.platforms(["a5"])]
         manual_platforms = []
         if (mask, lane) == (7, 0):
             manual_platforms.append("a5sim")
-        if (mask, lane) not in _PER_PR_SHAPES:
+        if (mask, lane) not in _PER_PR_SHAPES or (mask, lane) in daily_onboard:
             manual_platforms.append("a5")
         if manual_platforms:
             marks.append(pytest.mark.manual(manual_platforms))
@@ -308,7 +308,7 @@ def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_devic
     _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatch, _STALL_MS)
 
 
-@pytest.mark.parametrize("mask,lane", [(2, 1), (7, 2)])
+@pytest.mark.parametrize("mask,lane", [pytest.param(2, 1, marks=pytest.mark.manual(["a5"])), (7, 2)])
 def test_native_graph_failure_does_not_release_exit(st_platform, st_device_ids, mask, lane, monkeypatch):
     timeout_ms = _SIM_TIMEOUT_MS if st_platform.endswith("sim") else _TIMEOUT_MS
     stall_ms = _STALL_MS * timeout_ms // _TIMEOUT_MS
@@ -366,7 +366,7 @@ def test_nonreturning_kernel_timeout_keeps_failed_run_contained(st_platform, st_
     _exercise_failure(st_platform, st_device_ids, mask, lane, 2, monkeypatch, -1)
 
 
-@pytest.mark.parametrize("mask,lane", _shape_params(_TICKET_SHAPES))
+@pytest.mark.parametrize("mask,lane", _shape_params(_TICKET_SHAPES, daily_onboard={(7, 1)}))
 def test_large_ticket_claim_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, monkeypatch):
     # 257 exceeds twice every supported single-chip claimant population.
     _exercise_failure(st_platform, st_device_ids, mask, lane, 257, monkeypatch, _STALL_MS)

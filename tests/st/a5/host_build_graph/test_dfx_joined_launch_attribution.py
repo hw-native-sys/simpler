@@ -545,6 +545,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
     CASES = [
         {
             "name": "agreeing_pair",
+            "manual": ["a5"],
             "platforms": ["a5sim", "a5"],
             "config": {
                 "device_count": 1,

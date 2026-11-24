@@ -19,6 +19,8 @@ from simpler.worker import Worker
 from tests.st.a5.tensormap_and_ringbuffer.ccu_native_domain.test_ccu_native_domain import _build_callable
 
 
+# A5 onboard failures remain covered by the Daily full sweep.
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
@@ -26,6 +28,8 @@ def test_ccu_real_window_transfer(st_platform, st_device_ids, tmp_path, request)
     _exercise_window_transfer(st_platform, st_device_ids[:2], tmp_path, request, (0, 1))
 
 
+# A5 onboard failures remain covered by the Daily full sweep.
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(3)
@@ -34,6 +38,8 @@ def test_ccu_all_peer_channels_and_subset_rank_mapping(st_platform, st_device_id
     _exercise_window_transfer(st_platform, st_device_ids[:3], tmp_path, request, members)
 
 
+# A5 onboard failures remain covered by the Daily full sweep.
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(3)
