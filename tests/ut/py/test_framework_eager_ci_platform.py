@@ -241,19 +241,23 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
         f"#!{sys.executable}\nimport os,subprocess,sys\n"
         "args=sys.argv[1:]\n"
         "if args==['--list']: sys.exit(0)\n"
-        "assert args[args.index('--device-num')+1]=='1'\n"
+        "assert args[args.index('--device-num')+1]=='4'\n"
         "assert args[args.index('--timeout')+1]=='2100'\n"
         "assert args[args.index('--max-time')+1]=='1200'\n"
         "assert ['--env','PLATFORM']==args[4:6]\n"
         "assert ['--env','PYTEST_ADDOPTS']==args[6:8]\n"
         "assert ['--env','FRAMEWORK_WHEEL_SITE']==args[8:10]\n"
+        "for name in ('SIMPLER_FRAMEWORK_BUILD_DIR','SIMPLER_FRAMEWORK_NATIVE_PROBE',"
+        "'SIMPLER_FRAMEWORK_DESTROY_SHIM'):\n"
+        "    assert ['--env',name] in [args[index:index+2] for index in range(len(args)-1)]\n"
         "subprocess.run(['bash','-e','-c',args[args.index('--run')+1]], "
-        "env={**os.environ,'TASK_DEVICE':'0'},check=True)\n",
+        "env={**os.environ,'TASK_DEVICE':'2,4,6,8','TASKQUEUE_INSIDE':'1'},check=True)\n",
     )
     _executable(binary / "git", "#!/bin/sh\necho CPU-source\n")
     _executable(binary / "npu-smi", "#!/bin/sh\necho CPU-inventory\n")
     _executable(
-        tmp_path / ".claude/skills/onboard-arch-precheck/check.sh", '#!/bin/sh\n[ "$1" = "$ACTUAL_PLATFORM" ]\n'
+        tmp_path / ".claude/skills/onboard-arch-precheck/check.sh",
+        '#!/bin/sh\nprintf "%s\\n" "$1" > "$PRECHECK_LOG"\n[ "$1" = "$ACTUAL_PLATFORM" ]\n',
     )
     cann = tmp_path / "set_env.sh"
     cann.write_text("export PYTHONPATH=/cann-site\n")
@@ -270,11 +274,13 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
             "COMMAND_LOG": str(log),
             "PYTEST_ADDOPTS": "-o pythonpath=/framework-site",
             "FRAMEWORK_WHEEL_SITE": "/framework-site",
+            "PRECHECK_LOG": str(tmp_path / "precheck.log"),
         },
         text=True,
         capture_output=True,
         check=False,
     )
+    assert (tmp_path / "precheck.log").read_text().strip() == platform_name
     if platform_name != actual_platform:
         assert result.returncode != 0
         assert not log.exists(), "wrong-silicon execution must stop before backend/pytest"
@@ -285,9 +291,86 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
     pytest_command = commands[1]
     assert pytest_command[:4] == ["-m", "pytest", "examples", "tests/st"]
     assert pytest_command[pytest_command.index("--platform") + 1] == platform_name
-    assert pytest_command[pytest_command.index("--max-parallel") + 1] == "1"
+    assert pytest_command[pytest_command.index("--max-parallel") + 1] == "4"
+    assert pytest_command[pytest_command.index("--device") + 1] == "2,4,6,8"
     assert pytest_command[pytest_command.index("--test-environment") + 1] == "torch_npu"
     assert commands[2][:3] == ["-m", "simpler_setup.test_environments", "verify"]
+
+
+@pytest.mark.parametrize("platform_name", ["a2a3", "a5"])
+def test_framework_preparation_builds_with_wheel_paths_without_devices(tmp_path, platform_name):
+    steps = _yaml(_WORKFLOW)["jobs"]["run"]["steps"]
+    prepare = next(step for step in steps if step["name"] == "Build framework artifacts")
+    run_index = next(index for index, step in enumerate(steps) if step["name"] == "Run framework scene tests")
+    assert steps.index(prepare) < run_index
+    commands = tmp_path / "commands.jsonl"
+    site = tmp_path / "framework site"
+    site.mkdir()
+    _executable(
+        tmp_path / ".venv-framework/bin/python",
+        f"#!{sys.executable}\nimport json,os,sys\nfrom pathlib import Path\n"
+        "args=sys.argv[1:]\n"
+        "assert not os.environ.get('TASKQUEUE_INSIDE') and not os.environ.get('TASK_DEVICE')\n"
+        "assert os.environ['PYTHONPATH'].split(os.pathsep)[0]==os.environ['FRAMEWORK_WHEEL_SITE']\n"
+        "with open(os.environ['COMMAND_LOG'],'a') as out: out.write(json.dumps(args)+'\\n')\n"
+        "if args==['-']: exec(sys.stdin.read()); sys.exit(0)\n"
+        "if args[0].endswith('main.py'):\n"
+        "    assert '--compile-only' in args\n"
+        "    directory=Path(args[args.index('--build-dir')+1]); directory.mkdir(parents=True,exist_ok=True)\n"
+        "    (directory/'_simpler_framework_queue_cpu.so').touch()\n"
+        "elif args[0].endswith('probe.py'):\n"
+        "    assert args[1]=='build'\n"
+        "    directory=Path(args[args.index('--output')+1]); directory.mkdir(parents=True,exist_ok=True)\n"
+        "    (directory/'_framework_queue_gil_probe_cpu.so').touch()\n"
+        "elif args[0].endswith('warm_kernels.py'):\n"
+        "    assert args[args.index('--platform')+1]==os.environ['PLATFORM']\n"
+        "    output=Path(args[args.index('--output')+1])\n"
+        "    output.write_text(json.dumps({'platform':os.environ['PLATFORM'],"
+        "'project_root':str(Path(os.environ['FRAMEWORK_WHEEL_SITE'])/'simpler_setup/_assets')}))\n"
+        "else: raise AssertionError(args)\n",
+    )
+    binary = tmp_path / "bin"
+    _executable(
+        binary / "cc",
+        f"#!{sys.executable}\nimport json,os,sys\nfrom pathlib import Path\n"
+        "assert not os.environ.get('TASKQUEUE_INSIDE')\n"
+        "with open(os.environ['COMMAND_LOG'],'a') as out: out.write(json.dumps(['cc',*sys.argv[1:]])+'\\n')\n"
+        "Path(sys.argv[sys.argv.index('-o')+1]).touch()\n",
+    )
+    for name in ("task-submit", "npu-smi"):
+        _executable(binary / name, "#!/bin/sh\necho unexpected-device-access >&2\nexit 9\n")
+    cann = tmp_path / "set_env.sh"
+    cann.write_text("export PYTHONPATH=/cann-site\n")
+    github_env = tmp_path / "github-env"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", prepare["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{binary}:{os.environ['PATH']}",
+            "CANN_ENV": str(cann),
+            "PLATFORM": platform_name,
+            "FRAMEWORK_WHEEL_SITE": str(site),
+            "COMMAND_LOG": str(commands),
+            "GITHUB_ENV": str(github_env),
+            "TASKQUEUE_INSIDE": "",
+            "TASK_DEVICE": "",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    values = dict(line.split("=", 1) for line in github_env.read_text().splitlines())
+    assert set(values) == {
+        "SIMPLER_FRAMEWORK_BUILD_DIR",
+        "SIMPLER_FRAMEWORK_NATIVE_PROBE",
+        "SIMPLER_FRAMEWORK_DESTROY_SHIM",
+    }
+    assert Path(values["SIMPLER_FRAMEWORK_BUILD_DIR"]).is_dir()
+    assert Path(values["SIMPLER_FRAMEWORK_NATIVE_PROBE"]).is_file()
+    assert Path(values["SIMPLER_FRAMEWORK_DESTROY_SHIM"]).is_file()
 
 
 @pytest.mark.parametrize("caller", ["ci", "daily"])
@@ -307,7 +390,7 @@ def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller)
             if platform_name == "a5":
                 assert job["with"]["ref"] == "${{ github.sha }}"
     workflow = _yaml(_WORKFLOW)
-    assert workflow["jobs"]["run"]["timeout-minutes"] == "45"
+    assert workflow["jobs"]["run"]["timeout-minutes"] == "${{ inputs.platform == 'a5' && 60 || 45 }}"
     assert workflow["jobs"]["run"]["steps"][-1]["with"]["name"] == (
         "framework-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}"
     )

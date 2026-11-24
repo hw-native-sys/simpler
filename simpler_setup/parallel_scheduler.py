@@ -30,6 +30,7 @@ import signal
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -49,6 +50,8 @@ class Job:
     cwd: str | None = None
     env: dict | None = None
     nodeid: str | None = None  # pytest nodeid, when the caller has one
+    isolated_process_group: bool = False
+    output_path: str | None = None  # Optional live stdout/stderr log, independent of completion callbacks.
 
 
 @dataclass
@@ -69,7 +72,55 @@ class _RunningJob:
     device_ids: list[int]
     start_time: float
     output_lines: list[str]
-    pump_thread: threading.Thread
+    pump_thread: threading.Thread | None = None
+    output_offset: int = 0
+    output_error: Exception | None = None
+
+    def join_output(self) -> None:
+        if self.pump_thread is not None:
+            self.pump_thread.join(timeout=2.0)
+
+    def echo_output(self, enabled: bool) -> None:
+        if self.output_error is not None:
+            raise OSError(
+                f"Cannot write subprocess log {self.job.output_path}: {self.output_error}"
+            ) from self.output_error
+        if enabled and self.output_offset < len(self.output_lines):
+            end = len(self.output_lines)
+            print("".join(self.output_lines[self.output_offset : end]), end="", flush=True)
+            self.output_offset = end
+
+    def pump_output(self, p: subprocess.Popen) -> None:
+        """Drain ``p.stdout`` into the capture buffer and optional live log.
+
+        Without a continuous reader the child would block once the OS pipe
+        buffer fills up (~64 KB on Linux / macOS) — typical for a verbose
+        pytest run. Runs on its own daemon thread per job so the pump
+        cannot contend with the scheduler loop's ``poll`` cadence.
+        """
+        assert p.stdout is not None
+        output_file = None
+        try:
+            if self.job.output_path is not None:
+                try:
+                    output_file = open(self.job.output_path, "w", encoding="utf-8")
+                except OSError as error:
+                    self.output_error = error
+            for line in iter(p.stdout.readline, ""):
+                if output_file is not None and self.output_error is None:
+                    try:
+                        output_file.write(line)
+                        output_file.flush()
+                    except (OSError, UnicodeError) as error:
+                        self.output_error = error
+                self.output_lines.append(line)
+        finally:
+            p.stdout.close()
+            if output_file is not None:
+                try:
+                    output_file.close()
+                except OSError as error:
+                    self.output_error = error
 
 
 @dataclass
@@ -79,6 +130,10 @@ class _RunState:
     results: list[JobResult] = field(default_factory=list)
     failed: bool = False
     cancelled: bool = False
+
+    def echo_output(self, enabled: bool) -> None:
+        for running in self.running.values():
+            running.echo_output(enabled)
 
 
 # Module-global handle to the active _RunState while run_jobs is in flight.
@@ -119,10 +174,83 @@ def _release_devices(state: _RunState, ids: list[int]) -> None:
     state.free_devices.extend(ids)
 
 
+def _restore_stop_handlers(handlers):
+    """Restore all handlers despite Python interrupts delivered through other threads."""
+    previous_mask = None
+    restore_error = None
+    if hasattr(signal, "pthread_sigmask"):
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set(handlers))
+    try:
+        remaining = dict(handlers)
+        while remaining:
+            try:
+                for signum, handler in tuple(remaining.items()):
+                    signal.signal(signum, handler)
+                    remaining.pop(signum)
+            except BaseException as error:
+                if restore_error is None:
+                    restore_error = error
+    finally:
+        if previous_mask is not None:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            except BaseException as error:
+                if restore_error is None:
+                    restore_error = error
+    return restore_error
+
+
+@contextmanager
+def _defer_interrupts():
+    """Defer installed stop handlers until subprocess bookkeeping is consistent.
+
+    Only Python handlers are deferred; ignored/default dispositions remain
+    unchanged. Children keep the caller's signal mask. Only handler restoration
+    briefly blocks signals in the controller, after subprocess bookkeeping.
+    Signal handlers and the scheduler's process lifecycle run on the main thread.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    handlers = {}
+    pending = {}
+
+    def defer(signum, frame):
+        pending.setdefault(signum, frame)
+
+    try:
+        for name in ("SIGINT", "SIGTERM", "SIGALRM"):
+            signum = getattr(signal, name, None)
+            if signum is not None:
+                handler = signal.getsignal(signum)
+                if callable(handler):
+                    handlers[signum] = handler
+                    signal.signal(signum, defer)
+        yield
+    finally:
+        restore_error = _restore_stop_handlers(handlers)
+        for signum, frame in pending.items():
+            handlers[signum](signum, frame)
+        if restore_error is not None:
+            raise restore_error
+
+
+def _signal_process_group(p: subprocess.Popen, job: Job, signum: int) -> None:
+    if job.isolated_process_group and os.name == "posix":
+        try:
+            os.killpg(p.pid, signum)
+        except ProcessLookupError:
+            pass
+
+
+@_defer_interrupts()
 def _terminate_all(state: _RunState, timeout_s: float = 5.0) -> None:
     """SIGTERM all running children, wait briefly, then SIGKILL stragglers."""
     for p in list(state.running):
-        if p.poll() is None:
+        job = state.running[p].job
+        if job.isolated_process_group and os.name == "posix":
+            _signal_process_group(p, job, signal.SIGTERM)
+        elif p.poll() is None:
             try:
                 p.send_signal(signal.SIGTERM)
             except ProcessLookupError:
@@ -136,6 +264,10 @@ def _terminate_all(state: _RunState, timeout_s: float = 5.0) -> None:
                 p.wait(timeout=1.0)
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            _signal_process_group(p, state.running[p].job, signal.SIGKILL)
+    for running in state.running.values():
+        running.join_output()
 
 
 def run_jobs(
@@ -146,6 +278,7 @@ def run_jobs(
     fail_fast: bool = False,
     poll_interval_s: float = 0.1,
     on_job_done: Callable[[JobResult], None] | None = None,
+    stream_output: bool = False,
 ) -> list[JobResult]:
     """Run jobs concurrently up to the device-pool capacity.
 
@@ -171,6 +304,7 @@ def run_jobs(
         on_job_done: called (thread-safe w.r.t. this function — which is
             single-threaded) whenever a job completes, useful for streaming
             pytest reports or printing PASS/FAIL lines.
+        stream_output: echo child output while jobs run, retaining it in results.
 
     Returns:
         List of JobResult in completion order. Jobs cancelled under
@@ -193,19 +327,6 @@ def run_jobs(
     _active_state = state
     queue = list(jobs)
 
-    def _pump_stdout(p: subprocess.Popen, sink: list[str]) -> None:
-        """Drain ``p.stdout`` line-by-line into ``sink``.
-
-        Without a continuous reader the child would block once the OS pipe
-        buffer fills up (~64 KB on Linux / macOS) — typical for a verbose
-        pytest run. Runs on its own daemon thread per job so the pump
-        cannot contend with the scheduler loop's ``poll`` cadence.
-        """
-        assert p.stdout is not None
-        for line in iter(p.stdout.readline, ""):
-            sink.append(line)
-        p.stdout.close()
-
     def _try_launch_head() -> bool:
         """Launch queue[0] if it fits; return True if launched or queue empty/blocked."""
         if not queue:
@@ -219,32 +340,35 @@ def run_jobs(
             return False
         queue.pop(0)
         cmd = head.build_cmd(allocated)
-        try:
+        with _defer_interrupts():
             # Capture both streams into a single pipe so the buffer we replay
             # preserves natural interleaving. Without ``text=True`` readline()
             # would return bytes and we'd have to decode ourselves.
-            p = subprocess.Popen(
-                cmd,
-                cwd=head.cwd,
-                env=head.env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,  # line-buffered; pump sees each line as it's written
+            try:
+                p = subprocess.Popen(
+                    cmd,
+                    cwd=head.cwd,
+                    env=head.env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,  # line-buffered; pump sees each line as it's written
+                    start_new_session=head.isolated_process_group,
+                )
+            except Exception:
+                _release_devices(state, allocated)
+                raise
+            output_lines: list[str] = []
+            rj = _RunningJob(
+                job=head,
+                device_ids=allocated,
+                start_time=time.monotonic(),
+                output_lines=output_lines,
             )
-        except Exception:
-            _release_devices(state, allocated)
-            raise
-        output_lines: list[str] = []
-        pump = threading.Thread(target=_pump_stdout, args=(p, output_lines), daemon=True)
-        pump.start()
-        state.running[p] = _RunningJob(
-            job=head,
-            device_ids=allocated,
-            start_time=time.monotonic(),
-            output_lines=output_lines,
-            pump_thread=pump,
-        )
+            state.running[p] = rj
+            pump = threading.Thread(target=rj.pump_output, args=(p,), daemon=True)
+            pump.start()
+            rj.pump_thread = pump
         # Emit at launch (not just at completion) so a hung child is locatable:
         # the last START without a matching PASS/FAIL line in _emit_group output
         # is the case that's stuck.
@@ -260,11 +384,14 @@ def run_jobs(
             rc = p.poll()
             if rc is None:
                 continue
-            rj = state.running.pop(p)
+            rj = state.running[p]
+            _signal_process_group(p, rj.job, signal.SIGKILL)
+            state.running.pop(p)
             _release_devices(state, rj.device_ids)
             # Wait for the pump to drain remaining buffer (EOF after the child
             # exits). ``join`` is essentially instant at this point.
-            rj.pump_thread.join(timeout=2.0)
+            rj.join_output()
+            rj.echo_output(stream_output)
             duration = time.monotonic() - rj.start_time
             res = JobResult(
                 label=rj.job.label,
@@ -286,6 +413,7 @@ def run_jobs(
             pass
 
         while state.running or queue:
+            state.echo_output(stream_output)
             # If cancelled, stop pulling from queue
             if state.cancelled:
                 queue.clear()
@@ -313,28 +441,29 @@ def run_jobs(
             except subprocess.TimeoutExpired:
                 pass
     finally:
-        if state.cancelled and state.running:
-            _terminate_all(state)
-            # Sweep final results for the terminated ones
-            for p in list(state.running):
-                rc = p.poll()
-                if rc is None:
-                    rc = -signal.SIGTERM
-                rj = state.running.pop(p)
-                _release_devices(state, rj.device_ids)
-                rj.pump_thread.join(timeout=2.0)
-                duration = time.monotonic() - rj.start_time
-                state.results.append(
-                    JobResult(
-                        label=rj.job.label,
-                        returncode=rc,
-                        device_ids=rj.device_ids,
-                        output="".join(rj.output_lines),
-                        duration_s=duration,
-                        nodeid=rj.job.nodeid,
+        with _defer_interrupts():
+            if state.running:
+                _terminate_all(state)
+                # Sweep final results for the terminated ones
+                for p in list(state.running):
+                    rc = p.poll()
+                    if rc is None:
+                        rc = -signal.SIGTERM
+                    rj = state.running.pop(p)
+                    _release_devices(state, rj.device_ids)
+                    rj.join_output()
+                    duration = time.monotonic() - rj.start_time
+                    state.results.append(
+                        JobResult(
+                            label=rj.job.label,
+                            returncode=rc,
+                            device_ids=rj.device_ids,
+                            output="".join(rj.output_lines),
+                            duration_s=duration,
+                            nodeid=rj.job.nodeid,
+                        )
                     )
-                )
-        _active_state = None
+            _active_state = None
 
     return state.results
 

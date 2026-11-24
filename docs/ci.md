@@ -132,10 +132,10 @@ Admin PR comment /run-a5
 | [`st-sim-wse`](../src/wse/docs/README.md#build-and-test) | self-hosted CPU | `pytest examples tests/st --platform wsesim` |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
-| `st-framework-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
+| `st-framework-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 4 -p no:xdist` in one exclusive four-device task, then verify plan/JUnit |
 | `ut-a5` | a5 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then CANN example smokes. |
 | `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA and the active URMA regressions, then adaptive-parallel DFX feature smokes |
-| `st-framework-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
+| `st-framework-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 4 -p no:xdist` in one exclusive four-device task, then verify plan/JUnit |
 | `st-network1-onboard-a2a3` (Daily only) | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
 | `st-deepseek-onboard-a2a3` | a2a3 self-hosted | `pytest <the two deepseek_v4_flash_decode dirs> --platform a2a3 --manual only --device ...`, both 2-device cases concurrently, in parallel with `st-onboard-a2a3` |
 
@@ -197,6 +197,7 @@ NPU jobs:
 | `Checkout target` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `Validate manual mode` | ✓ | ✓ | — | — | ✓ | — | — |
 | `Set up environment` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `Build framework artifacts` | — | — | — | — | ✓ | — | — |
 | `Checkout diagnostic upload action` | ✓ | ✓ | — | — | ✓ | ✓ | — |
 | `Upload logs` | ✓ | ✓ | — | — | ✓ | ✓ | — |
 
@@ -628,6 +629,11 @@ and `setup-framework/`. Execution modes belong to test declarations and coverage
 reports, so future qualified capture cases share this environment and device lease.
 The suite includes Kernel eager and native graph capture/replay declarations;
 actual qualification requires their source-bound passing execution receipts.
+Both architectures prepare the bridge, native probe, destroy shim and consumer
+kernel cache before acquiring four physical devices. Preparation uses the installed
+wheel's `PYTHONPATH`, and the device task reuses those artifacts with one pytest
+process per device. The framework job timeout is 60 minutes on A5 and 45 minutes
+on A2/A3, including preparation and queue wait.
 
 Comment-trigger workflows are loaded from the default branch, whereas their local
 actions and identity scripts come from the checked-out PR. The canonical

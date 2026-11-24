@@ -425,23 +425,27 @@ def main():
     if args.destroy_refusal:
         assert args.runtime == "tensormap_and_ringbuffer"
         assert env.get("TASK_QUEUE_ENABLE") == "0" and not env.get("LD_PRELOAD")
-        shim_path = args.output / "native_capture_destroy_shim.so"
-        command = [
-            "cc",
-            "-std=c11",
-            "-O2",
-            "-fPIC",
-            "-shared",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            str(Path(__file__).with_name("native_capture_destroy_shim.c")),
-            "-o",
-            str(shim_path),
-            "-ldl",
-        ]
-        with (args.output / "shim-build.log").open("w") as log:
-            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=30, check=True)
+        prepared_shim = env.get("SIMPLER_FRAMEWORK_DESTROY_SHIM")
+        shim_path = Path(prepared_shim) if prepared_shim else args.output / "native_capture_destroy_shim.so"
+        if prepared_shim:
+            assert shim_path.is_file(), f"Prepared destroy shim is missing: {shim_path}"
+        else:
+            command = [
+                "cc",
+                "-std=c11",
+                "-O2",
+                "-fPIC",
+                "-shared",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                str(Path(__file__).with_name("native_capture_destroy_shim.c")),
+                "-o",
+                str(shim_path),
+                "-ldl",
+            ]
+            with (args.output / "shim-build.log").open("w") as log:
+                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=30, check=True)
         env["LD_PRELOAD"] = str(shim_path.resolve())
         argv.append("--destroy-refusal")
     (args.output / "command.json").write_text(json.dumps(argv, indent=2) + "\n")

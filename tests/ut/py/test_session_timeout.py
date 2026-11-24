@@ -24,11 +24,296 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+def _assert_process_stopped(pid):
+    assert Path("/proc/self/stat").is_file(), "Process-state verification requires Linux procfs"
+    stat = Path(f"/proc/{pid}/stat")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            state = stat.read_text().rsplit(")", 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        if state in {"Z", "X", "x"}:
+            return
+        time.sleep(0.01)
+    pytest.fail(f"Process {pid} is still alive: {state}")
+
+
+def test_scheduler_output_log_failure_cannot_pass(tmp_path):
+    from simpler_setup import parallel_scheduler as scheduler  # noqa: PLC0415
+
+    job = scheduler.Job(
+        label="unwritable-log",
+        device_count=1,
+        build_cmd=lambda _: [sys.executable, "-c", "print('diagnostic', flush=True)"],
+        output_path=str(tmp_path),  # Opening a directory as a log must fail.
+        isolated_process_group=True,
+    )
+    with pytest.raises(OSError, match="Cannot write subprocess log"):
+        scheduler.run_jobs([job], [1])
+    assert scheduler._active_state is None
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux process-state inspection")
+@pytest.mark.parametrize("exception", [RuntimeError, KeyboardInterrupt])
+def test_scheduler_exception_reaps_isolated_descendants(tmp_path, exception):
+    from simpler_setup import parallel_scheduler as scheduler  # noqa: PLC0415
+
+    marker = tmp_path / "descendant"
+    descendant = (
+        "import os,signal; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"marker=Path({str(marker)!r}); pending=marker.with_name('.preparing-'+marker.name); "
+        "pending.write_text(str(os.getpid())); pending.replace(marker); signal.pause()"
+    )
+    slow = f"import subprocess,sys; subprocess.run([sys.executable, '-c', {descendant!r}])"
+    fast = (
+        "import time; from pathlib import Path; "
+        f"marker=Path({str(marker)!r}); end=time.monotonic()+10\n"
+        "while not marker.exists() and time.monotonic()<end: time.sleep(0.01)\n"
+        "assert marker.exists()\n"
+    )
+    jobs = [
+        scheduler.Job(
+            label="slow", device_count=1, build_cmd=lambda _: [sys.executable, "-c", slow], isolated_process_group=True
+        ),
+        scheduler.Job(
+            label="fast", device_count=1, build_cmd=lambda _: [sys.executable, "-c", fast], isolated_process_group=True
+        ),
+    ]
+
+    def stop(_):
+        raise exception("stop")
+
+    try:
+        with pytest.raises(exception):
+            scheduler.run_jobs(jobs, [1, 3], on_job_done=stop)
+        assert marker.exists()
+        _assert_process_stopped(int(marker.read_text()))
+        assert scheduler._active_state is None
+    finally:
+        if marker.exists():
+            try:
+                os.kill(int(marker.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals and process groups")
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGALRM, signal.SIGINT])
+def test_scheduler_signal_during_launch_cannot_escape_tracking(monkeypatch, signum):
+    from simpler_setup import parallel_scheduler as scheduler  # noqa: PLC0415
+
+    processes = []
+    original_popen = subprocess.Popen
+    previous = signal.getsignal(signum)
+
+    def stop(_signum, _frame):
+        raise RuntimeError("launch interrupted")
+
+    def interrupt_after_spawn(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        os.kill(os.getpid(), signum)
+        return process
+
+    job = scheduler.Job(
+        label="launch-race",
+        device_count=1,
+        isolated_process_group=True,
+        build_cmd=lambda _: [sys.executable, "-c", "import signal; signal.pause()"],
+    )
+    signal.signal(signum, stop)
+    monkeypatch.setattr(scheduler.subprocess, "Popen", interrupt_after_spawn)
+    try:
+        with pytest.raises(RuntimeError, match="launch interrupted"):
+            scheduler.run_jobs([job], [1])
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+        assert signal.getsignal(signum) is stop
+        assert scheduler._active_state is None
+    finally:
+        signal.signal(signum, previous)
+        for process in processes:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux process-state inspection")
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGALRM, signal.SIGINT])
+def test_scheduler_signal_during_reap_cannot_orphan_descendants(tmp_path, monkeypatch, signum):
+    from simpler_setup import parallel_scheduler as scheduler  # noqa: PLC0415
+
+    marker = tmp_path / "descendant"
+    descendant = (
+        "import os,signal; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"marker=Path({str(marker)!r}); pending=marker.with_name('.preparing-'+marker.name); "
+        "pending.write_text(str(os.getpid())); pending.replace(marker); signal.pause()"
+    )
+    parent = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        f"subprocess.Popen([sys.executable, '-c', {descendant!r}]); "
+        f"marker=Path({str(marker)!r}); end=time.monotonic()+10\n"
+        "while not marker.exists() and time.monotonic()<end: time.sleep(0.01)\n"
+        "assert marker.exists()\n"
+    )
+    previous = signal.getsignal(signum)
+    original_killpg = os.killpg
+    interrupted = False
+
+    def stop(_signum, _frame):
+        raise RuntimeError("reap interrupted")
+
+    def interrupt_before_group_kill(pgid, sig):
+        nonlocal interrupted
+        if sig == signal.SIGKILL and not interrupted:
+            interrupted = True
+            os.kill(os.getpid(), signum)
+        original_killpg(pgid, sig)
+
+    job = scheduler.Job(
+        label="reap-race",
+        device_count=1,
+        isolated_process_group=True,
+        build_cmd=lambda _: [sys.executable, "-c", parent],
+    )
+    signal.signal(signum, stop)
+    monkeypatch.setattr(scheduler.os, "killpg", interrupt_before_group_kill)
+    try:
+        with pytest.raises(RuntimeError, match="reap interrupted"):
+            scheduler.run_jobs([job], [1])
+        assert interrupted
+        _assert_process_stopped(int(marker.read_text()))
+        assert scheduler._active_state is None
+        assert signal.getsignal(signum) is stop
+    finally:
+        signal.signal(signum, previous)
+        if marker.exists():
+            try:
+                os.kill(int(marker.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="POSIX signal masks")
+def test_scheduler_children_preserve_signal_mask():
+    from simpler_setup import parallel_scheduler as scheduler  # noqa: PLC0415
+
+    original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    child = "import signal; print(sorted(map(int, signal.pthread_sigmask(signal.SIG_BLOCK, set()))))"
+    job = scheduler.Job(
+        label="signal-mask",
+        device_count=1,
+        isolated_process_group=True,
+        build_cmd=lambda _: [sys.executable, "-c", child],
+    )
+    (result,) = scheduler.run_jobs([job], [1])
+    assert result.returncode == 0
+    assert result.output.strip() == str(sorted(map(int, original_mask)))
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == original_mask
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="POSIX signal masks")
+@pytest.mark.parametrize("pending_termination", [False, True])
+def test_scheduler_signal_during_handler_restore_restores_every_handler(monkeypatch, pending_termination):
+    from simpler_setup import parallel_scheduler as scheduler  # noqa: PLC0415
+
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGALRM)
+    previous = {sig: signal.getsignal(sig) for sig in signals}
+    original_signal = signal.signal
+    interrupted = False
+    delivered = []
+    original_popen = subprocess.Popen
+
+    def stop(_signum, _frame):
+        raise RuntimeError("restore interrupted")
+
+    def record(signum, _frame):
+        delivered.append(signum)
+
+    def spawn(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        if pending_termination:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return process
+
+    def interrupt_restore(sig, handler):
+        nonlocal interrupted
+        result = original_signal(sig, handler)
+        if sig == signal.SIGINT and handler is stop and not interrupted:
+            interrupted = True
+            os.kill(os.getpid(), sig)
+        return result
+
+    expected = {sig: record if sig == signal.SIGTERM else stop for sig in signals}
+    for sig, handler in expected.items():
+        original_signal(sig, handler)
+    monkeypatch.setattr(signal, "signal", interrupt_restore)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    try:
+        job = scheduler.Job(label="restore-race", device_count=1, build_cmd=lambda _: [sys.executable, "-c", "pass"])
+        with pytest.raises(RuntimeError, match="restore interrupted"):
+            scheduler.run_jobs([job], [1])
+        assert interrupted
+        assert all(signal.getsignal(sig) is expected[sig] for sig in signals)
+        assert delivered == ([signal.SIGTERM] if pending_termination else [])
+        assert scheduler._active_state is None
+    finally:
+        for sig, handler in previous.items():
+            original_signal(sig, handler)
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux process-state inspection")
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGALRM])
+def test_scheduler_launch_signal_with_exiting_handler_reaps_child(tmp_path, signum):
+    marker = tmp_path / "spawned"
+    program = textwrap.dedent(f"""
+        import os, signal, subprocess, sys
+        from pathlib import Path
+        from simpler_setup import parallel_scheduler as scheduler
+
+        original_popen = subprocess.Popen
+        def spawn(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            Path({str(marker)!r}).write_text(str(process.pid))
+            os.kill(os.getpid(), {int(signum)})
+            return process
+
+        def stop(signum, frame):
+            scheduler._terminate_all(scheduler._active_state)
+            os._exit(128 + signum)
+
+        signal.signal({int(signum)}, stop)
+        scheduler.subprocess.Popen = spawn
+        job = scheduler.Job(
+            label="launch-exit", device_count=1, isolated_process_group=True,
+            build_cmd=lambda _: [sys.executable, "-c", "import signal; signal.pause()"],
+        )
+        scheduler.run_jobs([job], [1])
+    """)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", program], cwd=_ROOT, capture_output=True, timeout=15, check=False
+        )
+        assert result.returncode == 128 + signum, result.stderr.decode()
+        assert marker.exists()
+        _assert_process_stopped(int(marker.read_text()))
+    finally:
+        if marker.exists():
+            try:
+                os.killpg(int(marker.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def _load_root_conftest():
