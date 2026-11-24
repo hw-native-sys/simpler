@@ -52,12 +52,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "b0684e426e9ce29daebd67d544a2ff24b0506900f59957188c2792768b37fdee",
       "code_name": "hc_collapse_norm",
       "vf_llvm": [
@@ -81,12 +75,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "98b78a8f885a3bb5ab3227dd7181c5a1a135d1489c41b767c57d42db40a9b168",
       "code_name": "hc_rms"
     },
@@ -103,12 +91,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "1c6dd76e20b5b62b6cfcf86cc713264d8ab278e3fa4ea0ce5e92b7c8777d360f",
       "code_name": "hc_linear"
     },
@@ -129,12 +111,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "a30da9cd161604f6e06323e26c1fcee48cf460217abb690b1db6d783d6fc60cc",
       "code_name": "mhc_sinkhorn",
       "vf_llvm": [
@@ -154,12 +130,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "225afc6b9f1da9245a8d95d1310bdebfee48756e1ca485e31e04c3b648575c53"
     },
     {
@@ -175,12 +145,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "5f2ab45b10e097376501d351100c7c6ddb069b71091e164c4f3bf8418de2f808",
       "code_name": "_gate_pre_route_vf",
       "vf_llvm": [
@@ -203,12 +167,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "8dcc205c966848d13580d28ad5661c4408a062b658ec3f9b4a2a889d4b78a298",
       "code_name": "_gate_scores_vf_aic"
     },
@@ -227,12 +185,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "6a2e668bdcb1fb74011cc18c70014dce5ede06cb7875f94b5544dcd1d58529f9",
       "code_name": "_gate_scores_vf_aiv",
       "vf_llvm": [
@@ -253,12 +205,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "5f6fc8f24312be8c8cef96c31cd1d1e2ce443d1e9d5c084da85e23bb32c3e742",
       "code_name": "_gate_route_sort_vf",
       "vf_llvm": [
@@ -282,12 +228,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "5005ffe4b80bf22fda86f2e66d128cd2b823e2af5a7d4ddef5bc1d049f7f6509"
     },
     {
@@ -303,12 +243,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "7e31b127c5e385b0faac941e03d4f19983237aab3bfa6144d78d99033b9df68d"
     },
     {
@@ -326,12 +260,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "840373ed4624d8f8b4142ba9fc21688f32653e440da84a28d59beb22764ed834",
       "code_name": "sh_w2_mm"
     },
@@ -347,12 +275,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "df90ea2de65c804aa4e4533b81298edd9a86e8ef6be4c6c51c841c404d176e37",
       "code_name": "dispatch_scale_unpack"
     },
@@ -372,12 +294,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "0567fbd88588b04f4b30525f0b20f7a4d89391dd5b1b42ab9ad43b8e5d18491c",
       "code_name": "dispatch_push"
     },
@@ -392,12 +308,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "d5d0f0a8be55f0207daa5235e0a49b29402fd1a5c80bfd07853484d6273b43bc",
       "code_name": "combine_notify"
     },
@@ -412,12 +322,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "DEFERRED",
-        "max_conditions": 2,
-        "condition_types": 1
-      },
       "original_sha256": "36808a353c460730310f9cbd575b7e3e994db4770debef14bfdc576810678db2",
       "code_name": "combine_wait"
     },
@@ -441,12 +345,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "045496b7f9b4b1ab0c49cb24c4495505c663ba0730788a886743b5799740628b",
       "code_name": "dispatch_gather"
     },
@@ -470,12 +368,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213"
     },
     {
@@ -498,12 +390,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213"
     },
     {
@@ -521,12 +407,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "01959e6e30a5d37e68d7492fffc36bf5e58282530140758fc59c60af50d8fb5a"
     },
     {
@@ -545,12 +425,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c"
     },
     {
@@ -569,12 +443,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c"
     },
     {
@@ -592,12 +460,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "efd0c616a51ccfed35999dbbf52f134b545c163859f8c3ac282439dfc70f4327",
       "code_name": "ffn_scatter"
     },
@@ -614,12 +476,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "21d41ca9690c79811532363dc53b9b9fb2a5dd237e3498f556e58310aed656f2",
       "code_name": "combine_reduce"
     },
@@ -638,12 +494,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "cc763495603b67acf00081043e7876881d2c64f57dc5959aca4ba36792f97825"
     },
     {
@@ -659,12 +509,6 @@
       "include_dirs": [
         "vendor/external"
       ],
-      "async_capability": {
-        "version": 1,
-        "mode": "SYNCHRONOUS",
-        "max_conditions": 0,
-        "condition_types": 0
-      },
       "original_sha256": "eaf56a6aa6cb25f4f6dd16bc862a9082206ac456ef0a0d07971244c39223c8d8",
       "code_name": "moe_signal_clear"
     }

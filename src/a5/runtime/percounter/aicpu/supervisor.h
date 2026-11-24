@@ -11,12 +11,8 @@
 /**
  * The AICPU's part in a percounter run.
  *
- * The AICPU schedules nothing under percounter: the lanes draw their own work.
- * It runs the runtime's ordinary bring-up and retirement (AicpuExecutor with
- * AicoreLifecycle) and replaces three resident-specific steps with the ones
- * here: publishing the discovered topology into the control block, telling
- * each reported core READY, and watching the progress count. The threads that
- * do not watch materialize the Graph bodies (graph_prepare.h).
+ * AICPU publishes the topology, resets CntNotify, releases the AICores and
+ * watches logical sinks. The assisting threads bind the Graph bodies.
  *
  * Header-only because aicpu_executor.cpp is included by name into a unit test.
  */
@@ -57,22 +53,21 @@ inline PercounterControl *percounter_control(Runtime *runtime) {
     return reinterpret_cast<PercounterControl *>(runtime->dev.scheduler_bootstrap.worker_context_base);
 }
 
-/**
- * Clear every CntNotify register this run holds. The pool is shared with the
- * sibling runtime and reused across runs, so a cohort's register still carries
- * its previous holder's count until this runs. No AICore can observe READY yet.
- *
- * A cohort whose entry is zero uses the GM arrival sectors, which the Host
- * zeroes in the uploaded image instead.
- */
-inline void percounter_reset_sync_notifications(PercounterControl *control) {
-    if (control->sync_notify_offset == 0 || control->sync_cohort_count == 0) return;
-    auto *notify = percounter_region<uint64_t>(control, control->sync_notify_offset);
-    cache_invalidate_range(notify, static_cast<size_t>(control->sync_cohort_count) * sizeof(uint64_t));
-    for (uint64_t cohort = 0; cohort < control->sync_cohort_count; ++cohort) {
-        if (notify[cohort] == 0) continue;
-        *reinterpret_cast<volatile uint32_t *>(notify[cohort]) = 0;
-    }
+inline const uint64_t *percounter_calendar_slots(const CalendarRangeHeader &calendar) {
+    return reinterpret_cast<const uint64_t *>(
+        reinterpret_cast<const uint8_t *>(&calendar) + calendar.notify_slots_offset
+    );
+}
+
+inline uint32_t percounter_read_slot(uint64_t address) {
+    return __atomic_load_n(reinterpret_cast<const uint32_t *>(address), __ATOMIC_RELAXED);
+}
+
+inline void percounter_reset_calendar_notifications(const CalendarRangeHeader &calendar) {
+    const auto *slots = percounter_calendar_slots(calendar);
+    cache_invalidate_range(slots, static_cast<size_t>(calendar.notify_slots_count) * sizeof(*slots));
+    for (uint32_t i = 0; i < calendar.notify_slots_count; ++i)
+        *reinterpret_cast<volatile uint32_t *>(slots[i]) = 0;
 }
 
 /**
@@ -120,14 +115,10 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     control->scheduler_timeout_cycles = scheduler_timeout_cycles;
     cache_flush_range(control, sizeof(*control));
     percounter_graph_prepare_init(control);
-    percounter_reset_sync_notifications(control);
-    auto *counters = scheduler_state_at<PercounterCounter>(control, control->counters_offset);
-    cache_invalidate_range(counters, control->table_task_count * sizeof(PercounterCounter));
-    for (uint64_t id = 0; id < control->table_task_count; ++id) {
-        const auto &counter = counters[id];
-        if (percounter_completion_notify_head(counter, counter.value))
-            *reinterpret_cast<volatile uint32_t *>(counter.completion_notify_address) = 0;
-    }
+    const auto *calendar = scheduler_state_at<CalendarRangeHeader>(control, control->calendar_offset);
+    if (calendar == nullptr) return -1;
+    cache_invalidate_range(calendar, sizeof(*calendar));
+    percounter_reset_calendar_notifications(*calendar);
     wmb();
     LOG_INFO("A5 percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);
     return 0;
@@ -158,30 +149,29 @@ inline void percounter_publish_partition(
 }
 
 /** What an AICPU thread other than the supervisor does while the lanes run. */
-inline void percounter_assist(Runtime *runtime) { percounter_prepare_graphs(runtime, percounter_control(runtime)); }
-
-inline bool percounter_task_published(const PercounterCounter &counter) {
-    cache_invalidate_range(&counter, sizeof(counter));
-    if (counter.completion_notify_address != 0) {
-        const auto *notify = reinterpret_cast<const volatile uint32_t *>(counter.completion_notify_address);
-        return *notify >= counter.completion_notify_target;
-    }
-    return percounter_counter_published(__atomic_load_n(&counter.value, __ATOMIC_ACQUIRE));
+inline PercounterAicpuTiming *percounter_aicpu_timing(PercounterControl *control, int32_t thread_idx) {
+    if (control == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) return nullptr;
+    const uint64_t offset = control->aicpu_profile_offset;
+    if (offset == 0 || offset > control->image_bytes || offset % alignof(PercounterAicpuTiming) != 0 ||
+        control->image_bytes - offset < PLATFORM_MAX_AICPU_THREADS * sizeof(PercounterAicpuTiming))
+        return nullptr;
+    return percounter_region<PercounterAicpuTiming>(control, control->aicpu_profile_offset) + thread_idx;
 }
 
-/** Hash the GM counters and read each SRAM chain once when the watchdog checks for progress. */
-inline uint64_t percounter_progress_fingerprint(const PercounterControl *control, const PercounterCounter *counters) {
-    const uint64_t tasks = control->task_count;
-    cache_invalidate_range(counters, static_cast<size_t>(tasks) * sizeof(PercounterCounter));
+inline void percounter_assist(Runtime *runtime, int32_t thread_idx) {
+    percounter_prepare_graphs(runtime, percounter_control(runtime), thread_idx);
+}
+
+inline bool percounter_task_published(const PercounterCounter &counter) {
+    return (percounter_read_slot(counter.completion_notify_address) & CALENDAR_COUNT_MASK) >=
+           counter.completion_notify_target;
+}
+
+inline uint64_t percounter_progress_fingerprint(const CalendarRangeHeader &calendar) {
+    const auto *slots = percounter_calendar_slots(calendar);
     uint64_t hash = 0xcbf29ce484222325ULL;
-    for (uint64_t i = 0; i < tasks; ++i) {
-        const auto &counter = counters[i];
-        const uint64_t preset = __atomic_load_n(&counter.value, __ATOMIC_RELAXED);
-        const uint64_t value = percounter_completion_notify_head(counter, preset) ?
-                                   *reinterpret_cast<const volatile uint32_t *>(counter.completion_notify_address) :
-                                   preset;
-        hash = (hash ^ value) * 0x100000001b3ULL;
-    }
+    for (uint32_t i = 0; i < calendar.notify_slots_count; ++i)
+        hash = (hash ^ percounter_read_slot(slots[i])) * 0x100000001b3ULL;
     return hash;
 }
 
@@ -203,7 +193,7 @@ inline uint64_t percounter_progress_fingerprint(const PercounterControl *control
  *
  * The supervisor stops watching when the completion count is in, and a lane
  * can fail after that: it publishes its last block and then fails on the way
- * out, or fails while draining, which it does after its own list is spent. The
+ * out, or fails while draining, which it does after its final calendar range. The
  * terminal is the first point at which every core has stopped, so it is the
  * only place the whole run's error can be read.
  *
@@ -239,13 +229,19 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
     const uint64_t start_cycles = get_sys_cnt_aicpu();
 
     cache_invalidate_range(control, sizeof(*control));
-    if (aicpu_thread_count <= 1) percounter_prepare_graphs(runtime, control);
+    if (aicpu_thread_count <= 1) percounter_prepare_graphs(runtime, control, thread_idx);
+    auto *timing = percounter_aicpu_timing(control, thread_idx);
+    if (timing != nullptr) timing->observe_start_cycles = get_sys_cnt_aicpu();
     const uint64_t sink_count = control->sink_count;
     const uint64_t *sinks = scheduler_state_at<uint64_t>(control, control->sinks_offset);
     // Host-built and immutable for the run, but this line can still hold what
     // the previous run left at the same address.
     cache_invalidate_range(sinks, static_cast<size_t>(sink_count) * sizeof(uint64_t));
     const auto *counters = scheduler_state_at<PercounterCounter>(control, control->counters_offset);
+    cache_invalidate_range(counters, static_cast<size_t>(control->table_task_count) * sizeof(*counters));
+    const auto *calendar = scheduler_state_at<CalendarRangeHeader>(control, control->calendar_offset);
+    cache_invalidate_range(calendar, sizeof(*calendar));
+    cache_invalidate_range(percounter_calendar_slots(*calendar), calendar->notify_slots_count * sizeof(uint64_t));
     // Published sink counters stay satisfied for the rest of the run.
     uint64_t resolved = 0;
     uint64_t last_progress = ~uint64_t{0};
@@ -263,8 +259,6 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
     uint64_t registered = 0;
     uint64_t settled = 0;
     while (true) {
-        // The upload presets GM counters. AICPU resets mapped CntNotify
-        // registers before READY so each sink observes this run's credits.
         while (resolved < sink_count && percounter_task_published(counters[sinks[resolved]]))
             ++resolved;
         const bool sinks_done = resolved >= sink_count;
@@ -284,7 +278,10 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
             last_progress_cycles = now;
             scanned = false;
         }
-        if (sinks_done && outstanding == 0) break;
+        if (sinks_done && outstanding == 0) {
+            if (timing != nullptr) timing->sinks_observed_cycles = now;
+            break;
+        }
         if (++error_poll_count == 64) {
             error_poll_count = 0;
             chip_swimlane_aicpu_poll_self_scheduled_cores(thread_idx, aicpu_thread_count, runtime->get_worker_count());
@@ -305,7 +302,7 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
             if (error != 0) break;
         }
         if (scheduler_watchdog_expired(last_progress_cycles, now, scan_cycles)) {
-            const uint64_t current = percounter_progress_fingerprint(control, counters);
+            const uint64_t current = percounter_progress_fingerprint(*calendar);
             if (!scanned || current != fingerprint) {
                 // Some component moved, so the graph is running and only the
                 // sinks and the deferred counts were still.
@@ -347,6 +344,10 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
     // an invocation stops at its next slice.
     percounter_graph_prepare_stop(control, error);
     percounter_graph_prepare_report(control, start_cycles);
+    if (timing != nullptr) {
+        timing->observe_end_cycles = get_sys_cnt_aicpu();
+        cache_flush_range(timing, sizeof(*timing));
+    }
     if (error == 0) return 0;
     (void)latch_aicore_scheduler_runtime_error(&header->sched_error_code, error);
     const int32_t rc = runtime_status_from_error_code(header->sched_error_code.load(std::memory_order_acquire));

@@ -11,16 +11,11 @@
 /**
  * Materializing Graph bodies for percounter's lanes.
  *
- * The Host provides body ids, ordered entries and static task shapes before
- * launch. The upload image also contains the body completion counter presets.
- * AICPU preserves those counters during materialization and AICore adds credits.
+ * The Host supplies the calendar rows and the offsets of their bindings.
  * AICPU threads that do not supervise localize each invocation and materialize
  * its descriptors and argument spans in slices, independently of fanin.
- * Each task's metadata_ready publication follows its descriptor and argument
- * metadata. A lane may claim static entries before that publication, but it
- * cannot resolve or execute their descriptors until it observes metadata_ready.
- *
- * Header-only because aicpu_executor.cpp is included by name into a unit test.
+ * Calendar rows wait for the invocation's materialized prefix before loading
+ * their kernel and argument bindings.
  */
 
 #pragma once
@@ -35,8 +30,8 @@
 #include "device/graph_image_source.h"
 #include "host_build_graph/graph_execution.h"
 #include "runtime.h"
+#include "scheduler/calendar_wire.h"
 #include "scheduler/wire_types.h"
-#include "scheduler/argument_metadata.h"
 #include "scheduler/scheduler_graph.h"
 
 namespace simpler::percounter {
@@ -61,10 +56,6 @@ inline void percounter_graph_prepare_init(PercounterControl *control) {
         static_cast<size_t>(control->callable_addresses_count) * sizeof(uint64_t)
     );
     cache_invalidate_range(
-        percounter_region<PercounterTaskMetadata>(control, control->metadata_offset),
-        static_cast<size_t>(control->task_count) * sizeof(PercounterTaskMetadata)
-    );
-    cache_invalidate_range(
         percounter_region<uint8_t>(control, control->graph_invocations_offset),
         static_cast<size_t>(invocation_count) * sizeof(PercounterGraphInvocation)
     );
@@ -75,19 +66,7 @@ inline void percounter_graph_prepare_init(PercounterControl *control) {
     for (uint64_t k = 0; k < invocation_count; ++k) {
         const auto *tmpl = percounter_region<PercounterGraphTemplate>(control, invocations[k].template_offset);
         cache_invalidate_range(tmpl, sizeof(*tmpl));
-        cache_invalidate_range(
-            percounter_region<uint8_t>(control, tmpl->tasks_offset),
-            static_cast<size_t>(tmpl->task_count) * sizeof(PercounterBodyTask)
-        );
-        cache_invalidate_range(
-            percounter_region<uint8_t>(control, tmpl->fanin_offsets_offset),
-            static_cast<size_t>(tmpl->task_count + 1) * sizeof(int32_t)
-        );
     }
-    cache_invalidate_range(
-        percounter_region<uint64_t>(control, control->metadata_ready_offset),
-        static_cast<size_t>(control->task_count) * sizeof(uint64_t)
-    );
 }
 
 inline void percounter_graph_prepare_fail(PercounterGraphPrepare *prepare, uint64_t rank, SchedulerGraphResult why) {
@@ -105,26 +84,20 @@ inline void percounter_graph_prepare_fail(PercounterGraphPrepare *prepare, uint6
     );
 }
 
-/** Write back one materialized body task: its storage entry and its argument spans. */
-inline void percounter_flush_body_task(ChipTaskStorage &storage) {
-    cache_flush_range(&storage, sizeof(storage));
-    TaskPayload &payload = storage.payload;
-    if (payload.tensor_count > 0)
-        cache_flush_range(
-            payload.tensor_data(), static_cast<size_t>(payload.tensor_count) * sizeof(*payload.tensor_data())
-        );
-}
-
 /** Materialize and publish the invocation at `rank`. Returns false on any failure, already recorded. */
 inline bool percounter_prepare_invocation(
-    PercounterControl *control, PercounterGraphPrepare *prepare, uint64_t rank, const GraphImageView &view
+    PercounterControl *control, PercounterGraphPrepare *prepare, uint64_t rank, const GraphImageView &view,
+    int32_t thread_idx
 ) {
     auto *invocation = percounter_region<PercounterGraphInvocation>(control, control->graph_invocations_offset) + rank;
+    const uint64_t timing_offset = invocation->ready_timing_offset;
+    auto *ready_timing =
+        timing_offset == 0 ? nullptr : percounter_region<PercounterGraphReadyTiming>(control, timing_offset);
+    if (ready_timing != nullptr) {
+        invocation->materializer_thread_id = thread_idx;
+        invocation->materialize_start_cycles = get_sys_cnt_aicpu();
+    }
     const auto *tmpl = percounter_region<const PercounterGraphTemplate>(control, invocation->template_offset);
-    const auto *body = percounter_region<const PercounterBodyTask>(control, tmpl->tasks_offset);
-    const auto *fanin_rows = percounter_region<const int32_t>(control, tmpl->fanin_offsets_offset);
-    auto *counters = percounter_region<PercounterCounter>(control, control->counters_offset);
-    auto *metadata_ready = percounter_region<uint64_t>(control, control->metadata_ready_offset);
     const uint64_t body_base = invocation->body_base;
 
     auto *storage = reinterpret_cast<ChipTaskStorage *>(control->graph_storage_address);
@@ -143,10 +116,15 @@ inline bool percounter_prepare_invocation(
         percounter_graph_prepare_fail(prepare, rank, SchedulerGraphResult::INVALID_ARGUMENTS);
         return false;
     }
-    invocation->storage_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(execution->task_storage));
-    cache_flush_range(&invocation->storage_address, sizeof(invocation->storage_address));
-
+    auto *calendar = scheduler_state_at<CalendarRangeHeader>(control, control->calendar_offset);
+    cache_invalidate_range(calendar, sizeof(*calendar));
+    const auto *patches = reinterpret_cast<const CalendarDispatchPatch *>(
+                              reinterpret_cast<const uint8_t *>(calendar) + calendar->patch_offset
+                          ) +
+                          body_base;
+    cache_invalidate_range(patches, static_cast<size_t>(tmpl->task_count) * sizeof(*patches));
     int32_t materialized = 0;
+    uint32_t ready_count = 0;
     while (true) {
         // At the slice boundary, so a failure anywhere stops this invocation
         // too rather than only the taking of the next one. A graph's
@@ -166,61 +144,60 @@ inline bool percounter_prepare_invocation(
         }
         const int32_t end = execution->materialized_tasks;
         for (int32_t i = materialized; i < end; ++i) {
-            percounter_flush_body_task(execution->task_at(i));
-            PercounterCounter &counter = counters[body_base + static_cast<uint64_t>(i)];
-            // Preserve the Host's uploaded completion preset for AICore credits.
-            counter.storage_address = invocation->storage_address;
-            counter.body_index = static_cast<uint32_t>(i);
-            counter.flags = body[i].flags;
-            counter.shell_task_id = static_cast<uint32_t>(invocation->shell_task_id);
-            counter.fanin_count = static_cast<uint32_t>(fanin_rows[i + 1] - fanin_rows[i]);
-            counter.fanin_offset = tmpl->fanin_indices_offset + static_cast<uint64_t>(fanin_rows[i]) * sizeof(uint64_t);
-            counter.invocation = static_cast<uint32_t>(rank);
             const auto &task = execution->task_at(i);
             const auto &payload = task.payload;
-            const uint32_t mask =
-                percounter_region<PercounterTaskMetadata>(control, control->metadata_offset)[body_base + i].active_mask;
-            uint64_t functions[PLATFORM_CORES_PER_BLOCKDIM]{};
+            if (payload.tensor_count > 0)
+                cache_flush_range(
+                    payload.tensor_data(), static_cast<size_t>(payload.tensor_count) * sizeof(*payload.tensor_data())
+                );
+            auto *arguments = execution->kernel_arguments(i);
+            cache_flush_range(arguments, (payload.tensor_count + payload.scalar_count) * sizeof(uint64_t));
+
+            const uint32_t predicate_offset = patches[i].predicate_extra_offset;
+            if (predicate_offset != 0) {
+                auto *extra = reinterpret_cast<CalendarExecutionExtra *>(
+                    reinterpret_cast<uint8_t *>(calendar) + predicate_offset
+                );
+                cache_invalidate_range(extra, sizeof(*extra));
+                cache_flush_range(&payload.predicate, sizeof(payload.predicate));
+                extra->predicate_address = reinterpret_cast<uint64_t>(&payload.predicate);
+                cache_flush_range(extra, sizeof(*extra));
+            }
             const auto *entries = reinterpret_cast<const uint64_t *>(control->callable_addresses_address);
             for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+                const uint32_t offset = patches[i].dispatch_offsets[lane];
+                if (offset == 0) continue;
                 const int32_t kernel = task.task.kernel_id[lane];
-                if (!(mask & (1U << lane))) continue;
                 if (kernel < 0 || static_cast<uint64_t>(kernel) >= control->callable_addresses_count ||
-                    entries == nullptr) {
+                    entries == nullptr || entries[kernel] == 0) {
                     percounter_graph_prepare_fail(prepare, rank, SchedulerGraphResult::INVALID_CALLABLE);
                     return false;
                 }
-                functions[lane] = entries[kernel];
+                auto *binding = reinterpret_cast<CalendarDispatch *>(reinterpret_cast<uint8_t *>(calendar) + offset);
+                cache_invalidate_range(binding, sizeof(*binding));
+                binding->kernel_entry = entries[kernel];
+                binding->args_address = reinterpret_cast<uint64_t>(arguments);
+                cache_flush_range(binding, sizeof(*binding));
             }
-            const auto prepared = percounter_prepare_argument_metadata(
-                counter, functions, mask, reinterpret_cast<uint64_t>(execution->kernel_arguments(i)),
-                mask == 0 ? 0 : static_cast<uint32_t>(payload.tensor_count),
-                mask == 0 ? 0 : static_cast<uint32_t>(payload.scalar_count)
-            );
-            if (prepared != SchedulerGraphResult::OK) {
-                percounter_graph_prepare_fail(prepare, rank, prepared);
-                return false;
-            }
-            cache_flush_range(
-                execution->kernel_arguments(i), (payload.tensor_count + payload.scalar_count) * sizeof(uint64_t)
-            );
-            cache_flush_range(&counter, sizeof(counter));
-            wmb();
-            // Publication cannot write back the completion counter's line:
-            // a lane may increment it immediately after observing this token.
-            auto *ready = &metadata_ready[body_base + static_cast<uint64_t>(i)];
-            __atomic_store_n(ready, uint64_t{1}, __ATOMIC_RELEASE);
-            cache_flush_range(ready, sizeof(*ready));
         }
+        wmb();
+        __atomic_store_n(&invocation->calendar_ready, static_cast<uint64_t>(end), __ATOMIC_RELEASE);
+        cache_flush_range(&invocation->calendar_ready, sizeof(invocation->calendar_ready));
         materialized = end;
         if (made > 0) {
             uint64_t expected = 0;
             const uint64_t now = get_sys_cnt_aicpu();
+            if (ready_timing != nullptr) ready_timing[ready_count++] = {now, static_cast<uint64_t>(end)};
             __atomic_compare_exchange_n(
                 &prepare->first_publish_cycles, &expected, now, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
             );
         }
         if (result == GraphMaterializeResult::MATERIALIZED) break;
+    }
+    if (ready_timing != nullptr) {
+        invocation->materialize_end_cycles = get_sys_cnt_aicpu();
+        if (ready_count != 0) cache_flush_range(ready_timing, ready_count * sizeof(*ready_timing));
+        cache_flush_range(invocation, sizeof(*invocation));
     }
     return true;
 }
@@ -229,7 +206,7 @@ inline bool percounter_prepare_invocation(
  * Take invocations until none is left or one has failed. Any AICPU thread may
  * call this; the threads share the work through the prepare record.
  */
-inline void percounter_prepare_graphs(Runtime *runtime, PercounterControl *control) {
+inline void percounter_prepare_graphs(Runtime *runtime, PercounterControl *control, int32_t thread_idx) {
     if (control == nullptr || control->graph_invocation_count == 0) return;
     auto *prepare = percounter_region<PercounterGraphPrepare>(control, control->graph_prepare_offset);
     const GraphImageView view = graph_image_view_for_reader(*runtime);
@@ -242,7 +219,7 @@ inline void percounter_prepare_graphs(Runtime *runtime, PercounterControl *contr
             percounter_graph_prepare_fail(prepare, rank, SchedulerGraphResult::INVALID_ARGUMENTS);
             return;
         }
-        if (!percounter_prepare_invocation(control, prepare, rank, view)) return;
+        if (!percounter_prepare_invocation(control, prepare, rank, view, thread_idx)) return;
         if (__atomic_add_fetch(&prepare->prepared, uint64_t{1}, __ATOMIC_ACQ_REL) == invocation_count)
             __atomic_store_n(&prepare->prepared_cycles, get_sys_cnt_aicpu(), __ATOMIC_RELEASE);
     }

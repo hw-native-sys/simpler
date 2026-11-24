@@ -96,7 +96,8 @@ def test_l1_rotates_and_reuses_buffers(st_platform, st_device_ids, tmp_path):
                 assert len(rows) == EXECUTIONS
                 assert len({(r[0], r[2], r[6]) for r in rows}) == EXECUTIONS
                 assert Counter(r[1] for r in rows) == {0: BLOCKS, 1: BLOCKS, 2: BLOCKS}
-                assert all(r[4] >= r[3] > 0 for r in rows)
+                assert all(r[4] >= r[3] > 0 and r[8] == BLOCKS for r in rows)
+                assert {r[7] for r in rows if r[1] == 0} == set(range(BLOCKS))
                 assert max(Counter(r[0] for r in rows).values()) > 1024
                 current_epochs = {r[6] for r in rows}
                 assert len(current_epochs) == 1 and not epochs.intersection(current_epochs)
@@ -107,7 +108,7 @@ def test_l1_rotates_and_reuses_buffers(st_platform, st_device_ids, tmp_path):
         worker.close()
 
 
-def _check_task_milestones(milestones, blocks, level):
+def _check_task_milestones(milestones, blocks):
     assert milestones["dropped"] == milestones["unmatched_deferred_updates"] == 0
     per_block = defaultdict(list)
     for event in milestones["records"]:
@@ -115,26 +116,15 @@ def _check_task_milestones(milestones, blocks, level):
     assert len(per_block) == blocks * TASKS
     for events in per_block.values():
         by_kind = {e["kind"]: e for e in events}
-        expected = {"claim", "ready", "kernel_end", "completion_issue"}
-        if level == 2:
-            expected.add("inputs_ready")
-            if "inputs_pending" in by_kind:
-                expected.add("inputs_pending")
-                assert by_kind["inputs_pending"]["cycles"] <= by_kind["inputs_ready"]["cycles"]
-            assert by_kind["claim"]["mix"] is False
-            assert by_kind["claim"]["cycles"] <= by_kind["inputs_ready"]["cycles"] <= by_kind["ready"]["cycles"]
+        expected = {"row_begin", "inputs_ready", "ready", "kernel_end", "completion_issue", "local_retired"}
         assert len(events) == len(expected) and by_kind.keys() == expected
-        claim, ready, kernel, completion = (by_kind[k] for k in ("claim", "ready", "kernel_end", "completion_issue"))
-        assert 0 < claim["claim_start_cycles"] <= claim["cycles"]
-        assert claim["cycles"] <= ready["cycles"] <= kernel["kernel_start_cycles"]
-        assert kernel["kernel_start_cycles"] <= kernel["cycles"] <= completion["cycles"]
-        if level == 2:
-            assert (
-                kernel["dispatch_cycles"]
-                <= kernel["kernel_start_cycles"]
-                <= kernel["cycles"]
-                <= kernel["finish_cycles"]
-            )
+        begin, inputs, ready, kernel, completion, retired = (
+            by_kind[k]
+            for k in ("row_begin", "inputs_ready", "ready", "kernel_end", "completion_issue", "local_retired")
+        )
+        assert begin["cycles"] <= inputs["cycles"] <= ready["cycles"] <= kernel["dispatch_cycles"]
+        assert kernel["dispatch_cycles"] <= kernel["kernel_start_cycles"] <= kernel["cycles"]
+        assert kernel["cycles"] <= kernel["finish_cycles"] <= completion["cycles"] <= retired["cycles"]
         assert completion["contribution"] == 1
         assert all(e["block_count"] == blocks for e in events)
         assert len({(e["worker_id"], e["run_epoch"]) for e in events}) == 1
@@ -189,7 +179,18 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                     timing = raw["scheduler_tasks"]
                     assert timing["producer"] == "aicore"
                     assert {(r[0], r[1], r[4]) for r in timing["records"]} == {(r[0], r[2], r[6]) for r in rows}
-                    _check_task_milestones(raw["percounter_task_events"], blocks, level)
+                    _check_task_milestones(raw["percounter_task_events"], blocks)
+                    assert raw["percounter_task_events"]["range_records"]
+                    assert any(
+                        0 < r["ready_publish_start_cycles"] <= r["ready_publish_end_cycles"]
+                        for r in raw["aicpu_lifecycle_records"]
+                        if "ready_publish_start_cycles" in r
+                    )
+                    assert any(
+                        r["sinks_observed_cycles"]
+                        for r in raw["aicpu_lifecycle_records"]
+                        if "sinks_observed_cycles" in r
+                    )
                 else:
                     assert not raw.get("scheduler_tasks", {}).get("records")
                     assert "percounter_task_events" not in raw
@@ -202,11 +203,24 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                         "scalar_bypass_",
                         "scalar_atomic_",
                         "scalar_ssbuf_",
+                        "scalar_cntnotify_",
                         "scalar_dsb_",
                         "scalar_dcci_",
                     )
                     if level == 4:
-                        assert {"scalar_percounter_run_task", "scalar_bypass_load", "scalar_ssbuf_store"} <= kinds
+                        assert {
+                            "scalar_percounter_run_task",
+                            "scalar_cntnotify_add_issue",
+                            "scalar_ssbuf_store",
+                        } <= kinds
+                        adds = [
+                            m
+                            for s in streams
+                            for m in s["metrics"]
+                            if "operand" in m
+                            and s["records"][m["record_index"]]["kind"] == "scalar_cntnotify_add_issue"
+                        ]
+                        assert adds and all(m["address"] and m["operand"] == 1 for m in adds)
                     else:
                         assert not any(kind.startswith(memory_prefixes) for kind in kinds)
                 else:
@@ -228,6 +242,7 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                         scheduler_phases=data.get("scheduler_records"),
                         scheduler_streams=data.get("scheduler_streams"),
                         scalar_profiles=profiles,
+                        aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
                         scheduler_task_producer=data["scheduler_task_producer"],
                         chip_swimlane_level=level,
                         percounter_task_events=data["percounter_task_events"],
@@ -235,8 +250,8 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                     events = json.loads(trace.read_text())["traceEvents"]
                     assert any(e.get("pid") == 2 and e.get("name") == "trace_finish" for e in events) == (level >= 3)
                     if level == 2:
-                        starts = [e for e in events if e["ph"] == "b" and e["cat"] == "Percounter L2"]
-                        assert starts and not any(e["name"].startswith(("EXECUTE", "Kernel execution")) for e in starts)
+                        starts = [e for e in events if e["ph"] == "X" and e["cat"] == "percounter_task_timing"]
+                        assert starts and not any("Kernel execution" in e["name"] for e in starts)
                         workers = [
                             e for e in events if e["pid"] == 4 and e["ph"] == "X" and "kernel-duration-us" in e["args"]
                         ]
@@ -251,7 +266,7 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                             (tracks[e["tid"]], e["args"]["taskId"], e["ts"], e["ts"] + e["dur"]) for e in workers
                         )
                         expected = sorted(
-                            (f"C{r['cluster_index']:02d} / AIC", r["task_id"], r["kernel_start_us"], r["time_us"])
+                            (f"Cluster {r['cluster_index']:02d} · C", r["task_id"], r["kernel_start_us"], r["time_us"])
                             for r in data["percounter_task_events"]["records"]
                             if r["kind"] == "kernel_end"
                         )
@@ -259,12 +274,8 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                         for bar, kernel in zip(actual, expected, strict=True):
                             assert bar[:2] == kernel[:2]
                             assert bar[2:] == pytest.approx(kernel[2:], rel=0, abs=1e-8)
-                        assert not any(e.get("pid") == 3 for e in events)
-                    else:
-                        milestones = Counter(
-                            e["args"]["kind"] for e in events if e.get("pid") == 3 and e.get("ph") == "i"
-                        )
-                        assert milestones["claim_start"] == milestones["claim"] == blocks * TASKS
+                    milestones = Counter(e["args"]["kind"] for e in events if e.get("pid") == 3 and e.get("ph") == "i")
+                    assert milestones["row_begin"] == milestones["local_retired"] == blocks * TASKS
                 assert bool(raw.get("host_orchestrator_phases")) == (level == 4)
         finally:
             worker.free(buffer)

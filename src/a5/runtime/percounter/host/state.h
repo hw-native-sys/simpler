@@ -33,6 +33,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -46,6 +48,8 @@
 #include "callable_entry.h"
 #include "image/image_pack.h"
 #include "scheduler/argument_metadata.h"
+#include "calendar_cache.h"
+#include "calendar_image.h"
 #include "graph_template.h"
 #include "region_plan.h"
 #include "scheduler/scheduler_layout.h"
@@ -64,6 +68,7 @@ inline void log_unsupported(int32_t total_tasks, const char *reason, int64_t tas
 /** The bind's Graph templates and invocations, gathered from the task table. */
 struct GraphInputs {
     std::vector<HostGraphTemplate> templates;
+    std::vector<CalendarKey> definitions;
     std::vector<GraphInvocationInput> invocations;
     GraphLayoutInput layout{};
     uint64_t body_blocks{0};
@@ -80,8 +85,8 @@ struct GraphInputs {
  * not run. `failed_task_id` is then the GRAPH task that named it.
  */
 inline TemplateResult gather_graph_inputs(
-    const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks, uint64_t worker_count,
-    std::vector<TaskInput> *inputs, GraphInputs *out, int64_t *failed_task_id
+    Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
+    uint64_t worker_count, std::vector<TaskInput> *inputs, GraphInputs *out, int64_t *failed_task_id
 ) {
     // Read on the first GRAPH task: a graph without one has no staging block.
     GraphImageView view{};
@@ -113,9 +118,30 @@ inline TemplateResult gather_graph_inputs(
                 *failed_task_id = task_id;
                 return TemplateResult{TemplateStatus::MALFORMED, "the Definition framing is invalid", -1};
             }
+            for (int32_t i = 0; i < definition.definition.task_count; ++i) {
+                SubTaskDefinition task{};
+                *failed_task_id = task_id;
+                if (!graph_definition_load_element(
+                        view, definition, definition.definition.off_sub_tasks, definition.definition.task_count, i,
+                        &task
+                    ))
+                    return TemplateResult{TemplateStatus::MALFORMED, "the body task does not decode", i};
+                for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+                    if ((task.active_mask.raw() & (1U << lane)) != 0 &&
+                        runtime->get_function_bin_addr(task.kernel_id[lane]) == 0)
+                        return TemplateResult{TemplateStatus::MALFORMED, "a body kernel is unregistered", i};
+                }
+            }
+            // The recorded definition contains relative tensor and scalar
+            // records. Its bind-local graph_key is not a replay identity.
+            const auto bytes = definition.definition.total_bytes;
+            CalendarKey structure((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+            std::memcpy(structure.data(), view.section + definition_offset, bytes);
+            structure.front() = 0;  // graph_key is the first uint64_t in Graph.
+            out->definitions.push_back(std::move(structure));
             out->section = view.section;
             out->section_bytes = std::max(out->section_bytes, definition_offset + definition.definition.total_bytes);
-            out->layout.templates_bytes += graph_template_bytes(tmpl);
+            out->layout.templates_bytes += sizeof(PercounterGraphTemplate);
             out->templates.push_back(std::move(tmpl));
             found = template_of_definition.emplace(definition_offset, out->templates.size() - 1).first;
         }
@@ -150,6 +176,7 @@ inline StateSelection select_percounter_state(
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
     const sm_layout::SegmentOffsets &device_segments, const void *uploaded_sm
 ) {
+    if (total_tasks < 0) return StateSelection::FAILED;
     const size_t task_count = static_cast<size_t>(total_tasks);
     std::vector<bool> inline_completed(task_count, false);
     for (int64_t id : inline_completed_task_ids)
@@ -159,7 +186,7 @@ inline StateSelection select_percounter_state(
     GraphInputs graph{};
     int64_t graph_failed_task = -1;
     const TemplateResult graph_status = gather_graph_inputs(
-        api, host_sm_handle, total_tasks, runtime->get_worker_count(), &inputs, &graph, &graph_failed_task
+        runtime, api, host_sm_handle, total_tasks, runtime->get_worker_count(), &inputs, &graph, &graph_failed_task
     );
     if (graph_status.status == TemplateStatus::MALFORMED) {
         LOG_ERROR(
@@ -181,15 +208,12 @@ inline StateSelection select_percounter_state(
     }
     std::vector<int32_t> edges;
     std::vector<size_t> edge_begin(task_count, 0);
-    uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
     uint64_t mix_task_count = 0;
-    uint64_t boundary_task_count = 0;
     uint64_t sync_cohort_count = 0;
-    uint64_t completion_notify_count = 0;
     // Each GRAPH task places its body's blocks, and holds one of its own that
     // no list carries.
     uint64_t block_total = graph.body_blocks;
-    uint64_t execution_count = 0;
+    uint64_t defer_rows = 0;
     for (size_t t = 0; t < task_count; ++t) {
         const int64_t task_id = static_cast<int64_t>(t);
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
@@ -198,14 +222,10 @@ inline StateSelection select_percounter_state(
         if (input.graph_invocation >= 0) {
             const HostGraphTemplate &tmpl =
                 graph.templates[graph.invocations[static_cast<size_t>(input.graph_invocation)].template_index];
-            order_count[0] += tmpl.orders[0].size();
-            order_count[1] += tmpl.orders[1].size();
             mix_task_count += tmpl.mix_task_count;
-            boundary_task_count += tmpl.boundary_task_count;
             sync_cohort_count += tmpl.sync_cohort_count;
             ++block_total;
-            for (const auto &body_task : tmpl.tasks)
-                execution_count += body_task.subtask_total;
+            defer_rows += tmpl.defer_rows;
         } else if (!input.inline_completed) {
             input.sync_start = slot.task_attrs.requires_sync_start();
             input.has_predicate = slot.task_attrs.has_predicate();
@@ -217,21 +237,14 @@ inline StateSelection select_percounter_state(
                 );
                 return StateSelection::FAILED;
             }
-            input.active_mask = 0;
-            const auto &descriptor = slot.to_descriptor();
-            for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
-                if (descriptor.kernel_id[lane] >= 0) input.active_mask |= 1U << lane;
+            input.active_mask = slot.active_mask.raw();
             input.block_num = slot.logical_block_num;
             input.is_mix = placement == TaskPlacement::MIX;
             input.subtask_count = __builtin_popcount(active_mask);
-            execution_count += static_cast<uint64_t>(input.block_num) * input.subtask_count;
-            // SPMD tasks allocate blocks through a task-private counter.
-            const uint64_t entries = 1;
-            if (input.block_num > 1 || input.is_mix) ++boundary_task_count;
-            if (input.sync_start) ++sync_cohort_count;
-            if (percounter_completion_notify_eligible(input)) ++completion_notify_count;
-            if (input.is_mix) mix_task_count += entries;
-            order_count[input.is_mix ? 1 : input.core_type_index] += entries;
+            if (input.active_mask != 0)
+                defer_rows += uint64_t{static_cast<uint32_t>(input.block_num)} * input.subtask_count;
+            sync_cohort_count += input.sync_start;
+            mix_task_count += input.is_mix;
             block_total += static_cast<uint64_t>(input.block_num);
         } else {
             ++block_total;
@@ -251,29 +264,130 @@ inline StateSelection select_percounter_state(
         LOG_ERROR("A5 percounter: invalid dependency-only task fanin");
         return StateSelection::FAILED;
     }
-    uint64_t edge_count = edges.size();
-    if (!folded.empty()) {
-        edge_count = 0;
-        for (const auto &input : inputs)
-            edge_count += static_cast<uint64_t>(input.fanin_count);
-        for (const int64_t id : folded)
-            --order_count[inputs[id].core_type_index];
-        execution_count -= folded.size();
-        LOG_TIMING("A5 percounter: folded %zu dependency-only tasks", folded.size());
+    if (!folded.empty()) LOG_TIMING("A5 percounter: folded %zu dependency-only tasks", folded.size());
+
+    const int32_t worker_count = runtime->get_worker_count();
+    const auto cluster_count = static_cast<uint32_t>(worker_count / PLATFORM_CORES_PER_BLOCKDIM);
+    const GraphPlanInput graph_plan{
+        graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
+    };
+    std::vector<CalendarPhase> phases;
+    std::vector<RangeCalendarInput> range_inputs;
+    std::vector<std::shared_ptr<CalendarTraining>> training;
+    std::vector<const char *> calendar_events;
+    RangeCalendarImage calendar;
+    if (worker_count < static_cast<int32_t>(PLATFORM_CORES_PER_BLOCKDIM) ||
+        worker_count % PLATFORM_CORES_PER_BLOCKDIM != 0 || !plan_calendar_phases(inputs, graph_plan, &phases)) {
+        LOG_ERROR("A5 calendar: unsupported task graph or worker topology");
+        return StateSelection::FAILED;
+    }
+    {
+        auto cache = std::static_pointer_cast<CalendarCache>(
+            api->acquire_callable_calendar_cache(runtime->get_active_callable_id(), make_calendar_cache)
+        );
+        range_inputs.resize(phases.size());
+        training.resize(phases.size());
+        calendar_events.resize(phases.size());
+        std::optional<uint64_t> outer_signature_id;
+        // The last equivalent Graph invocation supplies the timing sample.
+        // Earlier invocations in the bind share its immutable seed plan.
+        for (size_t p = phases.size(); p != 0; --p) {
+            const auto n = p - 1;
+            const auto &phase = phases[n];
+            auto &entry = range_inputs[n];
+            entry.phase = &phase;
+            if (cache == nullptr) {
+                auto initial = std::make_shared<CalendarPlan>();
+                if (!build_static_calendar(phase.tasks, cluster_count, {}, initial.get())) break;
+                entry.plan = std::move(initial);
+                continue;
+            }
+            CalendarKey key;
+            if (phase.invocation < 0) {
+                if (!outer_signature_id) {
+                    auto signature = make_calendar_key(*runtime, inputs, task_metadata);
+                    const std::lock_guard<std::mutex> lock(cache->mutex);
+                    auto &signatures = cache->outer_signatures;
+                    outer_signature_id = signatures.try_emplace(std::move(signature), signatures.size()).first->second;
+                }
+                key = {*outer_signature_id, phase.task_ids.size()};
+                key.insert(key.end(), phase.task_ids.begin(), phase.task_ids.end());
+                for (size_t id = 0; id < phase.tasks.size(); ++id) {
+                    key.push_back(phase.fanins[id].size());
+                    key.insert(key.end(), phase.fanins[id].begin(), phase.fanins[id].end());
+                }
+            } else {
+                const auto &invocation = graph.invocations[phase.invocation];
+                const auto &definition = graph.definitions[invocation.template_index];
+                const auto &payload =
+                    host_sm_handle.header->tasks.get_slot_state_by_task_id(invocation.shell_task_id).to_payload();
+                key = {
+                    UINT64_MAX, static_cast<uint64_t>(worker_count), definition.size(),
+                    static_cast<uint64_t>(payload.scalar_count), static_cast<uint64_t>(payload.tensor_count)
+                };
+                key.insert(key.end(), definition.begin(), definition.end());
+                append_calendar_argument_key(
+                    key, payload.scalar_count, payload.tensor_count,
+                    [&](int32_t i) {
+                        return payload.scalar_data()[i];
+                    },
+                    [&](int32_t i) -> const auto & {
+                        return payload.tensor_data()[i];
+                    }
+                );
+            }
+            std::unique_lock<std::mutex> lock(cache->mutex);
+            if (const auto found = cache->plans.find(key); found != cache->plans.end()) {
+                entry.plan = found->second;
+                calendar_events[n] = "HIT";
+                continue;
+            }
+            if (const auto pending = cache->training.find(key); pending != cache->training.end()) {
+                if ((entry.plan = pending->second.lock())) {
+                    calendar_events[n] = "REUSE";
+                    continue;
+                }
+            }
+            auto initial = std::make_shared<CalendarPlan>();
+            if (!build_static_calendar(phase.tasks, cluster_count, {}, initial.get())) break;
+            const auto sample = std::make_shared<CalendarTraining>();
+            sample->cache = cache;
+            sample->baseline = initial;
+            sample->cluster_count = cluster_count;
+            sample->key = std::move(key);
+            sample->copy_tasks(phase.tasks);
+            cache->training.insert_or_assign(sample->key, initial);
+            sample->owns_training = true;
+            entry.plan = std::move(initial);
+            entry.sample = true;
+            training[n] = sample;
+            calendar_events[n] = "MISS";
+        }
+        if (!build_range_calendar(
+                range_inputs, graph_plan, static_cast<uint32_t>(task_count), cluster_count, &calendar
+            )) {
+            LOG_ERROR("A5 calendar: could not plan execution ranges or completion counters");
+            return StateSelection::FAILED;
+        }
     }
 
     PercounterLayout layout{};
     if (!plan_layout(
-            task_count, block_total, edge_count, order_count, &layout, mix_task_count, boundary_task_count,
-            sync_cohort_count, graph.layout, execution_count, runtime->dev.chip_swimlane_level
+            task_count, block_total, &layout, mix_task_count, sync_cohort_count, graph.layout, defer_rows,
+            runtime->dev.chip_swimlane_level
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");
         return StateSelection::FAILED;
     }
+    constexpr uint64_t alignment = 128;
+    if (layout.total_size > SIZE_MAX - alignment - calendar.bytes.size()) return StateSelection::FAILED;
+    const uint64_t calendar_offset = (layout.total_size + alignment - 1) & ~(alignment - 1);
+    const uint64_t allocation_size = calendar_offset + calendar.bytes.size();
+    const auto calendar_header = calendar.load<CalendarRangeHeader>(0);
     void *device_state = nullptr;
     void *host_base = nullptr;
     if (api->acquire_scheduler_state_storage(
-            static_cast<size_t>(layout.total_size), alignof(PercounterControl), &device_state, &host_base
+            static_cast<size_t>(allocation_size), alignof(PercounterControl), &device_state, &host_base
         ) != 0 ||
         device_state == nullptr || host_base == nullptr) {
         LOG_ERROR("A5 percounter: failed to obtain %" PRIu64 " scheduler state bytes", layout.total_size);
@@ -281,46 +395,20 @@ inline StateSelection select_percounter_state(
     }
     const uint64_t device_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_state));
 
-    SchedulerCompletionCounterPlan completion_plan;
-    if (completion_notify_count != 0) {
-        std::string error;
-        if (!plan_percounter_completion_counters(inputs, &completion_plan, &error)) {
-            LOG_ERROR("A5 percounter: completion counter plan failed: %s", error.c_str());
+    SchedulerDoneNotifications notifications{};
+    if (calendar.sync_slot_count != sync_cohort_count) return StateSelection::FAILED;
+    if (calendar_header.notify_slots_count != 0) {
+        const auto requested = calendar_header.notify_slots_count;
+        const int rc = api->acquire_scheduler_notifications(
+            SchedulerNotificationPurpose::CALENDAR_COUNTER, requested, &notifications
+        );
+        if (rc != 0 || notifications.addresses.size() != requested || notifications.owner == nullptr) {
+            LOG_ERROR(
+                "A5 calendar: complete CntNotify lease required (requested=%u, received=%zu, status=%d)", requested,
+                notifications.addresses.size(), rc
+            );
             return StateSelection::FAILED;
         }
-    }
-
-    // Keep sync cohorts first in the lease so allocation pressure does not
-    // displace their existing mappings. The AICPU clears both groups before READY.
-    std::vector<uint64_t> notify_addresses;
-    const uint64_t notify_count = sync_cohort_count + completion_plan.chains.size();
-    if (notify_count != 0) {
-        SchedulerDoneNotifications notifications{};
-        if (api->acquire_scheduler_notifications(
-                SchedulerNotificationPurpose::COMPLETION_COUNTER, static_cast<size_t>(notify_count), &notifications
-            ) == 0) {
-            notify_addresses = std::move(notifications.addresses);
-            if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));
-        }
-        const auto mapped = [&](size_t index) {
-            return index < notify_addresses.size() && a5_cnt_notify_increment_address(notify_addresses[index]) != 0;
-        };
-        uint64_t mapped_sync = 0;
-        for (size_t index = 0; index < sync_cohort_count; ++index)
-            mapped_sync += mapped(index);
-        size_t mapped_chains = 0;
-        for (size_t chain = 0; chain < completion_plan.chains.size(); ++chain)
-            mapped_chains += mapped(sync_cohort_count + chain);
-        const auto mapped_tasks =
-            std::count_if(completion_plan.task_chains.begin(), completion_plan.task_chains.end(), [&](uint32_t chain) {
-                return chain != UINT32_MAX && mapped(sync_cohort_count + chain);
-            });
-        LOG_TIMING(
-            "A5 percounter: completion counters planned_chains=%zu mapped_chains=%zu eligible_tasks=%" PRIu64
-            " mapped_tasks=%zu mapped_sync=%" PRIu64 " sync_cohorts=%" PRIu64,
-            completion_plan.chains.size(), mapped_chains, completion_notify_count, static_cast<size_t>(mapped_tasks),
-            mapped_sync, sync_cohort_count
-        );
     }
 
     ExternalAddresses external{};
@@ -328,50 +416,13 @@ inline StateSelection select_percounter_state(
     external.graph_storage_count = task_count;
     external.callable_table = runtime->callable_entry_table_addr();
     external.callable_count = static_cast<uint64_t>(runtime->callable_table_len());
-    external.sync_notify = notify_addresses.data();
-    external.sync_notify_count = std::min<uint64_t>(notify_addresses.size(), sync_cohort_count);
-    if (notify_addresses.size() > sync_cohort_count) {
-        external.completion_plan = &completion_plan;
-        external.completion_notify = notify_addresses.data() + sync_cohort_count;
-        external.completion_notify_count = notify_addresses.size() - sync_cohort_count;
-    }
-    BuildResult build{};
-    const GraphPlanInput graph_plan{
-        graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
-    };
-    const auto may_defer = [&](uint32_t id) {
-        const auto &input = inputs[id];
-        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-            if ((input.active_mask & (1U << lane)) == 0) continue;
-            try {
-                const auto capability = runtime->get_function_async_capability(task_metadata[id].kernel_ids[lane]);
-                if (capability.mode != CoreAsyncMode::SYNCHRONOUS) return true;
-            } catch (const std::exception &) {
-                return true;
-            }
-        }
-        return false;
-    };
-    if (!build_tables(
-            inputs.data(), task_count, layout, host_base, device_base,
-            static_cast<uint32_t>(runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM), external, &build,
-            graph_plan, true, may_defer
-        )) {
-        LOG_ERROR(
-            "A5 percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status), build.task_id,
-            build.fanin_index
-        );
+    external.sync_notify = notifications.addresses.data();
+    external.sync_notify_count = sync_cohort_count;
+    if (!build_tables(inputs, layout, host_base, external, graph_plan)) {
+        LOG_ERROR("A5 calendar: failed to build scheduler metadata");
         return StateSelection::FAILED;
     }
 
-    const auto *terminal_control = region_at<PercounterControl>(host_base, layout.control_offset);
-    if (terminal_control->terminal.step_count != 0)
-        LOG_TIMING(
-            "A5 percounter: terminal pipeline %u steps, first=%u, last=%u, prerequisites=%u",
-            terminal_control->terminal.step_count, terminal_control->terminal.steps[0],
-            terminal_control->terminal.steps[terminal_control->terminal.step_count - 1],
-            terminal_control->terminal.prerequisite_count
-        );
     if (task_count != 0 && uploaded_sm == nullptr) return StateSelection::FAILED;
     const auto address_space = std::strcmp(get_platform(), "a5sim") == 0 ? SchedulerCallableAddressSpace::HOST :
                                                                            SchedulerCallableAddressSpace::DEVICE;
@@ -389,12 +440,9 @@ inline StateSelection select_percounter_state(
         return true;
     };
     auto *counters = region_at<PercounterCounter>(host_base, layout.counters_offset);
-    region_at<PercounterControl>(host_base, layout.control_offset)->arguments_address =
-        device_image + device_segments.scalar_pool;
     for (size_t id = 0; id < task_count; ++id) {
         const auto &input = inputs[id];
-        if (input.graph_invocation >= 0 || input.inline_completed || input.published_off_lane || input.active_mask == 0)
-            continue;
+        if (input.graph_invocation >= 0 || input.inline_completed || input.active_mask == 0) continue;
         const auto &payload = task_image::payload(uploaded_sm, device_segments, id);
         if (payload.tensor_count < 0 || payload.scalar_count < 0) return StateSelection::FAILED;
         const uint32_t tensors = static_cast<uint32_t>(payload.tensor_count);
@@ -403,6 +451,9 @@ inline StateSelection select_percounter_state(
         const void *arguments =
             reinterpret_cast<const uint8_t *>(uploaded_sm) + device_segments.scalar_pool + id * sizeof(DispatchPayload);
         if (!image_address(arguments, sizeof(DispatchPayload), arguments_address)) return StateSelection::FAILED;
+        if (input.has_predicate &&
+            !image_address(&payload.predicate, sizeof(payload.predicate), counters[id].predicate_address))
+            return StateSelection::FAILED;
         uint64_t functions[PLATFORM_CORES_PER_BLOCKDIM]{};
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
             if (input.active_mask & (1U << lane))
@@ -429,19 +480,55 @@ inline StateSelection select_percounter_state(
         }
         runtime->publish_graph_section(static_cast<GraphSectionSource>(source), base, graph.section_bytes);
     }
+    {
+        auto *control = region_at<PercounterControl>(host_base, layout.control_offset);
+        control->calendar_offset = calendar_offset - layout.control_offset;
+        control->image_bytes = allocation_size;
+        if (!bind_range_calendar(calendar, device_base, layout, host_base, notifications.addresses)) {
+            LOG_ERROR("A5 calendar: failed to bind leased CntNotify counters");
+            return StateSelection::FAILED;
+        }
+        if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));
+        auto *host_calendar = region_at<std::byte>(host_base, calendar_offset);
+        std::memcpy(host_calendar, calendar.bytes.data(), calendar.bytes.size());
+        runtime->add_pending_metadata(
+            static_cast<std::byte *>(device_state) + calendar_offset, host_calendar, calendar.bytes.size(),
+            HostPhaseKind::Count, {}
+        );
+        for (size_t p = 0; p < range_inputs.size(); ++p) {
+            if (calendar_events[p] == nullptr) continue;
+            const auto &plan = *range_inputs[p].plan;
+            LOG_INFO(
+                "A5 calendar: %s plan=%016" PRIx64 " rows=%zu pid=%d", calendar_events[p], calendar_plan_id(plan),
+                plan.logical_row_by_packed.size(), getpid()
+            );
+        }
+        LOG_INFO(
+            "A5 calendar: ranges=%u phases=%zu graph_invocations=%zu counters=%u phase_slots=%u fanin_slots=%u",
+            calendar_header.range_count, phases.size(), graph.invocations.size(), calendar_header.notify_slots_count,
+            calendar.phase_slot_count, calendar.fanin_slot_count
+        );
+        if (calendar_header.sample_index_offset != 0) {
+            runtime->on_pending_execution_complete(
+                [training = std::move(training), offsets = std::move(calendar.sample_offsets),
+                 timings_base = device_base + calendar_offset](const HostApi &run_api) {
+                    for (size_t p = 0; p < training.size(); ++p) {
+                        if (training[p] == nullptr) continue;
+                        try {
+                            training[p]->finish(run_api, reinterpret_cast<const void *>(timings_base + offsets[p]));
+                        } catch (const std::exception &error) {
+                            LOG_WARN("A5 calendar: could not retain schedule: %s", error.what());
+                        }
+                    }
+                }
+            );
+        }
+    }
     retain_profile_state(runtime, api, device_state, layout, folded, inline_completed_task_ids);
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);
     if (api != nullptr) api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_PERCOUNTER);
     runtime->add_pending_metadata(
         device_state, host_base, static_cast<size_t>(layout.upload_size), HostPhaseKind::Count, {}
-    );
-    LOG_INFO(
-        "A5 percounter: selected for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
-        " MIX list entries, %" PRIu64 " sync cohorts, %zu edges, %zu Graph invocations of %zu Definitions with %" PRIu64
-        " body tasks; %" PRIu64 " of %" PRIu64 " region bytes uploaded)",
-        total_tasks, terminal_control->order_count[0], terminal_control->order_count[1],
-        terminal_control->mix_task_count, sync_cohort_count, edges.size(), graph.invocations.size(),
-        graph.templates.size(), graph.layout.body_task_count, layout.upload_size, layout.total_size
     );
     return StateSelection::PERCOUNTER;
 }

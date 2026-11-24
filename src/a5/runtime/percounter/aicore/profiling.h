@@ -16,9 +16,10 @@ namespace {
 
 class ProfileScope {
 public:
-    inline __aicore__ ProfileScope(PercounterScalarTrace *trace, ProfilePhase phase) :
+    inline __aicore__ ProfileScope(PercounterScalarTrace *trace, ProfilePhase phase, uint64_t entry = 0) :
         trace_(trace),
-        phase_(phase) {
+        phase_(phase),
+        entry_(entry) {
         if constexpr (profile_compiled) {
             if (trace_) {
                 depth_ = ++trace_->depth;
@@ -31,7 +32,7 @@ public:
             if (trace_) {
                 const auto end = percounter_scalar_clock();
                 --trace_->depth;
-                trace_->append_function(phase_, begin_, end, -1, depth_);
+                trace_->append_function(phase_, begin_, end, entry_ == 0 ? -1 : static_cast<int64_t>(entry_), depth_);
                 trace_ = nullptr;
             }
         }
@@ -43,6 +44,7 @@ public:
 private:
     PercounterScalarTrace *trace_;
     ProfilePhase phase_;
+    uint64_t entry_;
     uint64_t begin_{0};
     uint32_t depth_{0};
 };

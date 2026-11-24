@@ -36,8 +36,7 @@ enum class SchedulerPredicateResult : uint8_t {
 };
 
 inline __aicore__ SchedulerPredicateResult
-scheduler_evaluate_task_predicate(const SchedulerGraphAccess &graph, int64_t task_ref) {
-    auto *predicate = scheduler_node_predicate(graph, task_ref);
+scheduler_evaluate_task_predicate(__gm__ SchedulerDispatchPredicate *predicate) {
     if (predicate == nullptr) return SchedulerPredicateResult::MALFORMED;
     percounter_observe_cache_line(predicate);
     if (predicate->op == 0) return SchedulerPredicateResult::PASS;

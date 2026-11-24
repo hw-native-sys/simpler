@@ -17,7 +17,6 @@
 #include <vector>
 
 #include "scheduler/scheduler_async_layout.h"
-#include "core_async_capability.h"
 
 struct AsyncTaskPlanInput {
     int64_t task_ref{-1};
@@ -26,27 +25,7 @@ struct AsyncTaskPlanInput {
     std::array<uint16_t, 3> capacities{};
 };
 
-// Every active leaf lane requires an explicit valid registration contract.
-// Zero capacity is the projection of SYNCHRONOUS, never a missing-capability fallback.
-inline bool
-async_task_apply_capabilities(AsyncTaskPlanInput *task, const std::array<CoreAsyncCapability, 3> &capabilities) {
-    if (task == nullptr) return false;
-    for (uint32_t lane = 0; lane < 3; ++lane) {
-        if (!task->active_mask.has(static_cast<SubtaskSlot>(lane))) {
-            task->capacities[lane] = 0;
-            continue;
-        }
-        const auto &capability = capabilities[lane];
-        if (!core_async_capability_valid(capability) ||
-            (capability.mode != CoreAsyncMode::SYNCHRONOUS && capability.mode != CoreAsyncMode::DEFERRED))
-            return false;
-        task->capacities[lane] = capability.mode == CoreAsyncMode::SYNCHRONOUS ? 0 : capability.max_conditions;
-    }
-    return true;
-}
-
-// This is a separate data-visibility proof, not the task's own capability.
-// Every executable node receives this proof from the actual expanded DAG.
+// Mark input visibility requirements along the expanded DAG.
 inline bool async_mark_input_visibility(
     const std::vector<std::vector<int64_t>> &fanin, const std::vector<int64_t> &order,
     const std::vector<LaneMask> &producers, std::vector<SchedulerTaskMetadata> *metadata

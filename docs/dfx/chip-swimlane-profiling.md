@@ -151,15 +151,10 @@ shows the measured kernel interval. If the scheduler actually observes a pending
 predecessor, a separate interval starts at that observation and identifies the
 predecessor in its details. A deferred task can complete logically later.
 
-At L2, Worker View labels HBG and Percounter execution slices as
-`<task-id>-<kernel>` (for example, `t7-proj_spmd`).
-L2 scheduling slices and block-view markers use `<task-id>-b<block-index>-<stage>`,
-for example `t8-b0-Claim and bind`.
-Both views use the logical SPMD task color and retain the original member
-label in the slice details. Each execution slice spans kernel entry to kernel return. Percounter records
-executor pickup and the completion fence on its scheduling track. The scheduling
-lane resumes at kernel return.
-The resulting gap on that lane can overlap a running kernel on Worker View.
+At L2, Worker View labels HBG and Percounter kernel slices as
+`<task-id>-<kernel>` (for example, `t7-proj_spmd`). Each slice spans kernel
+entry to return. Both views use the logical SPMD task color and retain the
+original member label in the slice details.
 
 To export a native Perfetto file from the converted L2 JSON, install
 `perfetto==0.59.1` in the project environment and run
@@ -184,40 +179,43 @@ successful claim attempt includes scheduler work and any earlier unsuccessful
 attempts. Fixed-owner blocks take their assigned index directly.
 Use L3 to attribute active Scalar work inside an interval.
 
-A5 `percounter` also exports **AICore Schedule (L2)** with physical cluster,
-slot, AIV0 proxy and MIX member lanes. Worker View uses the same cluster and
-role labels. A block's first unsuccessful fan-in probe and its successful
-proof split the interval after claim (ordinary) or SSBUF publication (MIX).
-MIX has one fan-in observer, the lowest participating lane. Each member's
-entry commitment and selection delimit its own rendezvous, which includes
-the task-wide gate when `sync_start` applies. A pure `sync_start` block
-uses its local arrival and selection. Executor pickup, kernel start, kernel
-return and the output fence delimit entry preparation and return handling.
-Each MIX member's lane shows the interval from its own output fence to its
-immediate completion credit. Separate deferred lanes pair registration and
-settlement by group, including remote settlement.
+### A5 Percounter calendar
 
-These are elapsed intervals between observed transitions. Shared proof
-to member commitment includes the time before the member next runs.
-Publication and arrival checkpoints mark the issue site; successful
-selection observes the protocol's release conditions. Only the first
-failed dependency check is recorded per block. All subsequent failed polls
-are uninstrumented at L2. Measure capture inflation by dividing the L2
-mean AICore wall by the same workload's L0 mean on the same device.
+| Level | AICore | AICPU |
+| ----- | ------ | ----- |
+| L0 | AICore wall from the first kernel start to the last kernel's output fence | Coarse run wall in strace when enabled |
+| L1 | Actual kernel entry to return for every task, block and participating role | Assists streaming the AICore records |
+| L2 | Calendar range entry, Graph watermark observed, row begin, inputs satisfied, READY, kernel return, output fence, DONE issue, and row retirement. Defer records link registration with the polling core, signal observation and DONE issue | Core READY publication, Graph materialization and each published watermark, sink and deferred completion observation, and assistant shutdown wait |
+| L3 | Adds scalar intervals for row decoding, range entry and exit, dependency checks, MIX and START rendezvous, argument binding, output fences and completion work. Reports omitted intervals shorter than 1 µs | L2 records |
+| L4 | Adds the instrumented GM, SSBUF and CntNotify SRAM operations, and retains sub-µs scalar intervals. CntNotify reads show the address and returned word. CntNotify writes show their address and operand at issue | L2 records and existing Host preparation capture |
 
-For a block lifetime instead, export Percounter L2 with `--percounter-block-view`.
-This Scheduler View shows Claim start, Claim,
-Ready, Kernel end and Completion issued markers. With complete predecessor
-evidence in `deps.json` and the same capture's completion records, Ideal ready
-marks the estimated dependency boundary, even when it precedes the claim.
-If dependencies were ready at claim time, the wait span begins at Claim.
-Worker View remains available. L3 adds nested AICore Scheduler function
-intervals, such as dependency checks, MIX
-rendezvous and completion publication. L4 adds individual memory operations and
-Host phases and retains all instrumented function intervals. The Scalar lane includes
-nested kernel execution and uses the same exclusive-time accounting as HBG. See the [percounter
-profiling contract](../../src/a5/runtime/percounter/README.md#chip-swimlanes-l1l4)
-for timing boundaries, storage limits and truncation behavior.
+**Worker View** uses the physical lanes `Cluster NN · C`, `V0` and `V1`.
+A slice identifies its run, Graph invocation and inner task where applicable,
+block and role. **Scheduler View** uses the same core names and records the
+calendar transitions before and after the kernel interval. MIX followers mark
+when they observe the local release. The participating lane responsible for
+dependencies records when its inputs are satisfied and when it can enter.
+**AICPU Lifecycle** uses the executing AICPU thread for each operation. Match
+Graph materialization to an AICore wait by the shell task and the watermark.
+Publication is timestamped after the AICPU cache flush, and observation is
+timestamped after the first successful AICore test of the required value.
+
+DONE issue timestamps mark when the producer issues its counter write.
+A successor's inputs-satisfied marker records when its dependencies have
+passed the runtime check. At L4 the individual read intervals expose timing
+and observed values. A deferred row retires locally after registration while
+its logical completion remains pending. The trace names the producer on
+the polling core's first poll, signal observation, and deferred DONE
+issue. At L2, DAG arrows from `deps.json` reach every visible consumer
+execution. Their source is the recorded logical graph.
+
+Chip Swimlane covers actual execution, including Graph instances that do not
+contribute any online PGO samples. Online PGO uses its separate start, end,
+defer register and defer completion timing slots. The AICore Scheduler track
+at L3/L4 explains scalar scheduling work. The Worker View carries kernel
+execution. Check capture status for bounded-buffer drops before attributing
+missing events to the scheduler. Measure L2 inflation with mean AICore wall
+at L2 and L0 for the same workload and device.
 
 ### A5 HBG Scalar detail at Level 3
 
@@ -441,7 +439,8 @@ Existing `metrics` entries
 carry the function threshold in cycles, the number of
 omitted short function intervals, nesting depth and the no-progress iteration
 count. Omissions are distinct from dropped records. `iterations_detailed=true`
-identifies level 4 per-iteration bookkeeping. Level 3 counts no-progress loops without timing them individually.
+identifies level 4 per-iteration bookkeeping. At level 3, the calendar counts
+unsuccessful wait probes without timing them individually.
 The fixed scheduler record fields retain their existing shape.
 
 For a positive function threshold, omitted short parents can leave gaps in

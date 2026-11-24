@@ -117,10 +117,6 @@ struct PercounterScalarTrace {
         write({begin, end, -1, static_cast<uint32_t>(kind) | ((depth + 1) << 16), calls});
     }
 
-    inline __aicore__ void end_iteration(bool progress) {
-        if (buffer != nullptr && !progress) ++poll_loops;
-    }
-
     // Only semantic function spans are duration-filtered. Primitive memory
     // operations, backoff and recorder intervals always use append directly.
     inline __aicore__ void

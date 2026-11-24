@@ -1782,7 +1782,6 @@ bool create_scheduler_state(
     AsyncCompletionHostPlan async_plan;
     std::vector<AsyncTaskPlanInput> async_inputs;
     std::vector<LaneMask> possible_async_lanes(task_metadata.size());
-    std::array<uint64_t, 2> capability_lanes{}, capability_executions{};
     for (uint32_t ref = 0; ref < task_metadata.size(); ++ref) {
         const auto &metadata = task_metadata[ref];
         if ((metadata.flags & SCHEDULER_TASK_EXECUTABLE) == 0 || scheduler_task_is_inline(metadata.flags)) continue;
@@ -1790,30 +1789,11 @@ bool create_scheduler_state(
         input.task_ref = ref;
         input.block_count = metadata.logical_block_num;
         input.active_mask = metadata.active_mask;
-        std::array<CoreAsyncCapability, 3> capabilities{};
         for (uint32_t lane = 0; lane < 3; ++lane) {
-            if (!metadata.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-            try {
-                capabilities[lane] = runtime->get_function_async_capability(metadata.kernel_ids[lane]);
-            } catch (const std::exception &error) {
-                LOG_ERROR(
-                    "A5 HBG: async capability unavailable for task=%u lane=%u kernel=%u: %s", ref, lane,
-                    metadata.kernel_ids[lane], error.what()
-                );
-                return false;
-            }
+            if (metadata.active_mask.has(static_cast<SubtaskSlot>(lane)))
+                input.capacities[lane] = MAX_COMPLETIONS_PER_TASK;
         }
-        if (!async_task_apply_capabilities(&input, capabilities)) {
-            LOG_ERROR("A5 HBG: invalid async capability for leaf task=%u", ref);
-            return false;
-        }
-        for (uint32_t lane = 0; lane < 3; ++lane) {
-            if (!metadata.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-            const auto mode = static_cast<uint32_t>(capabilities[lane].mode) - 1;
-            ++capability_lanes[mode];
-            capability_executions[mode] += metadata.logical_block_num;
-            if (input.capacities[lane] != 0) possible_async_lanes[ref].activate(static_cast<SubtaskSlot>(lane));
-        }
+        possible_async_lanes[ref] = metadata.active_mask;
         async_inputs.push_back(input);
     }
     std::string async_error;
@@ -1824,13 +1804,6 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: async completion layout failed: %s", async_error.c_str());
         return false;
     }
-    LOG_TIMING(
-        "A5 HBG async capabilities: leaf_lanes synchronous=%" PRIu64 " deferred=%" PRIu64
-        " executions synchronous=%" PRIu64 " deferred=%" PRIu64 " groups=%u layout_offset=%" PRIu64
-        " async_bytes=%" PRIu64,
-        capability_lanes[0], capability_lanes[1], capability_executions[0], capability_executions[1],
-        async_plan.layout.group_count, async_plan.layout_offset, async_plan.total_bytes - async_plan.begin_offset
-    );
     layout.total_size = async_plan.total_bytes;
     layout.async_layout_offset = async_plan.layout_offset;
     layout.executable_subtask_count = executable_subtask_count;
@@ -2831,10 +2804,6 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     const int transfer_status = validate_program_tensor_transfers(orch_args, true, signature, sig_count);
     if (transfer_status != 0) return transfer_status;
-    if (!runtime->bind_callable_async_capabilities(*api)) {
-        LOG_ERROR("A5 HBG: callable async capability table is unavailable or has an invalid length");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
     // host_build_graph host-orch: register_callable_impl resolved the
     // orchestration entry on the host and passed it here as host_orch_func_ptr;
     // it is run below (after the arena is built) against a host SM mirror.
@@ -3157,6 +3126,16 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
     // content hash) and bulk-freed in DeviceRunner::finalize(), so re-running the
     // same callable repeatedly does not re-upload.
     return 0;
+}
+
+extern "C" bool runtime_has_completion_feedback_impl(const Runtime *runtime) {
+    const auto publication = runtime->prepared_publication();
+    return publication && static_cast<bool>(publication->on_execution_complete);
+}
+
+extern "C" void runtime_collect_completion_feedback_impl(const Runtime *runtime, const HostApi *api) {
+    const auto publication = runtime->prepared_publication();
+    if (publication && publication->on_execution_complete) publication->on_execution_complete(*api);
 }
 
 /**

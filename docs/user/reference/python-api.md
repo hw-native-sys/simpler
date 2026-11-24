@@ -214,10 +214,7 @@ a child lookup does not enroll the owner's run.
 ## Callables and task args
 
 ```python
-CoreCallable.build(
-    signature=[ArgDirection...], binary=kernel_bytes,
-    async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
-)
+CoreCallable.build(signature=[ArgDirection...], binary=kernel_bytes)
 
 ChipCallable.build(
     signature=[ArgDirection...],
@@ -226,18 +223,6 @@ ChipCallable.build(
     children=[(func_id, core_callable), ...],
 )
 ```
-
-Core callables accept a version-1 `async_capability` declaration.
-`SYNCHRONOUS` requires zero `max_conditions` and `condition_types`; `DEFERRED`
-requires a bound of 1–64 conditions and a nonzero condition-type mask from 1–3.
-For compatibility, an omitted declaration, `None`, or `UNKNOWN` with zero
-condition fields is normalized at registration to `DEFERRED` with
-`max_conditions=64` and `condition_types=3`. Legacy all-zero serialized metadata
-uses the same conservative default. Scene specs use this normalization for each
-`incores` entry and cache the canonical declaration. Invalid versions, fields,
-and bounds are still rejected. Explicit `SYNCHRONOUS` declarations retain the
-synchronous fast path; a run that happens to register no conditions does not
-establish that a kernel is synchronous.
 
 `ArgDirection` is `SCALAR`, `IN`, `OUT`, or `INOUT`. The signature list is
 positional and defines the task-arg order. `func_id` must match the id the

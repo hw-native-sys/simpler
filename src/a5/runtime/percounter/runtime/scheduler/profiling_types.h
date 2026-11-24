@@ -49,7 +49,21 @@ enum class ProfilePhase : uint8_t {
     TraceFinishBarrier,
     BypassStoreIssue,
     DsbDdr,
+    ResolveRow,
+    RangeEnter,
+    RangeExit,
+    MixRendezvous,
+    StartRendezvous,
+    OutputFence,
+    CntNotifyRead,
+    CntNotifyAddIssue,
+    CntNotifyDeferIssue,
 };
+
+constexpr bool percounter_profile_is_notify(ProfilePhase phase) {
+    return phase == ProfilePhase::CntNotifyRead || phase == ProfilePhase::CntNotifyAddIssue ||
+           phase == ProfilePhase::CntNotifyDeferIssue;
+}
 
 constexpr const char *profile_phase_name(ProfilePhase kind) {
     switch (kind) {
@@ -121,6 +135,24 @@ constexpr const char *profile_phase_name(ProfilePhase kind) {
         return "scalar_bypass_store_issue";
     case ProfilePhase::DsbDdr:
         return "scalar_dsb_ddr";
+    case ProfilePhase::ResolveRow:
+        return "scalar_calendar_resolve_row";
+    case ProfilePhase::RangeEnter:
+        return "scalar_calendar_range_enter";
+    case ProfilePhase::RangeExit:
+        return "scalar_calendar_range_exit";
+    case ProfilePhase::MixRendezvous:
+        return "scalar_calendar_mix_rendezvous";
+    case ProfilePhase::StartRendezvous:
+        return "scalar_calendar_start_rendezvous";
+    case ProfilePhase::OutputFence:
+        return "scalar_calendar_output_fence";
+    case ProfilePhase::CntNotifyRead:
+        return "scalar_cntnotify_read";
+    case ProfilePhase::CntNotifyAddIssue:
+        return "scalar_cntnotify_add_issue";
+    case ProfilePhase::CntNotifyDeferIssue:
+        return "scalar_cntnotify_defer_issue";
     }
     return "unknown";
 }
@@ -135,26 +167,28 @@ struct PercounterTaskTiming {
 };
 
 enum class PercounterTaskEventKind : uint32_t {
-    Claim,
+    RowBegin,
+    InputsReady,
+    MixReleaseObserved,
     Ready,
+    KernelEnd,
     CompletionIssue,
+    LocalRetired,
     DeferRegistered,
     DeferredCompletionIssue,
-    KernelEnd,
-    MixPublished,
-    InputsPending,
-    InputsReady,
-    EntryCommitted,
+    DeferPollBegin,
+    DeferSignalReady,
+    RangeEnterBegin,
+    GraphReadyObserved,
+    RangeEntered,
 };
 
 struct PercounterTaskEvent {
     uint64_t cycles;
     uint64_t entry;
-    uint64_t detail;  // Interval start, completion contribution or deferred group reference.
+    uint64_t detail;  // Completion contribution or deferred group reference.
     PercounterTaskEventKind kind;
-    uint16_t slot;
-    uint8_t participant_mask;
-    uint8_t mix;
+    uint32_t reserved;
 };
 
 inline constexpr uint32_t PERCOUNTER_SCALAR_WORD_CAPACITY =

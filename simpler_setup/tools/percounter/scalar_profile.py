@@ -10,12 +10,23 @@
 
 from simpler_setup.tools.hbg import scalar_profile as scalar
 
+from .scheduler_view import worker_lane
+
 
 def analyze_streams(streams, metadata, task_rows, execution_identities=None):
     return scalar.analyze_streams(streams, metadata, task_rows, execution_identities, nested_kernels=True)
 
 
 def trace_events(profiles, **kwargs):
-    names = {row["kind"]: row["kind"].removeprefix("scalar_") for profile in profiles for row in profile["rows"]}
+    visible_profiles = [
+        {
+            **profile,
+            "rows": [row for row in profile["rows"] if row["kind"] not in ("scalar_kernel", "scalar_task_skip")],
+        }
+        for profile in profiles
+    ]
+    names = {
+        row["kind"]: row["kind"].removeprefix("scalar_") for profile in visible_profiles for row in profile["rows"]
+    }
     names["scalar_run_percounter_lane"] = "run_percounter_lane: setup"
-    return scalar.trace_events(profiles, function_names=names, **kwargs)
+    return scalar.trace_events(visible_profiles, function_names=names, worker_lane=worker_lane, **kwargs)

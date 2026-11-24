@@ -215,9 +215,7 @@ std::vector<uint8_t> loadable_kernel_bytes() {
 }
 
 std::vector<uint8_t> make_child(const std::vector<uint8_t> &binary) {
-    return make_callable<CORE_MAX_TENSOR_ARGS>(
-        nullptr, 0, binary.data(), static_cast<uint32_t>(binary.size()), {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0}
-    );
+    return make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, binary.data(), static_cast<uint32_t>(binary.size()));
 }
 
 // A ChipCallable whose children claim `func_ids`, each carrying `binary`.
@@ -326,33 +324,6 @@ TEST_F(SimCallablePoolTest, AnEmptyLaunchNeverEntersTheBackend) {
     EXPECT_EQ(outcome.prepared, nullptr);
     EXPECT_EQ(outcome.active, nullptr);
     EXPECT_EQ(runner.launch_calls, 0);
-}
-
-TEST_F(SimCallablePoolTest, RegistrationCanonicalizesUnknownWithoutMutatingInput) {
-    auto raw = make_chip({0, 7}, kernel_, 0x12);
-    auto *image = reinterpret_cast<ChipCallable *>(raw.data());
-    const_cast<CoreCallable &>(image->child(1)).async_capability_ = {};
-    const auto unchanged = raw;
-    auto canonical = raw;
-    normalize_chip_callable_buffer(canonical.data(), canonical.size());
-    const auto address = runner_.upload_chip_callable_buffer(as_chip(raw));
-    ASSERT_NE(address, 0u);
-    EXPECT_EQ(raw, unchanged);
-    EXPECT_EQ(runner_.upload_chip_callable_buffer(as_chip(canonical)), address);
-    EXPECT_EQ(runner_.pool_size(), 1u);
-    const auto *retained = reinterpret_cast<const ChipCallable *>(address);
-    EXPECT_EQ(retained->child(1).async_capability().mode, CoreAsyncMode::DEFERRED);
-    EXPECT_EQ(retained->child(1).async_capability().max_conditions, 64);
-    EXPECT_EQ(retained->child(1).async_capability().condition_types, 3);
-    EXPECT_EQ(runner_.view(hash_of(raw)).refcount, 2);
-}
-
-TEST_F(SimCallablePoolTest, RegistrationRejectsMalformedUnknown) {
-    auto raw = make_chip({0}, kernel_, 0x12);
-    auto *image = reinterpret_cast<ChipCallable *>(raw.data());
-    const_cast<CoreCallable &>(image->child(0)).async_capability_ = {1, static_cast<CoreAsyncMode>(0), 1, 0, 0};
-    EXPECT_EQ(runner_.upload_chip_callable_buffer(image), 0u);
-    EXPECT_EQ(runner_.pool_size(), 0u);
 }
 
 TEST_F(SimCallablePoolTest, AFailedRegistrationPublishesNothing) {

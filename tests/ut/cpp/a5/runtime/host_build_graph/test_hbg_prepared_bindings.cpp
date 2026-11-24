@@ -95,9 +95,7 @@ TEST_F(HbgPreparedBindings, MixCallsExposeOnlyTheTensorPrefixForPrefetch) {
 
 TEST_F(HbgPreparedBindings, SimCallsUseTheResolvedSymbolRatherThanTheObjectAddress) {
     const std::array<uint8_t, 4> binary{};
-    auto bytes = make_callable<CORE_MAX_TENSOR_ARGS>(
-        nullptr, 0, binary.data(), binary.size(), {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0}
-    );
+    auto bytes = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, binary.data(), binary.size());
     auto *callable = reinterpret_cast<CoreCallable *>(bytes.data());
     constexpr uint64_t entry = UINT64_C(0x98760000);
     callable->set_resolved_addr(entry);

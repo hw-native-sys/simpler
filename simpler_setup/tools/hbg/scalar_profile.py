@@ -255,7 +255,7 @@ def analyze_streams(streams, metadata, task_rows, execution_identities=None, *, 
     }
     kernels = defaultdict(list)
     for row in task_rows:
-        worker, task, registration, begin, end, _, epoch = row
+        worker, task, registration, begin, end, _, epoch = row[:7]
         kernels[(worker, epoch)].append(
             {
                 "task_id": task,
@@ -358,7 +358,9 @@ def apply_l3_detail_policy(profile):
             row.pop("hbg_stage", None)
 
 
-def trace_events(profiles, *, pid, tid_base, display, streams=None, function_names=None, kernel_labels=None):
+def trace_events(
+    profiles, *, pid, tid_base, display, streams=None, function_names=None, kernel_labels=None, worker_lane=None
+):
     """Render one nested Scalar lane per core using the capture's core identity."""
     lanes = {
         stream.get("scheduler_id", index): (index, stream)
@@ -372,6 +374,13 @@ def trace_events(profiles, *, pid, tid_base, display, streams=None, function_nam
         tid = tid_base + index * 10
         core_type = stream.get("core_type")
         name = f"{core_type.upper()}_{worker}" if core_type else f"Worker_{worker}"
+        sort_index = index
+        if (
+            worker_lane is not None
+            and stream.get("cluster_index") is not None
+            and stream.get("cluster_lane") is not None
+        ):
+            name, sort_index = worker_lane(stream["cluster_index"], stream["cluster_lane"])
         if stream.get("physical_core_id") is not None:
             name += f" (physical {stream['physical_core_id']})"
         if not profile["complete"]:
@@ -386,7 +395,7 @@ def trace_events(profiles, *, pid, tid_base, display, streams=None, function_nam
                 "name": "thread_sort_index",
                 "pid": pid,
                 "tid": tid,
-                "args": {"sort_index": index},
+                "args": {"sort_index": sort_index},
             }
         )
         rows = sorted(profile["rows"], key=lambda r: (r["start_time_us"], -r["end_time_us"], r.get("scalar_depth", 0)))

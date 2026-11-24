@@ -34,13 +34,7 @@ struct RegionBanks {
     uint32_t image;
 };
 
-struct CoreAsyncCapability;
-
-// Registration-owned host metadata, borrowed while that callable is retained.
-struct HostCallableAsyncCapabilities {
-    const CoreAsyncCapability *data;
-    uint32_t count;
-};
+using HostCalendarCacheFactory = std::shared_ptr<void> (*)();
 
 // Borrowed source views, valid through stage_launch_metadata; the platform
 // captures values and never takes ownership of the source containers.
@@ -305,12 +299,12 @@ struct HostApiOps {
         void *runner_ctx, uint32_t pipeline_slot, SchedulerNotificationPurpose purpose, size_t count,
         SchedulerDoneNotifications *out
     ) = nullptr;
-    std::optional<HostCallableAsyncCapabilities> (*get_callable_async_capabilities)(
-        void *runner_ctx, int32_t callable_id
-    ) = nullptr;
     bool launch_owns_execution_image{false};
     int (*stage_owned_references)(
         void *, uint32_t, const HostMetadataRegion *, size_t, std::vector<HbgImageReference> *
+    ) = nullptr;
+    std::shared_ptr<void> (*acquire_callable_calendar_cache)(
+        void *runner_ctx, int32_t callable_id, HostCalendarCacheFactory factory
     ) = nullptr;
 };
 
@@ -375,11 +369,6 @@ public:
     // record streams stamp it into each row: per-task tokens restart every run,
     // so a row without it cannot be attributed once one file holds several runs.
     uint64_t run_epoch() const { return run_epoch_; }
-
-    std::optional<HostCallableAsyncCapabilities> get_callable_async_capabilities(int32_t callable_id) const {
-        if (ops_->get_callable_async_capabilities == nullptr) return std::nullopt;
-        return ops_->get_callable_async_capabilities(runner_ctx_, callable_id);
-    }
 
     int acquire_scheduler_notifications(
         SchedulerNotificationPurpose purpose, size_t count, SchedulerDoneNotifications *out
@@ -466,6 +455,10 @@ public:
     void set_prepare_plan(std::shared_ptr<void> plan) const {
         if (ops_->set_prepare_plan != nullptr)
             ops_->set_prepare_plan(runner_ctx_, pipeline_slot_, run_epoch_, std::move(plan));
+    }
+    std::shared_ptr<void> acquire_callable_calendar_cache(int32_t callable_id, HostCalendarCacheFactory factory) const {
+        if (ops_->acquire_callable_calendar_cache == nullptr) return {};
+        return ops_->acquire_callable_calendar_cache(runner_ctx_, callable_id, factory);
     }
     int acquire_sm_mirror(size_t bytes, size_t alignment, void **addr_out) const {
         if (ops_->acquire_sm_mirror == nullptr) {

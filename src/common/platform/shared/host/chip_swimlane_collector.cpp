@@ -2735,8 +2735,14 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
                     const ChipSwimlaneAicoreTaskRecord &r = collected.record;
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << TaskId::to_uint64(r.task_token) << ", " << r.reg_task_id
-                            << ", " << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << ", "
-                            << collected.run_epoch << "]";
+                            << ", " << r.start_time << ", " << r.end_time << ", ";
+                    if constexpr (std::string_view{SIMPLER_RUNTIME_NAME} == "percounter") {
+                        outfile << "0, " << collected.run_epoch << ", " << (r.percounter_block_shape & 0xffffU) << ", "
+                                << (r.percounter_block_shape >> 16);
+                    } else {
+                        outfile << r.receive_to_start_cycles << ", " << collected.run_epoch;
+                    }
+                    outfile << "]";
                     first = false;
                     total++;
                 }

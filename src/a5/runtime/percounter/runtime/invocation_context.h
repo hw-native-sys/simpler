@@ -48,15 +48,15 @@ inline constexpr uint32_t PERCOUNTER_CONTEXT_SSBUF_STRIDE = 64;
 struct PercounterInvocationContext {
     LocalContext local;
     GlobalContext global;
+    uint32_t async_touched;  // Accessed by the kernel and scheduler on the same lane.
 };
-static_assert(sizeof(PercounterInvocationContext) == 56);
+static_assert(sizeof(PercounterInvocationContext) == PERCOUNTER_CONTEXT_SSBUF_STRIDE);
 static_assert(
     std::is_standard_layout_v<PercounterInvocationContext> && std::is_trivially_copyable_v<PercounterInvocationContext>
 );
 
 struct PercounterInvocationContextSlot {
     PercounterInvocationContext value;
-    uint8_t reserved[8];
 };
 static_assert(sizeof(PercounterInvocationContextSlot) == PERCOUNTER_CONTEXT_SSBUF_STRIDE);
 static_assert(

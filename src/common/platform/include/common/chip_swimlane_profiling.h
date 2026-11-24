@@ -181,11 +181,14 @@ static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskR
  * The 32-bit delta represents intervals below 2^32 ticks (about 4.3 s at 1 GHz).
  */
 struct ChipSwimlaneAicoreTaskRecord {
-    uint64_t start_time;               // Post-dcci+ack timestamp (kernel begins next)
-    uint64_t end_time;                 // Post-kernel timestamp
-    TaskId task_token;                 // identity, in the minting runtime's layout (NOT join key)
-    uint32_t reg_task_id;              // Per-core dispatch token — host join key vs AICPU stream
-    uint32_t receive_to_start_cycles;  // Local setup interval: start_time - receive_time
+    uint64_t start_time;   // Post-dcci+ack timestamp (kernel begins next)
+    uint64_t end_time;     // Post-kernel timestamp
+    TaskId task_token;     // identity, in the minting runtime's layout (NOT join key)
+    uint32_t reg_task_id;  // Per-core dispatch token — host join key vs AICPU stream
+    union {
+        uint32_t receive_to_start_cycles;  // Local setup interval: start_time - receive_time
+        uint32_t percounter_block_shape;   // [block count:16, block index:16] for the calendar L1 stream
+    };
 } __attribute__((aligned(32)));
 
 static_assert(sizeof(ChipSwimlaneAicoreTaskRecord) == 32, "ChipSwimlaneAicoreTaskRecord must be 32B");

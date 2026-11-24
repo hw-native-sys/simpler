@@ -34,6 +34,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -45,7 +46,6 @@
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "callable_limits.h"
-#include "core_async_capability.h"
 #include "core_input_cache_proof.h"
 #include "task_args.h"
 #include "aicore_teardown.h"
@@ -414,7 +414,6 @@ private:
         // the first is a host pointer, and because the host lookup must not
         // reach for the device address `dev` carries.
         const uint64_t *callable_table_host_;
-        const CoreAsyncCapability *callable_async_capabilities_;
         uint64_t callable_entry_table_addr_;
 
         // Host-side tensor ledger for the run's H2D and D2H transfers.
@@ -456,6 +455,7 @@ private:
             std::vector<HbgImageReference> image_references;
             std::vector<MetadataRegion> prerequisites;
             std::vector<std::shared_ptr<const void>> resources;
+            std::function<void(const struct HostApi &)> on_execution_complete;
         };
         RunImagePublication pending_publication_;
         std::shared_ptr<const RunImagePublication> prepared_publication_;
@@ -502,6 +502,9 @@ public:
     }
     void retain_pending_resource(std::shared_ptr<const void> resource) {
         host_.pending_publication_.resources.push_back(std::move(resource));
+    }
+    void on_pending_execution_complete(std::function<void(const struct HostApi &)> callback) {
+        host_.pending_publication_.on_execution_complete = std::move(callback);
     }
     using RunImagePublication = HostOnlyState::RunImagePublication;
     void restore_pending_publication(RunImagePublication publication) {
@@ -632,8 +635,6 @@ public:
      * the descriptor carries is never dereferenced here.
      */
     uint64_t get_function_bin_addr(int func_id) const;
-    CoreAsyncCapability get_function_async_capability(int func_id) const;
-    bool bind_callable_async_capabilities(const struct HostApi &api);
     const CoreInputCacheProof *get_function_input_cache_proof(int func_id) const;
     friend void bind_registered_input_cache_proofs(Runtime &runtime, const std::vector<CoreInputCacheProof> &proofs);
 
