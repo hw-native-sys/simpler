@@ -485,6 +485,60 @@ static void snapshot_controls() {
     valid(ring, Diagnosis::Cycle);
 }
 
+TEST(TwaitModel, RecordMergeSlotConflictStaysUnknown) {
+    const Identity waiter{1, 0, 11, 1, 0};
+    const twait::Event event{1, 0, 21, 31, 1};
+    const Identity producer{1, 0, 12, 2, 0};
+    const auto record = [&](uint32_t token) {
+        twait::Record entry{};
+        entry.waiter = waiter;
+        entry.event = event;
+        entry.producer = producer;
+        entry.complete = true;
+        entry.alternative_count = 1;
+        entry.alternatives[0] = {1, 0, 7, 0, 0, token, true, true, waiter};
+        return entry;
+    };
+    {
+        twait::Snapshot input{};
+        input.count = 2;
+        input.records[0] = record(7);
+        input.records[1] = record(7);
+        const auto witness = twait::diagnose(input);
+        ASSERT_EQ(witness.diagnosis, Diagnosis::Cycle);
+        ASSERT_EQ(witness.count, 1U);
+        EXPECT_TRUE(witness.hops[0].waiter == waiter);
+        EXPECT_TRUE(witness.hops[0].producer == producer);
+        EXPECT_EQ(witness.hops[0].core_slot.token, 7U);
+    }
+    {
+        twait::Snapshot input{};
+        input.count = 1;
+        input.records[0] = record(7);
+        input.records[0].alternative_count = 2;
+        input.records[0].alternatives[1] = {1, 0, 8, 0, 1, 0, true, false, {}};
+        const auto witness = twait::diagnose(input);
+        EXPECT_EQ(witness.diagnosis, Diagnosis::NoCycle);
+        EXPECT_EQ(witness.count, 0U);
+    }
+    for (const auto kind : {0, 1}) {
+        for (const auto order : {0, 1}) {
+            twait::Snapshot input{};
+            input.count = 2;
+            auto conflict = record(7);
+            if (kind == 0)
+                ++conflict.alternatives[0].generation;
+            else
+                conflict.alternatives[0].token = 8;
+            input.records[order] = record(7);
+            input.records[1 - order] = conflict;
+            const auto witness = twait::diagnose(input);
+            EXPECT_EQ(witness.diagnosis, Diagnosis::Unknown);
+            EXPECT_EQ(witness.count, 0U);
+        }
+    }
+}
+
 TEST(TwaitModel, SnapshotIntegrityAndCertificateControls) {
     try {
         snapshot_controls();

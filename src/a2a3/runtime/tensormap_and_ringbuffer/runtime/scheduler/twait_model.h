@@ -49,7 +49,8 @@ inline bool same_slot(const CoreSlot &left, const CoreSlot &right) {
 
 inline bool same_slot_fact(const CoreSlot &left, const CoreSlot &right) {
     return same_slot(left, right) && left.generation == right.generation && left.executing == right.executing &&
-           left.occupied == right.occupied && (!left.occupied || left.owner == right.owner);
+           left.occupied == right.occupied &&
+           (!left.occupied || (left.owner == right.owner && left.token == right.token));
 }
 
 inline bool same_event(const Event &left, const Event &right) {
