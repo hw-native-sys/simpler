@@ -27,15 +27,34 @@ A MIX block uses a local SSBUF rendezvous across its participating roles. An
 explicit `sync_start` also waits for the entire cohort's CntNotify START count.
 The kernel's output barrier precedes completion publication.
 
+### Graph boundaries
+
+Graph invocations in a Percounter run execute serially. The first range on each
+lane in the phase following a Graph waits for that Graph's shell to reach
+logical completion, even when the submitted DAG has no dependency between the
+two invocations.
+
+For kernels inside a Graph, every deferred wait (`defer_wait`) must settle
+within that invocation. A deferred wait must never depend on a later Graph
+invocation making progress. Express dependencies between Graph invocations as
+explicit DAG edges.
+
+## CntNotify capacity
+
+The Host requires a complete CntNotify lease for START, DONE, range tail and
+fan-in counters. Quota exhaustion fails bind before launch. This makes the
+counter demand visible at the point of failure so it can be investigated.
+The `complete CntNotify lease required` error reports `requested`, `received`
+and `status`. Check the requested slot count and the SDK allocation error in
+the preceding `scheduler notification acquire failed` message when diagnosing
+quota exhaustion. The AICPU clears a successful lease before it releases the
+lanes.
+
 ## Completion and defer
 
 One CntNotify word holds a 24-bit completion count and up to eight sticky defer
 bits. Tasks can share the count when the Host can prove their completions advance
-in order. Each executable task has its own defer bit within the slot. The Host
-requires a complete CntNotify lease to bind the START, DONE, range and fan-in
-counters. If the CntNotify quota cannot supply all the slots, the Host rejects
-the calendar before launch. The AICPU clears the leased slots before it releases
-the lanes.
+in order. Each executable task has its own defer bit within the slot.
 
 1. After the output barrier, an execution with no registered signal issues a
    DONE ADD in CntNotify SRAM. An execution with registered signals publishes
