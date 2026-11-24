@@ -1,4 +1,4 @@
-# Capture percounter L1 and export Perfetto
+# Capture Percounter swimlanes and export Perfetto
 
 Use a Simpler revision that includes [#3073](https://github.com/hw-native-sys/simpler/pull/3073).
 For FDWIC use `run.sh` with level `1` and `--runtime=percounter`.
@@ -6,7 +6,12 @@ For a live lib case follow [pypto-lib decode](pypto-lib.md), select the
 percounter runtime for the chip worker, and pass `enable_chip_swimlane=1`
 in the PyPTO run config. The daily benchmark disables profiling. Use a separate
 correctness run with `PYPTO_BENCH=0` and set the swimlane flag on the config
-passed to `golden.run`.
+passed to `golden.run`. Use L1 for kernel lanes. For the [A5 calendar
+scheduler](../../../../docs/dfx/chip-swimlane-profiling.md#a5-percounter-calendar),
+set `enable_chip_swimlane=2` to include scheduler transitions and AICPU
+lifecycle. L3 adds scalar scheduler phases and L4 adds detailed memory and
+notification operations. Capture at the selected level in a separate
+board replay and export after releasing the reservation.
 
 For a pinned PyPTO checkout whose codegen exposes HBG but has no percounter
 selector, prepare the lib case with HBG per-task submission. Copy the generated
@@ -49,6 +54,13 @@ Set the name-map path to the file generated for the selected capture. Open
 `merged_swimlane.json` in Perfetto. When the merged trace is present, the tool
 also writes `CPM_static.json` and `CPM_observed.json` with the corresponding
 paths highlighted and `critical_path_report.md` with the timing breakdown.
+
+For a distributed workload, select the shortest Worker View across valid
+recordings of the same fixture and level. Use the first block start and last
+block end from each capture and its own device clock. The L0 performance
+reducer identifies the best fixed-rank median independently. Keep both rank
+identities in the report. The [DSpark exporter](dspark-8k.md#capture-and-export-perfetto)
+can scan existing distributed L2 recordings with `--trace-root`.
 
 Before quoting CPM, verify every executable task joins to the dependency graph
 and the per-task AIC/AIV event counts agree with block count and active slots.
