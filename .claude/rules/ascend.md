@@ -43,3 +43,11 @@ Details + measurement provenance in
 "We tried it and dropped it" history for the AICore-side MMIO ideas
 sits in
 [docs/investigations/2026-06-aicore-mmio-to-spr.md](../../docs/investigations/2026-06-aicore-mmio-to-spr.md).
+
+## A5 Percounter execution constraints
+
+- Graph invocations execute serially. A `defer_wait` must settle within its
+  invocation. See the [Graph boundary contract](../../src/a5/runtime/percounter/README.md#graph-boundaries).
+- Exhausting CntNotify quota fails calendar bind before launch. Use the
+  requested slot count to investigate resource demand. See the
+  [CntNotify capacity contract](../../src/a5/runtime/percounter/README.md#cntnotify-capacity).
