@@ -294,14 +294,6 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
 def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller):
     jobs = _yaml(_ROOT / f".github/workflows/{caller}.yml")["jobs"]
     for platform_name in ("a2a3", "a5"):
-        if caller == "ci" and platform_name == "a5":
-            assert "st-framework-a5" not in jobs
-            job = _yaml(_ROOT / ".github/workflows/ci-a5-comment.yml")["jobs"]["st-framework-a5"]
-            assert job["uses"] == "./.github/workflows/_st-framework.yml"
-            assert job["with"]["platform"] == "a5"
-            assert json.loads(job["with"]["runs_on"]) == ["self-hosted", "a5"]
-            assert job["needs"] == ["gate-and-resolve"]
-            continue
         job = jobs[f"st-framework-{platform_name}"]
         assert job["uses"] == "./.github/workflows/_st-framework.yml"
         assert job["with"]["platform"] == platform_name
@@ -312,6 +304,8 @@ def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller)
             assert f"outputs.{platform_name}_changed == 'true'" in job["if"]
             assert "outputs.st_affected == 'true'" in job["if"]
             assert job["needs"] == ["detect-changes", "pre-commit"]
+            if platform_name == "a5":
+                assert job["with"]["ref"] == "${{ github.sha }}"
     workflow = _yaml(_WORKFLOW)
     assert workflow["jobs"]["run"]["timeout-minutes"] == "45"
     assert workflow["jobs"]["run"]["steps"][-1]["with"]["name"] == (
