@@ -63,7 +63,8 @@ TEST(HbgAsyncPlan, DeclaredLeafCapabilitiesPruneSyncAndRejectMissingContracts) {
     auto input = task(0, 5, LaneMask::all());
     const CoreAsyncCapability sync{1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0};
     const CoreAsyncCapability deferred{1, CoreAsyncMode::DEFERRED, 7, 3, 0};
-    ASSERT_TRUE(async_task_apply_capabilities(&input, {sync, sync, deferred}));
+    const CoreAsyncCapability independent{1, CoreAsyncMode::SYNCHRONOUS_INDEPENDENT, 0, 0, 0};
+    ASSERT_TRUE(async_task_apply_capabilities(&input, {sync, independent, deferred}));
     EXPECT_EQ(input.capacities, (std::array<uint16_t, 3>{0, 0, 7}));
     AsyncCompletionHostPlan plan;
     std::string error;
@@ -81,7 +82,7 @@ TEST(HbgAsyncPlan, DeclaredLeafCapabilitiesPruneSyncAndRejectMissingContracts) {
     EXPECT_EQ(scheduler_async_task_lanes(image.base, 0, 0), LaneMask::none());
     EXPECT_FALSE(async_task_apply_capabilities(&input, {}));
     auto invalid = sync;
-    invalid.mode = static_cast<CoreAsyncMode>(3);
+    invalid.mode = static_cast<CoreAsyncMode>(255);
     EXPECT_FALSE(async_task_apply_capabilities(&input, {sync, invalid, deferred}));
 }
 

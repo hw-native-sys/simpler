@@ -281,13 +281,43 @@ inline StateSelection select_percounter_state(
     }
     const uint64_t device_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_state));
 
+    const auto progress_independent = [&](uint32_t id) {
+        const auto mask = inputs[id].active_mask;
+        if (mask == 0) return false;
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            if ((mask & (1U << lane)) == 0) continue;
+            try {
+                const auto capability = runtime->get_function_async_capability(task_metadata[id].kernel_ids[lane]);
+                if (capability.mode != CoreAsyncMode::SYNCHRONOUS_INDEPENDENT) return false;
+            } catch (const std::invalid_argument &) {
+                return false;
+            }
+        }
+        return true;
+    };
     SchedulerCompletionCounterPlan completion_plan;
+    uint32_t terminal_frontier_chain = UINT32_MAX;
     if (completion_notify_count != 0) {
+        std::vector<uint32_t> frontier;
+        uint32_t frontier_arrivals = 0;
+        if (graph.invocations.empty() && !inputs.empty()) {
+            const uint32_t clusters = runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM;
+            const auto terminal =
+                plan_proven_terminal_pipeline(inputs.data(), task_count, clusters, progress_independent);
+            if (terminal && terminal->steps.size() <= PERCOUNTER_TERMINAL_MAX_STEPS &&
+                terminal->prerequisites.size() > 1 &&
+                terminal->prerequisites.size() <= PERCOUNTER_TERMINAL_MAX_PREREQUISITES &&
+                inputs[terminal->steps.front()].sync_start) {
+                frontier = terminal->prerequisites;
+                frontier_arrivals = static_cast<uint32_t>(inputs[terminal->steps.front()].block_num);
+            }
+        }
         std::string error;
-        if (!plan_percounter_completion_counters(inputs, &completion_plan, &error)) {
+        if (!plan_percounter_completion_counters(inputs, &completion_plan, &error, frontier, frontier_arrivals)) {
             LOG_ERROR("A5 percounter: completion counter plan failed: %s", error.c_str());
             return StateSelection::FAILED;
         }
+        if (!frontier.empty()) terminal_frontier_chain = completion_plan.task_chains[frontier.front()];
     }
 
     // Keep sync cohorts first in the lease so allocation pressure does not
@@ -334,28 +364,16 @@ inline StateSelection select_percounter_state(
         external.completion_plan = &completion_plan;
         external.completion_notify = notify_addresses.data() + sync_cohort_count;
         external.completion_notify_count = notify_addresses.size() - sync_cohort_count;
+        external.terminal_frontier_chain = terminal_frontier_chain;
     }
     BuildResult build{};
     const GraphPlanInput graph_plan{
         graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
     };
-    const auto may_defer = [&](uint32_t id) {
-        const auto &input = inputs[id];
-        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-            if ((input.active_mask & (1U << lane)) == 0) continue;
-            try {
-                const auto capability = runtime->get_function_async_capability(task_metadata[id].kernel_ids[lane]);
-                if (capability.mode != CoreAsyncMode::SYNCHRONOUS) return true;
-            } catch (const std::exception &) {
-                return true;
-            }
-        }
-        return false;
-    };
     if (!build_tables(
             inputs.data(), task_count, layout, host_base, device_base,
             static_cast<uint32_t>(runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM), external, &build,
-            graph_plan, true, may_defer
+            graph_plan, true, progress_independent
         )) {
         LOG_ERROR(
             "A5 percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status), build.task_id,
@@ -365,6 +383,8 @@ inline StateSelection select_percounter_state(
     }
 
     const auto *terminal_control = region_at<PercounterControl>(host_base, layout.control_offset);
+    if (terminal_control->terminal.frontier_includes_start != 0)
+        LOG_TIMING("A5 percounter: terminal frontier shares START counter");
     if (terminal_control->terminal.step_count != 0)
         LOG_TIMING(
             "A5 percounter: terminal pipeline %u steps, first=%u, last=%u, prerequisites=%u",
@@ -439,9 +459,9 @@ inline StateSelection select_percounter_state(
         "A5 percounter: selected for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
         " MIX list entries, %" PRIu64 " sync cohorts, %zu edges, %zu Graph invocations of %zu Definitions with %" PRIu64
         " body tasks; %" PRIu64 " of %" PRIu64 " region bytes uploaded)",
-        total_tasks, terminal_control->order_count[0], terminal_control->order_count[1],
-        terminal_control->mix_task_count, sync_cohort_count, edges.size(), graph.invocations.size(),
-        graph.templates.size(), graph.layout.body_task_count, layout.upload_size, layout.total_size
+        total_tasks, order_count[0], order_count[1], mix_task_count, sync_cohort_count, edges.size(),
+        graph.invocations.size(), graph.templates.size(), graph.layout.body_task_count, layout.upload_size,
+        layout.total_size
     );
     return StateSelection::PERCOUNTER;
 }

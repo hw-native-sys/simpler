@@ -11,7 +11,7 @@
 /**
  * Host-side selection of terminal suffixes for percounter. The shape planner
  * identifies closed suffixes. Dispatch requires the proven planner's additional
- * check that the prefix can drain even with deferred completions.
+ * check that prefix draining adds no unproven dependency before the entry task.
  *
  * Host-only (it uses the STL). Everything here is `inline` and free-standing so
  * it can be unit-tested without a Runtime.
@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <limits>
 #include <optional>
 
@@ -70,11 +71,14 @@ inline std::optional<TerminalPipeline> plan_terminal_pipeline(const Task *tasks,
         return live(id) && t.is_mix == mix && !t.sync_start && !t.has_predicate && t.active_mask == (mix ? 7U : 2U) &&
                t.block_num == static_cast<int64_t>(clusters) * (mix ? 1 : 2);
     };
-    // A DAG with a unique sink must end with its live sink in submission order.
+    // Fan-ins precede their consumers in submission order. Earlier sinks
+    // remain in the prefix and are included in the progress check.
     size_t live_count = task_count;
     while (live_count != 0 && !live(static_cast<uint32_t>(live_count - 1)))
         --live_count;
-    if (live_count == 0 || !full_wave(static_cast<uint32_t>(live_count - 1), true)) return std::nullopt;
+    if (live_count == 0) return std::nullopt;
+    const auto sink = static_cast<uint32_t>(live_count - 1);
+    if (!full_wave(sink, true)) return std::nullopt;
     std::vector<bool> forked(task_count, false);
     std::vector<uint32_t> consumer(task_count, absent);
     std::vector<std::vector<uint32_t>> consumers(task_count);
@@ -92,13 +96,6 @@ inline std::optional<TerminalPipeline> plan_terminal_pipeline(const Task *tasks,
             consumers[pred].push_back(id);
         }
     }
-    uint32_t sink = absent;
-    for (uint32_t id = 0; id < task_count; ++id) {
-        if (!live(id) || consumer[id] != absent) continue;
-        if (sink != absent) return std::nullopt;
-        sink = id;
-    }
-    if (sink == absent) return std::nullopt;
     const auto one_parent = [&](uint32_t id, bool mix) {
         uint32_t parent = absent;
         for (int32_t i = 0; i < tasks[id].fanin_count; ++i) {
@@ -159,12 +156,13 @@ inline std::optional<TerminalPipeline> plan_terminal_pipeline(const Task *tasks,
     return plan;
 }
 
-// A prefix task can register a deferred condition backed by work outside
-// its explicit fan-in. Draining it before entry may add a new dependency
-// unless entry already waits for that task through the DAG.
-template <typename Task, typename MayDefer>
-inline bool
-terminal_prefix_has_progress(const Task *tasks, size_t task_count, const TerminalPipeline &plan, MayDefer may_defer) {
+// Draining an unrelated prefix task before entry can delay a producer of
+// an in-kernel or deferred wait that is absent from the task DAG.
+template <typename Task>
+inline bool terminal_prefix_has_progress(
+    const Task *tasks, size_t task_count, const TerminalPipeline &plan,
+    const std::function<bool(uint32_t)> &progress_independent
+) {
     const uint32_t entry = plan.steps.front();
     std::vector<bool> required(task_count, false);
     required[entry] = true;
@@ -177,23 +175,24 @@ terminal_prefix_has_progress(const Task *tasks, size_t task_count, const Termina
         }
     }
     for (uint32_t id = 0; id < task_count; ++id) {
-        if (required[id] || tasks[id].inline_completed || tasks[id].active_mask == 0 ||
-            std::find(plan.steps.begin(), plan.steps.end(), id) != plan.steps.end())
-            continue;
-        if (may_defer(id)) return false;
+        if (!required[id] && !tasks[id].inline_completed &&
+            std::find(plan.steps.begin(), plan.steps.end(), id) == plan.steps.end() &&
+            (!progress_independent || !progress_independent(id)))
+            return false;
     }
     return true;
 }
 
-template <typename Task, typename MayDefer>
-inline std::optional<TerminalPipeline>
-plan_proven_terminal_pipeline(const Task *tasks, size_t task_count, uint32_t clusters, MayDefer may_defer) {
+template <typename Task>
+inline std::optional<TerminalPipeline> plan_proven_terminal_pipeline(
+    const Task *tasks, size_t task_count, uint32_t clusters,
+    const std::function<bool(uint32_t)> &progress_independent = {}
+) {
     auto plan = plan_terminal_pipeline(tasks, task_count, clusters);
     if (!plan) return std::nullopt;
     const auto original_steps = plan->steps.size();
-    while (!terminal_prefix_has_progress(tasks, task_count, *plan, may_defer)) {
-        // The three full-width output stages form the base terminal shape.
-        if (plan->steps.size() == 3) return std::nullopt;
+    while (!terminal_prefix_has_progress(tasks, task_count, *plan, progress_independent)) {
+        if (plan->steps.size() == 1) return std::nullopt;
         plan->steps.erase(plan->steps.begin());
     }
     if (plan->steps.size() != original_steps) terminal_pipeline_collect_prerequisites(tasks, task_count, *plan);

@@ -3241,6 +3241,7 @@ NB_MODULE(_task_interface, m) {
             throw std::invalid_argument("invalid async_capability version, mode, or bounds");
         const auto mode = nb::cast<std::string>(dictionary["mode"]);
         if (mode == "SYNCHRONOUS") result.mode = CoreAsyncMode::SYNCHRONOUS;
+        else if (mode == "SYNCHRONOUS_INDEPENDENT") result.mode = CoreAsyncMode::SYNCHRONOUS_INDEPENDENT;
         else if (mode == "DEFERRED") result.mode = CoreAsyncMode::DEFERRED;
         else if (mode == "UNKNOWN") result.mode = static_cast<CoreAsyncMode>(0);
         else throw std::invalid_argument("invalid async_capability mode");
@@ -3281,7 +3282,17 @@ NB_MODULE(_task_interface, m) {
                 const auto value = normalize_core_async_capability(self.get().async_capability());
                 nb::dict result;
                 result["version"] = 1;
-                result["mode"] = value.mode == CoreAsyncMode::SYNCHRONOUS ? "SYNCHRONOUS" : "DEFERRED";
+                switch (value.mode) {
+                case CoreAsyncMode::SYNCHRONOUS:
+                    result["mode"] = "SYNCHRONOUS";
+                    break;
+                case CoreAsyncMode::SYNCHRONOUS_INDEPENDENT:
+                    result["mode"] = "SYNCHRONOUS_INDEPENDENT";
+                    break;
+                case CoreAsyncMode::DEFERRED:
+                    result["mode"] = "DEFERRED";
+                    break;
+                }
                 result["max_conditions"] = value.max_conditions;
                 result["condition_types"] = value.condition_types;
                 return result;

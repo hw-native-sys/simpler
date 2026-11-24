@@ -348,15 +348,16 @@ inline __aicore__ void percounter_prefetch_arguments(uint64_t address, __gm__ Pe
 }
 #endif
 
-inline __aicore__ bool
-percounter_resolve_dispatch(const LaneConfig &cfg, int64_t id, uint32_t mask, PercounterTask *task) {
+inline __aicore__ bool percounter_resolve_dispatch(
+    const LaneConfig &cfg, int64_t id, uint32_t mask, PercounterTask *task, bool prefetch = true
+) {
     if (!percounter_resolve(cfg, id, task)) return false;
     if (mask != 0) {
         auto &counter = cfg.counters[id];
         task->function_address = percounter_gm_read(counter.function_addresses[__builtin_ctz(mask)]);
 #if defined(__CCE_AICORE__)
         // Resolve follows parameter publication, so the hints can overlap the fanin wait.
-        percounter_prefetch_arguments(task->arguments_address, counter);
+        if (prefetch) percounter_prefetch_arguments(task->arguments_address, counter);
 #endif
     } else {
         task->function_address = 0;
@@ -958,6 +959,17 @@ inline __aicore__ void percounter_service_records(
         if (static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(c.mask))) {
             if (!c.ready && percounter_metadata_ready(cfg, percounter_order_task_id(c.entry))) {
                 const bool resolved_now = percounter_ssbuf_load_field(&record->metadata_generation) != c.generation;
+                const auto task_id = percounter_order_task_id(c.entry);
+                const bool share_fanin = c.sync_index != PERCOUNTER_NO_SYNC &&
+                                         percounter_order_block_num(c.entry) == cfg.cluster_count &&
+                                         static_cast<uint64_t>(task_id) < cfg.table_task_count;
+                if (share_fanin && resolved_now && percounter_gm_read(cfg.counters[task_id].shared_fanin_proven) != 0) {
+                    percounter_memory_barrier();
+                    percounter_schedule_checkpoint(cfg, PercounterTaskEventKind::InputsReady, c.entry);
+                    percounter_ssbuf_store_release(&record->fanin_ready, c.generation);
+                    c.ready = true;
+                    return;
+                }
                 if (resolved_now) {
                     PercounterTask task;
                     if (!percounter_resolve(cfg, percounter_order_task_id(c.entry), &task)) return;
@@ -991,6 +1003,10 @@ inline __aicore__ void percounter_service_records(
                     percounter_ssbuf_store_field(&record->fanin_pending, pending);
                     percounter_ssbuf_store_field(&record->fanin_target, target);
                     if (cursor == count) {
+                        if (share_fanin && percounter_gm_read(cfg.counters[task_id].shared_fanin_proven) == 0) {
+                            percounter_memory_barrier();
+                            percounter_gm_store(cfg.counters[task_id].shared_fanin_proven, uint64_t{1});
+                        }
                         percounter_schedule_checkpoint(cfg, PercounterTaskEventKind::InputsReady, c.entry);
                         percounter_ssbuf_store_release(&record->fanin_ready, c.generation);
                         c.ready = true;
@@ -1084,21 +1100,15 @@ percounter_publish_segment(const LaneConfig &cfg, uint32_t index, uint64_t close
 
 /**
  * AIC work and MIX take one owner per cluster; ordinary vector work takes one
- * per AIV lane. A sync boundary sized to that count assigns block `rank` to the
- * owner of rank `rank`. Every owner reaches the same verdict from the same two
- * words, so the ticket path and this one never share a boundary.
- *
- * Only a sync boundary qualifies, and only one exactly as wide as its domain.
- * Binding a block to one owner gives up the ticket path's balancing -- a busy
- * owner's block waits for that owner rather than moving to a free one. A
- * full-width cohort has no such balancing to lose, since every owner takes a
- * block; a narrower one does, and pays for it.
+ * per AIV lane. A full-width assignment reserves one block for each owner.
+ * Synchronized tasks and full-width asynchronous MIX use this assignment.
+ * The task's sync flag independently controls the start barrier.
  */
 inline __aicore__ bool
 percounter_claim_is_static(const LaneConfig &cfg, uint32_t list, bool mix, bool sync, uint32_t blocks) {
-    if (!sync) return false;
+    if (blocks < 2 || (!sync && !mix)) return false;
     const uint32_t owners = (list == 0 || mix) ? cfg.cluster_count : cfg.cluster_count * cfg.aiv_per_cluster;
-    return owners != 0 && blocks == owners;
+    return blocks == owners;
 }
 
 inline __aicore__ uint32_t percounter_owner_rank(const LaneConfig &cfg, uint32_t list, bool mix) {
@@ -1124,13 +1134,21 @@ percounter_claim_static_block(const LaneConfig &cfg, uint32_t list, bool mix, ui
     return rank < blocks ? rank : blocks;
 }
 
-inline __aicore__ uint32_t percounter_claim_block(const LaneConfig &cfg, uint32_t index, uint32_t blocks) {
+inline __aicore__ uint32_t
+percounter_claim_block(const LaneConfig &cfg, uint32_t index, uint32_t blocks, uint64_t closed_sectors) {
     auto *claim = cfg.task_claims + index;
     const uint32_t first = cfg.cluster_index & (PERCOUNTER_CLAIM_SECTOR_COUNT - 1);
-    for (uint32_t offset = 0; offset < PERCOUNTER_CLAIM_SECTOR_COUNT; ++offset) {
-        const uint32_t part = (first + offset) & (PERCOUNTER_CLAIM_SECTOR_COUNT - 1);
-        const uint32_t count = (blocks + PERCOUNTER_CLAIM_SECTOR_COUNT - 1 - part) / PERCOUNTER_CLAIM_SECTOR_COUNT;
-        if (count == 0 || percounter_gm_read(claim->sectors[part].next) >= count) continue;
+    constexpr uint32_t sector_count = PERCOUNTER_CLAIM_SECTOR_COUNT;
+    constexpr uint32_t sector_mask = (1U << sector_count) - 1U;
+    const uint32_t open = ~static_cast<uint32_t>(closed_sectors) & sector_mask;
+    // Visit open sectors in the same cyclic order as the original scan.
+    uint32_t candidates = ((open | (open << sector_count)) >> first) & sector_mask;
+    while (candidates != 0) {
+        const uint32_t offset = static_cast<uint32_t>(__builtin_ctz(candidates));
+        candidates &= candidates - 1U;
+        const uint32_t part = (first + offset) & (sector_count - 1U);
+        const uint32_t count = (blocks + sector_count - 1U - part) / sector_count;
+        if (percounter_gm_read(claim->sectors[part].next) >= count) continue;
         const uint64_t ticket = percounter_gm_fetch_add(claim->sectors[part].next, uint64_t{1});
         if (ticket >= count) continue;
         // Only this owner draws the sector's last ticket, so the bit lands once
@@ -1164,9 +1182,7 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
         state->revisit &= ~(1U << slot);
         auto &previous = state->slots[slot];
         const auto metadata = previous.metadata;
-        // A statically assigned boundary gives this owner exactly one block, and
-        // its exhaustion mask completes before the lowest ranks have scanned, so
-        // neither the mask nor the summary bit may steer an owner here.
+        // Each owner has exactly one block at a statically assigned boundary.
         if (percounter_claim_is_static(
                 cfg, list, __builtin_popcount(metadata.active_mask) > 1, metadata.sync_index != PERCOUNTER_NO_SYNC,
                 metadata.block_num
@@ -1177,7 +1193,7 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
             percounter_publish_segment(cfg, previous.claim_index, closed, previous.claim_index + list);
             continue;
         }
-        const uint32_t block = percounter_claim_block(cfg, previous.claim_index, metadata.block_num);
+        const uint32_t block = percounter_claim_block(cfg, previous.claim_index, metadata.block_num, closed);
         if (block < metadata.block_num) {
             percounter_own_entry(
                 cfg, state, percounter_order_entry(percounter_order_task_id(previous.entry), block, metadata.block_num),
@@ -1205,36 +1221,36 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
             source.segment += skip - 1;
             continue;
         }
+        // Bind publishes the schedule before READY. Each lane invalidates
+        // its data cache before consuming the schedule for this launch.
+        const auto &segment = cfg.segments[segment_index];
         const bool loaded_now = source.loaded_segment != scan;
         if (loaded_now) {
-            source.task_shape = percounter_gm_read(cfg.segments[segment_index].task_shape);
+            source.task_shape = segment.task_shape;
             source.loaded_segment = scan;
         }
         const uint64_t shape = source.task_shape;
         const uint32_t blocks = static_cast<uint32_t>(shape >> 48);
         // A closed boundary counter also proves its preceding interval claimed.
-        // A statically assigned boundary is exempt: its mask completes as soon as
-        // the highest ranks publish, which can precede a lower rank's scan, and
-        // that owner's block is reserved for it alone.
+        // A statically assigned boundary holds a separate block for each owner.
         const bool statically_assigned =
             shape != 0 && percounter_claim_is_static(
                               cfg, list, __builtin_popcount(static_cast<uint32_t>(shape >> 32) & 7U) > 1,
                               (shape & (uint64_t{8} << 32)) != 0, blocks
                           );
+        uint64_t closed_sectors = 0;
         if (shape != 0 && !statically_assigned) {
-            const uint64_t closed = percounter_claim_closed(cfg, segment_index - list);
-            if (percounter_claim_exhausted(closed)) {
-                percounter_publish_segment(cfg, segment_index - list, closed, segment_index);
+            closed_sectors = percounter_claim_closed(cfg, segment_index - list);
+            if (percounter_claim_exhausted(closed_sectors)) {
+                percounter_publish_segment(cfg, segment_index - list, closed_sectors, segment_index);
                 continue;
             }
         }
         if (loaded_now) {
-            const uint64_t bounds = percounter_gm_read_immutable_word(&cfg.segments[segment_index].begin);
-            source.begin = static_cast<uint32_t>(bounds);
-            source.end = static_cast<uint32_t>(bounds >> 32);
+            source.begin = segment.begin;
+            source.end = segment.end;
             source.interval_spent = source.begin == source.end;
-            if (!source.interval_spent)
-                source.ticket_begin = percounter_gm_read(cfg.segments[segment_index].ticket_begin);
+            if (!source.interval_spent) source.ticket_begin = segment.ticket_begin;
         }
         if (!source.interval_spent) {
             // Positions not yet owned remain available to other lanes.
@@ -1243,7 +1259,7 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
             source.interval_spent = first + 1 >= size;
             if (first < size) {
                 if (shape == 0 && source.interval_spent) percounter_close_segment(cfg, segment_index);
-                const uint64_t entry = percounter_gm_read(cfg.order[source.begin + first]);
+                const uint64_t entry = cfg.order[source.begin + first];
                 percounter_own_entry(
                     cfg, state, entry, __builtin_ctz(free), false, percounter_regular_metadata(cfg, entry), claim_start
                 );
@@ -1259,16 +1275,14 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
             const bool mix = __builtin_popcount(mask) > 1;
             if (!mix || cfg.cluster_lane == 1) {
                 const uint32_t claim_index = segment_index - list;
-                const uint32_t block = statically_assigned ? percounter_claim_static_block(cfg, list, mix, blocks) :
-                                                             percounter_claim_block(cfg, claim_index, blocks);
+                const uint32_t block = statically_assigned ?
+                                           percounter_claim_static_block(cfg, list, mix, blocks) :
+                                           percounter_claim_block(cfg, claim_index, blocks, closed_sectors);
                 if (block < blocks) {
                     const uint32_t task = static_cast<uint32_t>(shape);
-                    const uint32_t rank =
-                        static_cast<uint32_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].global_order_id));
+                    const uint32_t rank = cfg.metadata[task].global_order_id;
                     const uint32_t sync =
-                        (shape & (uint64_t{8} << 32)) ?
-                            static_cast<uint32_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].sync_index)) :
-                            PERCOUNTER_NO_SYNC;
+                        (shape & (uint64_t{8} << 32)) ? cfg.metadata[task].sync_index : PERCOUNTER_NO_SYNC;
                     const PercounterTaskMetadata metadata{
                         rank, static_cast<uint16_t>(mask), static_cast<uint16_t>(blocks), sync, PERCOUNTER_NO_BOUNDARY
                     };
@@ -1313,11 +1327,10 @@ inline __aicore__ uint32_t percounter_source_floor(const LaneConfig &cfg, Percou
         if (blocks == 0) {
             const uint64_t shape = source.loaded_segment == index - cfg.segment_begin[list] ?
                                        source.task_shape :
-                                       percounter_gm_read(cfg.segments[index].task_shape);
+                                       cfg.segments[index].task_shape;
             blocks = static_cast<uint32_t>(shape >> 48);
             task = static_cast<uint32_t>(shape);
-            cursor.next_segment =
-                static_cast<uint32_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].sync_index) >> 32);
+            cursor.next_segment = cfg.metadata[task].next_boundary_segment;
             cursor.statically_assigned = percounter_claim_is_static(
                 cfg, list, __builtin_popcount(static_cast<uint32_t>(shape >> 32) & 7U) > 1,
                 (shape & (uint64_t{8} << 32)) != 0, blocks
@@ -1329,8 +1342,7 @@ inline __aicore__ uint32_t percounter_source_floor(const LaneConfig &cfg, Percou
         if (!released) {
             if (cursor.block_count == 0) {
                 cursor.block_count = blocks;
-                cursor.rank =
-                    static_cast<uint32_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].global_order_id));
+                cursor.rank = cfg.metadata[task].global_order_id;
             }
             return cursor.rank;
         }
@@ -1534,6 +1546,7 @@ inline __aicore__ bool percounter_select_ready(
 #endif
     PercounterCandidate cohort;
     PercounterCandidate ordinary;
+    PercounterCandidate waiting_aic;
     for (uint32_t i = 0; i < PERCOUNTER_PENDING_CAPACITY; ++i) {
         if ((state->occupied & ~state->mix_owned & (1U << i)) == 0) continue;
         auto &slot = state->slots[i];
@@ -1559,7 +1572,13 @@ inline __aicore__ bool percounter_select_ready(
         };
         if (slot.metadata.sync_index != PERCOUNTER_NO_SYNC) {
             if (percounter_candidate_before(c, cohort)) cohort = c;
-        } else if (c.ready && percounter_candidate_before(c, ordinary)) ordinary = c;
+        } else if (c.ready && percounter_candidate_before(c, ordinary)) {
+            ordinary = c;
+        } else if (cfg.cluster_lane == 0 && !c.ready && slot.resolved && c.mask == 1 && slot.metadata.block_num <= 8 &&
+                   static_cast<uint64_t>(id) < cfg.table_task_count && slot.task.fanin_count == 1 &&
+                   percounter_candidate_before(c, waiting_aic)) {
+            waiting_aic = c;
+        }
     }
     if (shared_candidate.index >= 0) {
         if (percounter_candidate_before(shared_candidate, cohort)) cohort = shared_candidate;
@@ -1580,6 +1599,28 @@ inline __aicore__ bool percounter_select_ready(
     if (cohort.index >= 0 && cohort.ready && !ordinary_first && state->observed_mix_floor >= cohort.rank &&
         percounter_source_floor(cfg, state->source, false) >= cohort.rank) {
         ProfileScope entry_scope(cfg.scalar, ProfilePhase::Entry);
+        if (state->committed < 0 && cohort.shared && cohort.sync_index == PERCOUNTER_NO_SYNC &&
+            waiting_aic.index >= 0 && waiting_aic.rank < cohort.rank) {
+            auto &slot = state->slots[waiting_aic.index];
+            // A narrow vector wave can finish while this lane retries. Wider
+            // predecessors use the normal scheduler pass on a miss.
+            const uint64_t producer_address = percounter_gm_read(slot.task.fanin[0]) & ~PERCOUNTER_COMPLETION_NOTIFY;
+            const uint64_t counter_base = reinterpret_cast<uint64_t>(cfg.counters);
+            const uint64_t producer = (producer_address - counter_base) / sizeof(PercounterCounter);
+            const bool narrow_aiv = producer < cfg.table_task_count && cfg.metadata[producer].active_mask == 2 &&
+                                    cfg.metadata[producer].block_num < cfg.cluster_count;
+            for (uint32_t attempt = 0; narrow_aiv && attempt < 8; ++attempt) {
+                if (!percounter_probe_fanin(
+                        cfg, slot.task, &slot.fanin_cursor, &slot.fanin_pending, &slot.fanin_target
+                    ))
+                    continue;
+                slot.ready = true;
+                state->proven_task = slot.task.id;
+                waiting_aic.ready = true;
+                *selected = waiting_aic;
+                return true;
+            }
+        }
         const int32_t identity = cohort.shared ? PERCOUNTER_PENDING_CAPACITY + cohort.index : cohort.index;
         if (state->committed >= 0 && state->committed != identity) {
             percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS);
@@ -1751,7 +1792,8 @@ inline __aicore__ bool percounter_run_terminal(const LaneConfig &cfg, Percounter
         if (!mix || cfg.cluster_lane == 1)
             percounter_record_task_event(cfg, PercounterTaskEventKind::Claim, entry, claim_time, claim_time);
         PercounterTask task;
-        if (!percounter_resolve_dispatch(cfg, id, 1U << role, &task) || task.function_address == 0) {
+        if (!percounter_resolve_dispatch(cfg, id, 1U << role, &task, phase + 1 < plan->step_count) ||
+            task.function_address == 0) {
             percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE, id, role);
             return false;
         }
@@ -1765,6 +1807,8 @@ inline __aicore__ bool percounter_run_terminal(const LaneConfig &cfg, Percounter
         auto &grant = cfg.ssbuf->terminal_grant[phase];
         if (cfg.cluster_lane == 1) {
             const bool sync = mix && metadata.sync_index != PERCOUNTER_NO_SYNC;
+            const bool joined = phase == 0 && plan->frontier_includes_start != 0;
+            uint32_t start_target = blocks;
             PercounterSyncNotify notify{0, 0};
             if (mix) {
                 for (uint32_t iteration = 0;
@@ -1773,19 +1817,27 @@ inline __aicore__ bool percounter_run_terminal(const LaneConfig &cfg, Percounter
                     if (!percounter_terminal_poll(cfg, state, iteration)) return false;
                 percounter_memory_barrier();
                 if (sync) {
-                    notify = percounter_sync_notify(cfg, state, metadata.sync_index);
-                    percounter_start_arrive(cfg, notify, metadata.sync_index, block);
+                    if (joined) {
+                        const auto &frontier = cfg.counters[plan->prerequisites[0]];
+                        notify.read_address = frontier.completion_notify_address;
+                        start_target = frontier.completion_notify_target;
+                        percounter_issue_completion(notify.read_address | PERCOUNTER_COMPLETION_NOTIFY, 1);
+                    } else {
+                        notify = percounter_sync_notify(cfg, state, metadata.sync_index);
+                        percounter_start_arrive(cfg, notify, metadata.sync_index, block);
+                    }
                 }
             }
             if (phase == 0) {
-                for (uint32_t i = 0; i < plan->prerequisite_count; ++i)
+                const uint32_t prerequisites = joined ? 0 : plan->prerequisite_count;
+                for (uint32_t i = 0; i < prerequisites; ++i)
                     if (!percounter_terminal_wait(cfg, state, plan->prerequisites[i])) return false;
             } else if (!percounter_terminal_wait(cfg, state, plan->steps[phase - 1])) {
                 return false;
             }
             if (sync) {
-                for (uint32_t iteration = 0; !percounter_start_ready(cfg, notify, metadata.sync_index, blocks, block);
-                     ++iteration)
+                for (uint32_t iteration = 0;
+                     !percounter_start_ready(cfg, notify, metadata.sync_index, start_target, block); ++iteration)
                     if (!percounter_terminal_poll(cfg, state, iteration)) return false;
             }
             percounter_ssbuf_store_release(&grant, uint32_t{1});

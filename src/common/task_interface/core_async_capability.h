@@ -14,11 +14,13 @@
 #include <stdexcept>
 #include <type_traits>
 
-enum class CoreAsyncMode : uint8_t { SYNCHRONOUS = 1, DEFERRED = 2 };
+enum class CoreAsyncMode : uint8_t { SYNCHRONOUS = 1, DEFERRED = 2, SYNCHRONOUS_INDEPENDENT = 3 };
 
 // A SYNCHRONOUS kernel completes on return and must make progress without waiting
 // for a signal from another rank. It may signal a peer. Cross-rank waits are
 // registered through defer_wait by DEFERRED kernels. Unknown metadata is normalized at ingress.
+// SYNCHRONOUS_INDEPENDENT also guarantees that completion never waits for
+// another scheduled task. Synchronization among roles of one launch is allowed.
 struct CoreAsyncCapability {
     uint32_t version{0};
     CoreAsyncMode mode{};
@@ -32,7 +34,8 @@ inline constexpr bool core_async_capability_valid(const CoreAsyncCapability &val
     if (value.mode == CoreAsyncMode::DEFERRED)
         return value.max_conditions >= 1 && value.max_conditions <= 64 && value.condition_types >= 1 &&
                value.condition_types <= 3;
-    return value.mode == CoreAsyncMode::SYNCHRONOUS && value.max_conditions == 0 && value.condition_types == 0;
+    return (value.mode == CoreAsyncMode::SYNCHRONOUS || value.mode == CoreAsyncMode::SYNCHRONOUS_INDEPENDENT) &&
+           value.max_conditions == 0 && value.condition_types == 0;
 }
 
 // Older producers left this padding zero; version 1 also permits an explicit

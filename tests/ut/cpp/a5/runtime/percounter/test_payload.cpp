@@ -42,8 +42,6 @@ void *read_context() { return current_context; }
 alignas(64) std::array<uint8_t, PLATFORM_SSBUF_SIZE> startup_ssbuf{};
 void kernel(int64_t *args) { execute(args); }
 
-bool synchronous_task(uint32_t) { return false; }
-
 std::function<void(uint32_t, int64_t *)> execute_terminal_role;
 template <uint32_t Role>
 void terminal_role_kernel(int64_t *args) {
@@ -84,7 +82,7 @@ struct Fixture {
     explicit Fixture(
         std::vector<TaskInput> in = {task(1), task(1), task(1)}, uint32_t clusters = 2,
         const ExternalAddresses &external = {}, bool fold_dependencies = false, bool enable_terminal = false,
-        const std::function<bool(uint32_t)> &may_defer = {}
+        const std::function<bool(uint32_t)> &progress_independent = {}
     ) :
         inputs(std::move(in)),
         storage(inputs.size()),
@@ -121,7 +119,7 @@ struct Fixture {
         auto *base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(region.data()) + 127) & ~uintptr_t{127});
         EXPECT_TRUE(build_tables(
             inputs.data(), inputs.size(), layout, base, reinterpret_cast<uint64_t>(base), clusters, external, nullptr,
-            {}, enable_terminal, may_defer
+            {}, enable_terminal, progress_independent
         ));
         control = reinterpret_cast<PercounterControl *>(base);
         counters = region_at<PercounterCounter>(base, layout.counters_offset);
@@ -433,7 +431,7 @@ TEST(PercounterAcquire, ClaimPartitionsCoverRaggedTasksAndCloseOnce) {
             for (uint32_t round = 0; round <= blocks; ++round) {
                 for (uint32_t owner = 0; owner < owners; ++owner) {
                     cfg.cluster_index = owner;
-                    const uint32_t block = percounter_claim_block(cfg, 0, blocks);
+                    const uint32_t block = percounter_claim_block(cfg, 0, blocks, percounter_claim_closed(cfg, 0));
                     if (block < blocks) {
                         EXPECT_EQ(++seen[block], 1U);
                         ++claimed;
@@ -787,6 +785,95 @@ TEST(PercounterAcquire, DeferredOddMixCompletionOutlivesSharedRecordReuse) {
     }
 }
 
+TEST(PercounterAcquire, TerminalFrontierCounterWaitsForBothCreditsAndStartArrivals) {
+    const int32_t gather_inputs[]{0, 1};
+    const int32_t gather_id = 2;
+    const int32_t vector_id = 3;
+    const int32_t mix_id = 4;
+    auto gather = task(7, 2, true);
+    gather.fanin_ids = gather_inputs;
+    gather.fanin_count = 2;
+    auto vector = task(2, 4);
+    vector.fanin_ids = &gather_id;
+    vector.fanin_count = 1;
+    auto mix = task(7, 2);
+    mix.fanin_ids = &vector_id;
+    mix.fanin_count = 1;
+    auto final = task(7, 2);
+    final.fanin_ids = &mix_id;
+    final.fanin_count = 1;
+    const std::vector<TaskInput> inputs{task(1, 2), task(2, 2), gather, vector, mix, final};
+    const auto progress_independent = [](uint32_t) {
+        return true;
+    };
+    const auto terminal = plan_proven_terminal_pipeline(inputs.data(), inputs.size(), 2, progress_independent);
+    ASSERT_TRUE(terminal.has_value());
+    ASSERT_EQ(terminal->prerequisites, (std::vector<uint32_t>{0, 1}));
+
+    SchedulerCompletionCounterPlan plan;
+    std::string error;
+    ASSERT_TRUE(plan_percounter_completion_counters(inputs, &plan, &error, terminal->prerequisites, 2)) << error;
+    const uint32_t chain = plan.task_chains[0];
+    ASSERT_EQ(chain, plan.task_chains[1]);
+    ASSERT_NE(chain, plan.task_chains[gather_id]);
+    ASSERT_EQ(plan.thresholds[0], 6U);
+    ASSERT_EQ(plan.thresholds[1], 6U);
+
+    alignas(32) uint32_t completion = 0;
+    std::vector<uint64_t> addresses(plan.chains.size(), 0);
+    addresses[chain] = reinterpret_cast<uint64_t>(&completion);
+    ExternalAddresses external{};
+    external.completion_plan = &plan;
+    external.completion_notify = addresses.data();
+    external.completion_notify_count = addresses.size();
+    external.terminal_frontier_chain = chain;
+    Fixture f(inputs, 2, external, false, true, progress_independent);
+    ASSERT_EQ(f.control->terminal.prerequisite_count, 1U);
+    EXPECT_EQ(f.control->terminal.frontier_includes_start, 1U);
+    EXPECT_EQ(f.control->terminal.prerequisites[0], 0U);
+    EXPECT_TRUE(percounter_completion_notify_head(f.counters[0], f.counters[0].value));
+    EXPECT_FALSE(percounter_completion_notify_head(f.counters[1], f.counters[1].value));
+    std::atomic<uint32_t> gather_calls{0};
+    std::atomic<uint32_t> finished_lanes{0};
+    std::array<bool, 6> status{};
+    execute = [&](int64_t *args) {
+        if (args[0] == gather_id) gather_calls.fetch_add(1, std::memory_order_relaxed);
+    };
+    percounter_issue_completion(percounter_completion_address(f.cfg[0], 1), 2);
+    percounter_issue_completion(percounter_completion_address(f.cfg[0], 0), 1);
+    std::vector<std::thread> lanes;
+    for (size_t lane = 0; lane < f.cfg.size(); ++lane) {
+        lanes.emplace_back([&, lane] {
+            percounter_bind_sim_context(&f.signals[lane / 3].contexts[lane % 3].value);
+            status[lane] = percounter_run_terminal(f.cfg[lane], &f.state[lane]);
+            finished_lanes.fetch_add(1, std::memory_order_release);
+        });
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (percounter_notify_query(completion) < 5 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_EQ(percounter_notify_query(completion), 5U);
+    EXPECT_EQ(gather_calls.load(std::memory_order_relaxed), 0U);
+    percounter_issue_completion(percounter_completion_address(f.cfg[0], 0), 1);
+    while (finished_lanes.load(std::memory_order_acquire) < status.size() &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    if (finished_lanes.load(std::memory_order_acquire) < status.size())
+        percounter_gm_store(f.control->lane_error, uint64_t{1});
+    for (auto &lane : lanes)
+        lane.join();
+    for (bool ran : status)
+        EXPECT_TRUE(ran);
+    EXPECT_EQ(gather_calls.load(std::memory_order_relaxed), 6U);
+
+    external.completion_notify_count = chain;
+    Fixture fallback(inputs, 2, external, false, true, progress_independent);
+    ASSERT_EQ(fallback.control->terminal.prerequisite_count, 2U);
+    EXPECT_EQ(fallback.control->terminal.frontier_includes_start, 0U);
+    EXPECT_EQ(fallback.counters[0].completion_notify_address, 0U);
+    EXPECT_EQ(fallback.counters[1].completion_notify_address, 0U);
+}
+
 TEST(PercounterAcquire, CntNotifyDoesNotReleaseFaninBeforeTheDeferredSubtask) {
     for (const uint32_t mask : {2U, 3U, 5U, 6U, 7U}) {
         alignas(32) uint32_t completion = 0;
@@ -1018,10 +1105,8 @@ TEST(PercounterAcquire, NotifiedStartCountsTheWholeCohortInOneRegister) {
 /**
  * Owner counts follow the reported topology, so the gate opens at exactly the
  * width a part of that size can fill: one owner per cluster for AIC and MIX,
- * one per AIV lane for ordinary vector work. A sync cohort is never wider --
- * `percounter_sync_widths_fit` rejects that at the AICPU handshake -- so the
- * equality selects the cohort that spans every owner rather than a width that
- * happens to match the part.
+ * one per AIV lane for ordinary vector work. Full-width MIX assignments
+ * apply with or without a synchronized start.
  */
 TEST(PercounterAcquire, StaticAssignmentOpensAtEachDomainsFullWidth) {
     for (uint32_t clusters : {2U, 32U, 36U}) {
@@ -1040,9 +1125,10 @@ TEST(PercounterAcquire, StaticAssignmentOpensAtEachDomainsFullWidth) {
         // blocks on whichever owners reach the boundary first.
         for (uint32_t blocks : {1U, cluster_wide - 1, lane_wide - 1})
             EXPECT_FALSE(percounter_claim_is_static(cfg, 1, false, true, blocks));
-        // Ordinary work draws tickets at every width.
         EXPECT_FALSE(percounter_claim_is_static(cfg, 0, false, false, cluster_wide));
+        EXPECT_TRUE(percounter_claim_is_static(cfg, 1, true, false, cluster_wide));
         EXPECT_FALSE(percounter_claim_is_static(cfg, 1, false, false, lane_wide));
+        EXPECT_FALSE(percounter_claim_is_static(cfg, 1, false, false, cluster_wide));
     }
 }
 
@@ -1457,8 +1543,7 @@ TEST(PercounterAcquire, PublicationBoundariesKeepSeparateOrderedDomains) {
     };
     // Exhaustion is a statement about every lane, and it releases a ticket
     // boundary outright. A statically assigned boundary reserves this lane's
-    // own block, so only this lane's scan passing it releases the floor --
-    // two of the three domains here are full-width and take that rule.
+    // own block, so this lane's scan must pass it before the floor advances.
     const auto finish_scan = [&](uint32_t list) {
         f.state[list == 0 ? 0 : 1].source.segment = f.control->segment_count[list];
     };
@@ -1473,6 +1558,9 @@ TEST(PercounterAcquire, PublicationBoundariesKeepSeparateOrderedDomains) {
     close_boundary(3);
     EXPECT_EQ(aiv_floor(), 5U);
     close_boundary(2);
+    EXPECT_EQ(mix_floor(), 4U);
+    const auto first_mix = f.control->first_boundary_segment[2];
+    f.state[1].source.segment = first_mix - f.control->segment_begin[1] + 1;
     EXPECT_EQ(mix_floor(), 7U);
     close_boundary(7);
     EXPECT_EQ(mix_floor(), 7U);
@@ -2279,6 +2367,8 @@ TEST(PercounterAcquire, FoldedJoinStillWaitsForOffLaneCompletion) {
     EXPECT_EQ(f.calls.size(), 2U);
 }
 
+bool independent_task(uint32_t) { return true; }
+
 TEST(PercounterAcquire, TerminalPipelineRequiresClosedSuffixAndKeepsIndependentInput) {
     const int32_t before_vector[] = {0};
     const int32_t before_mix[] = {2};
@@ -2298,7 +2388,7 @@ TEST(PercounterAcquire, TerminalPipelineRequiresClosedSuffixAndKeepsIndependentI
     EXPECT_EQ(plan->steps, (std::vector<uint32_t>{0, 2, 3, 4}));
     EXPECT_EQ(plan->prerequisites, (std::vector<uint32_t>{1}));
     {
-        Fixture f(inputs, 2, {}, false, true, synchronous_task);
+        Fixture f(inputs, 2, {}, false, true, independent_task);
         EXPECT_EQ(f.control->terminal.step_count, 4U);
         EXPECT_EQ(f.control->terminal.steps[0], 0U);
         EXPECT_EQ(f.control->terminal.steps[1], 2U);
@@ -2321,9 +2411,10 @@ TEST(PercounterAcquire, TerminalPipelineRequiresClosedSuffixAndKeepsIndependentI
     }
     {
         Fixture unknown(inputs, 2, {}, false, true);
-        EXPECT_EQ(unknown.control->terminal.step_count, 0U);
-        EXPECT_EQ(unknown.control->order_count[1], 5U);
-        EXPECT_EQ(unknown.control->mix_task_count, 3U);
+        EXPECT_EQ(unknown.control->terminal.step_count, 1U);
+        EXPECT_EQ(unknown.control->terminal.steps[0], 4U);
+        EXPECT_EQ(unknown.control->order_count[1], 4U);
+        EXPECT_EQ(unknown.control->mix_task_count, 2U);
     }
     inputs[3].sync_start = true;
     EXPECT_FALSE(plan_terminal_pipeline(inputs.data(), inputs.size(), 2));
@@ -2335,33 +2426,133 @@ TEST(PercounterAcquire, TerminalPipelineRequiresClosedSuffixAndKeepsIndependentI
     EXPECT_FALSE(plan_terminal_pipeline(inputs.data(), inputs.size(), 2));
 }
 
-TEST(PercounterAcquire, TerminalPipelinePreservesDeferredPrefixProgress) {
-    const int32_t required = 0;
-    const int32_t vector_id = 2;
-    const std::array<int32_t, 2> sink_fanins{1, 3};
+TEST(PercounterAcquire, TerminalPipelineRetainsIndependentSink) {
+    const int32_t vector_id = 1;
+    const int32_t mix_id = 2;
     auto vector = task(2, 4);
-    auto projection = task(7, 2);
+    auto mix = task(7, 2);
+    mix.fanin_ids = &vector_id;
+    mix.fanin_count = 1;
     auto sink = task(7, 2);
-    vector.fanin_ids = &required;
-    vector.fanin_count = 1;
+    sink.fanin_ids = &mix_id;
+    sink.fanin_count = 1;
+    const std::vector<TaskInput> tasks{task(2), vector, mix, sink};
+
+    Fixture known(tasks, 2, {}, false, true, independent_task);
+    EXPECT_EQ(known.control->terminal.step_count, 3U);
+    EXPECT_EQ(known.control->terminal.prerequisite_count, 1U);
+    EXPECT_EQ(known.control->terminal.prerequisites[0], 0U);
+    EXPECT_EQ(known.control->order_count[1], 1U);
+    EXPECT_EQ(known.control->sink_count, 2U);
+
+    Fixture unknown(tasks, 2, {}, false, true);
+    EXPECT_EQ(unknown.control->terminal.step_count, 0U);
+    EXPECT_EQ(unknown.control->order_count[1], 4U);
+    EXPECT_EQ(unknown.control->sink_count, 2U);
+}
+
+TEST(PercounterAcquire, TerminalPipelineKeepsNotificationProducerInOrdinaryQueue) {
+    const int32_t vector_id = 0;
+    const std::array<int32_t, 2> sink_fanins{1, 2};
+    auto projection = task(7, 2);
     projection.fanin_ids = &vector_id;
     projection.fanin_count = 1;
+    auto sink = task(7, 2);
     sink.fanin_ids = sink_fanins.data();
     sink.fanin_count = sink_fanins.size();
-    const std::vector<TaskInput> tasks{task(2), task(2), vector, projection, sink};
-    {
-        Fixture required(tasks, 2, {}, false, true, [](uint32_t id) {
-            return id == 0;
+    // The side input can wait inside its kernel for a notification from the vector task.
+    Fixture f({task(2, 4), task(2), projection, sink}, 2, {}, false, true);
+    ASSERT_EQ(f.control->terminal.step_count, 1U);
+    EXPECT_EQ(f.control->terminal.steps[0], 3U);
+    ASSERT_EQ(f.control->terminal.prerequisite_count, 2U);
+    EXPECT_EQ(f.control->terminal.prerequisites[0], 1U);
+    EXPECT_EQ(f.control->terminal.prerequisites[1], 2U);
+    EXPECT_EQ(f.control->order_count[1], 3U);
+
+    // The single-block side task models a kernel waiting for a peer reply.
+    // The peer can reply only once V has executed. No defer_wait is registered.
+    const std::array<uint64_t, 3> addresses{
+        reinterpret_cast<uint64_t>(&terminal_role_kernel<0>), reinterpret_cast<uint64_t>(&terminal_role_kernel<1>),
+        reinterpret_cast<uint64_t>(&terminal_role_kernel<2>)
+    };
+    for (size_t id = 0; id < f.inputs.size(); ++id)
+        for (uint32_t role = 0; role < addresses.size(); ++role)
+            if (f.inputs[id].active_mask & (1U << role)) f.counters[id].function_addresses[role] = addresses[role];
+    std::array<uint64_t, 2> startup_ready{};
+    std::array<std::atomic<uint32_t>, 4> calls{};
+    std::atomic<bool> peer_reply{false};
+    std::atomic<size_t> finished{0};
+    execute_terminal_role = [&](uint32_t, int64_t *args) {
+        const uint32_t id = args[0];
+        ASSERT_LT(id, calls.size());
+        calls[id].fetch_add(1, std::memory_order_release);
+        if (id == 1)
+            while (!peer_reply.load(std::memory_order_acquire))
+                std::this_thread::yield();
+    };
+    std::vector<std::thread> lanes;
+    for (auto &cfg : f.cfg) {
+        cfg.mix_signal_ready = startup_ready.data();
+        lanes.emplace_back([&cfg, &finished] {
+            percounter_bind_sim_context(&cfg.ssbuf->contexts[cfg.cluster_lane].value);
+            if (percounter_clear_mix_signal(cfg, 1'000'000'000ULL)) {
+                if (cfg.cluster_lane == 0) percounter_lane_loop<0>(cfg);
+                else if (cfg.cluster_lane == 1) percounter_lane_loop<1>(cfg);
+                else percounter_lane_loop<2>(cfg);
+            }
+            finished.fetch_add(1, std::memory_order_release);
         });
-        EXPECT_EQ(required.control->terminal.step_count, 3U);
-        EXPECT_EQ(required.control->order_count[1], 2U);
     }
-    {
-        Fixture independent(tasks, 2, {}, false, true, [](uint32_t id) {
-            return id == 1;
+    constexpr auto wait_limit = std::chrono::seconds(2);
+    const auto reply_deadline = std::chrono::steady_clock::now() + wait_limit;
+    while (calls[0].load(std::memory_order_acquire) != 4U && std::chrono::steady_clock::now() < reply_deadline)
+        std::this_thread::yield();
+    const bool reached_peer = calls[0].load(std::memory_order_acquire) == 4U;
+    EXPECT_TRUE(reached_peer);
+    // Release the mock peer even if the assertion failed so threads can exit.
+    peer_reply.store(true, std::memory_order_release);
+    const auto finish_deadline = std::chrono::steady_clock::now() + wait_limit;
+    while (finished.load(std::memory_order_acquire) != lanes.size() &&
+           std::chrono::steady_clock::now() < finish_deadline)
+        std::this_thread::yield();
+    const bool all_finished = finished.load(std::memory_order_acquire) == lanes.size();
+    if (!all_finished)
+        percounter_gm_store(f.control->lane_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
+    for (auto &lane : lanes)
+        lane.join();
+    execute_terminal_role = {};
+    ASSERT_TRUE(all_finished);
+    EXPECT_EQ(calls[0].load(std::memory_order_relaxed), 4U);
+    EXPECT_EQ(calls[1].load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(calls[2].load(std::memory_order_relaxed), 6U);
+    EXPECT_EQ(calls[3].load(std::memory_order_relaxed), 6U);
+    for (size_t id = 0; id < f.inputs.size(); ++id)
+        f.expect_completed(id);
+}
+
+TEST(PercounterAcquire, TerminalPipelineUsesSeparateProofForUnrelatedPrefixWork) {
+    const int32_t vector_id = 0;
+    const std::array<int32_t, 2> sink_fanins{1, 2};
+    auto projection = task(7, 2);
+    projection.fanin_ids = &vector_id;
+    projection.fanin_count = 1;
+    auto sink = task(7, 2);
+    sink.fanin_ids = sink_fanins.data();
+    sink.fanin_count = sink_fanins.size();
+    const std::array<TaskInput, 4> tasks{task(2, 4), task(2), projection, sink};
+    for (const auto mode : {CoreAsyncMode::SYNCHRONOUS, CoreAsyncMode::SYNCHRONOUS_INDEPENDENT}) {
+        const auto plan = plan_proven_terminal_pipeline(tasks.data(), tasks.size(), 2, [&](uint32_t id) {
+            EXPECT_EQ(id, 1U);
+            return mode == CoreAsyncMode::SYNCHRONOUS_INDEPENDENT;
         });
-        EXPECT_EQ(independent.control->terminal.step_count, 0U);
-        EXPECT_EQ(independent.control->order_count[1], 5U);
+        ASSERT_TRUE(plan);
+        if (mode == CoreAsyncMode::SYNCHRONOUS) {
+            EXPECT_EQ(plan->steps, (std::vector<uint32_t>{3}));
+            EXPECT_EQ(plan->prerequisites, (std::vector<uint32_t>{1, 2}));
+        } else {
+            EXPECT_EQ(plan->steps, (std::vector<uint32_t>{0, 2, 3}));
+            EXPECT_EQ(plan->prerequisites, (std::vector<uint32_t>{1}));
+        }
     }
 }
 
@@ -2381,9 +2572,7 @@ TEST(PercounterAcquire, TerminalPipelineRetainsSuffixWithProvenEntryAncestry) {
     sink.fanin_ids = &projection_id;
     sink.fanin_count = 1;
     const std::vector<TaskInput> tasks{gather, task(2), vector, projection, sink};
-    const auto plan = plan_proven_terminal_pipeline(tasks.data(), tasks.size(), 2, [](uint32_t id) {
-        return id == 1;
-    });
+    const auto plan = plan_proven_terminal_pipeline(tasks.data(), tasks.size(), 2);
     ASSERT_TRUE(plan);
     EXPECT_EQ(plan->steps, (std::vector<uint32_t>{2, 3, 4}));
     EXPECT_EQ(plan->prerequisites, (std::vector<uint32_t>{0, 1}));
@@ -2433,7 +2622,7 @@ TEST(PercounterAcquire, TerminalPipelineLeavesIndependentBridgeInPrefix) {
     projection.fanin_count = 1;
     sink.fanin_ids = &projection_id;
     sink.fanin_count = 1;
-    Fixture f({task(2), task(2), topk, gather, vector, projection, sink}, 2, {}, false, true, synchronous_task);
+    Fixture f({task(2), task(2), topk, gather, vector, projection, sink}, 2, {}, false, true, independent_task);
     ASSERT_EQ(f.control->terminal.step_count, 5U);
     ASSERT_EQ(f.control->terminal.steps[0], static_cast<uint32_t>(topk_id));
     ASSERT_EQ(f.control->terminal.steps[1], static_cast<uint32_t>(gather_id));
@@ -2467,90 +2656,165 @@ TEST(PercounterAcquire, ExtendedTerminalPipelineExecutesEveryBlockAndRoleOnce) {
         next->fanin_ids = predecessor;
         next->fanin_count = 1;
     }
-    Fixture f({task(2), topk, reset, gather, vector, projection, sink}, 2, {}, false, true, synchronous_task);
+    Fixture f({task(2), topk, reset, gather, vector, projection, sink}, 2, {}, false, true, independent_task);
     ASSERT_EQ(f.control->terminal.step_count, 6U);
     ASSERT_EQ(f.control->terminal.prerequisite_count, 1U);
     ASSERT_EQ(f.control->terminal.prerequisites[0], 0U);
 
-    const std::array<uint64_t, 3> addresses{
-        reinterpret_cast<uint64_t>(&terminal_role_kernel<0>), reinterpret_cast<uint64_t>(&terminal_role_kernel<1>),
-        reinterpret_cast<uint64_t>(&terminal_role_kernel<2>)
-    };
-    for (size_t id = 1; id < f.inputs.size(); ++id) {
-        for (uint32_t role = 0; role < addresses.size(); ++role) {
-            if ((f.inputs[id].active_mask & (1U << role)) != 0)
-                f.counters[id].function_addresses[role] = addresses[role];
-        }
-    }
-    std::array<std::array<std::array<std::atomic<uint32_t>, 3>, 4>, 7> counts{};
+    std::array<std::array<std::atomic<uint32_t>, 4>, 7> counts{};
     std::array<std::atomic<bool>, 6> status{};
-    std::atomic<size_t> finished{0};
-    execute_terminal_role = [&](uint32_t role, int64_t *args) {
+    execute = [&](int64_t *args) {
         const uint32_t id = args[0];
-        const auto *context = percounter_current_context();
-        const uint32_t block = context->local.block_idx;
-        ASSERT_LT(id, counts.size());
-        ASSERT_LT(block, counts[id].size());
-        if (f.inputs[id].is_mix) EXPECT_EQ(context, &f.signals[block].contexts[role].value);
-        if (id == topk_id) EXPECT_TRUE(percounter_counter_published(percounter_gm_read(f.counters[external].value)));
-        counts[id][block][role].fetch_add(1, std::memory_order_relaxed);
-    };
-    const auto sync = percounter_metadata(f.cfg[1], topk_id).sync_index;
-    const PercounterSyncNotify no_notify{0, 0};
-    std::atomic<uint32_t> prerequisite_polls{0};
-    on_poll = [&] {
-        if (current_context != &f.signals[0].contexts[1].value ||
-            percounter_ssbuf_load_field(&f.signals[0].terminal_grant[0]) != 0 ||
-            !percounter_start_ready(f.cfg[1], no_notify, sync, 2, 0))
-            return;
-
-        // START can miss the last arrival once. A second poll before grant,
-        // with all arrivals visible, comes from the prerequisite wait.
-        prerequisite_polls.fetch_add(1, std::memory_order_release);
+        const auto *local = &percounter_current_context()->local;
+        counts[id][local->block_idx].fetch_add(1, std::memory_order_relaxed);
     };
     std::vector<std::thread> lanes;
     for (size_t lane = 0; lane < f.cfg.size(); ++lane) {
         lanes.emplace_back([&, lane] {
             percounter_bind_sim_context(&f.signals[lane / 3].contexts[lane % 3].value);
             status[lane].store(percounter_run_terminal(f.cfg[lane], &f.state[lane]), std::memory_order_relaxed);
-            finished.fetch_add(1, std::memory_order_release);
         });
     }
-    const auto wait_limit = std::chrono::seconds(2);
-    const auto prerequisite_deadline = std::chrono::steady_clock::now() + wait_limit;
-    while (prerequisite_polls.load(std::memory_order_acquire) < 2 &&
-           std::chrono::steady_clock::now() < prerequisite_deadline)
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto sync = percounter_metadata(f.cfg[1], topk_id).sync_index;
+    const PercounterSyncNotify no_notify{0, 0};
+    bool arrived = false;
+    while (!(arrived = percounter_start_ready(f.cfg[1], no_notify, sync, 2, 0)) &&
+           std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
-    EXPECT_GE(prerequisite_polls.load(std::memory_order_acquire), 2U);
-    for (auto &cluster : f.signals)
-        EXPECT_EQ(percounter_ssbuf_load_field(&cluster.terminal_grant[0]), 0U);
+    EXPECT_TRUE(arrived);
+    for (const auto &count : counts[topk_id])
+        EXPECT_EQ(count.load(std::memory_order_relaxed), 0U);
 
     percounter_gm_store(f.counters[external].value, PERCOUNTER_COUNTER_PUBLISHED);
-    const auto finish_deadline = std::chrono::steady_clock::now() + wait_limit;
-    while (finished.load(std::memory_order_acquire) != lanes.size() &&
-           std::chrono::steady_clock::now() < finish_deadline)
-        std::this_thread::yield();
-    const bool all_finished = finished.load(std::memory_order_acquire) == lanes.size();
-    if (!all_finished)
-        percounter_gm_store(f.control->lane_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
     for (auto &lane : lanes)
         lane.join();
-    on_poll = {};
-    execute_terminal_role = {};
-    ASSERT_TRUE(all_finished) << "terminal lanes did not exit after releasing the prerequisite";
 
     for (const auto &ok : status)
         EXPECT_TRUE(ok.load(std::memory_order_relaxed));
     for (uint32_t i = 1; i < links.size() + 1; ++i) {
         const auto &task = f.inputs[i];
-        for (int block = 0; block < task.block_num; ++block) {
-            for (uint32_t role = 0; role < addresses.size(); ++role) {
-                const uint32_t expected = (task.active_mask >> role) & 1U;
-                EXPECT_EQ(counts[i][block][role].load(std::memory_order_relaxed), expected)
-                    << "task " << i << " block " << block << " role " << role;
-            }
-        }
+        for (int block = 0; block < task.block_num; ++block)
+            EXPECT_EQ(counts[i][block].load(std::memory_order_relaxed), static_cast<uint32_t>(task.subtask_count));
         f.expect_completed(i);
+    }
+}
+
+TEST(PercounterAcquire, TerminalHandoffClearsGrantsWhenReusingSsbuf) {
+    const std::array<int32_t, 4> predecessors{0, 1, 2, 3};
+    std::vector<TaskInput> inputs{task(1), task(7, 2, true), task(2, 4), task(7, 2), task(7, 2)};
+    for (size_t id = 1; id < inputs.size(); ++id) {
+        inputs[id].fanin_ids = &predecessors[id - 1];
+        inputs[id].fanin_count = 1;
+    }
+
+    const std::array<uint64_t, 3> addresses{
+        reinterpret_cast<uint64_t>(&terminal_role_kernel<0>), reinterpret_cast<uint64_t>(&terminal_role_kernel<1>),
+        reinterpret_cast<uint64_t>(&terminal_role_kernel<2>)
+    };
+    alignas(64) std::array<PercounterSsbufRegion, 2> cluster_signals{};
+    constexpr auto wait_limit = std::chrono::seconds(2);
+    for (uint32_t run = 0; run < 2; ++run) {
+        SCOPED_TRACE(run);
+        Fixture f(inputs, 2, {}, false, true);
+        ASSERT_EQ(f.control->order_count[0], 1U);
+        ASSERT_EQ(f.control->order_count[1], 0U);
+        ASSERT_EQ(f.control->terminal.step_count, 4U);
+        ASSERT_EQ(f.control->terminal.steps[0], 1U);
+
+        // Preserve the previous run's terminal grants in the same cluster SSBUF.
+        for (auto &cluster : cluster_signals)
+            for (uint32_t phase = 0; phase < f.control->terminal.step_count; ++phase)
+                EXPECT_EQ(percounter_ssbuf_load_field(&cluster.terminal_grant[phase]), run);
+
+        std::array<uint64_t, 2> startup_ready{};
+        for (size_t lane = 0; lane < f.cfg.size(); ++lane) {
+            f.cfg[lane].ssbuf = &cluster_signals[lane / 3];
+            f.cfg[lane].mix_signal_ready = startup_ready.data();
+        }
+        for (size_t id = 0; id < inputs.size(); ++id)
+            for (uint32_t role = 0; role < addresses.size(); ++role)
+                if (inputs[id].active_mask & (1U << role)) f.counters[id].function_addresses[role] = addresses[role];
+
+        std::array<std::array<std::array<std::atomic<uint32_t>, 3>, 4>, 5> calls{};
+        std::atomic<bool> prefix_entered{false};
+        std::atomic<bool> release_prefix{false};
+        std::atomic<uint32_t> waiting_clusters{0};
+        std::atomic<uint32_t> early_calls{0};
+        std::atomic<size_t> finished{0};
+        execute_terminal_role = [&](uint32_t role, int64_t *args) {
+            const uint32_t id = args[0];
+            const uint32_t block = percounter_current_context()->local.block_idx;
+            ASSERT_LT(id, calls.size());
+            ASSERT_LT(block, calls[id].size());
+            calls[id][block][role].fetch_add(1, std::memory_order_relaxed);
+            if (id == 0) {
+                prefix_entered.store(true, std::memory_order_release);
+                while (!release_prefix.load(std::memory_order_acquire))
+                    std::this_thread::yield();
+            } else if (!percounter_counter_published(percounter_gm_read(f.counters[id - 1].value))) {
+                early_calls.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+        on_poll = [&] {
+            for (size_t group = 0; group < cluster_signals.size(); ++group) {
+                auto &cluster = cluster_signals[group];
+                if (current_context == &cluster.contexts[2].value &&
+                    percounter_ssbuf_load_field(&cluster.terminal_ready[2]) == 1U &&
+                    percounter_ssbuf_load_field(&cluster.terminal_grant[0]) == 0U)
+                    waiting_clusters.fetch_or(1U << group, std::memory_order_release);
+            }
+        };
+
+        std::vector<std::thread> lanes;
+        for (size_t lane = 0; lane < f.cfg.size(); ++lane) {
+            lanes.emplace_back([&, lane] {
+                auto &cfg = f.cfg[lane];
+                percounter_bind_sim_context(&cfg.ssbuf->contexts[cfg.cluster_lane].value);
+                if (percounter_clear_mix_signal(cfg, 1'000'000'000ULL)) {
+                    if (cfg.cluster_lane == 0) percounter_lane_loop<0>(cfg);
+                    else if (cfg.cluster_lane == 1) percounter_lane_loop<1>(cfg);
+                    else percounter_lane_loop<2>(cfg);
+                }
+                finished.fetch_add(1, std::memory_order_release);
+            });
+        }
+
+        const auto wait_deadline = std::chrono::steady_clock::now() + wait_limit;
+        while ((!prefix_entered.load(std::memory_order_acquire) ||
+                waiting_clusters.load(std::memory_order_acquire) != 3U) &&
+               std::chrono::steady_clock::now() < wait_deadline)
+            std::this_thread::yield();
+        EXPECT_TRUE(prefix_entered.load(std::memory_order_acquire));
+        EXPECT_EQ(waiting_clusters.load(std::memory_order_acquire), 3U);
+        for (auto &cluster : cluster_signals)
+            for (uint32_t phase = 0; phase < f.control->terminal.step_count; ++phase)
+                EXPECT_EQ(percounter_ssbuf_load_field(&cluster.terminal_grant[phase]), 0U);
+        release_prefix.store(true, std::memory_order_release);
+
+        const auto finish_deadline = std::chrono::steady_clock::now() + wait_limit;
+        while (finished.load(std::memory_order_acquire) != lanes.size() &&
+               std::chrono::steady_clock::now() < finish_deadline)
+            std::this_thread::yield();
+        const bool all_finished = finished.load(std::memory_order_acquire) == lanes.size();
+        if (!all_finished)
+            percounter_gm_store(f.control->lane_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
+        for (auto &lane : lanes)
+            lane.join();
+        on_poll = {};
+        execute_terminal_role = {};
+        ASSERT_TRUE(all_finished);
+        EXPECT_EQ(early_calls.load(std::memory_order_relaxed), 0U);
+        for (size_t id = 0; id < inputs.size(); ++id) {
+            for (int block = 0; block < inputs[id].block_num; ++block)
+                for (uint32_t role = 0; role < addresses.size(); ++role)
+                    EXPECT_EQ(
+                        calls[id][block][role].load(std::memory_order_relaxed), (inputs[id].active_mask >> role) & 1U
+                    ) << "task "
+                      << id << " block " << block << " role " << role;
+            f.expect_completed(id);
+        }
+        EXPECT_EQ(f.control->lane_error, 0U);
     }
 }
 

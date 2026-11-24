@@ -231,10 +231,25 @@ Lanes publish task completion only; they keep no whole-graph progress count and
 reach no completion verdict of their own. A lane can end its scheduler loop when
 its local list is exhausted, all owned positions and retirement revisits are
 empty, its MIX domain is closed (or the run has no MIX), and it has no pending
-MIX launch or deferred completion record — that is a statement about the lane, not about the run. It
-then enters the register EXIT wait. Active lanes poll EXIT and the shared error
+MIX launch or deferred completion record. A lane with a terminal plan next
+executes its assigned terminal stages, then enters the register EXIT wait.
+Active lanes poll EXIT and the shared error
 word at the existing observation interval; they do not reread the run-wide
 completion and async counts or maintain another progress watchdog.
+
+At bind, the Host can remove a closed suffix from ordinary dispatch if every
+live prefix task is already a transitive predecessor of the first terminal
+stage or every active callable of that task declares
+`SYNCHRONOUS_INDEPENDENT`. This declaration guarantees completion without
+waiting on progress from another scheduled task or rank. The Host can
+shorten the suffix to satisfy this check and uses ordinary
+dispatch when no supported suffix qualifies. Other sinks can stay in ordinary
+dispatch and remain part of the supervisor's completion check. After local
+drain, the terminal coordinator waits for prefix completion and any required
+START arrivals before the first grant. It waits
+for the preceding stage before each later grant and honors any START
+barrier. Startup clears terminal ready and grant words in the cluster's
+SSBUF before releasing its lanes.
 
 The AICPU supervisor owns the completion verdict: it waits for every top-level
 sink the Host found to read published and for `async_registered ==
