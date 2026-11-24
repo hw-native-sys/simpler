@@ -139,6 +139,40 @@ def _success(result):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_direct_parallel_shards_use_distinct_devices_and_complete_receipts(tmp_path):
+    source = """
+import os
+from pathlib import Path
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(8))
+def test_direct(index, request):
+    device = request.config.getoption("--device")
+    Path(__file__).with_name(f"case-{index}").write_text(f"{device}:{os.getpid()}")
+"""
+    result, plan, xml = _run_pytest(
+        tmp_path, source, "--device", "0-3", "--max-parallel", "4", "--environment-receipts"
+    )
+    _success(result)
+    records = [path.read_text().split(":") for path in tmp_path.rglob("case-*")]
+    assert len(records) == 8
+    assert {device for device, _ in records} == {"0", "1", "2", "3"}
+    assert len({pid for _, pid in records}) == 4
+    test_environments.verify_results(plan, xml)
+
+
+def test_direct_parallel_preserves_child_failure_and_all_results(tmp_path):
+    source = _DIRECT.format(count=8).replace("assert index >= 0", "assert index != 3")
+    result, plan, xml = _run_pytest(
+        tmp_path, source, "--device", "0-3", "--max-parallel", "4", "--environment-receipts"
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert len(list(ET.parse(xml).getroot().iter("testcase"))) == 8
+    with pytest.raises(ValueError, match="failure"):
+        test_environments.verify_results(plan, xml)
+
+
 def test_actual_collection_plan_and_junit_follow_added_cases_and_changed_paths(tmp_path):
     for count, path in ((4, "tests/first/test_one.py"), (5, "moved/elsewhere/test_two.py")):
         result, plan_path, xml_path = _run_pytest(tmp_path / str(count), _DIRECT.format(count=count), path=path)

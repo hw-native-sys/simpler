@@ -241,14 +241,14 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
         f"#!{sys.executable}\nimport os,subprocess,sys\n"
         "args=sys.argv[1:]\n"
         "if args==['--list']: sys.exit(0)\n"
-        "assert args[args.index('--device-num')+1]=='1'\n"
+        "assert args[args.index('--device-num')+1]==os.environ['DEVICE_NUM']\n"
         "assert args[args.index('--timeout')+1]=='2100'\n"
         "assert args[args.index('--max-time')+1]=='1200'\n"
         "assert ['--env','PLATFORM']==args[4:6]\n"
         "assert ['--env','PYTEST_ADDOPTS']==args[6:8]\n"
         "assert ['--env','FRAMEWORK_WHEEL_SITE']==args[8:10]\n"
         "subprocess.run(['bash','-e','-c',args[args.index('--run')+1]], "
-        "env={**os.environ,'TASK_DEVICE':'0'},check=True)\n",
+        "env={**os.environ,'TASK_DEVICE':os.environ['EXPECTED_DEVICES']},check=True)\n",
     )
     _executable(binary / "git", "#!/bin/sh\necho CPU-source\n")
     _executable(binary / "npu-smi", "#!/bin/sh\necho CPU-inventory\n")
@@ -270,6 +270,8 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
             "COMMAND_LOG": str(log),
             "PYTEST_ADDOPTS": "-o pythonpath=/framework-site",
             "FRAMEWORK_WHEEL_SITE": "/framework-site",
+            "DEVICE_NUM": "4" if platform_name == "a5" else "1",
+            "EXPECTED_DEVICES": "1,3,5,7" if platform_name == "a5" else "2",
         },
         text=True,
         capture_output=True,
@@ -277,31 +279,26 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
     )
     if platform_name != actual_platform:
         assert result.returncode != 0
-        assert not log.exists(), "wrong-silicon execution must stop before backend/pytest"
+        commands = [json.loads(line) for line in log.read_text().splitlines()]
+        assert len(commands) == 1 and "--compile-only" in commands[0]
         return
     assert result.returncode == 0, result.stdout + result.stderr
     commands = [json.loads(line) for line in log.read_text().splitlines()]
-    assert commands[0] == [".github/actions/setup-framework/identity.py", "--platform", platform_name]
-    pytest_command = commands[1]
+    assert commands[0][:2] == ["examples/workers/l2/framework_eager/main.py", "--compile-only"]
+    assert commands[1] == [".github/actions/setup-framework/identity.py", "--platform", platform_name]
+    pytest_command = commands[2]
     assert pytest_command[:4] == ["-m", "pytest", "examples", "tests/st"]
     assert pytest_command[pytest_command.index("--platform") + 1] == platform_name
-    assert pytest_command[pytest_command.index("--max-parallel") + 1] == "1"
+    assert pytest_command[pytest_command.index("--max-parallel") + 1] == ("4" if platform_name == "a5" else "1")
+    assert pytest_command[pytest_command.index("--device") + 1] == ("1,3,5,7" if platform_name == "a5" else "2")
     assert pytest_command[pytest_command.index("--test-environment") + 1] == "torch_npu"
-    assert commands[2][:3] == ["-m", "simpler_setup.test_environments", "verify"]
+    assert commands[3][:3] == ["-m", "simpler_setup.test_environments", "verify"]
 
 
 @pytest.mark.parametrize("caller", ["ci", "daily"])
 def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller):
     jobs = _yaml(_ROOT / f".github/workflows/{caller}.yml")["jobs"]
     for platform_name in ("a2a3", "a5"):
-        if caller == "ci" and platform_name == "a5":
-            assert "st-framework-a5" not in jobs
-            job = _yaml(_ROOT / ".github/workflows/ci-a5-comment.yml")["jobs"]["st-framework-a5"]
-            assert job["uses"] == "./.github/workflows/_st-framework.yml"
-            assert job["with"]["platform"] == "a5"
-            assert json.loads(job["with"]["runs_on"]) == ["self-hosted", "a5"]
-            assert job["needs"] == ["gate-and-resolve"]
-            continue
         job = jobs[f"st-framework-{platform_name}"]
         assert job["uses"] == "./.github/workflows/_st-framework.yml"
         assert job["with"]["platform"] == platform_name

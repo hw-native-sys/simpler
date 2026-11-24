@@ -25,6 +25,13 @@ _EXAMPLE = _ROOT / "examples/workers/l2/framework_eager/main.py"
 
 @pytest.fixture(scope="session")
 def framework_module(tmp_path_factory):
+    prepared = os.environ.get("SIMPLER_FRAMEWORK_BUILD_DIR")
+    if prepared:
+        directory = Path(prepared)
+        modules = list(directory.glob("_simpler_framework_queue*.so"))
+        assert len(modules) == 1, f"Expected one prepared framework bridge under {directory}"
+        print("FRAMEWORK_QUEUE_MODULE_SHA256 " + hashlib.sha256(modules[0].read_bytes()).hexdigest(), flush=True)
+        return directory
     dependencies = {}
     for module, distribution in (("torch", "torch"), ("torch_npu", "torch-npu")):
         spec = importlib.util.find_spec(module)

@@ -400,6 +400,78 @@ def verify_results(plan_path: Path, xml_path: Path) -> None:
     verify_result_files(plan_path, [xml_path])
 
 
+def run_parallel(session):
+    """Run disjoint direct pytest shards, each owning one allocated device."""
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+    from simpler_setup.parallel_scheduler import device_range_to_list  # noqa: PLC0415
+
+    config = session.config
+    if config.getoption("--environment-parent-plan", default=None):
+        return
+    devices = device_range_to_list(config.getoption("--device"))
+    limit = config.getoption("--max-parallel", default="auto")
+    count = len(devices) if limit in (None, "auto", "") else min(len(devices), int(limit))
+    count = min(count, len(session.items))
+    if count <= 1:
+        return
+    plan, result = session._test_environment_receipt
+    shards = [session.items[index::count] for index in range(count)]
+
+    def run(index):
+        directory = plan.parent / f"direct-shard-{index}"
+        directory.mkdir(parents=True, exist_ok=True)
+        xml = directory / "results.xml"
+        command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            *config.args,
+            "--platform",
+            config.getoption("--platform"),
+            "--manual",
+            config.getoption("--manual", default="exclude"),
+            "--test-environment",
+            "torch_npu",
+            "--environment-receipts",
+            "--environment-parent-plan",
+            str(plan),
+            "--device",
+            str(devices[index]),
+            "--max-parallel",
+            "1",
+            "-p",
+            "no:xdist",
+            "-v",
+            "-s",
+            "--basetemp",
+            str(directory / "pytest"),
+            "--junitxml",
+            str(xml),
+        ]
+        if config.inipath:
+            command.extend(["-c", str(config.inipath)])
+        command.extend(["--rootdir", str(config.rootpath)])
+        if config.getoption("confcutdir", default=None):
+            command.extend(["--confcutdir", config.getoption("confcutdir")])
+        if config.getoption("--verify-feature-coverage", default=False):
+            command.append("--verify-feature-coverage")
+        if config.getoption("--require-pto-isa", default=False):
+            command.append("--require-pto-isa")
+        for item in shards[index]:
+            command.extend(["--environment-shard-case", item.nodeid])
+        print(f"FRAMEWORK_SHARD index={index} device={devices[index]} cases={len(shards[index])}", flush=True)
+        with (directory / "pytest.log").open("w") as log:
+            completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False)
+        return completed.returncode, xml
+
+    with ThreadPoolExecutor(max_workers=count) as executor:
+        results = list(executor.map(run, range(count)))
+    session._framework_shard_results = results
+    session.testsfailed = sum(code != 0 for code, _ in results)
+    return True
+
+
 def _retry_targets(paths, expected, retries, dispatcher):
     retry_targets = {}
     if len(set(paths)) != len(paths):
@@ -575,6 +647,15 @@ def finish_session(session) -> None:
     receipt = getattr(session, "_test_environment_receipt", None)
     if receipt is not None:
         try:
+            shards = getattr(session, "_framework_shard_results", None)
+            if shards is not None:
+                merged = ET.Element("testsuites")
+                for code, path in shards:
+                    root = ET.parse(path).getroot()
+                    merged.extend(list(root) if root.tag == "testsuites" else [root])
+                ET.ElementTree(merged).write(receipt[1], encoding="utf-8", xml_declaration=True)
+                if any(code != 0 for code, _ in shards):
+                    session.exitstatus = 1
             results = getattr(session.config, "_environment_results", None)
             if results is None:
                 verify_results(*receipt)

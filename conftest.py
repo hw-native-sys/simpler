@@ -1616,6 +1616,9 @@ def pytest_runtestloop(session):
     if not session.items:
         return
 
+    if session.config.getoption("--test-environment", default="default") == "torch_npu":
+        return _test_environments.run_parallel(session)
+
     # If only L2 items exist in a single runtime and no resource-dispatched
     # jobs (L3 classes or standalone resource functions) are collected, the
     # dispatcher would reduce to a single L2 subprocess — not worth the

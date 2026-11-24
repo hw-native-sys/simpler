@@ -64,19 +64,24 @@ jobs:
           CANN_ENV: ${{ steps.framework.outputs.cann_env }}
           MANUAL_MODE: ${{ inputs.manual_mode }}
           PLATFORM: ${{ inputs.platform }}
+          DEVICE_NUM: ${{ inputs.platform == 'a5' && '4' || '1' }}
         run: |
           source "$CANN_ENV"
           mkdir -p outputs/framework-ci
           git rev-parse HEAD | tee outputs/framework-ci/source.txt
+          export SIMPLER_FRAMEWORK_BUILD_DIR="$PWD/outputs/framework-ci/bridge"
+          PYTHONPATH="$FRAMEWORK_WHEEL_SITE${PYTHONPATH:+:$PYTHONPATH}" \
+            .venv-framework/bin/python examples/workers/l2/framework_eager/main.py \
+            --compile-only --build-dir "$SIMPLER_FRAMEWORK_BUILD_DIR"
           task-submit --list
-          task-submit --env CANN_ENV --env MANUAL_MODE --env PLATFORM --env PYTEST_ADDOPTS --env FRAMEWORK_WHEEL_SITE --timeout 2100 --max-time 1200 --device auto --device-num 1 \
+          task-submit --env CANN_ENV --env MANUAL_MODE --env PLATFORM --env PYTEST_ADDOPTS --env FRAMEWORK_WHEEL_SITE --env SIMPLER_FRAMEWORK_BUILD_DIR --timeout 2100 --max-time 1200 --device auto --device-num "$DEVICE_NUM" \
             --run "source \"\$CANN_ENV\" && \
               export PYTHONPATH=\"\$FRAMEWORK_WHEEL_SITE\${PYTHONPATH:+:\$PYTHONPATH}\" && \
               .claude/skills/onboard-arch-precheck/check.sh \"\$PLATFORM\" && \
               npu-smi info > outputs/framework-ci/npu-smi.txt && \
               .venv-framework/bin/python .github/actions/setup-framework/identity.py --platform \"\$PLATFORM\" && \
               .venv-framework/bin/python -m pytest examples tests/st --platform \"\$PLATFORM\" --test-environment torch_npu --environment-receipts --verify-feature-coverage --coverage-partition all \
-              --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s \
+              --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel $DEVICE_NUM -p no:xdist -v -s \
               --basetemp outputs/framework-ci/pytest --junitxml outputs/framework-ci/results.xml"
           .venv-framework/bin/python -m simpler_setup.test_environments verify outputs/framework-ci/results.plan.json outputs/framework-ci/results.xml
 
