@@ -19,36 +19,38 @@ four AIV blocks start as one resident cohort. Each block handles two distinct
 output rows, using URMA reads from the same peer. Two blocks fetch
 the repeated row index into separate destinations. A dependent consumer checks
 all eight URMA results, so early task completion or missing block output fails
-verification. This uses the stable resident URMA sender binding from #2886.
+verification. Each resident AIV block keeps its URMA sender binding.
 
-The hardware cases target Ascend950DT_9581. On the A5 PR CI machine,
-Host-source URMA reports an ACK timeout despite successful Host mapping and
-segment registration. PCIe Host-memory reachability remains under investigation
-in [#2922](https://github.com/hw-native-sys/simpler/issues/2922#issuecomment-6681771862).
-These cases are manual and skipped in GitHub Actions, including runs that select
-manual tests. They remain available for explicit local DT validation.
+Pytest checks the Host–Device connection of both selected devices. It skips
+the four Host-source URMA cases when either device connects to the Host over
+PCIe. On that topology, cross-rank URMA reads of Host memory have reported
+an ACK timeout after successful memory registration. The cases run on both UB
+and HCCS. All four passed on UB hardware. HCCS has only been checked with a
+simulated link query.
 
-Use an initialized project-local environment on a validated A5 DT machine and reserve two
-devices through the device queue:
-
-```bash
-.claude/skills/onboard-arch-precheck/check.sh a5
-task-submit --device auto --device-num 2 --run \
-  '.venv/bin/python examples/a5/tensormap_and_ringbuffer/host_comm_domain/run.py --devices "$TASK_DEVICE"'
-```
-
-Add `--staged` to exercise two submissions with independent output slices,
-checking both slices after completion. Retained-domain submissions keep their
-existing ordered cleanup; this does not assert that the runs overlap. Outputs
-are cleared between rounds and before the final Device-only run to detect
-missing writes. Add `--aiv-blocks 4` for multiple AIV senders. Pytest collects all four combinations of serial/staged
-execution and one/four AIV blocks:
+Compile the orchestration and both AIV kernels before reserving devices.
+The standard scene precompiler discovers the L3 class and populates the same
+cache that pytest reads on the target machine.
 
 ```bash
-.claude/skills/onboard-arch-precheck/check.sh a5
-task-submit --device auto --device-num 2 --run \
-  '.venv/bin/python -m pytest examples/a5/tensormap_and_ringbuffer/host_comm_domain --platform a5 --manual include --device "$TASK_DEVICE" -v'
+.venv/bin/python -m simpler_setup.tools.scene_test_compile \
+  examples/a5/tensormap_and_ringbuffer/host_comm_domain \
+  --platform a5 --exclude-level 4 --require-pto-isa --manual exclude
 ```
 
-`run.py --prepare` compiles the kernels without initializing devices. The source
-and lifecycle contract is described in [A5 Host-source domains](../../../../docs/a5-host-comm-domain.md).
+Run all four combinations of serial or staged submissions with one or four AIV
+blocks on the allocated devices:
+
+```bash
+task-submit --device auto --device-num 2 --run \
+  'bash .claude/skills/onboard-arch-precheck/check.sh a5 &&
+   .venv/bin/python -m pytest examples/a5/tensormap_and_ringbuffer/host_comm_domain \
+     --platform a5 --device "$TASK_DEVICE" -v'
+```
+
+Staged execution submits two runs with independent output slices and checks both
+after completion. The example clears outputs between rounds and before the
+final Device-only run to detect missing writes. To select one configuration,
+add a pytest filter such as `-k "multi_aiv and staged"`.
+
+The source and lifecycle contract is described in [A5 Host-source domains](../../../../docs/a5-host-comm-domain.md).
