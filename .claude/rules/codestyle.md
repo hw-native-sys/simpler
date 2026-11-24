@@ -32,10 +32,15 @@
 5. **No sleeping on the dispatch path — at any tier.** A wait that a task's
    latency passes through may only ever *spin* or *block on a wakeup
    primitive* (semaphore, futex, condition variable, pipe/eventfd read).
-   `sleep`, `yield`, and backoff timers are all forbidden there, on the host
-   as much as on the AICPU: a sleep quantum is added to every dispatch that
-   lands mid-quantum, and it is not recoverable by tuning — the sleep
-   interval on any general-purpose OS overshoots what you asked for.
+   `sleep` and OS scheduler yields are forbidden there. Backoff timers
+   are also forbidden except for the AICore polling case below. An OS
+   sleep can delay a dispatch that becomes ready before the sleep ends.
+
+   **AICore polling may use bounded cycle-based staggering.** Use it when
+   an on-device A/B comparison on a representative workload shows a
+   performance gain from reducing contention for a shared resource such
+   as a CntNotify counter. The synchronization protocol must remain correct
+   under any polling order.
 
    **Initialization and teardown paths are exempt** and may poll with a
    sleep — a startup handshake or a shutdown drain costs a one-off wait,

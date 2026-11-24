@@ -32,7 +32,7 @@ struct RangeCalendarInput {
 };
 
 struct RangeCalendarImage {
-    enum class WaitKind { COMPLETION, PHASE_END, MATERIALIZED, FANIN };
+    enum class WaitKind { COMPLETION, PHASE_END, MATERIALIZED, FANIN, FUSED_FANIN, FUSED_PRODUCER };
 
     struct WaitPatch {
         uint32_t offset;
@@ -65,6 +65,13 @@ struct RangeCalendarImage {
         uint32_t phase;
     };
 
+    struct FusedFanin {
+        std::array<uint32_t, CALENDAR_FUSED_FANIN_MAX_PRODUCERS> producers;
+        uint32_t producer_count;
+        uint32_t slot;
+        uint32_t credits;
+    };
+
     std::vector<std::byte> bytes;
     std::vector<WaitPatch> waits;
     std::vector<DispatchPatch> dispatches;
@@ -73,12 +80,14 @@ struct RangeCalendarImage {
     std::vector<RangeTail> tails;
     std::vector<uint32_t> sample_offsets;
     std::vector<uint32_t> graph_shells;
+    std::vector<FusedFanin> fused_fanins;
     CalendarCompletionPlan completion;
     std::vector<uint32_t> sync_indices;
     std::array<uint64_t, 3> sync_widths{};
     uint32_t sync_slot_count{0};
     uint32_t phase_slot_count{0};
     uint32_t fanin_slot_count{0};
+    bool uses_cluster_input_share{false};
 
     template <class T>
     uint32_t allocate(size_t count) {
@@ -141,7 +150,9 @@ inline bool decode_template(
         );
 
     const auto &waits = plan.waits;
-    if (waits.row_waits.size() != header.row_count || waits.task_fanins.size() != phase.tasks.size()) return false;
+    if (waits.row_waits.size() != header.row_count || waits.row_input_owners.size() != header.row_count ||
+        waits.task_fanins.size() != phase.tasks.size())
+        return false;
     result.binding_indexes.resize(phase.tasks.size());
     result.polls_task_fanins.resize(phase.tasks.size());
     for (size_t task = 0; task < phase.tasks.size(); ++task) {
@@ -178,7 +189,6 @@ inline bool decode_template(
                 mix_delta = result.joins_offset + row.local_join * sizeof(CalendarLocalJoin) - offset;
                 if (result.joins[row.local_join].leader_lane != lane) wait_count = 0;
             }
-            result.polls_task_fanins[task] = result.polls_task_fanins[task] || wait_count != 0;
             uint16_t flags = static_cast<uint16_t>(role);
             if (input.sync_start) flags |= CALENDAR_EXEC_SYNC_START;
             if (input.has_predicate) flags |= CALENDAR_EXEC_PREDICATE;
@@ -189,6 +199,31 @@ inline bool decode_template(
                 mix_delta = assignment.begin;
                 wait_count = assignment.count;
             }
+            const uint32_t owner = waits.row_input_owners[i];
+            if (owner != CALENDAR_NO_INPUT_OWNER) {
+                const bool summary = (flags & CALENDAR_EXEC_FANIN) != 0;
+                if (lane == 0 || input.is_mix || input.sync_start || input.has_predicate || input.active_mask == 0 ||
+                    row.local_join != CALENDAR_NO_JOIN || (!summary && wait_count != 1) ||
+                    (summary && owner != i && wait_count != 0) || owner >= header.row_count ||
+                    waits.row_input_owners[owner] != owner ||
+                    percounter_order_task_id(result.rows[owner].entry) != task)
+                    return false;
+                const uint32_t owner_worker = owner == i ? worker : (lane == 1 ? worker + 1 : worker - 1);
+                const uint32_t owner_begin = result.indexes[owner_worker];
+                if (owner < owner_begin || owner >= result.indexes[owner_worker + 1]) return false;
+                if (owner == i) {
+                    // A summary helper keeps its assignment's begin in mix_delta.
+                    flags |= CALENDAR_EXEC_INPUT_OWNER;
+                } else {
+                    flags |= CALENDAR_EXEC_INPUT_FOLLOWER;
+                    mix_delta = owner - owner_begin + 1;
+                    wait_count = 0;
+                }
+                image.uses_cluster_input_share = true;
+            }
+            // A cluster follower can fall back to its producer's original DONE wait.
+            result.polls_task_fanins[task] =
+                result.polls_task_fanins[task] || wait_count != 0 || (flags & CALENDAR_EXEC_INPUT_FOLLOWER) != 0;
             if (graph != nullptr && graph->tasks[task].sink) flags |= CALENDAR_EXEC_SINK;
             image.store(
                 offset, CalendarExecutionRow{
@@ -224,6 +259,30 @@ inline uint32_t sole_sink(const CalendarPhase &phase) {
         result = i;
     }
     return result;
+}
+
+inline void materialize_fused_fanins(
+    const CalendarPhase &phase, const CalendarWaitPlan &waits, RangeCalendarImage &image,
+    std::vector<uint32_t> &fused_consumers, std::vector<bool> &fused_producers
+) {
+    if (waits.fused_fanin_credits.empty()) return;
+    fused_consumers.assign(phase.tasks.size(), UINT32_MAX);
+    fused_producers.resize(phase.tasks.size());
+    for (size_t consumer = 0; consumer < phase.tasks.size(); ++consumer) {
+        const uint32_t credits = waits.fused_fanin_credits[consumer];
+        if (credits == 0) continue;
+        const auto &inputs = waits.task_fanins[consumer];
+        RangeCalendarImage::FusedFanin group{};
+        group.producer_count = static_cast<uint32_t>(inputs.size());
+        group.credits = credits;
+        group.slot = image.fanin_slot_count++;
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            group.producers[i] = phase.task_ids[inputs[i]];
+            fused_producers[inputs[i]] = true;
+        }
+        fused_consumers[consumer] = static_cast<uint32_t>(image.fused_fanins.size());
+        image.fused_fanins.push_back(group);
+    }
 }
 
 }  // namespace range_calendar_detail
@@ -264,13 +323,19 @@ inline bool build_range_calendar(
         const int32_t shell = invocation == nullptr ? -1 : static_cast<int32_t>(invocation->shell_task_id);
         if (shell >= 0) image.graph_shells.push_back(static_cast<uint32_t>(shell));
         const uint32_t base = graph == nullptr ? 0 : body_base[phase.invocation];
-        if (!chains.append_phase(
-                phase, base, static_cast<uint32_t>(shell), graph == nullptr ? 0 : graph->sink_subtask_total
-            ))
-            return false;
         auto [entry, inserted] = templates.try_emplace(input.plan.get());
         auto &tmpl = entry->second;
         if (inserted && !decode_template(image, phase, *input.plan, graph, clusters, tmpl)) return false;
+
+        std::vector<uint32_t> fused_consumers;
+        std::vector<bool> fused_producers;
+        if (inputs.size() == 1 && graphs.invocation_count == 0)
+            materialize_fused_fanins(phase, input.plan->waits, image, fused_consumers, fused_producers);
+        if (!chains.append_phase(
+                phase, base, static_cast<uint32_t>(shell), graph == nullptr ? 0 : graph->sink_subtask_total,
+                fused_producers
+            ))
+            return false;
 
         std::vector<bool> polled(phase.tasks.size(), false);
         for (size_t task = 0; task < phase.tasks.size(); ++task) {
@@ -310,9 +375,12 @@ inline bool build_range_calendar(
             }
             const auto &producers = input.plan->waits.task_fanins[task];
             const bool fanin = input.plan->waits.summarized_fanins[task];
+            const uint32_t group = fused_consumers.empty() ? UINT32_MAX : fused_consumers[task];
             const uint32_t wait_offset = image.allocate<CalendarWait>(producers.size() + fanin);
             if (!producers.empty() && wait_offset == 0) return false;
-            if (fanin) {
+            if (group != UINT32_MAX) {
+                image.waits.push_back({wait_offset, RangeCalendarImage::WaitKind::FUSED_FANIN, group, 0});
+            } else if (fanin) {
                 image.waits.push_back(
                     {wait_offset, RangeCalendarImage::WaitKind::FANIN, image.fanin_slot_count++,
                      static_cast<uint32_t>(producers.size())}
@@ -321,9 +389,13 @@ inline bool build_range_calendar(
             for (size_t i = 0; i < producers.size(); ++i) {
                 const int32_t producer = producers[i];
                 if (producer < 0 || static_cast<uint32_t>(producer) >= task) return false;
+                // No execution row reads the input bindings of an unobserved task.
+                if (!tmpl.polls_task_fanins[task] && !fused_producers.empty() && fused_producers[producer]) continue;
+                const auto kind = group == UINT32_MAX ? RangeCalendarImage::WaitKind::COMPLETION :
+                                                        RangeCalendarImage::WaitKind::FUSED_PRODUCER;
                 image.waits.push_back(
-                    {static_cast<uint32_t>(wait_offset + (i + fanin) * sizeof(CalendarWait)),
-                     RangeCalendarImage::WaitKind::COMPLETION, physical_task(producer, phase, body_base), 0}
+                    {static_cast<uint32_t>(wait_offset + (i + fanin) * sizeof(CalendarWait)), kind,
+                     physical_task(producer, phase, body_base), 0}
                 );
             }
             const uint32_t extra_offset = image.allocate<CalendarExecutionExtra>(1);
@@ -405,7 +477,7 @@ inline bool build_range_calendar(
                     {{static_cast<uint32_t>(tmpl.rows_offset + begin * sizeof(CalendarExecutionRow)), limit - begin,
                       bindings, wait_offset, num_waits, sequence_base, 0, settle ? exit_offset : 0,
                       settle ? static_cast<uint32_t>(exit_tasks.size()) : 0,
-                      shell < 0 ? UINT32_MAX : static_cast<uint32_t>(shell)},
+                      shell < 0 ? UINT32_MAX : static_cast<uint32_t>(shell), begin - first},
                      samples == 0 ? 0 : static_cast<uint32_t>(samples + begin * sizeof(CalendarTiming)),
                      tail ? static_cast<int32_t>(p) : -1}
                 );
@@ -514,13 +586,27 @@ inline bool bind_range_calendar(
         }
     }
     const size_t first_phase_slot = image.sync_slot_count + image.completion.slot_count;
+    const size_t first_fanin_slot = first_phase_slot + image.phase_slot_count;
+    for (const auto &group : image.fused_fanins) {
+        const size_t slot = first_fanin_slot + group.slot;
+        if (slot >= notifications.size()) return false;
+        for (uint32_t member = 0; member < group.producer_count; ++member) {
+            const uint32_t producer = group.producers[member];
+            if (producer >= layout.task_count || counters[producer].completion_notify_address != 0) return false;
+            auto &counter = counters[producer];
+            counter.completion_notify_address = notifications[slot];
+            counter.completion_notify_target = group.credits;
+            counter.calendar_defer_bit = uint32_t{1} << (24 + member);
+        }
+    }
     std::vector<CalendarWait> phase_waits(image.phase_ends.size());
     std::vector<uint64_t> phase_add(image.phase_ends.size(), 0);
     for (size_t phase = 0; phase < image.phase_ends.size(); ++phase) {
         const auto &end = image.phase_ends[phase];
         if (end.task != UINT32_MAX) {
             const auto &counter = counters[end.task];
-            if (counter.completion_notify_address == 0) return false;
+            if (counter.completion_notify_address == 0 || image.completion.tasks[end.task].slot == UINT32_MAX)
+                return false;
             phase_waits[phase] = range_completion_wait(counter, end.task);
         } else if (end.slot != UINT32_MAX) {
             const uint64_t set = notifications[first_phase_slot + end.slot];
@@ -531,17 +617,30 @@ inline bool bind_range_calendar(
     for (const auto &patch : image.waits) {
         switch (patch.kind) {
         case RangeCalendarImage::WaitKind::COMPLETION:
+        case RangeCalendarImage::WaitKind::FUSED_PRODUCER: {
             if (patch.index >= layout.task_count || counters[patch.index].completion_notify_address == 0) return false;
+            const bool fused = image.completion.tasks[patch.index].slot == UINT32_MAX;
+            if (fused != (patch.kind == RangeCalendarImage::WaitKind::FUSED_PRODUCER)) return false;
             image.store(patch.offset, range_completion_wait(counters[patch.index], patch.index));
             break;
+        }
         case RangeCalendarImage::WaitKind::PHASE_END:
             if (patch.index >= phase_waits.size() || phase_waits[patch.index].read_cmd == 0) return false;
             image.store(patch.offset, phase_waits[patch.index]);
             break;
         case RangeCalendarImage::WaitKind::FANIN: {
-            const size_t slot = first_phase_slot + image.phase_slot_count + patch.index;
+            const size_t slot = first_fanin_slot + patch.index;
             if (slot >= notifications.size()) return false;
             image.store(patch.offset, CalendarWait{notifications[slot] | CALENDAR_WAIT_NOTIFY, patch.target});
+            break;
+        }
+        case RangeCalendarImage::WaitKind::FUSED_FANIN: {
+            if (patch.index >= image.fused_fanins.size()) return false;
+            const auto &group = image.fused_fanins[patch.index];
+            const size_t slot = first_fanin_slot + group.slot;
+            if (slot >= notifications.size()) return false;
+            const uint64_t target = (uint64_t{group.producer_count} << 32) | group.credits;
+            image.store(patch.offset, CalendarWait{notifications[slot] | CALENDAR_WAIT_FUSED_FANIN, target});
             break;
         }
         case RangeCalendarImage::WaitKind::MATERIALIZED:

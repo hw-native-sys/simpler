@@ -30,6 +30,7 @@
 namespace simpler::percounter {
 
 inline constexpr uint32_t CALENDAR_NO_JOIN = UINT32_MAX;
+inline constexpr uint32_t CALENDAR_NO_INPUT_OWNER = UINT32_MAX;
 inline constexpr uint32_t CALENDAR_COUNT_MASK = 0x00ff'ffff;
 
 // Offsets are relative to the start of this immutable image in GM.
@@ -89,6 +90,7 @@ struct alignas(32) CalendarRange {
     uint32_t exit_wait_offset;
     uint32_t exit_wait_count;
     uint32_t graph_shell_id;
+    uint32_t phase_row_offset;  // Rows on this worker before this range, within this phase.
 };
 
 enum : uint16_t {
@@ -98,11 +100,13 @@ enum : uint16_t {
     CALENDAR_EXEC_SINK = 1 << 5,
     CALENDAR_EXEC_PREDICATE = 1 << 6,
     CALENDAR_EXEC_FANIN = 1 << 7,
+    CALENDAR_EXEC_INPUT_OWNER = 1 << 8,
+    CALENDAR_EXEC_INPUT_FOLLOWER = 1 << 9,
 };
 
 struct alignas(16) CalendarExecutionRow {
     uint32_t dispatch_offset;
-    uint32_t mix_delta;
+    uint32_t mix_delta;  // Join delta, helper begin, or a follower's input owner ordinal.
     uint16_t block_index;
     uint16_t block_count;
     uint16_t wait_count;
@@ -127,6 +131,7 @@ struct CalendarExecutionExtra {
 };
 
 enum : uint64_t {
+    CALENDAR_WAIT_FUSED_FANIN = 0,
     CALENDAR_WAIT_NOTIFY = 1,
     CALENDAR_WAIT_GM_TARGET = 2,
     CALENDAR_WAIT_DEFER = 3,
@@ -134,6 +139,10 @@ enum : uint64_t {
 };
 
 inline constexpr uint32_t CALENDAR_FANIN_TASKS_PER_LANE = 4;
+inline constexpr uint32_t CALENDAR_FUSED_FANIN_MAX_PRODUCERS = 4;
+
+inline constexpr uint32_t CALENDAR_FOLLOWER_DONE_INTERVAL = 64;
+inline constexpr uint32_t CALENDAR_FOLLOWER_FANIN_INTERVAL = 2 * CALENDAR_FOLLOWER_DONE_INTERVAL;
 
 struct alignas(16) CalendarWait {
     uint64_t read_cmd;

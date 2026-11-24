@@ -10,7 +10,7 @@ outer DAG by dependency and uses a separate range for each Graph body.
 | Storage | Contents and operations |
 | ------- | ----------------------- |
 | GM | Per-lane range indexes, calendar rows, bound kernel entries and arguments, and dependency descriptors. AICPU materializes a Graph's arguments and publishes a prefix watermark after flushing the bindings. |
-| SSBUF | Per-cluster rendezvous tokens for the participating roles of a MIX block and the block context read by each kernel. |
+| SSBUF | Per-cluster rendezvous tokens for MIX roles and eligible blocks of the same consumer, and the block context read by each kernel. |
 | CntNotify SRAM | START arrivals for explicit `sync_start`, logical DONE counts, defer indicators, and range tail arrivals. |
 | SPR | Core bring-up, exit and error handling through the shared platform lifecycle. |
 
@@ -57,8 +57,10 @@ bits. Tasks can share the count when the Host can prove their completions advanc
 in order. Each executable task has its own defer bit within the slot.
 
 1. After the output barrier, an execution with no registered signal issues a
-   DONE ADD in CntNotify SRAM. An execution with registered signals publishes
-   one record in GM and sets its task's defer bit in CntNotify SRAM.
+   DONE ADD in CntNotify SRAM. The scheduler can take this path after observing
+   that a single monotonic counter wait is already satisfied. A pending
+   deferred execution publishes one record in GM and sets its task's defer bit
+   in CntNotify SRAM.
 2. A successor reads the DONE word in SRAM. It checks the count first. If the
    count is short and the task's defer bit is set, it visits the task's
    registration records in GM and can claim any unowned record with a CAS.
@@ -86,15 +88,41 @@ in turn. Each completed predecessor contributes once to a shared CntNotify
 counter. The rest of the consumer lanes only wait for that counter. MIX and
 synchronized SPMD retain their per-block entry protocol and dependency checks.
 
+The Host can omit a wait when the calendar proves that the lane has already
+observed the required completion, including through a retained dependency.
+Within a cluster, eligible consumer blocks can share an input-ready observation
+through SSBUF. The lane assigned to service a deferred producer continues to
+poll it directly.
+
+A single ordinary phase without Graph invocations can fuse the DONE counts of
+independent producers that have one common remaining consumer. Each producer
+keeps its own defer bit and a lane that can service its registrations. The
+consumer waits for the combined count. Wide groups use a bounded,
+cluster-dependent interval between unsuccessful reads to reduce contention
+when many lanes poll the same CntNotify counter. A helper checks promptly when
+at most two credits remain or its producer has published a defer bit.
+The Host proves fusion eligibility while planning and reuses the result on
+cache hits. The independence check has a phase-wide edge budget. Groups
+without a completed proof use ordinary fan-in.
+
 ## Online PGO and tracing
 
 The first run of a shape executes a calendar generated from the submitted DAG
-and execution shapes. Sampled rows record kernel start, output barrier completion, defer
-registration and defer settlement. The Host uses these samples to estimate
-physical lane occupancy and logical completion separately, then plans a calendar
-for reuse. A repeated Graph in the same submission samples its last matching
-invocation. The cache is in memory, belongs to the worker and is released with
-the worker.
+and execution shapes. Sampled rows record kernel start, output barrier
+completion, defer registration and defer settlement. These samples distinguish
+physical lane occupancy from logical completion.
+
+The Host scores the sampled placement and three bounded candidate calendars.
+It considers block submission order, longer-output blocks with wait-aware
+priority, and a variant that can fill an idle interval with ready work from the
+same resource class. The backfill must preserve the selected task's estimated
+start and placements. The planner commits both groups before considering
+overlapping resource classes. The evaluator replays each placement's lane and
+wait events, including the follower's periodic DONE probe, fused producer
+counts, START, completion and lane retirement. The worker caches the calendar
+with the smallest estimated end time in memory.
+
+A repeated Graph in the same submission samples its last matching invocation.
 
 Chip Swimlane is a separate diagnostic stream. It can display actual kernel runs
 and scheduler events for all invocations, including the rows for which online

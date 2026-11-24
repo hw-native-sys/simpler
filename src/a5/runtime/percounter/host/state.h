@@ -354,6 +354,7 @@ inline StateSelection select_percounter_state(
             sample->cache = cache;
             sample->baseline = initial;
             sample->cluster_count = cluster_count;
+            sample->allow_fused_fanins = range_inputs.size() == 1 && graph_plan.invocation_count == 0;
             sample->key = std::move(key);
             sample->copy_tasks(phase.tasks);
             cache->training.insert_or_assign(sample->key, initial);
@@ -374,7 +375,7 @@ inline StateSelection select_percounter_state(
     PercounterLayout layout{};
     if (!plan_layout(
             task_count, block_total, &layout, mix_task_count, sync_cohort_count, graph.layout, defer_rows,
-            runtime->dev.chip_swimlane_level
+            runtime->dev.chip_swimlane_level, calendar.uses_cluster_input_share
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");
         return StateSelection::FAILED;
@@ -503,10 +504,15 @@ inline StateSelection select_percounter_state(
                 plan.logical_row_by_packed.size(), getpid()
             );
         }
+        std::array<size_t, CALENDAR_FUSED_FANIN_MAX_PRODUCERS + 1> fusion_counts{};
+        for (const auto &group : calendar.fused_fanins)
+            ++fusion_counts[group.producer_count];
         LOG_INFO(
-            "A5 calendar: ranges=%u phases=%zu graph_invocations=%zu counters=%u phase_slots=%u fanin_slots=%u",
+            "A5 calendar: ranges=%u phases=%zu graph_invocations=%zu counters=%u phase_slots=%u fanin_slots=%u "
+            "fused_fanins=%zu fused_2=%zu fused_3=%zu fused_4=%zu",
             calendar_header.range_count, phases.size(), graph.invocations.size(), calendar_header.notify_slots_count,
-            calendar.phase_slot_count, calendar.fanin_slot_count
+            calendar.phase_slot_count, calendar.fanin_slot_count, calendar.fused_fanins.size(), fusion_counts[2],
+            fusion_counts[3], fusion_counts[4]
         );
         if (calendar_header.sample_index_offset != 0) {
             runtime->on_pending_execution_complete(
