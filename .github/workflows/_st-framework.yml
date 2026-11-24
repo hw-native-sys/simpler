@@ -64,7 +64,7 @@ jobs:
           CANN_ENV: ${{ steps.framework.outputs.cann_env }}
           MANUAL_MODE: ${{ inputs.manual_mode }}
           PLATFORM: ${{ inputs.platform }}
-          DEVICE_NUM: "4"
+          DEVICE_NUM: ${{ inputs.platform == 'a5' && '4' || '1' }}
         run: |
           source "$CANN_ENV"
           mkdir -p outputs/framework-ci

@@ -228,7 +228,6 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
     assert setup["with"]["platform"] == "${{ inputs.platform }}"
     step = next(step for step in steps if "task-submit" in step.get("run", ""))
     assert step["env"]["PLATFORM"] == "${{ inputs.platform }}"
-    assert step["env"]["DEVICE_NUM"] == "4"
     log = tmp_path / "commands.jsonl"
     _executable(
         tmp_path / ".venv-framework/bin/python",
@@ -271,8 +270,8 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
             "COMMAND_LOG": str(log),
             "PYTEST_ADDOPTS": "-o pythonpath=/framework-site",
             "FRAMEWORK_WHEEL_SITE": "/framework-site",
-            "DEVICE_NUM": step["env"]["DEVICE_NUM"],
-            "EXPECTED_DEVICES": "1,3,5,7",
+            "DEVICE_NUM": "4" if platform_name == "a5" else "1",
+            "EXPECTED_DEVICES": "1,3,5,7" if platform_name == "a5" else "2",
         },
         text=True,
         capture_output=True,
@@ -290,8 +289,8 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
     pytest_command = commands[2]
     assert pytest_command[:4] == ["-m", "pytest", "examples", "tests/st"]
     assert pytest_command[pytest_command.index("--platform") + 1] == platform_name
-    assert pytest_command[pytest_command.index("--max-parallel") + 1] == "4"
-    assert pytest_command[pytest_command.index("--device") + 1] == "1,3,5,7"
+    assert pytest_command[pytest_command.index("--max-parallel") + 1] == ("4" if platform_name == "a5" else "1")
+    assert pytest_command[pytest_command.index("--device") + 1] == ("1,3,5,7" if platform_name == "a5" else "2")
     assert pytest_command[pytest_command.index("--test-environment") + 1] == "torch_npu"
     assert commands[3][:3] == ["-m", "simpler_setup.test_environments", "verify"]
 
