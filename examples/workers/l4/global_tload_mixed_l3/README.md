@@ -33,6 +33,10 @@ pip install --no-build-isolation -e .
 
 ## Start the remote L3 daemon
 
+On shared hosts, start the daemon and the L4 parent in separate
+`task-submit` allocations, one device on each host. Use the device IDs
+assigned by the respective queues.
+
 Start this on machine B. The daemon is the generic session server — nothing
 about it is specific to this example. `192.0.2.20` is a documentation
 placeholder, not a usable address:
@@ -75,13 +79,18 @@ Any `max_diff` above the tolerance exits non-zero.
 | `SIMPLER_GLOBAL_TLOAD_MIXED_L3_REMOTE_DEVICES` | `0` | Device list; the first id is the remote L3's L2 |
 | `SIMPLER_GLOBAL_TLOAD_MIXED_L3_PLATFORM` | `a2a3` | Target platform |
 | `SIMPLER_GLOBAL_TLOAD_MIXED_L3_RUNTIME` | `tensormap_and_ringbuffer` | Runtime |
-| `SIMPLER_GLOBAL_TLOAD_MIXED_L3_COMM_PROFILE` | `a3-fabric-v1` | Global CommDomain backend profile |
-| `SIMPLER_GLOBAL_TLOAD_MIXED_L3_SESSION_LISTEN_HOST` | `0.0.0.0` | Interface the parent's session runner binds |
+| `SIMPLER_GLOBAL_TLOAD_MIXED_L3_COMM_PROFILE` | `a3-fabric-v1` | Global CommDomain backend profile. Set `a5-fabric-v1` for real A5. |
+| `SIMPLER_GLOBAL_TLOAD_MIXED_L3_SESSION_LISTEN_HOST` | `0.0.0.0` | Bind address for the remote L3 command and health listeners |
 | `SIMPLER_GLOBAL_TLOAD_MIXED_L3_SESSION_TIMEOUT` | `120` | Seconds to wait on the remote session |
 
-The peer `TLOAD` needs real cross-device windows, so the default profile is
-`a3-fabric-v1` and requires real A3 devices on both machines. In CI the network1
-job runs the `test_global_tload_mixed_l3.py` wrapper through `network1-run-pytest`.
+The default profile is `a3-fabric-v1` for real A3 devices on both machines.
+For two A5 machines in the same superpod, select platform `a5` and profile
+`a5-fabric-v1`. When setting an explicit session listen address, use the
+peer's address. The parent connects to the command and health listeners on
+that address.
+
+In CI the network1 job runs the `test_global_tload_mixed_l3.py` wrapper
+through `network1-run-pytest`.
 CI supplies `NETWORK1_REMOTE_ENDPOINT`, `NETWORK1_REMOTE_DEVICES`,
 `NETWORK1_L3_SESSION_TIMEOUT_S`, `NETWORK1_L3_SESSION_LISTEN_HOST`, and pytest's
 `--platform` / `--device` options instead of the `SIMPLER_*` variables above;

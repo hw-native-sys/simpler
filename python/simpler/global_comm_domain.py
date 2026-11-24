@@ -67,9 +67,15 @@ GLOBAL_DOMAIN_DESCRIPTOR = struct.Struct("<IIIIQII256s")
 GLOBAL_DOMAIN_DESCRIPTOR_BYTES = GLOBAL_DOMAIN_DESCRIPTOR.size
 GLOBAL_DOMAIN_PROFILE_SIM = "sim"
 GLOBAL_DOMAIN_PROFILE_A3_FABRIC = "a3-fabric-v1"
+GLOBAL_DOMAIN_PROFILE_A5_FABRIC = "a5-fabric-v1"
 GLOBAL_DOMAIN_PROFILE_IDS = {
     GLOBAL_DOMAIN_PROFILE_SIM: 1,
     GLOBAL_DOMAIN_PROFILE_A3_FABRIC: 2,
+    GLOBAL_DOMAIN_PROFILE_A5_FABRIC: 3,
+}
+_FABRIC_PROFILE_PLATFORMS = {
+    GLOBAL_DOMAIN_PROFILE_A3_FABRIC: "a2a3",
+    GLOBAL_DOMAIN_PROFILE_A5_FABRIC: "a5",
 }
 GLOBAL_DOMAIN_MAX_STRING_BYTES = 1024
 GLOBAL_DOMAIN_MAX_COPY_BYTES = 8 * 1024 * 1024
@@ -199,12 +205,23 @@ class GlobalCommInitResult:
     local_device_count: int
 
 
+def _supports_fabric_profile(platform: str, profile: str) -> bool:
+    required_platform = _FABRIC_PROFILE_PLATFORMS.get(profile)
+    return required_platform is not None and platform.startswith(required_platform) and not platform.endswith("sim")
+
+
+def validate_global_comm_profile(label: str, platform: str, profile: str) -> None:
+    # Workers without a Global CommDomain use the default sim profile on every platform.
+    if profile != GLOBAL_DOMAIN_PROFILE_SIM and not _supports_fabric_profile(platform, profile):
+        raise ValueError(f"{label}.comm_profile {profile!r} is not supported by platform {platform!r}")
+
+
 def resolve_global_comm_capability(*, platform: str, profile: str, local_device_count: int) -> GlobalCommInitResult:
     """Return the capability implemented by the selected platform backend."""
     platform = str(platform)
     profile = str(profile)
-    supported = (platform.endswith("sim") and profile == GLOBAL_DOMAIN_PROFILE_SIM) or (
-        platform.startswith("a2a3") and not platform.endswith("sim") and profile == GLOBAL_DOMAIN_PROFILE_A3_FABRIC
+    supported = (platform.endswith("sim") and profile == GLOBAL_DOMAIN_PROFILE_SIM) or _supports_fabric_profile(
+        platform, profile
     )
     if not supported:
         raise ValueError(f"Global CommDomain is not supported by platform {platform!r} with comm_profile {profile!r}")

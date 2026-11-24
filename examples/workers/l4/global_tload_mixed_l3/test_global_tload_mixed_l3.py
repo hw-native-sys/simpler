@@ -9,6 +9,7 @@
 """Network1 ST for examples/workers/l4/global_tload_mixed_l3."""
 
 import pytest
+from simpler.global_comm_domain import GLOBAL_DOMAIN_PROFILE_A3_FABRIC, GLOBAL_DOMAIN_PROFILE_A5_FABRIC
 
 from simpler_setup import SceneTestLevel, scene_level
 
@@ -20,7 +21,7 @@ def _device_spec(device_ids) -> str:
 
 
 @scene_level(SceneTestLevel.NETWORK1)
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 @pytest.mark.network1_remote_device_count(1)
@@ -32,6 +33,7 @@ def test_global_tload_mixed_l3(
         local_devices=_device_spec(st_device_ids),
         remote_devices=_device_spec(st_network1_remote_device_ids),
         platform=st_platform,
+        comm_profile=GLOBAL_DOMAIN_PROFILE_A5_FABRIC if st_platform == "a5" else GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
         session_timeout=st_network1_peer.session_timeout_s,
         session_listen_host=st_network1_peer.session_listen_host,
     )

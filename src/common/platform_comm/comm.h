@@ -78,6 +78,7 @@ enum { COMM_INITIALIZATION_ABORT_REQUIRED = -7 };
 typedef enum CommGlobalDomainProfile {
     COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM = 1,
     COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC = 2,
+    COMM_GLOBAL_DOMAIN_PROFILE_A5_FABRIC = 3,
 } CommGlobalDomainProfile;
 
 typedef struct CommGlobalDomainDescriptor {

@@ -1090,6 +1090,23 @@ TEST(NativeRunOperationLeaseTest, WholeCloseReleasesEverythingWhenEveryRunIsProv
     EXPECT_TRUE(worker.native_runs_.empty());
 }
 
+TEST(NativeRunOperationLeaseTest, WholeCloseRetainsGlobalDomainWhenReleaseIsUnconfirmed) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.destroy_device_context_fn_ = stub_destroy_device_context;
+    worker.comm_global_domain_release_fn_ = [](uint64_t) {
+        return static_cast<int>(COMM_RECLAMATION_UNCONFIRMED);
+    };
+    worker.global_domain_ids_.insert(7);
+
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_TRUE(worker.comm_cleanup_unconfirmed_);
+    EXPECT_EQ(worker.global_domain_ids_.count(7), 1u);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+}
+
 // Carrier destruction leaves communication owners live when the lane has failed.
 TEST(NativeRunOperationLeaseTest, PoisonedLaneRefusesDeviceTeardownWithLiveCommunication) {
     for (bool failed : {false, true}) {
