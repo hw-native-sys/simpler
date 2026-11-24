@@ -24,7 +24,7 @@ jobs:
   run:
     name: ut-a5
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
@@ -54,7 +54,7 @@ jobs:
           ut_command="python -m pytest tests/ut -m 'requires_hardware and device_count' --platform a5 --device \$TASK_DEVICE -q &&"
           ut_command+=" python -m pytest tests/ut -m 'requires_hardware and not device_count' -k TestRuntimeBuilderIntegration --platform a5 --device \$TASK_DEVICE -q &&"
           ut_command+=" python -m pytest tests/ut -m 'requires_hardware and not device_count' -k 'not TestRuntimeBuilderIntegration' --platform a5 --device \$TASK_DEVICE -n $DEVICE_NUM -q"
-          task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+          task-submit --timeout 3600 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
             --run "$ut_command"
 
       # Every tool under tools/cann-examples, discovered rather than named, and
@@ -68,5 +68,5 @@ jobs:
         if: inputs.include_cann_examples
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
+          task-submit --timeout 3600 --max-time 1800 --device auto --device-num 1 \
             --run "tools/build_cann_examples.sh dav-c310-cube --run \$TASK_DEVICE"
