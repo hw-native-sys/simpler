@@ -117,9 +117,17 @@ def _execute(job, fixture, workflow="ci-a5-comment", step_index=0):
     return json.loads(result.stdout)
 
 
-def test_only_three_hardware_suites_move_from_automatic_ci():
+def test_a5_ut_runs_automatically_only_for_affected_changes():
     ci = _workflow("ci")["jobs"]
-    assert all(name not in ci for name in _SUITES)
+    job = ci["ut-a5"]
+    assert job["needs"] == ["detect-changes", "pre-commit"]
+    assert job["if"] == (
+        "needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.ut_affected == 'true'"
+    )
+    assert job["uses"] == "./.github/workflows/_ut-npu-a5.yml"
+    assert json.loads(job["with"]["runs_on"]) == ["self-hosted", "a5"]
+    assert job["with"]["include_cann_examples"] == "true"
+    assert "st-onboard-a5" not in ci
     for name in ("ut", "packaging-matrix", "st-sim-a5", "profiling-flags-smoke", "ut-a2a3", "st-onboard-a2a3"):
         assert name in ci
     daily = _workflow("daily")["jobs"]
