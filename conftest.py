@@ -621,7 +621,7 @@ def _validate_level_filters(config) -> None:
 
 def _configure_ascend_logs(config) -> None:
     """Keep A5 process/device logs with the JUnit artifacts, including child processes."""
-    report = config.getoption("xmlpath", default=None)
+    report = getattr(config, "_environment_xmlpath", config.getoption("xmlpath", default=None))
     if config.getoption("--platform", default=None) != "a5" or not report:
         return
     if os.environ.get("ASCEND_PROCESS_LOG_PATH"):
@@ -633,6 +633,7 @@ def _configure_ascend_logs(config) -> None:
     config.add_cleanup(patch.undo)
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
@@ -684,6 +685,7 @@ def pytest_configure(config):
     try:
         _test_environments.select_environment([], config.getoption("--test-environment"))
         _test_environments.validate_execution(config)
+        _test_environments.claim_result_output(config)
     except ValueError as error:
         raise pytest.UsageError(str(error)) from error
 
@@ -1082,11 +1084,14 @@ def _collect_unclaimed_items(items, resource_specs, l2_runtimes):
 def _strip_value_options(args, options):
     stripped = []
     skip_next = False
-    for arg in args:
+    for index, arg in enumerate(args):
         if skip_next:
             skip_next = False
             continue
         text = str(arg)
+        if text == "--":
+            stripped.extend(args[index:])
+            break
         if text in options:
             skip_next = True
             continue
@@ -1593,10 +1598,101 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912, PLR0915
     return True  # returning True prevents default runtestloop
 
 
+def pytest_sessionstart(session):
+    _test_environments.configure_result_output(session.config)
+
+
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_collection_finish(session):
+    if session.config.getoption("--environment-parent-plan", default=None):
+        for name in ("lfplugin", "nfplugin"):
+            plugin = session.config.pluginmanager.get_plugin(name)
+            if plugin is not None:
+                session.config.pluginmanager.unregister(plugin)
     yield
     _test_environments.prepare_session(session)
+
+
+def _dispatch_direct_environment(session, devices, count):
+    """Partition direct tests without changing their execution or receipt format."""
+    cfg = session.config
+    plan, _ = session._test_environment_receipt
+    base = _base_pytest_argv(
+        session,
+        strip_options=[
+            "--device",
+            "-d",
+            "--max-parallel",
+            "--junitxml",
+            "--junit-xml",
+            "--basetemp",
+            "--environment-parent-plan",
+        ],
+    )
+    paths = []
+    jobs = []
+    stream_output = cfg.getoption("capture", default="fd") in {"no", "tee-sys"}
+    shard_root = Path(tempfile.mkdtemp(prefix=f"{plan.stem}-shards-", dir=plan.parent))
+    for index in range(count):
+        members = [item.nodeid for item in session.items[index::count]]
+        directory = shard_root / f"shard-{index}"
+        directory.mkdir(parents=True, exist_ok=True)
+        result = directory / "results.xml"
+        result.unlink(missing_ok=True)
+        paths.append((result, members))
+        label = f"framework shard {index} ({len(members)} cases)"
+
+        def build(ids, *, _members=members, _directory=directory, _result=result):
+            options = [
+                "--device",
+                str(ids[0]),
+                "--max-parallel",
+                "1",
+                "--environment-parent-plan",
+                str(plan),
+                "--basetemp",
+                str(_directory / "pytest"),
+                "--junitxml",
+                str(_result),
+            ]
+            options.extend(f"--environment-shard-case={nodeid}" for nodeid in _members)
+            command = list(base)
+            separator = command.index("--") if "--" in command else len(command)
+            command[separator:separator] = options
+            return command
+
+        jobs.append(
+            _ps.Job(
+                label=label,
+                device_count=1,
+                build_cmd=build,
+                cwd=str(cfg.invocation_params.dir),
+                isolated_process_group=True,
+                output_path=str(directory / "pytest.log"),
+            )
+        )
+
+    def completed(result):
+        print(f"[framework] {result.label}: rc={result.returncode}; devices={result.device_ids}", flush=True)
+        if result.returncode and not stream_output:
+            print(result.output, flush=True)
+
+    session._direct_environment_results = paths
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, _frame):
+        state = _ps._active_state
+        if state is not None:
+            _ps._terminate_all(state)
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        results = _ps.run_jobs(jobs, devices, max_parallel=count, on_job_done=completed, stream_output=stream_output)
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+    session.testsfailed = sum(result.returncode != 0 for result in results)
+    return True
 
 
 def pytest_runtestloop(session):
@@ -1615,6 +1711,24 @@ def pytest_runtestloop(session):
     # If there are no items, nothing to orchestrate.
     if not session.items:
         return
+
+    if session.config.getoption("--test-environment", default="default") == "torch_npu":
+        if session.config.getoption("--environment-parent-plan", default=None):
+            return
+        devices = _parse_device_range(session.config.getoption("--device"))
+        limit = _resolve_max_parallel(session.config, session.config.getoption("--platform") or "", devices)
+        logging_plugin = session.config.pluginmanager.get_plugin("logging-plugin")
+        if (
+            session.config.getoption("usepdb", default=False)
+            or session.config.getoption("trace", default=False)
+            or session.config.getoption("maxfail", default=0)
+            or session.config.getoption("stepwise", default=False)
+            or (logging_plugin is not None and logging_plugin.log_file_handler.baseFilename != os.devnull)
+        ):
+            return
+        count = min(len(devices), limit, len(session.items))
+        if count > 1:
+            return _dispatch_direct_environment(session, devices, count)
 
     # If only L2 items exist in a single runtime and no resource-dispatched
     # jobs (L3 classes or standalone resource functions) are collected, the
@@ -1647,6 +1761,7 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     worker pool) lets those instances die while nanobind is still
     available.
     """
+    _test_environments.update_direct_cache(session)
     clear_compile_cache()
     yield
     _test_environments.finish_session(session)

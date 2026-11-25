@@ -13,8 +13,10 @@ import copy
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +29,7 @@ _ROOT = Path(__file__).resolve().parents[3]
 _HOOKS = (
     "pytest_addoption",
     "pytest_configure",
+    "pytest_sessionstart",
     "pytest_itemcollected",
     "pytest_collection_modifyitems",
     "pytest_collection_finish",
@@ -44,6 +47,19 @@ def test_direct(index):
 """
 
 
+def _pytest_subprocess_env():
+    """Start an independent controller without inheriting an outer xdist role."""
+    return {
+        **{
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"GIT_DIR", "GIT_WORK_TREE"} and not key.startswith("PYTEST_XDIST_")
+        },
+        "PYTHONPATH": os.pathsep.join((str(_ROOT), str(_ROOT / "python"))),
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+    }
+
+
 def _run_pytest(
     directory,
     source,
@@ -52,12 +68,22 @@ def _run_pytest(
     path="tests/new_place/test_direct.py",
     capable=True,
     extra_conftest="",
+    input_text=None,
+    path_after_separator=False,
+    ini_options="",
 ):
     directory.mkdir(parents=True, exist_ok=True)
+    if path_after_separator:
+        git_dir = subprocess.check_output(
+            ["git", "-C", str(_ROOT), "rev-parse", "--absolute-git-dir"], text=True
+        ).strip()
+        (directory / ".git").write_text(f"gitdir: {git_dir}\n")
     test_path = directory / path
     test_path.parent.mkdir(parents=True, exist_ok=True)
     test_path.write_text(source)
-    (directory / "pytest.ini").write_text("[pytest]\naddopts = --import-mode=importlib\nmarkers =\n    selected_tag\n")
+    (directory / "pytest.ini").write_text(
+        "[pytest]\naddopts = --import-mode=importlib\nmarkers =\n    selected_tag\n" + ini_options
+    )
     (directory / "conftest.py").write_text(
         f"""
 import builtins
@@ -95,7 +121,7 @@ real._test_environments.preflight = package_preflight
             sys.executable,
             "-m",
             "pytest",
-            str(test_path),
+            *([] if path_after_separator else [str(test_path)]),
             "-c",
             str(directory / "pytest.ini"),
             "--rootdir",
@@ -110,23 +136,13 @@ real._test_environments.preflight = package_preflight
             str(directory),
             "-q",
             *args,
+            *(["--", str(test_path)] if path_after_separator else []),
         ],
-        cwd=_ROOT,
-        env={
-            **{
-                key: value
-                for key, value in os.environ.items()
-                # xdist marks its per-process roles in the environment. The
-                # inner run is a separate pytest process whose role is decided
-                # by its own arguments, so inheriting an outer worker's marker
-                # would make it believe it is already a worker.
-                if key not in {"GIT_DIR", "GIT_WORK_TREE"} and not key.startswith("PYTEST_XDIST_")
-            },
-            "PYTHONPATH": os.pathsep.join((str(_ROOT), str(_ROOT / "python"))),
-            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-        },
+        cwd=directory if path_after_separator else _ROOT,
+        env=_pytest_subprocess_env(),
         capture_output=True,
         text=True,
+        input=input_text,
         timeout=60,
         check=False,
     )
@@ -137,6 +153,725 @@ real._test_environments.preflight = package_preflight
 
 def _success(result):
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_direct_parallel_shards_use_distinct_devices_and_complete_receipts(tmp_path):
+    source = """
+import os
+from pathlib import Path
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(8))
+def test_direct(index, request):
+    device = request.config.getoption("--device")
+    Path(__file__).with_name(f"case-{index}").write_text(f"{device}:{os.getpid()}")
+"""
+    result, plan, xml = _run_pytest(
+        tmp_path, source, "--device", "1,3,5,7", "--max-parallel", "4", "--environment-receipts"
+    )
+    _success(result)
+    records = [path.read_text().split(":") for path in tmp_path.rglob("case-*")]
+    assert len(records) == 8
+    assert {device for device, _ in records} == {"1", "3", "5", "7"}
+    assert len({pid for _, pid in records}) == 4
+    test_environments.verify_results(plan, xml)
+
+
+def test_direct_parallel_preserves_child_failure_and_all_results(tmp_path):
+    source = _DIRECT.format(count=8).replace("assert index >= 0", "assert index != 3")
+    result, plan, xml = _run_pytest(
+        tmp_path, source, "--device", "1,3,5,7", "--max-parallel", "4", "--environment-receipts"
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert len(list(ET.parse(xml).getroot().iter("testcase"))) == 8
+    with pytest.raises(ValueError, match="failure"):
+        test_environments.verify_results(plan, xml)
+
+
+def test_direct_parallel_lastfailed_keeps_all_shards_and_drives_rerun(tmp_path, monkeypatch):
+    source = """
+import os
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(4))
+def test_direct(index):
+    if os.environ.get("FRAMEWORK_CACHE_PASS") != "1":
+        assert index >= 2
+"""
+    cache = tmp_path / ".pytest_cache/v/cache/lastfailed"
+    cache.parent.mkdir(parents=True)
+    unrelated = {"other.py::test_old": True}
+    cache.write_text(json.dumps(unrelated))
+    result, _, _ = _run_pytest(tmp_path, source, "--device=1,3", "--max-parallel=2")
+    assert result.returncode == 1, result.stdout + result.stderr
+    failed = {f"tests/new_place/test_direct.py::test_direct[{index}]": True for index in (0, 1)}
+    assert json.loads(cache.read_text()) == {**unrelated, **failed}
+    monkeypatch.setenv("FRAMEWORK_CACHE_PASS", "1")
+    rerun, plan, xml = _run_pytest(tmp_path, source, "--device=1,3", "--max-parallel=2", "--lf")
+    _success(rerun)
+    assert {case["nodeid"] for case in json.loads(plan.read_text())["cases"]} == set(failed)
+    test_environments.verify_results(plan, xml)
+    assert json.loads(cache.read_text()) == unrelated
+
+
+@pytest.mark.parametrize("capture", ["fd", "no", "tee-sys"])
+def test_direct_parallel_preserves_visible_success_output(tmp_path, capture):
+    source = _DIRECT.format(count=4).replace("assert index >= 0", "print(f'case-output-{index}', flush=True)")
+    result, plan, xml = _run_pytest(tmp_path, source, "--device=1,3", "--max-parallel=2", f"--capture={capture}")
+    _success(result)
+    assert "[scheduler] START" in result.stdout
+    for index in range(4):
+        assert result.stdout.count(f"case-output-{index}") == (0 if capture == "fd" else 1)
+    test_environments.verify_results(plan, xml)
+
+
+@pytest.mark.parametrize("configuration", ["cli", "ini"])
+def test_direct_file_logging_runs_in_controller_and_preserves_all_records(tmp_path, configuration):
+    source = """
+import logging
+import time
+from pathlib import Path
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(2))
+def test_direct(index, request):
+    root = Path(__file__).parent
+    if request.config.getoption("--environment-parent-plan"):
+        ready = root / f"ready-{index}"
+        ready.touch()
+        other = root / f"ready-{1-index}"
+        deadline = time.monotonic() + 10
+        while not other.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert other.exists()
+        if index == 1:
+            written = root / "written-0"
+            while not written.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert written.exists()
+    logging.getLogger("exclusive-file-records").info("FILE_RECORD_%s", index)
+    if index == 0:
+        (root / "written-0").touch()
+"""
+    output = tmp_path / "run.log"
+    flags = ["--log-file", str(output), "--log-file-level=INFO"] if configuration == "cli" else []
+    ini = f"log_file = {output}\nlog_file_level = INFO\n" if configuration == "ini" else ""
+    result, plan, xml = _run_pytest(tmp_path, source, "--device=1,3", "--max-parallel=2", *flags, ini_options=ini)
+    _success(result)
+    content = output.read_text()
+    for index in range(2):
+        assert f"FILE_RECORD_{index}" in content, content
+    assert "[scheduler] START" not in result.stdout
+    test_environments.verify_results(plan, xml)
+
+
+@pytest.mark.parametrize("flags", [("--log-file", os.devnull), ("-p", "no:logging")])
+def test_direct_without_file_logging_keeps_parallel_execution(tmp_path, flags):
+    result, plan, xml = _run_pytest(tmp_path, _DIRECT.format(count=2), "--device=1,3", *flags)
+    _success(result)
+    assert result.stdout.count("[scheduler] START") == 2
+    test_environments.verify_results(plan, xml)
+
+
+def test_direct_callback_failure_preserves_completed_results(tmp_path):
+    extra = """
+original_print = builtins.print
+def fail_completion(*args, **kwargs):
+    if args and str(args[0]).startswith("[framework]"):
+        raise OSError("completion output failure")
+    return original_print(*args, **kwargs)
+builtins.print = fail_completion
+"""
+    result, _, xml = _run_pytest(
+        tmp_path, _DIRECT.format(count=4), "--device=1,3", "--max-parallel=2", extra_conftest=extra
+    )
+    assert result.returncode != 0
+    assert "completion output failure" in result.stdout + result.stderr
+    cases = list(ET.parse(xml).getroot().iter("testcase"))
+    assert 2 <= len(cases) <= 4
+    assert all(case.find("failure") is None and case.find("error") is None for case in cases)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal cleanup")
+@pytest.mark.parametrize("stop", ["callback", "SIGTERM", "SIGALRM"])
+def test_direct_interrupted_shards_preserve_already_produced_logs(tmp_path, stop):
+    source = """
+import os
+import signal
+import time
+from pathlib import Path
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(2))
+def test_direct(index):
+    root = Path(__file__).parent
+    print(f"SHARD_DIAGNOSTIC_{index}", flush=True)
+    if index == 1:
+        (root / "slow-ready").touch()
+        signal.pause()
+    else:
+        ready = root / "slow-ready"
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        if STOP != "callback":
+            os.kill(os.getppid(), getattr(signal, STOP))
+            signal.pause()
+""".replace("STOP", repr(stop))
+    extra = (
+        """
+original_print = builtins.print
+def fail_completion(*args, **kwargs):
+    if args and str(args[0]).startswith("[framework]"):
+        raise OSError("completion output failure")
+    return original_print(*args, **kwargs)
+builtins.print = fail_completion
+"""
+        if stop == "callback"
+        else ""
+    )
+    result, _, _ = _run_pytest(
+        tmp_path,
+        source,
+        "--device=1,3",
+        "--max-parallel=2",
+        "-s",
+        "--pto-session-timeout=60",
+        extra_conftest=extra,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    if stop == "callback":
+        assert "completion output failure" in result.stdout + result.stderr
+    else:
+        expected = 124 if stop == "SIGALRM" else 128 + getattr(signal, stop)
+        assert result.returncode == expected, result.stdout + result.stderr
+    for index in range(2):
+        log = next(tmp_path.glob(f"results.plan-shards-*/shard-{index}/pytest.log"), None)
+        assert log is not None, result.stdout + result.stderr
+        assert f"SHARD_DIAGNOSTIC_{index}" in log.read_text()
+
+
+@pytest.mark.parametrize("parallel", ["1", "2"])
+def test_direct_fanout_preserves_selection_and_execution_options(tmp_path, parallel):
+    source = """
+import os
+from pathlib import Path
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(8))
+def test_direct(index, request):
+    assert request.config.getoption("--rounds") == 3
+    Path(__file__).with_name(f"case-{index}").write_text(str(os.getpid()))
+"""
+    result, plan, xml = _run_pytest(
+        tmp_path,
+        source,
+        "--device=1,3,5,7",
+        f"--max-parallel={parallel}",
+        "--rounds=3",
+        "-k",
+        "not 7",
+        "--environment-receipts",
+    )
+    _success(result)
+    records = list(tmp_path.rglob("case-*"))
+    assert len(records) == 7
+    assert not list(tmp_path.rglob("case-7"))
+    assert len({path.read_text() for path in records}) == int(parallel)
+    test_environments.verify_results(plan, xml)
+
+
+@pytest.mark.parametrize("limit", ["0", "invalid"])
+def test_direct_parallel_rejects_invalid_limits(tmp_path, limit):
+    result, _, _ = _run_pytest(tmp_path, _DIRECT.format(count=4), "--device", "1,3", "--max-parallel", limit)
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert "--max-parallel" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("warning_error", [False, True])
+@pytest.mark.parametrize("path", ["tests/new_place/test_direct.py", "--device=literal.py"])
+def test_direct_parallel_keeps_options_before_path_separator(tmp_path, warning_error, path):
+    source = _DIRECT.format(count=4)
+    if warning_error:
+        source = source.replace("assert index >= 0", "__import__('warnings').warn('must fail')")
+    result, plan, xml = _run_pytest(
+        tmp_path,
+        source,
+        "--device=1,3",
+        "--max-parallel=2",
+        "-k",
+        "not 3",
+        "-W",
+        "error::UserWarning",
+        "--environment-receipts",
+        path_after_separator=True,
+        path=path,
+    )
+    assert result.returncode == (1 if warning_error else 0), result.stdout + result.stderr
+    assert "[scheduler] START" in result.stdout
+    cases = list(ET.parse(xml).getroot().iter("testcase"))
+    assert len(cases) == 3
+    assert all("[3]" not in case.get("name") for case in cases)
+    if warning_error:
+        assert all(case.find("failure") is not None for case in cases)
+    else:
+        test_environments.verify_results(plan, xml)
+
+
+def test_path_separator_contract_accepts_relative_worktree_metadata(tmp_path, monkeypatch):
+    alias = tmp_path / "linked-checkout"
+    alias.mkdir()
+    git_dir = subprocess.check_output(["git", "-C", str(_ROOT), "rev-parse", "--absolute-git-dir"], text=True).strip()
+    (alias / ".git").write_text(f"gitdir: {os.path.relpath(git_dir, alias)}\n")
+    for name in ("conftest.py", "python", "simpler_setup"):
+        (alias / name).symlink_to(_ROOT / name, target_is_directory=(_ROOT / name).is_dir())
+    monkeypatch.setattr(sys.modules[__name__], "_ROOT", alias)
+    result, plan, xml = _run_pytest(
+        tmp_path / "run", _DIRECT.format(count=2), "--device=1,3", path_after_separator=True
+    )
+    _success(result)
+    test_environments.verify_results(plan, xml)
+
+
+@pytest.mark.parametrize(
+    ("flags", "failures"),
+    [
+        (("-x",), 1),
+        (("--maxfail=1",), 1),
+        (("--maxfail", "2"), 2),
+        (("--maxfail=0",), 6),
+        (("--stepwise",), 1),
+        (("--stepwise-skip",), 2),
+        (("--stepwise-reset",), 1),
+    ],
+)
+def test_direct_failure_limit_applies_to_the_whole_run(tmp_path, flags, failures):
+    source = """
+from pathlib import Path
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(6))
+def test_direct(index):
+    Path(__file__).with_name(f"executed-{index}").touch()
+    assert index < 0
+"""
+    result, _, xml = _run_pytest(tmp_path, source, "--device=1,3", "--max-parallel=2", *flags)
+    assert result.returncode == 1, result.stdout + result.stderr
+    executed = {path.name for path in tmp_path.rglob("executed-*")}
+    assert executed == {f"executed-{index}" for index in range(failures)}, result.stdout + result.stderr
+    assert len(list(ET.parse(xml).getroot().iter("failure"))) == failures
+    assert ("[scheduler] START" in result.stdout) == (failures == 6)
+
+
+@pytest.mark.parametrize("debugger", ["--pdb", "--trace"])
+@pytest.mark.parametrize("devices", ["1", "1,3"])
+def test_direct_interactive_debugger_runs_in_controller(tmp_path, debugger, devices):
+    source = _DIRECT.format(count=2)
+    if debugger == "--pdb":
+        source = source.replace("assert index >= 0", "assert index < 0")
+    extra = f"""
+import os
+
+def pytest_sessionstart(session):
+    if not session.config.getoption("--environment-parent-plan", default=None):
+        Path({str(tmp_path / "controller-pid")!r}).write_text(str(os.getpid()))
+
+def pytest_enter_pdb(config, pdb):
+    with Path({str(tmp_path)!r}, f"debugger-{{os.getpid()}}").open("a") as output:
+        output.write("enter\\n")
+"""
+    result, plan, xml = _run_pytest(
+        tmp_path,
+        source,
+        "--device",
+        devices,
+        "--max-parallel",
+        "2",
+        debugger,
+        extra_conftest=extra,
+        input_text="continue\ncontinue\n",
+    )
+    assert result.returncode == (1 if debugger == "--pdb" else 0), result.stdout + result.stderr
+    pid = (tmp_path / "controller-pid").read_text()
+    records = list(tmp_path.glob("debugger-*"))
+    assert [path.name for path in records] == [f"debugger-{pid}"]
+    assert records[0].read_text().splitlines() == ["enter", "enter"]
+    assert result.stdout.count("(Pdb)") >= 2
+    assert "[scheduler] START" not in result.stdout
+    cases = list(ET.parse(xml).getroot().iter("testcase"))
+    assert len(cases) == 2
+    if debugger == "--pdb":
+        assert all(case.find("failure") is not None for case in cases)
+    else:
+        test_environments.verify_results(plan, xml)
+
+
+def test_unknown_environment_with_junit_remains_usage_error(tmp_path):
+    result, plan, xml = _run_pytest(tmp_path, _DIRECT.format(count=1), profile="unknown")
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert "Unknown test environment 'unknown'" in result.stderr
+    assert "INTERNALERROR" not in result.stdout + result.stderr
+    assert not plan.exists()
+    assert not xml.exists()
+    assert not list(tmp_path.glob("*.lock"))
+    assert not (tmp_path / "preflight-called").exists()
+
+
+@pytest.mark.parametrize("parallel", ["1", "2"])
+def test_junit_path_expands_environment_variables_exactly_once(tmp_path, monkeypatch, parallel):
+    monkeypatch.setenv("FRAMEWORK_REPORT", "$FRAMEWORK_TAG")
+    monkeypatch.setenv("FRAMEWORK_TAG", "other")
+    result, _, _ = _run_pytest(
+        tmp_path,
+        _DIRECT.format(count=4),
+        "--device=1,3",
+        f"--max-parallel={parallel}",
+        "--junitxml",
+        str(tmp_path / "$FRAMEWORK_REPORT.xml"),
+    )
+    _success(result)
+    xml = tmp_path / "$FRAMEWORK_TAG.xml"
+    plan = xml.with_suffix(".plan.json")
+    assert not (tmp_path / "other.xml").exists()
+    assert xml.with_name(xml.name + ".lock").exists()
+    test_environments.verify_results(plan, xml)
+
+
+@pytest.mark.parametrize("receipts", [False, True])
+def test_direct_parallel_keeps_parent_receipt_mode(tmp_path, receipts):
+    flags = ["--environment-receipts"] if receipts else []
+    result, plan, xml = _run_pytest(tmp_path, _DIRECT.format(count=4), "--device", "1,3", "--max-parallel", "2", *flags)
+    _success(result)
+    test_environments.verify_results(plan, xml)
+
+
+@pytest.mark.parametrize("parallel", ["1", "2"])
+def test_direct_parallel_keeps_warning_errors(tmp_path, parallel):
+    source = _DIRECT.format(count=4).replace("assert index >= 0", "__import__('warnings').warn('must fail')")
+    result, _, xml = _run_pytest(
+        tmp_path, source, "--device", "1,3", "--max-parallel", parallel, "-W", "error::UserWarning"
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert len(list(ET.parse(xml).getroot().iter("failure"))) == 4
+
+
+@pytest.mark.parametrize("xml_state", ["missing", "malformed", "unknown-encoding"])
+@pytest.mark.parametrize("returncode", [0, 9])
+def test_direct_parallel_keeps_readable_results_after_shard_crash(tmp_path, xml_state, returncode):
+    source = f"""
+import os
+from pathlib import Path
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(4))
+def test_direct(index, request):
+    if index == 0:
+        if {xml_state!r} == "malformed":
+            Path(request.config.getoption("xmlpath")).write_text("<broken>")
+        elif {xml_state!r} == "unknown-encoding":
+            Path(request.config.getoption("xmlpath")).write_text(
+                '<?xml version="1.0" encoding="no-such-codec"?><testsuites/>'
+            )
+        os._exit({returncode})
+"""
+    result, _, xml = _run_pytest(tmp_path, source, "--device", "1,3", "--max-parallel", "2")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert len(list(ET.parse(xml).getroot().iter("testcase"))) == 2
+    assert "TEST_ENVIRONMENT_SHARD_UNREADABLE" in result.stderr
+    assert "test_direct[0]" in result.stderr and "test_direct[2]" in result.stderr
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux process-state inspection")
+@pytest.mark.parametrize(("mode", "startup_delay"), [("timeout", 0), ("timeout", 5), ("terminate", 0)])
+def test_direct_timeout_kills_shards_and_descendants(tmp_path, mode, startup_delay):
+    source = """
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(2))
+def test_direct(index):
+    time.sleep(STARTUP_DELAY)
+    pidfile = str(Path(__file__).with_name(f"descendant-{index}"))
+    program = ("import os,signal; from pathlib import Path; "
+               "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+               "signal.signal(signal.SIGUSR1,signal.SIG_IGN); "
+               f"marker=Path({pidfile!r}); pending=marker.with_name('.preparing-'+marker.name); "
+               "pending.write_text(str(os.getpid())); pending.replace(marker); "
+               "signal.pause()")
+    subprocess.run([sys.executable, "-c", program], check=True)
+""".replace("STARTUP_DELAY", str(startup_delay))
+    extra = f"""
+import os, signal, threading, time
+
+def pytest_sessionstart(session):
+    if session.config.getoption("--environment-parent-plan", default=None):
+        return
+    def interrupt_when_ready():
+        end = time.monotonic() + 20
+        while time.monotonic() < end:
+            if len(list(Path({str(tmp_path)!r}).rglob("descendant-*"))) == 2:
+                Path({str(tmp_path / "interrupt-ready")!r}).touch()
+                if {mode!r} == "timeout":
+                    signal.setitimer(signal.ITIMER_REAL, 0.1)
+                else:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return
+            time.sleep(0.01)
+    threading.Thread(target=interrupt_when_ready, daemon=True).start()
+"""
+    try:
+        result, _, _ = _run_pytest(
+            tmp_path,
+            source,
+            "--device",
+            "1,3",
+            "--max-parallel",
+            "2",
+            "--pto-session-timeout",
+            "30",
+            extra_conftest=extra,
+        )
+        assert result.returncode == (124 if mode == "timeout" else 143), result.stdout + result.stderr
+        assert (tmp_path / "interrupt-ready").exists(), result.stdout + result.stderr
+        markers = list(tmp_path.rglob("descendant-*"))
+        assert len(markers) == 2, result.stdout + result.stderr
+        for marker in markers:
+            stat = Path(f"/proc/{int(marker.read_text())}/stat")
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    state = stat.read_text().rsplit(")", 1)[1].split()[0]
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                if state in {"Z", "X", "x"}:
+                    break
+                assert time.monotonic() < deadline, f"{marker}: process is still {state}"
+                time.sleep(0.01)
+    finally:
+        for marker in tmp_path.rglob("descendant-*"):
+            try:
+                os.kill(int(marker.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize(
+    ("parallel", "collect_only", "kill_owner", "output_kind"),
+    [
+        (1, False, False, "same"),
+        (2, False, False, "same"),
+        (1, True, False, "same"),
+        (2, True, False, "same"),
+        (1, False, True, "same"),
+        (2, False, False, "same-plan"),
+        (2, False, False, "owner-plan"),
+    ],
+)
+def test_same_result_output_is_exclusive_until_owner_exits(
+    tmp_path, monkeypatch, parallel, collect_only, kill_owner, output_kind
+):
+    import socket  # noqa: PLC0415
+
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    listener.settimeout(15)
+    source = f"""
+import os
+import socket
+from pathlib import Path
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("index", range(2))
+def test_direct(index):
+    actor = os.environ["OUTPUT_LOCK_ACTOR"]
+    Path(__file__).with_name(f"entered-{{actor}}-{{index}}").touch()
+    if actor == "owner":
+        with socket.create_connection({listener.getsockname()!r}, timeout=15) as connection:
+            assert connection.recv(1) == b"g"
+"""
+    scaffold, plan, xml = _run_pytest(tmp_path, source, "--collect-only")
+    _success(scaffold)
+    command = list(scaffold.args)
+    command.remove("--collect-only")
+    command.extend(["--device", "1,3", "--max-parallel", str(parallel)])
+    env = _pytest_subprocess_env()
+    clients = []
+    owner = subprocess.Popen(
+        command,
+        cwd=_ROOT,
+        env={**env, "OUTPUT_LOCK_ACTOR": "owner"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        for _ in range(parallel):
+            clients.append(listener.accept()[0])
+        original_plan = plan.read_bytes()
+        original_xml = xml.read_bytes()
+        contender_command = list(command)
+        if output_kind == "same-plan":
+            contender_command[contender_command.index("--junitxml") + 1] = str(xml.with_suffix(".junit"))
+        elif output_kind == "owner-plan":
+            contender_command[contender_command.index("--junitxml") + 1] = str(plan)
+        contender = subprocess.run(
+            contender_command + (["--collect-only"] if collect_only else []),
+            cwd=_ROOT,
+            env={**env, "OUTPUT_LOCK_ACTOR": "contender"},
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert contender.returncode == 4, contender.stdout + contender.stderr
+        assert "output already in use" in contender.stderr
+        assert not list(tmp_path.rglob("entered-contender-*"))
+        assert plan.read_bytes() == original_plan
+        assert xml.read_bytes() == original_xml
+        if output_kind == "same-plan":
+            assert not xml.with_suffix(".junit").exists()
+        assert owner.poll() is None
+        if kill_owner:
+            owner.kill()
+        else:
+            for client in clients:
+                client.sendall(b"g")
+            for _ in range(2 - parallel):
+                client = listener.accept()[0]
+                clients.append(client)
+                client.sendall(b"g")
+        output, _ = owner.communicate(timeout=20)
+        assert owner.returncode == (-signal.SIGKILL if kill_owner else 0), output
+        if not kill_owner:
+            test_environments.verify_results(plan, xml)
+        rerun = subprocess.run(
+            command,
+            cwd=_ROOT,
+            env={**env, "OUTPUT_LOCK_ACTOR": "after"},
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        _success(rerun)
+        assert len(list(tmp_path.rglob("entered-after-*"))) == 2
+        test_environments.verify_results(plan, xml)
+    finally:
+        for client in clients:
+            client.close()
+        listener.close()
+        if owner.poll() is None:
+            owner.terminate()
+        owner.communicate(timeout=10)
+
+
+def test_parallel_runs_share_output_parent_without_sharing_shards(tmp_path, monkeypatch):
+    import socket  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    listener.settimeout(20)
+    port = listener.getsockname()[1]
+    source = f"""
+import socket
+import pytest
+
+@pytest.mark.test_environment("torch_npu")
+@pytest.mark.parametrize("name", ["alpha", "bravo", "charlie", "delta"])
+def test_direct(name):
+    with socket.create_connection(("127.0.0.1", {port}), timeout=15) as connection:
+        assert connection.recv(1) == b"g"
+"""
+    result, _, _ = _run_pytest(tmp_path, source, "--collect-only")
+    _success(result)
+    errors = []
+
+    def release_all():
+        clients = []
+        try:
+            for _ in range(4):
+                clients.append(listener.accept()[0])
+            for client in clients:
+                client.sendall(b"g")
+        except OSError as error:
+            errors.append(error)
+        finally:
+            for client in clients:
+                client.close()
+            listener.close()
+
+    gate = threading.Thread(target=release_all, daemon=True)
+    gate.start()
+    children = []
+    try:
+        for label, expression in (("first", "alpha or bravo"), ("second", "charlie or delta")):
+            command = [
+                sys.executable,
+                "-m",
+                "pytest",
+                str(tmp_path / "tests/new_place/test_direct.py"),
+                "-c",
+                str(tmp_path / "pytest.ini"),
+                "--rootdir",
+                str(tmp_path),
+                "--confcutdir",
+                str(tmp_path),
+                "--platform",
+                "a2a3",
+                "--test-environment",
+                "torch_npu",
+                "--device",
+                "1,3",
+                "--max-parallel",
+                "2",
+                "-k",
+                expression,
+                "--junitxml",
+                str(tmp_path / f"{label}.xml"),
+            ]
+            children.append(
+                subprocess.Popen(
+                    command,
+                    cwd=_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=_pytest_subprocess_env(),
+                )
+            )
+        for child in children:
+            output, _ = child.communicate(timeout=30)
+            assert child.returncode == 0, output
+        assert not errors
+        for label in ("first", "second"):
+            test_environments.verify_results(tmp_path / f"{label}.plan.json", tmp_path / f"{label}.xml")
+        assert len(list(tmp_path.glob("*-shards-*"))) == 2
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+        listener.close()
+        gate.join(timeout=2)
 
 
 def test_actual_collection_plan_and_junit_follow_added_cases_and_changed_paths(tmp_path):

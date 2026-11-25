@@ -27,7 +27,7 @@ jobs:
   run:
     name: st-framework-${{ inputs.platform }}
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ inputs.platform == 'a5' && 60 || 45 }}
     env:
       TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
@@ -59,6 +59,44 @@ jobs:
         with:
           platform: ${{ inputs.platform }}
 
+      - name: Build framework artifacts
+        env:
+          CANN_ENV: ${{ steps.framework.outputs.cann_env }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          source "$CANN_ENV"
+          export PYTHONPATH="$FRAMEWORK_WHEEL_SITE${PYTHONPATH:+:$PYTHONPATH}"
+          mkdir -p outputs/framework-ci
+          .venv-framework/bin/python examples/workers/l2/framework_eager/main.py \
+            --compile-only --build-dir "$PWD/outputs/framework-ci/bridge"
+          cc -std=c11 -O2 -fPIC -shared -Wall -Wextra -Werror \
+            tests/st/worker/framework_eager/native_capture_destroy_shim.c \
+            -o outputs/framework-ci/native_capture_destroy_shim.so -ldl
+          .venv-framework/bin/python tools/framework_queue_gil/probe.py build \
+            --output "$PWD/outputs/framework-ci/native-probe"
+          .venv-framework/bin/python examples/workers/l2/framework_eager/warm_kernels.py \
+            --platform "$PLATFORM" --output outputs/framework-ci/kernel-warmup.json
+          .venv-framework/bin/python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("outputs/framework-ci").resolve()
+          warmup = json.loads((root / "kernel-warmup.json").read_text())
+          assets = Path(os.environ["FRAMEWORK_WHEEL_SITE"]) / "simpler_setup" / "_assets"
+          assert Path(warmup["project_root"]).resolve() == assets.resolve(), warmup
+          assert warmup["platform"] == os.environ["PLATFORM"], warmup
+          probes = list((root / "native-probe").glob("_framework_queue_gil_probe*.so"))
+          assert len(probes) == 1, probes
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              for name, path in (
+                  ("SIMPLER_FRAMEWORK_BUILD_DIR", root / "bridge"),
+                  ("SIMPLER_FRAMEWORK_NATIVE_PROBE", probes[0]),
+                  ("SIMPLER_FRAMEWORK_DESTROY_SHIM", root / "native_capture_destroy_shim.so"),
+              ):
+                  print(f"{name}={path}", file=output)
+          PY
+
       - name: Run framework scene tests
         env:
           CANN_ENV: ${{ steps.framework.outputs.cann_env }}
@@ -69,14 +107,16 @@ jobs:
           mkdir -p outputs/framework-ci
           git rev-parse HEAD | tee outputs/framework-ci/source.txt
           task-submit --list
-          task-submit --env CANN_ENV --env MANUAL_MODE --env PLATFORM --env PYTEST_ADDOPTS --env FRAMEWORK_WHEEL_SITE --timeout 2100 --max-time 1200 --device auto --device-num 1 \
+          task-submit --env CANN_ENV --env MANUAL_MODE --env PLATFORM --env PYTEST_ADDOPTS --env FRAMEWORK_WHEEL_SITE \
+            --env SIMPLER_FRAMEWORK_BUILD_DIR --env SIMPLER_FRAMEWORK_NATIVE_PROBE --env SIMPLER_FRAMEWORK_DESTROY_SHIM \
+            --timeout 2100 --max-time 1200 --device auto --device-num 4 \
             --run "source \"\$CANN_ENV\" && \
               export PYTHONPATH=\"\$FRAMEWORK_WHEEL_SITE\${PYTHONPATH:+:\$PYTHONPATH}\" && \
               .claude/skills/onboard-arch-precheck/check.sh \"\$PLATFORM\" && \
               npu-smi info > outputs/framework-ci/npu-smi.txt && \
               .venv-framework/bin/python .github/actions/setup-framework/identity.py --platform \"\$PLATFORM\" && \
               .venv-framework/bin/python -m pytest examples tests/st --platform \"\$PLATFORM\" --test-environment torch_npu --environment-receipts --verify-feature-coverage --coverage-partition all \
-              --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s \
+              --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 4 -p no:xdist -v -s \
               --basetemp outputs/framework-ci/pytest --junitxml outputs/framework-ci/results.xml"
           .venv-framework/bin/python -m simpler_setup.test_environments verify outputs/framework-ci/results.plan.json outputs/framework-ci/results.xml
 
@@ -112,4 +152,7 @@ jobs:
           path: |
             outputs/framework-ci
             !outputs/framework-ci/pytest/framework-eager-module*/**
+            !outputs/framework-ci/bridge/**
+            !outputs/framework-ci/native-probe/**
+            !outputs/framework-ci/native_capture_destroy_shim.so
           if-no-files-found: warn

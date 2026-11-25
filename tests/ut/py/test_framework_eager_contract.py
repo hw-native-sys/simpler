@@ -30,6 +30,77 @@ _CASES = {
 }
 
 
+def test_kernel_warmup_refuses_device_allocation_before_import_or_compile(tmp_path):
+    (tmp_path / "sitecustomize.py").write_text(
+        "import sys\n"
+        "class RejectBackend:\n"
+        "    def find_spec(self, fullname, *args):\n"
+        "        if fullname.split('.')[0] in {'torch', 'torch_npu', '_task_interface', 'simpler_setup'}:\n"
+        "            raise AssertionError('device-stage preparation imported ' + fullname)\n"
+        "sys.meta_path.insert(0, RejectBackend())\n"
+    )
+    output = tmp_path / "warmup.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_ROOT / "examples/workers/l2/framework_eager/warm_kernels.py"),
+            "--platform",
+            "a2a3",
+            "--output",
+            str(output),
+        ],
+        env={**os.environ, "TASKQUEUE_INSIDE": "1", "TASK_DEVICE": "0", "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "outside a device allocation" in result.stderr
+    assert "AssertionError" not in result.stderr
+    assert not output.exists()
+
+
+def test_prepared_bridge_entry_does_not_compile(tmp_path, monkeypatch):
+    import importlib.util  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location(
+        "framework_bridge_entry", _ROOT / "examples/workers/l2/framework_eager/main.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    bridge = tmp_path / "bridge.so"
+    bridge.write_bytes(b"CPU CLI contract")
+    observed = []
+
+    def unexpected_build(_):
+        pytest.fail("Prepared bridge must be loaded without rebuilding")
+
+    monkeypatch.setattr(module, "build_bridge", unexpected_build)
+    monkeypatch.setattr(module, "run", lambda *args, **kwargs: observed.append((args, kwargs)))
+    monkeypatch.setattr(sys, "argv", ["main.py", "--bridge", str(bridge), "--device", "7", "--platform", "a5"])
+    module.main()
+    assert observed[0][0][1:3] == (7, bridge)
+    assert observed[0][1] == {"platform": "a5"}
+
+
+def test_prepared_native_probe_fixture_does_not_compile(tmp_path, monkeypatch):
+    import runpy  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    fixture = runpy.run_path(str(_ST.with_name("test_native_submission.py")))["native_submit_probe"].__wrapped__
+    probe = tmp_path / "probe.so"
+    probe.write_bytes(b"CPU fixture contract")
+    monkeypatch.setenv("SIMPLER_FRAMEWORK_NATIVE_PROBE", str(probe))
+
+    def unexpected_build(*args, **kwargs):
+        pytest.fail("Prepared native probe must not be rebuilt")
+
+    monkeypatch.setitem(fixture.__globals__, "subprocess", SimpleNamespace(run=unexpected_build))
+    assert fixture(None) == probe
+
+
 def _run_selected_contract(tmp_path, *, missing, platform="a2a3"):
     # Only the external compiler/device subprocess is replaced. Pytest executes
     # the actual fixture, four parameterizations, and consumer JSON assertions.
@@ -71,10 +142,11 @@ def cpu_transport():
     def run(command, **kwargs):
         assert kwargs["env"]["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
         if "--compile-only" in command:
-            module = Path(command[command.index("--build-dir") + 1]) / "cpu-contract.so"
+            module = Path(command[command.index("--build-dir") + 1]) / "_simpler_framework_queue_cpu-contract.so"
             module.write_bytes(b"CPU test transport; no framework code")
             output = "FRAMEWORK_QUEUE_MODULE " + str(module) + "\\n"
         else:
+            assert "--bridge" in command and "--build-dir" not in command
             runtime = command[command.index("--runtime") + 1]
             assert command[command.index("--platform") + 1] == {platform!r}
             queue = kwargs["env"]["TASK_QUEUE_ENABLE"]
@@ -138,13 +210,17 @@ def pytest_sessionfinish(session):
         text=True,
         timeout=60,
         check=False,
-        env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        env={
+            **{key: value for key, value in os.environ.items() if key != "SIMPLER_FRAMEWORK_BUILD_DIR"},
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        },
     )
     return result, ET.parse(tmp_path / "results.xml").getroot().findall(".//testcase")
 
 
 @pytest.mark.parametrize("platform", ["a2a3", "a5"])
-def test_selected_framework_matrix_has_four_passed_junit_cases(tmp_path, platform):
+def test_selected_framework_matrix_has_four_passed_junit_cases(tmp_path, monkeypatch, platform):
+    monkeypatch.setenv("SIMPLER_FRAMEWORK_BUILD_DIR", str(tmp_path / "external-prepared-bridge"))
     result, cases = _run_selected_contract(tmp_path, missing=None, platform=platform)
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(cases) == 4

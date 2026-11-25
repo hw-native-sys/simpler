@@ -274,6 +274,56 @@ def execution_mode(item, default=None) -> str:
     return test_coverage.execution_mode(item, default=default)
 
 
+def claim_result_output(config) -> None:
+    """Hold the receipt output through pytest cleanup, before JUnit registers."""
+    name = config.getoption("--test-environment", default="default")
+    opted_in = config.getoption("--environment-receipts", default=False)
+    xmlpath = config.getoption("xmlpath", default=None)
+    # xdist workers do not write JUnit; their controller owns the output lock.
+    if hasattr(config, "workerinput") or not xmlpath or (_environment(name).execution != "direct" and not opted_in):
+        return
+
+    import fcntl  # noqa: PLC0415
+    from contextlib import ExitStack  # noqa: PLC0415
+
+    import pytest  # noqa: PLC0415
+
+    if config.getoption("--environment-parent-plan", default=None):
+        output = Path(xmlpath).resolve()
+    else:
+        output = Path(os.path.expandvars(str(xmlpath))).expanduser().resolve()
+    plan = output.with_suffix(".plan.json")
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    # The lock inode remains stable across owners; removing it permits a
+    # second inode to be locked while another process still holds the first.
+    locks = ExitStack()
+    try:
+        config.add_cleanup(locks.close)
+        for artifact in sorted({output, plan.resolve()}):
+            lock = locks.enter_context(artifact.with_name(artifact.name + ".lock").open("a"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        locks.close()
+        raise pytest.UsageError(f"Test result output already in use: {output}") from None
+    except BaseException:
+        locks.close()
+        raise
+    config._environment_xmlpath = output
+
+
+def configure_result_output(config) -> None:
+    """Bind JUnit to the claimed path after its normal option expansion."""
+    output = getattr(config, "_environment_xmlpath", None)
+    if output is None:
+        return
+    from _pytest.junitxml import LogXML  # noqa: PLC0415
+
+    for plugin in config.pluginmanager.get_plugins():
+        if isinstance(plugin, LogXML):
+            plugin.logfile = str(output)
+    config.option.xmlpath = str(output)
+
+
 def prepare_session(session) -> None:  # noqa: PLR0912
     """Freeze the final collection once; default keeps its existing dispatcher."""
     import pytest  # noqa: PLC0415
@@ -571,10 +621,55 @@ def verify_result_files(  # noqa: PLR0912
     )
 
 
+def update_direct_cache(session) -> None:
+    """Let the controller retain every shard's last-failed outcomes."""
+    results = getattr(session, "_direct_environment_results", None)
+    if results is None:
+        return
+    plugin = session.config.pluginmanager.get_plugin("lfplugin")
+    if plugin is None:
+        return
+    for path, members in results:
+        outcomes = {}
+        try:
+            root = ET.parse(path).getroot()
+        except (OSError, ET.ParseError, LookupError):
+            pass
+        else:
+            for case in root.iter("testcase"):
+                prop = case.find("properties/property[@name='simpler_nodeid']")
+                nodeid = prop.get("value") if prop is not None else None
+                if nodeid in members:
+                    failed = any(child.tag in {"failure", "error"} for child in case)
+                    outcomes[nodeid] = outcomes.get(nodeid, False) or failed
+        for nodeid in members:
+            # An incomplete shard cannot establish that an assigned case passed.
+            if outcomes.get(nodeid, True):
+                plugin.lastfailed[nodeid] = True
+            else:
+                plugin.lastfailed.pop(nodeid, None)
+
+
 def finish_session(session) -> None:
     receipt = getattr(session, "_test_environment_receipt", None)
     if receipt is not None:
         try:
+            direct_results = getattr(session, "_direct_environment_results", None)
+            if direct_results is not None:
+                merged = ET.Element("testsuites")
+                for path, members in direct_results:
+                    try:
+                        root = ET.parse(path).getroot()
+                    except (OSError, ET.ParseError, LookupError) as error:
+                        session.exitstatus = 1
+                        print(
+                            f"TEST_ENVIRONMENT_SHARD_UNREADABLE {path}: {error}; cases={members}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    merged.extend(list(root) if root.tag == "testsuites" else [root])
+                ET.ElementTree(merged).write(receipt[1], encoding="utf-8", xml_declaration=True)
             results = getattr(session.config, "_environment_results", None)
             if results is None:
                 verify_results(*receipt)

@@ -152,10 +152,13 @@ thread. Golden values are checked only after every framework successor has
 been enqueued and the final framework stream completion boundary returns.
 
 The system tests cover both runtimes and both policies. A session-scoped
-fixture builds the optional bridge artifact once. The additional consumer
-CLIs load the unique existing artifact, building only when it is absent; the
-original same-stream CLI still checks its incremental build cache. All use
-the original `build_bridge` / `_load_bridge` helpers. The
+fixture reuses `SIMPLER_FRAMEWORK_BUILD_DIR` when supplied or builds the optional
+bridge in its session directory. The same-stream CLI receives the exact `.so`
+through `--bridge`; the other consumers load the unique existing artifact,
+building only when it is absent. `warm_kernels.py --platform <arch> --output <file>`
+populates the consumers' kernel cache before device allocation using the same
+Python, CANN environment and `PYTHONPATH` as the device run. All consumers use
+the shared `build_bridge` / `_load_bridge` helpers. The
 `test_environment("torch_npu")` marker selects an isolated framework venv in the
 dedicated `st-framework-a2a3` and `st-framework-a5` PR and Daily jobs. The default environment
 automatically deselects these tests; no directory exclusion is needed.

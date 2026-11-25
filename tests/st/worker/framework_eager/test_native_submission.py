@@ -29,6 +29,11 @@ pytestmark = [
 
 @pytest.fixture(scope="session")
 def native_submit_probe(tmp_path_factory):
+    prepared = os.environ.get("SIMPLER_FRAMEWORK_NATIVE_PROBE")
+    if prepared:
+        path = Path(prepared)
+        assert path.is_file(), f"Prepared native submission probe is missing: {path}"
+        return path
     directory = tmp_path_factory.mktemp("native-submit-probe")
     built = subprocess.run(
         [sys.executable, str(ROOT / "tools/framework_queue_gil/probe.py"), "build", "--output", str(directory)],

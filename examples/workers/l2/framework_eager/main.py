@@ -288,10 +288,15 @@ def main():
     parser.add_argument("--calls", type=int, default=3)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/framework_eager")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--bridge", type=Path, help="Load an existing compiled bridge without rebuilding it")
     options = parser.parse_args()
     if options.calls < 1:
         parser.error("--calls must be positive")
-    path = build_bridge(options.build_dir)
+    if options.bridge and options.compile_only:
+        parser.error("--bridge cannot be used with --compile-only")
+    path = options.bridge if options.bridge else build_bridge(options.build_dir)
+    if not path.is_file():
+        parser.error(f"framework bridge does not exist: {path}")
     print("FRAMEWORK_QUEUE_MODULE " + str(path), flush=True)
     if not options.compile_only:
         run(options.runtime, options.device, path, options.calls, platform=options.platform)

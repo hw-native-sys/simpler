@@ -23,12 +23,79 @@ its final collection to the adjacent `.plan.json` file, executes it, then checks
 its actual JUnit against that plan. The plan retains the actual preflight
 identity, including CANN manifest version and host architecture. Source,
 environment and canonical nodeids must match, and every selected case must pass
-exactly once. Empty collection,
+exactly once. The result and adjacent plan are both held under nonblocking session
+locks in a common namespace until pytest cleanup. A concurrent invocation using either artifact is
+rejected before JUnit registers, including collect-only runs; different result
+files with distinct plans remain independent. Adjacent `.lock` files remain on disk, while their
+OS locks are released when the owner exits. Empty collection,
 missing/foreign/duplicate cases and any skip/error/failure are errors. This
 strict mode supports direct execution only. SceneTestCase, resource dispatch
 and xdist are rejected; default sweeps keep their existing execution strategy.
+An explicitly supplied device pool and `--max-parallel N` can partition direct
+tests across independent pytest subprocesses, with one physical device per
+subprocess. The controller preserves the original selection and execution
+options and merges the disjoint results into the requested JUnit file before
+checking the full immutable collection plan. `--max-parallel 1` retains serial
+execution. `--pdb` and `--trace` also execute serially in the controller, even
+with multiple devices, so debugger input and output remain interactive.
+`-x`, a nonzero `--maxfail`, and stepwise modes also use the controller's serial
+loop to retain pytest's global stop semantics; `--maxfail=0` keeps parallel execution enabled.
+An active pytest file log (`--log-file` or ini `log_file`) also uses the serial
+controller so subprocesses cannot truncate or overwrite that file. The default
+`/dev/null` handler and disabled logging plugin leave parallel execution enabled.
+Framework CI allocates four physical devices and uses `--max-parallel 4` on both
+platforms. Single-device callers retain their existing direct execution.
+Per-shard logs and results are retained beside the parent plan under a unique
+`<plan-stem>-shards-*` directory for each invocation. Failed, skipped, duplicate or missing receipts
+still fail the complete run.
+The controller owns pytest's last-failed cache and combines all shard outcomes;
+children retain cache-based selection but do not write last-failed or nodeid caches.
+With `-s` or `--capture=tee-sys`, shard output is streamed while tests run and retained in each shard log.
+Shard stdout/stderr is flushed to its log as it is read, independently of completion
+callbacks, and remaining output is drained during handled interruption. Child-side
+buffering still follows pytest capture and Python rules; a log write error fails the run.
+Readable shard XML is retained in the aggregate even when another shard crashes;
+the missing shard and its assigned cases are reported as an error. Shards run
+in separate process groups, which are terminated on timeout or interruption.
 Collect-only and compile warm-up select environments without importing or
 checking optional dependencies and do not emit execution plans.
+
+For hardware runs, install dependencies and build the framework bridge before
+requesting devices. Populate the managed PTO-ISA checkout by calling
+`simpler_setup.pto_isa.ensure_pto_isa_root()` with the same installed-wheel
+`PYTHONPATH` used by the device job; warming the source checkout alone does not
+populate the installed assets' cache. `framework_eager/main.py --compile-only --build-dir <dir>`
+prepares the bridge; exporting `SIMPLER_FRAMEWORK_BUILD_DIR=<absolute-dir>` makes
+the fixture reuse it. Without that explicit setting the fixture retains its
+existing session-local build. Run
+`python examples/workers/l2/framework_eager/warm_kernels.py --platform <arch> --output <warmup.json>`
+outside the allocation with the same Python, CANN environment and `PYTHONPATH`
+as the device run. It calls the consumers' own compile entries for both runtimes,
+including lifecycle x/y and HOST-control value arguments, and records each
+callable's size and SHA256 plus the resolved kernel-cache and PTO-ISA paths.
+The command refuses a device allocation before importing the backend.
+Use its recorded paths to check that the device process consumes the same cache;
+source, native ABI or compiler changes require warming it again. Cache misses
+retain the compiler's normal rebuild behavior, so a passing device run alone
+does not prove that compilation stayed outside the allocation. Audit compiler
+execution separately when validating the prepared run.
+The destroy-refusal case can reuse a precompiled shim through
+`SIMPLER_FRAMEWORK_DESTROY_SHIM=<absolute-so-path>`; build it from
+`tests/st/worker/framework_eager/native_capture_destroy_shim.c` using
+`cc -std=c11 -O2 -fPIC -shared -Wall -Wextra -Werror <source> -o <output> -ldl`
+before allocation. The eager entry point accepts `--bridge <existing-so>` to
+load the prepared bridge without any relinking.
+The GIL submission tests can reuse `SIMPLER_FRAMEWORK_NATIVE_PROBE=<absolute-so-path>`;
+prepare it with `python tools/framework_queue_gil/probe.py build --output <dir>`
+before allocation. These opt-in prepared paths leave existing callers' local
+fixture fallbacks available.
+
+After preparation, an allocated four-card run can use the existing pytest
+selection with `--device "$TASK_DEVICE" --max-parallel 4 -p no:xdist`.
+Pass the prepared paths through `task-submit --env` and perform the architecture
+precheck inside that same allocation. Use `--max-parallel 1` as the serial
+control and compare the complete selected-case receipts across both runs;
+elapsed time alone does not prove that the same tests ran.
 
 The ScopeStats consumer uses the same declared environment and shared bridge.
 It checks off/on/on/off selection, per-call exports and nested scope attribution
@@ -54,8 +121,8 @@ Its same-stream, cross-stream, alias/INOUT, callback-failure recovery and
 per-call-value and persistent-DEVICE-state modules are discovered by their
 environment declaration; adding
 a module does not require an expected-nodeid list or workflow path edit. Run the
-declared environment serially under one
-exclusive device allocation; a filtered plan proves only that filtered set.
+declared environment under an exclusive device allocation. Use one device with
+`--max-parallel 1` as the serial control; a filtered plan proves only that filtered set.
 The recovery consumer also exercises the public direct-chip close path: accepted
 handles are drained before workspace ownership can be released, without
 individual user waits. Native timeout/context refusals and retryable close debt
