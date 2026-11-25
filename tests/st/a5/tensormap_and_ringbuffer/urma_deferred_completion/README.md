@@ -1,6 +1,6 @@
 # URMA deferred completion validation
 
-These A5 `tensormap_and_ringbuffer` transfer regressions run two ranks with a registered
+These A5 `tensormap_and_ringbuffer` transfer regressions run two or three ranks with a registered
 communication window. Every transfer is followed by an add-one consumer that
 depends on the transfer output. Both the copied bytes and consumer result are
 checked against a host golden.
@@ -9,6 +9,9 @@ checked against a host golden.
 | ---- | -------- | ------------------------ |
 | `TestUrmaGet` | TGET from peer input | 1 |
 | `TestUrmaPut` | TPUT to peer receive window, then dependent TGET readback | 1 |
+| `TestUrmaGatherScatter` | Gather PUT to peer receive window, dependent Scatter GET into local registered readback, then add-one consumer | 2 disjoint transfers per AIV with a session built for each request; both lanes in the same cluster submit |
+| `TestUrmaNativeWait` | Same payload and dependent consumer as Gather/Scatter; after posting A both siblings rendezvous and use native ISA to submit and wait on B | 1 deferred + 1 native per lane and direction on the same jetty |
+| `TestUrmaMultiPeerSession` | With three ranks, a single session uses tensor and Gather PUTs to the right neighbor, Scatter GETs from the left, and a tensor GET to read back both PUTs | Simpler and native descriptor calls on each peer; checks registered queue rows and rank-specific data |
 | `TestUrmaRepeatedFetch` | TGET from peer input | 16 |
 | `TestUrmaRepeatedPut` | TPUT plus dependent readback | 16 |
 | `TestUrmaChunkedFetch` (temporarily skipped) | Static-shape TGET of 256 MiB + 32 KiB | 1 logical request, split by the adapter |

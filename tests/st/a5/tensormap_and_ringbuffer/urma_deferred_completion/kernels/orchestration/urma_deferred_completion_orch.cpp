@@ -40,8 +40,18 @@ __attribute__((visibility("default"))) void urma_deferred_completion_orchestrati
     const uint32_t mode = orch_args.scalar<uint32_t>(2);
     const uint32_t repeats = orch_args.scalar<uint32_t>(3);
 
+    auto submit_transfer = [mode](CoreTaskArgs &args) {
+        if (mode >= 2) {
+            // Both vector lanes in one cluster share the native CCE block index.
+            MixedKernels lanes;
+            lanes.aiv0_kernel_id = 0;
+            lanes.aiv1_kernel_id = 0;
+            return rt_submit_task(lanes, args);
+        }
+        return rt_submit_aiv_task(0, args);
+    };
     simpler::tmr::Tensor gate = input;
-    if (mode == 1) {
+    if (mode == 1 || mode == 2 || mode == 4) {
         uint32_t marker_shape[1] = {1};
         TensorCreateInfo marker(marker_shape, 1, DataType::INT32);
         CoreTaskArgs put;
@@ -51,23 +61,23 @@ __attribute__((visibility("default"))) void urma_deferred_completion_orchestrati
         put.add_input(input);
         put.add_scalar(comm_ctx);
         put.add_scalar(elems);
-        put.add_scalar(1);
+        put.add_scalar(mode);
         put.add_scalar(repeats);
-        TaskOutputTensors put_outputs = rt_submit_aiv_task(0, put);
+        TaskOutputTensors put_outputs = submit_transfer(put);
         gate = put_outputs.get_ref(0);
     }
 
     // A PUT successor reads the region written on the peer only after PUT completion.
     CoreTaskArgs get;
-    get.add_input(mode == 1 ? receive : input);
-    get.add_input(mode == 1 ? receive : input);
+    get.add_input(mode == 0 || mode == 6 ? input : receive);
+    get.add_input(mode != 0 ? receive : input);
     get.add_output(out);
     get.add_input(gate);
     get.add_scalar(comm_ctx);
     get.add_scalar(elems);
-    get.add_scalar(0);
+    get.add_scalar(mode == 6 ? mode : (mode >= 2 ? mode + 1 : 0));
     get.add_scalar(mode == 1 ? 1 : repeats);
-    rt_submit_aiv_task(0, get);
+    submit_transfer(get);
 
     CoreTaskArgs consumer;
     consumer.add_input(out);

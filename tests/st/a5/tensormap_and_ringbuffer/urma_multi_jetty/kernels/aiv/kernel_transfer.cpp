@@ -62,8 +62,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
     const auto &workspace_desc = comm_workspace<CommWorkspaceKind::URMA>(*comm);
     auto *workspace = reinterpret_cast<__gm__ uint8_t *>(workspace_desc.addr);
-    pto::comm::AsyncSession session;
-    if (!simpler::urma::build_urma_session(ctx.urma_sender_id, workspace, 1, session)) {
+    simpler::urma::UrmaSession session;
+    if (!simpler::urma::build_urma_session(ctx, workspace_desc, session, 1)) {
         fail(ctx, record, -2);
         return;
     }
@@ -110,8 +110,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     const uint32_t before = *ctx.completion_count;
     record->begin_cycles = get_sys_cnt();
     for (uint32_t rep = 0; rep < repeats; ++rep) {
-        const bool ok = mode == 1 ? send_request_entry(ctx, UrmaTput(dst, src, workspace, 1)) :
-                                    send_request_entry(ctx, UrmaTget(dst, src, workspace, 1));
+        const bool ok = mode == 1 ? send_request_entry(ctx, UrmaTput(dst, src, workspace_desc, 1)) :
+                                    send_request_entry(ctx, UrmaTget(dst, src, workspace_desc, 1));
         if (!ok) {
             fail(ctx, record, -4);
             return;
