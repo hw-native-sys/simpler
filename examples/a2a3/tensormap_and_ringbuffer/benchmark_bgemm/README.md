@@ -25,10 +25,10 @@ them comparable:
 | ---- | ------------ | ---------------- | ---------- | ----------- | ------ | -------- | -------- |
 | `Case1` | no | no | 64 | 128 | 4 | 2 | the reference point |
 | `Case2` | no | no | 256 | 128 | 4 | 2 | 4× the tasks |
-| `Case0` | **yes** | **yes** | 500 | 128 | 4 | 2 | ~8× the tasks |
+| `Case0` | **yes** | no | 500 | 128 | 4 | 2 | ~8× the tasks |
 | `Case3` | no | no | 64 | 128 | 16 | 2 | 4× the work per task, same task count |
 | `Case4` | no | no | 64 | 128 | 4 | 4 | twice the accumulation depth |
-| `Bgemm64` | no | **yes** | 32 | 64 | 1 | 4 | small tiles, minimal per-task work |
+| `Bgemm64` | no | no | 32 | 64 | 1 | 4 | small tiles, minimal per-task work |
 
 `Case2` against `Case3` is the interesting pair: both quadruple the total
 matmul work relative to `Case1`, one by adding tasks and one by making each
@@ -36,21 +36,23 @@ task bigger.
 
 ## The default run differs by platform
 
-`Case1`–`Case4` are manual on both platforms. `Bgemm64` is manual only on
-`a2a3sim`, so the Sim Per-PR run keeps the larger `Case0`, while the Onboard
-Per-PR run continues to execute both `Case0` and `Bgemm64`:
+`Case1`–`Case4` and `Bgemm64` are manual on both platforms. `Case0` is
+automatic on `a2a3sim` and manual on `a2a3`. The Sim Per-PR run keeps
+`Case0`; the Onboard Per-PR sweep excludes this benchmark. Daily includes
+all six cases on both platforms:
 
 ```bash
 # Sim default — Case0 only, 1 of 6 cases
 pytest examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm --platform a2a3sim
 
-# Onboard default — Case0 + Bgemm64, 2 of 6 cases
-pytest examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm --platform a2a3 --device 0
+# Onboard explicit single case — Case0 only
+pytest examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm \
+  --platform a2a3 --device 0 --manual include --case Case0
 
 # all six on either platform
 pytest examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm --platform a2a3sim --manual include
 
-# Sim Daily selection — Case1–Case4 + Bgemm64, 5 of 6 cases
+# Sim manual-only selection — Case1–Case4 + Bgemm64, 5 of 6 cases
 pytest examples/a2a3/tensormap_and_ringbuffer/benchmark_bgemm --platform a2a3sim --manual only
 ```
 

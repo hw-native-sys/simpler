@@ -52,6 +52,7 @@ class TestBenchmarkBgemm(SceneTestCase):
         {
             "name": "Case0",
             "platforms": ["a2a3sim", "a2a3"],
+            "manual": ["a2a3"],
             "params": {"matmul_add_task_num": 500, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
         },
         {
@@ -81,7 +82,7 @@ class TestBenchmarkBgemm(SceneTestCase):
         {
             "name": "Bgemm64",
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3sim"],
+            "manual": ["a2a3sim", "a2a3"],
             "params": {"matmul_add_task_num": 32, "incore_data_size": 64, "incore_loop": 1, "grid_k": 4},
         },
     ]

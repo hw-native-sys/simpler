@@ -65,6 +65,7 @@ class TestPagedAttentionUnrollHostBuildGraph(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "params": {
                 "batch": 256,
                 "num_heads": 16,

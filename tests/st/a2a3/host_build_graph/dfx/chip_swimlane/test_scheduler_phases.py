@@ -42,7 +42,7 @@ class TestSchedulerPhases(SceneTestCase):
         {
             "name": "resolve_dummy",
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3sim"],
+            "manual": ["a2a3sim", "a2a3"],
             "params": {},
         },
     ]

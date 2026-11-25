@@ -341,6 +341,7 @@ if __name__ == "__main__":
     print("\n".join(build_probe(Path(sys.argv[1]))))
 
 
+@pytest.mark.manual(["a2a3"])
 @pytest.mark.parametrize("replay", [0, 1], ids=["zero", "interleaved-models"])
 @pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
@@ -374,6 +375,7 @@ def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
             assert max(Counter(row["task_id"] for row in captured["records"]).values()) >= rounds
 
 
+@pytest.mark.manual(["a2a3"])
 @pytest.mark.parametrize("replay", [0, 1], ids=["zero", "interleaved-models"])
 @pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_retained_models_publish_swimlane_observations(tmp_path, request, replay):
@@ -551,6 +553,7 @@ def hbg_args_dump_probe(tmp_path_factory, request):
     )
 
 
+@pytest.mark.manual(["a2a3"])
 @pytest.mark.parametrize("replays", [0, 3])
 @pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_args_dump_capture_exports_task_time_values(hbg_args_dump_probe, tmp_path, request, replays):

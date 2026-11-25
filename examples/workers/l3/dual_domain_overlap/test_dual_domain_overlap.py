@@ -16,7 +16,7 @@ from .main import run
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(3)
-@pytest.mark.manual(["a2a3sim", "a5sim"])
+@pytest.mark.manual(["a2a3sim", "a5sim", "a2a3"])
 def test_dual_domain_overlap(st_platform, st_device_ids):
     rc = run(st_platform, [int(d) for d in st_device_ids])
     assert rc == 0

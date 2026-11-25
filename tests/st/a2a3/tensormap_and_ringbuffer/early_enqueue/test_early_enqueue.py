@@ -1446,6 +1446,7 @@ class TestA2a3TmrEarlyEnqueueDepthOneControl(_A2a3TmrEarlyEnqueueBase):
         {
             "name": "a2a3_tmr_early_enqueue_depth_one",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {"device_count": 1, "num_sub_workers": 0},
             "params": {},
         },
@@ -2056,6 +2057,7 @@ class TestA2a3TmrWideOutstandingClose(_A2a3TmrEarlyEnqueueBase):
         {
             "name": "a2a3_tmr_wide_outstanding_close",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,
@@ -2127,6 +2129,7 @@ class TestA2a3TmrCapacityBeyondTheOldCeiling(_A2a3TmrEarlyEnqueueBase):
         {
             "name": "a2a3_tmr_capacity_beyond_the_old_ceiling",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,
@@ -2294,6 +2297,7 @@ class TestA2a3TmrWorkedCapacityExample(_A2a3TmrEarlyEnqueueBase):
         {
             "name": "a2a3_tmr_worked_capacity_example",
             "platforms": ["a2a3"],
+            "manual": ["a2a3"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,

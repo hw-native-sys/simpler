@@ -50,6 +50,7 @@ class TestDumpArgsExample(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3sim", "a2a3"],
+            "manual": ["a2a3"],
             "params": {},
         },
     ]

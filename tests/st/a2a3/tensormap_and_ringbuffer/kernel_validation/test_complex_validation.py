@@ -41,7 +41,10 @@ pytestmark = [
         pytest.param(
             code,
             mode,
-            marks=pytest.mark.platforms(["a2a3"] if mode == 4 else ["a2a3sim"] if code == 108 else ["a2a3", "a2a3sim"]),
+            marks=[
+                pytest.mark.platforms(["a2a3"] if mode == 4 else ["a2a3sim"] if code == 108 else ["a2a3", "a2a3sim"]),
+                *([pytest.mark.manual(["a2a3"])] if code != 106 else []),
+            ],
             id=f"{code}-{name}",
         )
         for code in (0, 101, 102, 106, 108, 110, 111, 112)

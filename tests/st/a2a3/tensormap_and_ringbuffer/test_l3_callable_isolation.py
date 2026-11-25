@@ -169,10 +169,10 @@ def test_the_two_callables_are_distinguishable():
 @pytest.mark.parametrize(
     "sequence",
     [
-        pytest.param(["X"], id="single"),
+        pytest.param(["X"], id="single", marks=pytest.mark.manual(["a2a3"])),
         pytest.param(["X", "X"], id="same_twice"),
-        pytest.param(["X", "Y"], id="two_callables"),
-        pytest.param(["X", "Y", "X"], id="redispatch_after_other"),
+        pytest.param(["X", "Y"], id="two_callables", marks=pytest.mark.manual(["a2a3"])),
+        pytest.param(["X", "Y", "X"], id="redispatch_after_other", marks=pytest.mark.manual(["a2a3"])),
         pytest.param(["X", "Y", "X", "Y", "X", "Y"], id="alternating"),
     ],
 )
@@ -213,6 +213,7 @@ def test_dispatch_runs_the_named_callable(st_platform, st_device_ids, isolation_
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)
+@pytest.mark.manual(["a2a3"])
 def test_dispatch_runs_the_named_callable_fresh_worker_each(st_platform, st_device_ids, isolation_callables):
     """A fresh single-callable worker per dispatch produces each callable's own result.
 

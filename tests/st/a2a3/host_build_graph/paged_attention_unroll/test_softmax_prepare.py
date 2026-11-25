@@ -44,7 +44,11 @@ class TestSoftmaxPrepare(SceneTestCase):
             "name": f"m{m}_blocks{blocks}_valid{valid}_peak{peak}",
             "platforms": ["a2a3"],
             "params": {"m": m, "n": n, "blocks": blocks, "valid": valid, "peak": peak},
-            **({} if peak is None or (m, blocks, peak) == (16, 2, 0) else {"manual": True}),
+            **(
+                {}
+                if (m, blocks, valid, peak) in ((16, 1, 1, None), (16, 2, 127, 0), (64, 1, 64, None), (64, 65, 1, None))
+                else {"manual": ["a2a3"]}
+            ),
         }
         for m, n in ((16, 128), (64, 64))
         for blocks in (1, 2, 3, 4, 65)
