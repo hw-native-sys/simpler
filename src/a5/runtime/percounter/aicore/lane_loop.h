@@ -65,7 +65,6 @@ struct LaneConfig {
     mutable uint64_t last_exit_poll{0};
     __gm__ PercounterControl *control;
     __gm__ PercounterCounter *counters;
-    __gm__ uint64_t *sync_notify;
     uint64_t task_count;
     __gm__ pto2::resident::AsyncGroupData *async_group;
     __gm__ DeferredCompletionEntry *async_entries;
@@ -345,8 +344,6 @@ inline __aicore__ AicoreWorkWindow run_percounter_lane(
     }
     ProfileScope setup_scope(cfg.scalar, ProfilePhase::LaneSetup);
     cfg.control = control;
-    cfg.sync_notify =
-        control->sync_notify_offset == 0 ? nullptr : scheduler_state_at<uint64_t>(control, control->sync_notify_offset);
     cfg.counters = scheduler_state_at<PercounterCounter>(control, control->counters_offset);
     cfg.task_count = control->task_count;
     if (control->table_task_count != control->graph_storage_count) {

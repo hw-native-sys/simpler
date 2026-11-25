@@ -387,11 +387,10 @@ inline bool plan_calendar_waits(
 
         const size_t id = gate_tasks[node - gate_base];
         if (id == task_count) continue;
-        // START requires every participating worker's previous row to
-        // retire before any block enters its kernel. Its resource prefix
-        // therefore already covers any input completed in that prefix.
+        // The cohort edges validate progress if blocks wait inside their
+        // kernels. Only the local gate's prefix is guaranteed before entry.
         for (const size_t parent : parents[node]) {
-            if (parent < gate_base || parent >= cohort_base) merge(node, parent);
+            if (parent < gate_base) merge(node, parent);
         }
         for (const size_t edge : ordered_inputs[id]) {
             const auto pred = static_cast<size_t>(tasks[id].fanin_ids[edge]);

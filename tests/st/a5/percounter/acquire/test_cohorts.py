@@ -157,3 +157,79 @@ def test_mask_cohorts(st_platform, st_device_ids, tmp_path, mask, partial, asser
                 worker.free(buffer)
         finally:
             worker.close()
+
+
+def build_entry_order_callable(platform):
+    acquire = Path(__file__).resolve().parent
+    hbg = acquire.parents[1] / "host_build_graph"
+    spec = {
+        "orchestration": {
+            "source": str(acquire / "kernels/orchestration/cohort_entry_order.cpp"),
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.INOUT, D.INOUT],
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "source": str(hbg / "spmd_cohort_with_ordinary/kernels/aic/kernel_busy_mark.cpp"),
+                "core_type": "aic",
+                "signature": [D.INOUT, D.IN, D.IN],
+            },
+            {
+                "func_id": 1,
+                "source": str(hbg / "spmd_cohort_full_width/kernels/aic/kernel_stamp_block_resident.cpp"),
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+        ],
+    }
+    return compile_chip_callable_spec(spec, platform, "percounter", (__file__, platform, "cohort_entry_order"))
+
+
+def test_cohort_block_can_return_before_its_peer_enters(st_platform, st_device_ids, tmp_path):
+    worker = Worker(level=2, platform=st_platform, runtime="percounter", device_id=int(st_device_ids[0]))
+    try:
+        handle = worker.register(build_entry_order_callable(st_platform))
+        worker.init()
+        slow = torch.full((STRIDE,), -1.0)
+        blocks = torch.full((MAX_LANES, STRIDE), -1.0)
+        slow_buffer = worker.malloc(slow.nbytes)
+        try:
+            block_buffer = worker.malloc(blocks.nbytes)
+            try:
+                worker.copy_to(slow_buffer, slow)
+                worker.copy_to(block_buffer, blocks)
+                args = TaskArgs()
+                args.add_tensor(
+                    slow_buffer.tensor(shapes=tuple(slow.shape), dtype=DataType.FLOAT32), TensorArgType.INOUT
+                )
+                args.add_tensor(
+                    block_buffer.tensor(shapes=tuple(blocks.shape), dtype=DataType.FLOAT32), TensorArgType.INOUT
+                )
+                config = CallConfig()
+                config.enable_chip_swimlane = 1
+                config.output_prefix = str(tmp_path)
+                worker.run(handle, args, config)
+                assert worker.scheduler_runtime_mode == 5
+                worker.copy_from(slow, slow_buffer)
+                worker.copy_from(blocks, block_buffer)
+            finally:
+                worker.free(block_buffer)
+        finally:
+            worker.free(slow_buffer)
+
+        (capture,) = tmp_path.rglob("chip_swimlane_records.json")
+        raw = json.loads(capture.read_text())
+        cubes = raw["metadata"]["core_types"].count("aic")
+        assert cubes >= 2
+        assert slow[0].item() == 1
+        assert torch.equal(blocks[:cubes, 0], torch.arange(cubes, dtype=blocks.dtype))
+        assert torch.all(blocks[:cubes, 1] == cubes)
+        rows = raw["aicore_tasks"]
+        (blocker,) = (row for row in rows if row[1] == 0)
+        cohort = [row for row in rows if row[1] == 1]
+        assert len(cohort) == len({row[0] for row in cohort}) == cubes
+        (delayed,) = (row for row in cohort if row[0] == blocker[0])
+        assert min(row[4] for row in cohort) < blocker[4] <= delayed[3]
+    finally:
+        worker.close()

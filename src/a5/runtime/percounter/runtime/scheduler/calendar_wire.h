@@ -125,7 +125,6 @@ struct CalendarExecutionExtra {
     uint32_t task_id;
     uint32_t local_task_id;
     int32_t shell_task_id;
-    uint32_t sync_index;
     uint64_t shell_add_cmd;
     uint64_t predicate_address;
 };

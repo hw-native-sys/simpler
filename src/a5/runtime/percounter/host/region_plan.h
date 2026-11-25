@@ -50,8 +50,6 @@ struct PercounterLayout {
     uint64_t async_completion_capacity;
     uint64_t mix_task_count;
     uint64_t mix_signal_ready_offset;
-    uint64_t sync_cohort_count;
-    uint64_t sync_notify_offset;
     uint64_t graph_invocation_count;
     uint64_t graph_invocations_offset;
     uint64_t graph_prepare_offset;
@@ -92,7 +90,6 @@ struct HostGraphTemplate {
     uint64_t sink_subtask_total{0};
     uint64_t executable_blocks{0};
     uint64_t mix_task_count{0};
-    uint64_t sync_cohort_count{0};
     uint64_t defer_rows{0};
 };
 
@@ -113,21 +110,18 @@ struct ExternalAddresses {
     uint64_t graph_storage_count{0};
     uint64_t callable_table{0};
     uint64_t callable_count{0};
-    const uint64_t *sync_notify{nullptr};
-    uint64_t sync_notify_count{0};
 };
 
 inline bool plan_layout(
     uint64_t table_task_count, uint64_t block_total, PercounterLayout *layout, uint64_t mix_task_count = 0,
-    uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {}, uint64_t defer_rows = 0,
-    uint32_t profiling_level = 0, bool uses_cluster_input_share = false
+    const GraphLayoutInput &graph = {}, uint64_t defer_rows = 0, uint32_t profiling_level = 0,
+    bool uses_cluster_input_share = false
 ) {
     if (layout == nullptr || graph.body_task_count > UINT32_MAX ||
         table_task_count > UINT32_MAX - graph.body_task_count)
         return false;
     const uint64_t task_count = table_task_count + graph.body_task_count;
-    if (graph.invocation_count > table_task_count || mix_task_count > task_count || sync_cohort_count > task_count)
-        return false;
+    if (graph.invocation_count > table_task_count || mix_task_count > task_count) return false;
 
     PercounterLayout next{};
     next.profiling_level = profiling_level;
@@ -139,7 +133,6 @@ inline bool plan_layout(
     next.task_count = task_count;
     next.table_task_count = table_task_count;
     next.mix_task_count = mix_task_count;
-    next.sync_cohort_count = sync_cohort_count;
     next.graph_invocation_count = graph.invocation_count;
     next.graph_templates_bytes = graph.templates_bytes;
     next.async_completion_capacity = defer_rows;
@@ -157,7 +150,6 @@ inline bool plan_layout(
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
         ((mix_task_count != 0 || uses_cluster_input_share) &&
          !PERCOUNTER_RESERVE(SCHEDULER_CLUSTER_CAPACITY, uint64_t, mix_signal_ready_offset)) ||
-        (sync_cohort_count != 0 && !PERCOUNTER_RESERVE(sync_cohort_count, uint64_t, sync_notify_offset)) ||
         (graph.invocation_count != 0 &&
          (!PERCOUNTER_RESERVE(graph.invocation_count, PercounterGraphInvocation, graph_invocations_offset) ||
           !PERCOUNTER_RESERVE(1, PercounterGraphPrepare, graph_prepare_offset) ||
@@ -244,7 +236,7 @@ struct TaskInput {
     int32_t block_num{1};
     // Each block contributes one completion credit per participating role.
     int32_t subtask_count{1};
-    // All blocks must commit to entry before any may launch.
+    // Reserve distinct lanes for a cohort that can synchronize inside its kernel.
     bool sync_start{false};
     // Carries a dispatch predicate, evaluated on the lane before the kernel runs.
     bool has_predicate{false};
@@ -308,10 +300,8 @@ inline bool build_tables(
     if (base == nullptr || tasks.size() != layout.table_task_count ||
         graph.invocation_count != layout.graph_invocation_count ||
         graph.template_count * sizeof(PercounterGraphTemplate) != layout.graph_templates_bytes ||
-        external.sync_notify_count != layout.sync_cohort_count ||
         (graph.template_count != 0 && graph.templates == nullptr) ||
-        (graph.invocation_count != 0 && graph.invocations == nullptr) ||
-        (external.sync_notify_count != 0 && external.sync_notify == nullptr))
+        (graph.invocation_count != 0 && graph.invocations == nullptr))
         return false;
     std::memset(base, 0, static_cast<size_t>(layout.upload_size));
     auto *control = region_at<PercounterControl>(base, layout.control_offset);
@@ -357,12 +347,6 @@ inline bool build_tables(
         body_id += body.tasks.size();
     }
     if (body_id != layout.task_count) return false;
-    auto *sync_notify = region_at<uint64_t>(base, layout.sync_notify_offset);
-    for (uint32_t i = 0; i < external.sync_notify_count; ++i) {
-        const uint64_t set = external.sync_notify[i];
-        if (a5_cnt_notify_increment_address(set) == 0) return false;
-        sync_notify[i] = set;
-    }
     if (layout.profile_buffers_offset != 0) {
         auto *buffers = region_at<PercounterProfileBuffer>(base, layout.profile_buffers_offset);
         for (uint32_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
@@ -385,8 +369,6 @@ inline bool build_tables(
     control->counters_offset = layout.counters_offset;
     control->mix_task_count = layout.mix_task_count;
     control->mix_signal_ready_offset = layout.mix_signal_ready_offset;
-    control->sync_cohort_count = layout.sync_cohort_count;
-    control->sync_notify_offset = layout.sync_notify_offset;
     control->graph_invocation_count = layout.graph_invocation_count;
     control->graph_invocations_offset = layout.graph_invocations_offset;
     control->graph_prepare_offset = layout.graph_prepare_offset;

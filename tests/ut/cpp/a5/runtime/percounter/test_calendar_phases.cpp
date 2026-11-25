@@ -15,6 +15,7 @@
 #include <cstring>
 #include <vector>
 
+#include "host/calendar_cache.h"
 #include "host/calendar_event_score.h"
 #include "host/calendar_image.h"
 #include "host/graph_template.h"
@@ -319,7 +320,7 @@ TEST(CalendarPhases, SharesAivInputsWithAClusterSibling) {
         EXPECT_GT(aiv_range(worker, 1).sequence_base, aiv_range(worker, 0).sequence_base + follower.mix_delta);
     }
     PercounterLayout layout;
-    ASSERT_TRUE(plan_layout(4, 8, &layout, 0, 0, {}, 0, 0, image.uses_cluster_input_share));
+    ASSERT_TRUE(plan_layout(4, 8, &layout, 0, {}, 0, 0, image.uses_cluster_input_share));
     EXPECT_NE(layout.mix_signal_ready_offset, 0U);
     EXPECT_EQ(layout.mix_task_count, 0U);
 }
@@ -389,6 +390,40 @@ TEST(CalendarPhases, ReducesTransitiveWaitsButKeepsTheFirstObservers) {
     EXPECT_FALSE(plan.waits.summarized_fanins[3]);
     EXPECT_EQ(tasks[3].fanin_count, 3);
     EXPECT_EQ(tasks[3].fanin_ids, fanins[3].data());
+}
+
+TEST(CalendarPhases, KeepsControlWaitOnTheLaneThatDidNotExecuteIt) {
+    const std::vector<std::vector<int32_t>> fanins{{}, {0}};
+    auto tasks = cube_tasks(fanins);
+    tasks[0].active_mask = 0;
+    tasks[0].core_type_index = 1;
+    tasks[1].active_mask = 2;
+    tasks[1].core_type_index = 1;
+    tasks[1].block_num = 2;
+    tasks[1].sync_start = true;
+
+    CalendarPlan plan;
+    ASSERT_TRUE(build_static_calendar(tasks, 1, {}, &plan));
+    EXPECT_EQ(plan.waits.task_fanins[1], (std::vector<int32_t>{0}));
+    EXPECT_EQ(plan.waits.row_waits, (std::vector<bool>{false, false, true}));
+}
+
+TEST(CalendarEvents, MeasuresCohortTailFromTheLastEntry) {
+    CalendarTiming sample{};
+    sample.start = 10;
+    sample.end = 40;
+    sample.defer_register = 42;
+    sample.defer_completion = 58;
+
+    const auto middle = calendar_sample_cost(sample, 30);
+    ASSERT_TRUE(middle);
+    EXPECT_EQ(middle->occupancy_cycles, 12U);
+    EXPECT_EQ(middle->defer_tail_cycles, 16U);
+
+    const auto late = calendar_sample_cost(sample, 50);
+    ASSERT_TRUE(late);
+    EXPECT_EQ(late->occupancy_cycles, 1U);
+    EXPECT_EQ(late->defer_tail_cycles, 8U);
 }
 
 TEST(CalendarPhases, TransitiveWaitProofStopsAtTheBitmapBoundary) {
@@ -658,13 +693,12 @@ TEST(CalendarEvents, JoinsLocalMixRolesBeforeTheStartCohort) {
     CalendarEventCosts costs;
     costs.row_prepare_cycles = 1;
     costs.mix_arrival_cycles = 2;
-    costs.start_cycles = 3;
     costs.mix_release_cycles = 4;
     costs.mix_follower_observe_cycles = 1;
     costs.entry_cycles = 5;
     uint64_t cycles = 0;
     ASSERT_TRUE(evaluate_calendar_events(tasks, 2, plan, row_costs, costs, &cycles));
-    EXPECT_EQ(cycles, 28U);
+    EXPECT_EQ(cycles, 25U);
 }
 
 TEST(CalendarEvents, RejectsALaneOrderThatInvertsAnExecutionDependency) {

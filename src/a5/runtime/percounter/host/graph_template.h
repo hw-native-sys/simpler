@@ -118,7 +118,6 @@ inline TemplateResult build_graph_template(
         if (task.sink) next.sink_subtask_total += task.subtask_total;
         if (!dummy) next.defer_rows += task.subtask_total;
         next.executable_blocks += task.block_num;
-        next.sync_cohort_count += task.sync_start;
         next.mix_task_count += placement == TaskPlacement::MIX;
     }
     *out = std::move(next);

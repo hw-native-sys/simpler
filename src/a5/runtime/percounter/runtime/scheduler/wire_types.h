@@ -45,8 +45,6 @@ constexpr uint32_t SCHEDULER_RUNTIME_MODE_PERCOUNTER = 5;
 
 namespace simpler::percounter {
 
-inline constexpr uint32_t PERCOUNTER_NO_SYNC = UINT32_MAX;
-
 struct PercounterMixSignal {
     volatile uint32_t arrive[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t release[PLATFORM_CORES_PER_BLOCKDIM];
@@ -203,9 +201,6 @@ struct alignas(128) PercounterControl {
     uint64_t sink_count;
     uint64_t sinks_offset;
     uint64_t mix_task_count;
-    uint64_t sync_cohort_count;
-    // One CntNotify SET address per explicit START cohort.
-    uint64_t sync_notify_offset;
     uint64_t max_sync_blocks[3];
     uint64_t table_task_count;
     uint64_t graph_invocation_count;

@@ -114,16 +114,17 @@ inline uint64_t calendar_plan_id(const CalendarPlan &plan) {
     return calendar_fingerprint(plan.bytes.data(), plan.bytes.size());
 }
 
-inline std::optional<CalendarRowCost> calendar_sample_cost(const CalendarTiming &sample) {
+inline std::optional<CalendarRowCost> calendar_sample_cost(const CalendarTiming &sample, uint64_t cohort_entry) {
     if (sample.start == 0 || sample.end < sample.start ||
         (sample.defer_register == 0) != (sample.defer_completion == 0))
         return std::nullopt;
     const uint64_t release = std::max(sample.end, sample.defer_register);
     if (sample.defer_register != 0 && (sample.defer_register < sample.start || sample.defer_completion < release))
         return std::nullopt;
+    const uint64_t start = std::max(sample.start, cohort_entry);
     return CalendarRowCost{
-        std::max(uint64_t{1}, release - sample.start),
-        sample.defer_completion == 0 ? 0 : sample.defer_completion - release
+        release > start ? release - start : 1,
+        sample.defer_completion - std::min(sample.defer_completion, std::max(release, start))
     };
 }
 
@@ -167,10 +168,32 @@ struct CalendarTraining {
             LOG_WARN("A5 calendar: sample readback failed");
             return;
         }
+        calendar_detail::CalendarLayout layout;
+        std::vector<uint64_t> cohort_entries;
+        if (std::any_of(tasks.begin(), tasks.end(), [](const auto &task) {
+                return task.sync_start;
+            })) {
+            calendar_detail::Shape shape;
+            if (!calendar_detail::describe(tasks, cluster_count, {}, &shape) ||
+                !calendar_detail::read_calendar_layout(tasks, cluster_count, shape, *baseline, layout) ||
+                layout.rows.size() != records.size()) {
+                LOG_WARN("A5 calendar: could not identify sampled cohort rows");
+                return;
+            }
+            cohort_entries.resize(tasks.size());
+            // Replay a cohort from its latest entry. Early blocks can do work
+            // and wait for their peers before that point.
+            for (size_t i = 0; i < records.size(); ++i) {
+                const auto task = percounter_order_task_id(layout.rows[i].entry);
+                if (tasks[task].sync_start) cohort_entries[task] = std::max(cohort_entries[task], records[i].start);
+            }
+        }
         std::vector<CalendarRowCost> costs(order.size(), CalendarRowCost{0, 0});
         size_t deferred_rows = 0;
         for (size_t i = 0; i < order.size(); ++i) {
-            const auto cost = calendar_sample_cost(records[i]);
+            const uint64_t cohort_entry =
+                cohort_entries.empty() ? 0 : cohort_entries[percounter_order_task_id(layout.rows[i].entry)];
+            const auto cost = calendar_sample_cost(records[i], cohort_entry);
             if (!cost || order[i] >= costs.size() || costs[order[i]].occupancy_cycles != 0) {
                 LOG_WARN("A5 calendar: incomplete or invalid sample at row=%zu", i);
                 return;

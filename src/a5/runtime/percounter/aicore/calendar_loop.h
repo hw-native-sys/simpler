@@ -486,32 +486,9 @@ inline __aicore__ bool percounter_calendar_wait_range(
     return true;
 }
 
-inline __aicore__ bool percounter_calendar_start(
-    const LaneConfig &cfg, const __gm__ CalendarExecutionExtra &extra, uint32_t blocks, uint64_t entry
-) {
-    ProfileScope start_scope(cfg.scalar, ProfilePhase::StartRendezvous, entry);
-    const uint32_t sync = extra.sync_index;
-    if (sync >= cfg.control->sync_cohort_count || blocks < 2 || cfg.sync_notify == nullptr) {
-        percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, extra.task_id, sync);
-        return false;
-    }
-    const uint64_t address = cfg.sync_notify[sync];
-    if (address == 0) {
-        percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, extra.task_id, sync);
-        return false;
-    }
-    percounter_memory_barrier();
-    percounter_calendar_add(percounter_notify_add_address(address));
-    auto *counter = reinterpret_cast<__gm__ volatile uint32_t *>(address);
-    return percounter_calendar_wait(cfg, [&]() __aicore__ {
-        return percounter_notify_query(*counter) == blocks;
-    });
-}
-
 inline __aicore__ bool percounter_calendar_enter(
-    const LaneConfig &cfg, const __gm__ CalendarExecutionExtra *extra, const __gm__ CalendarLocalJoin *join,
-    const __gm__ CalendarWait *waits, uint32_t wait_count, uint32_t sequence_base, uint32_t blocks, bool sync,
-    uint64_t entry
+    const LaneConfig &cfg, const __gm__ CalendarLocalJoin *join, const __gm__ CalendarWait *waits, uint32_t wait_count,
+    uint32_t sequence_base, uint32_t blocks, bool sync, uint64_t entry
 ) {
     // Keep the first probes immediate. Longer groups use a staggered
     // retry interval so idle lanes do not flood one completion word.
@@ -521,7 +498,7 @@ inline __aicore__ bool percounter_calendar_enter(
         percounter_record_task_event(
             cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg)
         );
-        return !sync || percounter_calendar_start(cfg, *extra, blocks, entry);
+        return true;
     }
 
     ProfileScope mix_scope(cfg.scalar, ProfilePhase::MixRendezvous, entry);
@@ -558,7 +535,6 @@ inline __aicore__ bool percounter_calendar_enter(
     // have reached the same calendar block.
     if (!percounter_calendar_wait_list(cfg, waits, wait_count, entry, UINT64_MAX, retry_cycles)) return false;
     percounter_record_task_event(cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg));
-    if (sync && !percounter_calendar_start(cfg, *extra, blocks, entry)) return false;
     percounter_ssbuf_store_release(&signal->release[lane], arrivals[lane]);
     return true;
 }
@@ -708,9 +684,7 @@ inline __aicore__ bool percounter_calendar_execute_range(
             percounter_record_task_event(
                 cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg)
             );
-        } else if (!percounter_calendar_enter(
-                       cfg, extra, join, waits, row->wait_count, sequence_base, blocks, sync, entry
-                   )) {
+        } else if (!percounter_calendar_enter(cfg, join, waits, row->wait_count, sequence_base, blocks, sync, entry)) {
             return false;
         }
         if ((flags & CALENDAR_EXEC_INPUT_OWNER) != 0) {
