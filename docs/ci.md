@@ -38,7 +38,7 @@ The complete test-type × hardware-tier matrix across automatic CI, the A5 comme
 | Category | CPU (no hardware) | a2a3 runner | a5 runner |
 | -------- | ----------------- | ----------- | --------- |
 | **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py) |
-| **st** | `st-sim-a2a3`, `st-sim-a5`, `st-sim-wse` | `st-onboard-a2a3`, `st-network1-onboard-a2a3` (Daily only), `st-deepseek-onboard-a2a3`, `st-framework-a2a3` | `st-onboard-a5`, `st-framework-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5`, `st-sim-wse` | `st-onboard-a2a3`, `st-network1-onboard-a2a3` (Daily only), `st-model-onboard-a2a3`, `st-framework-a2a3` | `st-onboard-a5`, `st-framework-a5` |
 
 ## GitHub Actions Jobs
 
@@ -49,7 +49,7 @@ shape. The executable job bodies live in reusable workflows:
 `_packaging.yml`, `_profiling-flags-smoke.yml`, `_st-sim-a2a3.yml`,
 `_st-sim-a5.yml`, `_st-sim-wse.yml`, `_ut-npu-a2a3.yml`, `_ut-npu-a5.yml`,
 `_st-npu-a2a3.yml`, `_st-npu-a5.yml`, `_st-network1.yml`,
-`_st-deepseek-a2a3.yml`, and `_st-framework.yml`. The simulation,
+`_st-model-a2a3.yml`, and `_st-framework.yml`. The simulation,
 ordinary onboard, and NPU unit-test bodies are split by architecture so each
 job renders only its own steps. The framework environment shares `_st-framework.yml`;
 callers supply matching `platform` and `runs_on` inputs. Shared step scaffolding
@@ -116,7 +116,7 @@ PullRequest
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── st-framework-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
   ├── st-framework-a5   (a5 self-hosted)       — a5_changed && st_affected
-  └── st-deepseek-onboard-a2a3    (a2a3 self-hosted)      — a2a3_changed && st_affected
+  └── st-model-onboard-a2a3       (a2a3 self-hosted)      — a2a3_changed && st_affected
 
 Admin PR comment /run-a5
   └── gate-and-resolve       (ubuntu-24.04)          — open PR to this repo main; pinned merge
@@ -137,7 +137,7 @@ Admin PR comment /run-a5
 | `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA and the active URMA regressions, then adaptive-parallel DFX feature smokes |
 | `st-framework-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 4 -p no:xdist` in one exclusive four-device task, then verify plan/JUnit |
 | `st-network1-onboard-a2a3` (Daily only) | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
-| `st-deepseek-onboard-a2a3` | a2a3 self-hosted | `pytest <the two deepseek_v4_flash_decode dirs> --platform a2a3 --manual only --device ...`, both 2-device cases concurrently, in parallel with `st-onboard-a2a3` |
+| `st-model-onboard-a2a3` | a2a3 self-hosted | Qwen3-14B golden checks and DeepSeek V4 Flash smokes for both runtimes, selected with `--manual only` and scheduled across four devices, in parallel with `st-onboard-a2a3` in Per-PR |
 
 ### Job phase contract
 
@@ -192,8 +192,8 @@ CPU jobs:
 
 NPU jobs:
 
-| Step `name:` | st-onboard-a2a3 | st-onboard-a5 | ut-a2a3 | ut-a5 | `st-framework-<platform>` | `st-network1-onboard-<platform>` | st-deepseek-onboard-a2a3 |
-| ------------ | --------------- | ------------- | ------- | ----- | ------------------------- | -------------------------------- | ------------------------ |
+| Step `name:` | st-onboard-a2a3 | st-onboard-a5 | ut-a2a3 | ut-a5 | `st-framework-<platform>` | `st-network1-onboard-<platform>` | st-model-onboard-a2a3 |
+| ------------ | --------------- | ------------- | ------- | ----- | ------------------------- | -------------------------------- | --------------------- |
 | `Checkout target` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `Validate manual mode` | ✓ | ✓ | — | — | ✓ | — | — |
 | `Set up environment` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -225,8 +225,8 @@ jobs of the same platform therefore read alike — `Compile scene-test kernels
 
 Exactly one step per job runs its suite. The scene suites are `Run pytest scene
 tests (<platform>)`; a job whose suite name is the point says so instead (`Run
-framework scene tests`, `Run network1 pytest scene tests`, `Run DeepSeek pytest
-smokes (a2a3)`), and a job whose suite is the unit-test runner is `Run unit
+framework scene tests`, `Run network1 pytest scene tests`, `Run Qwen and DeepSeek pytest
+tests (a2a3)`), and a job whose suite is the unit-test runner is `Run unit
 tests (<platform>)` or `Run Python unit tests (sim)`.
 
 Two orderings are load-bearing rather than cosmetic: `Validate manual mode`
@@ -241,7 +241,7 @@ result.
 | `_profiling-flags-smoke.yml` | CPU-pool only: no hosted variant, so no Python setup and no compiler install; `Verify provisioned toolchain` checks the image unconditionally before `Set up environment`. |
 | `_packaging.yml` | The apt compiler install sits between `Set up C++ compiler` and `Set up environment`: the matrix installs the project, which needs the compiler, so the venv must come after it. It has no `Verify provisioned toolchain` because its venv installs cmake and ninja itself, so the pool image carries no toolchain contract to check. |
 | `_st-framework.yml`, `_st-network1.yml` | Same preparation skeleton; the run phase is a job-specific protocol — one exclusive `task-submit` for framework, stage → run → teardown across two machines for network1. |
-| `_st-deepseek-a2a3.yml` | Takes no `manual_mode` input (its run is `--manual only` by construction), so it has no `Validate manual mode` step; and its suite is a standalone model test, which the feature-coverage policy does not cover, so it has neither `--environment-receipts` nor a `Verify ... environment coverage` step. No post-run phase: it retains no artifact. |
+| `_st-model-a2a3.yml` | Takes no `manual_mode` input (its run is `--manual only` by construction), so it has no `Validate manual mode` step; and its suite consists of standalone model tests, which the feature-coverage policy does not cover, so it has neither `--environment-receipts` nor a `Verify ... environment coverage` step. Qwen computes its torch golden and compares `out`, `k_cache`, and `v_cache`; only the DeepSeek wrappers pass `skip_golden=True`. The task explicitly receives `OMP_NUM_THREADS=16` and `MKL_NUM_THREADS=16` for torch input generation, golden computation and comparison. Kernel compilation stays outside the task with 32 workers for Qwen and 64 for DeepSeek. No post-run phase: it retains no artifact. |
 | `_ut-npu-a2a3.yml`, `_ut-npu-a5.yml` | No post-run phase: they emit no retained artifacts. |
 
 ### Multi-machine network1 jobs
@@ -319,6 +319,19 @@ same DFX smoke steps used by Per-PR run once in each Daily platform job, and
 the A2/A3 `network1` corpus runs exclusively in Daily through the existing two-machine workflow. The
 main Per-PR scene-test steps keep the default `--manual exclude`, so moving an
 ordinary case to Daily does not require a second workflow exclusion list.
+
+The A2/A3 Qwen and DeepSeek cases retain their `manual` markers. Per-PR runs
+them in `st-model-onboard-a2a3`, with Qwen golden verification enabled and
+DeepSeek retaining its completion-only smoke checks. The main Per-PR sweep
+excludes them through `--manual exclude`. Daily keeps them in its full
+`--manual include` onboard sweep and does not call a separate model job.
+Kernel precompilation runs before `task-submit`; the model drivers still
+validate and load their compile cache inside the task and may compile again
+on a cache miss. Qwen input generation, torch golden computation, output
+readback and comparison also remain inside that allocation. Moving those CPU
+stages out requires a separate data handoff between preparation, device run
+and verification.
+
 WSE runs its dependency-capture smoke; its legacy PMU, chip-swimlane,
 args-dump and scope-stats collectors are unsupported.
 The dedicated A2/A3 and A5 dep-gen, chip-swimlane, PMU, args-dump, and scope-stats steps

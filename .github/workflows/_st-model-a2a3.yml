@@ -1,4 +1,4 @@
-name: NPU DeepSeek Smokes (a2a3)
+name: NPU Model Tests (a2a3)
 
 permissions:
   contents: read
@@ -18,7 +18,7 @@ on:
 
 jobs:
   run:
-    name: st-deepseek-onboard-a2a3
+    name: st-model-onboard-a2a3
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 40
     env:
@@ -59,14 +59,35 @@ jobs:
               --platform a2a3 --compile-only --compile-workers 64
           done
 
-      # The DS cases are the only manual tests under these two directories, so
-      # --manual only selects exactly the two smoke tests. They stay manual:
-      # the main sweep runs --manual exclude and must not adopt them back.
-      # Each case needs 2 devices (EP world size); 4 devices let both run
-      # concurrently.
-      - name: Run DeepSeek pytest smokes (a2a3)
+      - name: Compile Qwen standalone kernels (a2a3)
+        env:
+          TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          DS_TESTS="examples/a2a3/host_build_graph/deepseek_v4_flash_decode examples/a2a3/tensormap_and_ringbuffer/deepseek_v4_flash_decode"
-          task-submit --timeout 1800 --max-time 1800 --device auto --device-num 4 \
-            --run ".venv/bin/python -m pytest $DS_TESTS -m 'not sdma' --platform a2a3 --exclude-level 4 --manual only --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200"
+          runtimes=$(.venv/bin/python -c \
+              "from simpler_setup.platform_info import discover_runtimes; print(' '.join(discover_runtimes('a2a3')))")
+          test -n "$runtimes"
+          for runtime in $runtimes; do
+            .venv/bin/python "examples/a2a3/$runtime/qwen3_14b_decode/main.py" \
+              --platform a2a3 --compile-only --compile-workers 32
+          done
+
+      # Qwen uses the default golden path; only the DeepSeek wrappers set
+      # skip_golden=True. Each Qwen case needs one device and each DS case two;
+      # the pytest scheduler fits the four manual cases into four devices.
+      # Qwen fixture generation, CPU golden computation and comparison are
+      # inside the allocation; the drivers also check the precompiled cache.
+      - name: Run Qwen and DeepSeek pytest tests (a2a3)
+        env:
+          TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          MODEL_TESTS=(
+            examples/a2a3/host_build_graph/qwen3_14b_decode
+            examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode
+            examples/a2a3/host_build_graph/deepseek_v4_flash_decode
+            examples/a2a3/tensormap_and_ringbuffer/deepseek_v4_flash_decode
+          )
+          task-submit --env OMP_NUM_THREADS=16 --env MKL_NUM_THREADS=16 \
+            --timeout 1800 --max-time 1800 --device auto --device-num 4 \
+            --run ".venv/bin/python -m pytest ${MODEL_TESTS[*]} -m 'not sdma' --platform a2a3 --exclude-level 4 --manual only --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200"

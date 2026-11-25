@@ -49,5 +49,7 @@ task-submit --device auto --device-num 1 --run \
 The driver allocates all entry parameters once in device memory, streams one
 valid fixture upload before the first round, and reuses the same addresses for
 every Graph replay. `--skip-golden` skips only torch computation and explicit
-D2H comparison. The thin pytest wrapper remains manual, so the case runs in the
-daily full scene-test sweep and is excluded from per-PR CI.
+D2H comparison. The thin pytest wrapper remains manual. Per-PR runs it with
+golden verification in `st-model-onboard-a2a3`, alongside TMR Qwen and both
+DeepSeek smokes. Daily includes it in the full onboard sweep through
+`--manual include` without a separate model job.

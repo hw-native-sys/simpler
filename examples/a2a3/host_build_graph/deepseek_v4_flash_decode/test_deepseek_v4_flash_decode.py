@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Hardware ST for examples/a2a3/host_build_graph/deepseek_v4_flash_decode.
 
-The case is manual: Per-PR CI runs it in the dedicated `st-deepseek-onboard-a2a3`
+The case is manual: Per-PR CI runs it in the dedicated `st-model-onboard-a2a3`
 job instead of the main sweep. To run it explicitly:
 
     python -m pytest examples/a2a3/host_build_graph/deepseek_v4_flash_decode \\
