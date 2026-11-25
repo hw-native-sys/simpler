@@ -629,8 +629,11 @@ void AicoreLifecycle::collect_run_swimlane_records(Runtime *runtime) {
                     trace.kernel_start_cycles - trace.ready_observe_cycles :
                     0;
             ChipSwimlaneAicoreTaskRecord record{
-                trace.kernel_start_cycles, trace.kernel_end_cycles, identity, static_cast<uint32_t>(index),
-                static_cast<uint32_t>(std::min(receive, uint64_t{UINT32_MAX}))
+                trace.kernel_start_cycles,
+                trace.kernel_end_cycles,
+                identity,
+                static_cast<uint32_t>(index),
+                {static_cast<uint32_t>(std::min(receive, uint64_t{UINT32_MAX}))}
             };
             chip_swimlane_aicpu_record_staged_task(
                 static_cast<int>(trace.worker_id), kDiagnosticDumpLane, record, trace.dispatch_end_cycles,
