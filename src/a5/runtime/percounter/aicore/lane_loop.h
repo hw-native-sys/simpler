@@ -377,7 +377,7 @@ inline __aicore__
         return {};
     }
 #endif
-    if (control->mix_task_count != 0 && !percounter_clear_mix_signal(cfg, timeout_cycles)) return {};
+    if (control->mix_signal_ready_offset != 0 && !percounter_clear_mix_signal(cfg, timeout_cycles)) return {};
 
     ChipSwimlaneAicoreLocalState profile{};
     if (level == 1 && SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_CHIP_SWIMLANE)) {

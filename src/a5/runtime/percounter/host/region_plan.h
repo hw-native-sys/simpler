@@ -120,7 +120,7 @@ struct ExternalAddresses {
 inline bool plan_layout(
     uint64_t table_task_count, uint64_t block_total, PercounterLayout *layout, uint64_t mix_task_count = 0,
     uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {}, uint64_t defer_rows = 0,
-    uint32_t profiling_level = 0
+    uint32_t profiling_level = 0, bool uses_cluster_input_share = false
 ) {
     if (layout == nullptr || graph.body_task_count > UINT32_MAX ||
         table_task_count > UINT32_MAX - graph.body_task_count)
@@ -155,7 +155,8 @@ inline bool plan_layout(
     if (!PERCOUNTER_RESERVE(1, PercounterControl, control_offset) ||
         !PERCOUNTER_RESERVE(table_task_count, uint64_t, sinks_offset) ||
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
-        (mix_task_count != 0 && !PERCOUNTER_RESERVE(SCHEDULER_CLUSTER_CAPACITY, uint64_t, mix_signal_ready_offset)) ||
+        ((mix_task_count != 0 || uses_cluster_input_share) &&
+         !PERCOUNTER_RESERVE(SCHEDULER_CLUSTER_CAPACITY, uint64_t, mix_signal_ready_offset)) ||
         (sync_cohort_count != 0 && !PERCOUNTER_RESERVE(sync_cohort_count, uint64_t, sync_notify_offset)) ||
         (graph.invocation_count != 0 &&
          (!PERCOUNTER_RESERVE(graph.invocation_count, PercounterGraphInvocation, graph_invocations_offset) ||

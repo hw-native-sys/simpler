@@ -11,6 +11,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -23,7 +24,7 @@
 #include <vector>
 #include <unistd.h>
 
-#include "calendar_plan.h"
+#include "calendar_event_score.h"
 #include "common/host_api.h"
 #include "common/unified_log.h"
 #include "host_build_graph/host/graph_cache.h"
@@ -96,8 +97,9 @@ inline CalendarKey make_calendar_key(
         const auto &task = tasks[id];
         key.insert(
             key.end(),
-            {task.active_mask, static_cast<uint64_t>(task.block_num), task.sync_start, task.inline_completed,
-             static_cast<uint64_t>(task.fanin_count), static_cast<uint64_t>(task.graph_invocation), task.has_predicate}
+            {task.active_mask, static_cast<uint64_t>(task.block_num), static_cast<uint64_t>(task.subtask_count),
+             task.sync_start, task.inline_completed, static_cast<uint64_t>(task.fanin_count),
+             static_cast<uint64_t>(task.graph_invocation), task.has_predicate}
         );
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             if ((task.active_mask & (1U << lane)) != 0) key.push_back(metadata[id].kernel_ids[lane]);
@@ -133,6 +135,7 @@ struct CalendarTraining {
     std::vector<TaskInput> tasks;
     std::vector<int32_t> fanin;
     bool owns_training{false};
+    bool allow_fused_fanins{false};
 
     ~CalendarTraining() {
         if (!owns_training) return;
@@ -175,19 +178,71 @@ struct CalendarTraining {
             costs[order[i]] = *cost;
             deferred_rows += records[i].defer_register != 0;
         }
+        constexpr CalendarEventCosts event_costs{
+            .row_prepare_cycles = 55,
+            .direct_observe_cycles = 1010,
+            .fanin_credit_cycles = 1750,
+            .fanin_observe_cycles = 1550,
+            .entry_cycles = 249,
+            .done_publish_cycles = 46,
+            .retire_after_occupancy_cycles = 59,
+        };
         uint64_t baseline_cycles = 0;
-        if (!evaluate_static_calendar(tasks, cluster_count, *baseline, costs, &baseline_cycles)) {
+        const auto training_start = std::chrono::steady_clock::now();
+        if (!evaluate_calendar_events(
+                tasks, cluster_count, *baseline, costs, event_costs, &baseline_cycles, allow_fused_fanins
+            )) {
             LOG_WARN("A5 calendar: could not evaluate the sampled placement");
             return;
         }
 
+        struct Variant {
+            const char *name;
+            CalendarBlockOrder order;
+            uint64_t priority_window_cycles;
+            bool charge_waits;
+            bool backfill;
+        };
+        constexpr Variant variants[] = {
+            {"submission", CalendarBlockOrder::SUBMISSION, 0, false, false},
+            {"wait_aware", CalendarBlockOrder::LONGEST_OUTPUT_FIRST, 0, true, false},
+            {"backfill", CalendarBlockOrder::LONGEST_OUTPUT_FIRST, 20000, true, true},
+        };
+        std::vector<CalendarRowCost> planning_costs;
+        constexpr CalendarPriorityCosts placement_costs{
+            .row_cycles =
+                event_costs.row_prepare_cycles + event_costs.entry_cycles + event_costs.retire_after_occupancy_cycles,
+            .observation_cycles = event_costs.fanin_observe_cycles * 3 / 2,
+            .credit_cycles = event_costs.direct_observe_cycles * 3 / 2,
+        };
+        if (!calendar_placement_costs(tasks, cluster_count, costs, placement_costs, &planning_costs)) return;
         auto selected = baseline;
-        auto candidate = std::make_shared<CalendarPlan>();
-        uint64_t candidate_cycles = baseline_cycles;
-        if (build_static_calendar(tasks, cluster_count, costs, candidate.get())) {
-            candidate_cycles = candidate->predicted_cycles;
-            if (candidate_cycles < baseline_cycles) selected = std::move(candidate);
+        uint64_t selected_cycles = baseline_cycles;
+        const char *selected_variant = "cold";
+        for (const auto &variant : variants) {
+            auto candidate = std::make_shared<CalendarPlan>();
+            uint64_t predicted = 0;
+            const auto &weights = variant.charge_waits ? planning_costs : costs;
+            const auto rank = variant.charge_waits ? CalendarPriority::WORK_AND_WAIT : CalendarPriority::LONGEST_ROW;
+            if (!build_static_calendar(
+                    tasks, cluster_count, weights, candidate.get(), variant.order, variant.priority_window_cycles, rank,
+                    variant.backfill
+                ) ||
+                !evaluate_calendar_events(
+                    tasks, cluster_count, *candidate, costs, event_costs, &predicted, allow_fused_fanins
+                )) {
+                continue;
+            }
+            LOG_INFO("A5 calendar: TRIAL variant=%s cycles=%" PRIu64 " pid=%d", variant.name, predicted, getpid());
+            if (predicted >= selected_cycles) continue;
+            selected = std::move(candidate);
+            selected_cycles = predicted;
+            selected_variant = variant.name;
         }
+        const auto training_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - training_start)
+                .count()
+        );
         const auto id = calendar_plan_id(*selected);
         const auto rows = static_cast<uint32_t>(selected->logical_row_by_packed.size());
         const auto changed = static_cast<unsigned>(selected->bytes != baseline->bytes);
@@ -195,9 +250,9 @@ struct CalendarTraining {
         if (cache->plans.try_emplace(key, std::move(selected)).second) {
             LOG_INFO(
                 "A5 calendar: STORE plan=%016" PRIx64 " rows=%u changed=%u pid=%d base_cycles=%" PRIu64
-                " selected_cycles=%" PRIu64 " deferred_rows=%zu",
-                id, rows, changed, getpid(), baseline_cycles, changed ? candidate_cycles : baseline_cycles,
-                deferred_rows
+                " selected_cycles=%" PRIu64 " deferred_rows=%zu variant=%s training_us=%" PRIu64,
+                id, rows, changed, getpid(), baseline_cycles, selected_cycles, deferred_rows, selected_variant,
+                training_us
             );
         }
     }

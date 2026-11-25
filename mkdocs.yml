@@ -152,6 +152,7 @@ nav:
           - HBG L0 kernel 首尾计时: zh-cn/investigations/2026-11-a5-hbg-l0-aicore-wall.md
           - HBG 固定版本 L0 实测: zh-cn/investigations/2026-11-a5-hbg-latest-aicore-wall.md
           - Percounter L0 kernel 首尾实测: zh-cn/investigations/2026-11-a5-percounter-kernel-wall.md
+          - DSV4.1 Percounter 日历优化: zh-cn/investigations/2026-11-dsv41-percounter-calendar-optimization.md
           - 设计复审: zh-cn/design/a5-hbg-graph-task/review.md
           - 已否定的性能尝试: zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md
           - 固定前缀成员历史测量: zh-cn/design/a5-hbg-graph-task/fixed-prefix-members.md

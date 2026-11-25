@@ -12,8 +12,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -32,6 +34,113 @@ struct CalendarWaitPlan {
     std::vector<bool> row_waits;
     std::vector<bool> summarized_fanins;
     std::vector<CalendarFaninAssignment> row_assignments;
+    std::vector<uint32_t> row_input_owners;
+    // Total credits for each eligible fused fan-in, or zero for ordinary waits.
+    std::vector<uint32_t> fused_fanin_credits;
+};
+
+inline constexpr size_t calendar_wait_reach_width = std::numeric_limits<uint64_t>::digits;
+
+// A bit at distance d - 1 denotes a DONE dependency already ordered by another direct predecessor.
+inline bool calendar_transitive_waits(const std::vector<TaskInput> &tasks, std::vector<uint64_t> &covered) {
+    std::array<uint64_t, calendar_wait_reach_width> reachable{};
+    covered.resize(tasks.size(), 0);
+    for (size_t task = 0; task < tasks.size(); ++task) {
+        const auto &input = tasks[task];
+        if (input.fanin_count < 0 || (input.fanin_count != 0 && input.fanin_ids == nullptr)) return false;
+        uint64_t direct = 0;
+        uint64_t via = 0;
+        for (int32_t edge = 0; edge < input.fanin_count; ++edge) {
+            const int32_t pred = input.fanin_ids[edge];
+            if (pred < 0 || static_cast<size_t>(pred) >= task) return false;
+            if (input.inline_completed || tasks[pred].inline_completed) continue;
+            const size_t distance = task - static_cast<size_t>(pred);
+            if (distance > calendar_wait_reach_width) continue;
+            direct |= uint64_t{1} << (distance - 1);
+            if (distance < calendar_wait_reach_width) {
+                via |= reachable[pred % calendar_wait_reach_width] << distance;
+            }
+        }
+        covered[task] = via;
+        reachable[task % calendar_wait_reach_width] = direct | via;
+    }
+    return true;
+}
+
+// Each selected chain is a real directed path. Reaching a later node
+// on a chain proves that all earlier nodes on that chain have completed.
+inline constexpr size_t calendar_wait_chain_count = 8;
+struct CalendarWaitChains {
+    static constexpr uint32_t unassigned = UINT32_MAX;
+    using Positions = std::array<uint32_t, calendar_wait_chain_count>;
+    std::vector<uint32_t> chain_by_task;
+    std::vector<Positions> via_parent;
+
+    explicit CalendarWaitChains(const std::vector<TaskInput> &tasks) :
+        chain_by_task(tasks.size(), unassigned),
+        via_parent(tasks.size()) {
+        std::vector<size_t> weight(tasks.size(), 1);
+        for (const auto &task : tasks) {
+            if (task.inline_completed || task.fanin_count < 2) continue;
+            for (int32_t edge = 0; edge < task.fanin_count; ++edge)
+                ++weight[task.fanin_ids[edge]];
+        }
+
+        // Greedily cover the paths with the most potential repeated waits.
+        std::vector<size_t> length(tasks.size());
+        std::vector<uint32_t> previous(tasks.size());
+        for (uint32_t chain = 0; chain < calendar_wait_chain_count; ++chain) {
+            size_t best = 0;
+            uint32_t end = unassigned;
+            for (uint32_t id = 0; id < tasks.size(); ++id) {
+                if (tasks[id].inline_completed || chain_by_task[id] != unassigned) continue;
+                size_t longest = 0;
+                previous[id] = unassigned;
+                for (int32_t edge = 0; edge < tasks[id].fanin_count; ++edge) {
+                    const auto parent = static_cast<uint32_t>(tasks[id].fanin_ids[edge]);
+                    if (!tasks[parent].inline_completed && chain_by_task[parent] == unassigned &&
+                        length[parent] > longest) {
+                        longest = length[parent];
+                        previous[id] = parent;
+                    }
+                }
+                length[id] = longest + weight[id];
+                if (length[id] > best) {
+                    best = length[id];
+                    end = id;
+                }
+            }
+            if (best < 2) break;
+            for (uint32_t id = end; id != unassigned; id = previous[id])
+                chain_by_task[id] = chain;
+        }
+
+        std::vector<Positions> ancestor(tasks.size());
+        for (uint32_t id = 0; id < tasks.size(); ++id) {
+            const auto &task = tasks[id];
+            if (task.inline_completed) continue;
+            // Merge strict ancestors before adding the direct producers.
+            // A wait is removable only when reached through another input.
+            auto &via = via_parent[id];
+            for (int32_t edge = 0; edge < task.fanin_count; ++edge) {
+                const auto parent = static_cast<uint32_t>(task.fanin_ids[edge]);
+                for (size_t chain = 0; chain < calendar_wait_chain_count; ++chain)
+                    via[chain] = std::max(via[chain], ancestor[parent][chain]);
+            }
+            auto &strict = ancestor[id];
+            strict = via;
+            for (int32_t edge = 0; edge < task.fanin_count; ++edge) {
+                const auto parent = static_cast<uint32_t>(task.fanin_ids[edge]);
+                const auto chain = chain_by_task[parent];
+                if (chain != unassigned) strict[chain] = std::max(strict[chain], parent + 1U);
+            }
+        }
+    }
+
+    bool orders(size_t task, size_t predecessor) const {
+        const auto chain = chain_by_task[predecessor];
+        return chain != unassigned && via_parent[task][chain] >= predecessor + 1;
+    }
 };
 
 inline bool calendar_event_order(
@@ -56,6 +165,71 @@ inline bool calendar_event_order(
     return order.size() == parents.size();
 }
 
+inline void plan_fused_fanin_credits(
+    const std::vector<TaskInput> &tasks, const std::vector<std::vector<uint32_t>> &pollers,
+    const std::vector<size_t> &first_gate, size_t no_gate, CalendarWaitPlan &plan
+) {
+    const size_t count = tasks.size();
+    std::vector<bool> consumed(count);
+    std::vector<uint32_t> observers(count);
+    uint64_t edges = 0;
+    for (size_t task = 0; task < count; ++task) {
+        const auto &input = tasks[task];
+        edges += input.fanin_count;
+        for (int32_t edge = 0; edge < input.fanin_count; ++edge)
+            consumed[input.fanin_ids[edge]] = true;
+        if (first_gate[task] != no_gate) {
+            for (int32_t producer : plan.task_fanins[task])
+                ++observers[producer];
+        }
+    }
+
+    // Bound repeated walks over shared ancestors by the phase's edge count.
+    uint64_t remaining = std::min(edges, UINT64_MAX / 16) * 16;
+    std::vector<uint32_t> pending;
+    std::vector<uint32_t> visited(count, UINT32_MAX);
+    const auto independent = [&](const std::vector<int32_t> &producers) {
+        const auto earliest = *std::min_element(producers.begin(), producers.end());
+        for (int32_t producer : producers) {
+            pending.assign(1, producer);
+            while (!pending.empty()) {
+                const auto &task = tasks[pending.back()];
+                pending.pop_back();
+                for (int32_t edge = 0; edge < task.fanin_count; ++edge) {
+                    if (remaining == 0) return false;
+                    --remaining;
+                    const int32_t pred = task.fanin_ids[edge];
+                    if (pred < earliest || visited[pred] == static_cast<uint32_t>(producer)) continue;
+                    if (std::find(producers.begin(), producers.end(), pred) != producers.end()) return false;
+                    visited[pred] = producer;
+                    pending.push_back(pred);
+                }
+            }
+        }
+        return true;
+    };
+
+    plan.fused_fanin_credits.assign(count, 0);
+    for (size_t consumer = 0; consumer < count; ++consumer) {
+        const auto &producers = plan.task_fanins[consumer];
+        if (!consumed[consumer] || !plan.summarized_fanins[consumer] ||
+            producers.size() > CALENDAR_FUSED_FANIN_MAX_PRODUCERS || pollers[consumer].size() < producers.size())
+            continue;
+        uint32_t credits = 0;
+        for (int32_t producer : producers) {
+            const auto &shape = tasks[producer];
+            const uint64_t contribution = uint64_t{static_cast<uint32_t>(shape.block_num)} * shape.subtask_count;
+            if (observers[producer] != 1 || !consumed[producer] || shape.active_mask == 0 || contribution == 0 ||
+                contribution > CALENDAR_COUNT_MASK - credits) {
+                credits = 0;
+                break;
+            }
+            credits += static_cast<uint32_t>(contribution);
+        }
+        if (credits != 0 && independent(producers)) plan.fused_fanin_credits[consumer] = credits;
+    }
+}
+
 inline bool plan_calendar_waits(
     const std::vector<TaskInput> &tasks, const std::vector<CalendarRow> &rows, const std::vector<uint32_t> &indexes,
     size_t join_count, CalendarWaitPlan &result
@@ -72,6 +246,14 @@ inline bool plan_calendar_waits(
     const size_t worker_count = indexes.size() - 1;
     constexpr size_t max_prefix_bytes = 64 * 1024 * 1024;
     const bool use_prefixes = event_count <= max_prefix_bytes / sizeof(uint32_t) / worker_count;
+    std::vector<uint64_t> covered;
+    if (!calendar_transitive_waits(tasks, covered)) return false;
+    const CalendarWaitChains chains(tasks);
+    const auto needs_done = [&](size_t task, size_t pred) {
+        if (tasks[pred].inline_completed || chains.orders(task, pred)) return false;
+        const size_t distance = task - pred;
+        return distance > calendar_wait_reach_width || (covered[task] & (uint64_t{1} << (distance - 1))) == 0;
+    };
 
     std::vector<std::vector<size_t>> parents(use_prefixes ? event_count : 0);
     std::vector<uint32_t> row_workers(use_prefixes ? row_count : 0);
@@ -112,15 +294,17 @@ inline bool plan_calendar_waits(
     }
 
     result.task_fanins.resize(task_count);
-    result.row_waits.resize(row_count);
+    result.row_waits.assign(row_count, false);
     result.summarized_fanins.resize(task_count);
     result.row_assignments.resize(row_count);
+    result.row_input_owners.assign(row_count, CALENDAR_NO_INPUT_OWNER);
+    result.fused_fanin_credits.clear();
     if (!use_prefixes) {
         for (size_t task = 0; task < task_count; ++task) {
             const auto &input = tasks[task];
             for (int32_t i = 0; i < input.fanin_count; ++i) {
-                const auto &producer = tasks[input.fanin_ids[i]];
-                if (!producer.inline_completed) result.task_fanins[task].push_back(input.fanin_ids[i]);
+                const auto pred = input.fanin_ids[i];
+                if (needs_done(task, pred)) result.task_fanins[task].push_back(pred);
             }
         }
         for (size_t row = 0; row < row_count; ++row)
@@ -154,25 +338,50 @@ inline bool plan_calendar_waits(
         });
     }
 
-    // An event's prefix contains the latest row that it orders on every
-    // worker. Earlier rows on that worker are part of the same prefix.
-    std::vector<uint32_t> prefixes(parents.size() * worker_count, 0);
+    // The resource proof can only discharge dependency-only producers.
+    // With at most one machine word of such producers, propagate just their
+    // retirements instead of maintaining a wide prefix in every lane.
+    std::vector<uint64_t> control_bits(task_count);
+    size_t control_count = 0;
+    bool compact_proof = true;
+    for (size_t task = 0; task < task_count; ++task) {
+        if (tasks[task].active_mask != 0 || last_rows[task].empty()) continue;
+        if (last_rows[task].size() != 1 || control_count == 64) {
+            compact_proof = false;
+            break;
+        }
+        control_bits[task] = uint64_t{1} << control_count++;
+    }
+
+    std::vector<uint64_t> known_controls(compact_proof ? parents.size() : 0, 0);
+    std::vector<uint32_t> prefixes(compact_proof ? 0 : parents.size() * worker_count, 0);
     const auto prefix = [&](size_t node) {
         return prefixes.data() + node * worker_count;
     };
-    const auto merge = [&](uint32_t *dst, size_t node) {
-        const uint32_t *src = prefix(node);
+    const auto merge = [&](size_t node, size_t parent) {
+        if (compact_proof) {
+            known_controls[node] |= known_controls[parent];
+            return;
+        }
+        auto *dst = prefix(node);
+        const auto *src = prefix(parent);
         for (size_t worker = 0; worker < worker_count; ++worker)
             dst[worker] = std::max(dst[worker], src[worker]);
     };
 
     std::vector<bool> gate_waits(gate_tasks.size(), false);
     for (const size_t node : event_order) {
-        auto *ordered = prefix(node);
         if (node < gate_base || node >= done_base) {
             for (const size_t parent : parents[node])
-                merge(ordered, parent);
-            if (node < gate_base) ordered[row_workers[node]] = static_cast<uint32_t>(node + 1);
+                merge(node, parent);
+            if (node < gate_base) {
+                if (compact_proof) {
+                    const auto task = static_cast<size_t>(percounter_order_task_id(rows[node].entry));
+                    known_controls[node] |= control_bits[task];
+                } else {
+                    prefix(node)[row_workers[node]] = static_cast<uint32_t>(node + 1);
+                }
+            }
             continue;
         }
 
@@ -182,21 +391,23 @@ inline bool plan_calendar_waits(
         // retire before any block enters its kernel. Its resource prefix
         // therefore already covers any input completed in that prefix.
         for (const size_t parent : parents[node]) {
-            if (parent < gate_base || parent >= cohort_base) merge(ordered, parent);
+            if (parent < gate_base || parent >= cohort_base) merge(node, parent);
         }
         for (const size_t edge : ordered_inputs[id]) {
             const auto pred = static_cast<size_t>(tasks[id].fanin_ids[edge]);
-            if (tasks[pred].inline_completed) continue;
+            if (!needs_done(id, pred)) continue;
             const auto &required = last_rows[pred];
             // A deferred row can retire before its completion is published.
-            if (tasks[pred].active_mask == 0 && !required.empty() &&
-                std::all_of(required.begin(), required.end(), [&](uint32_t row) {
-                    return ordered[row_workers[row]] >= row + 1;
-                }))
-                continue;
+            if (tasks[pred].active_mask == 0 && !required.empty()) {
+                const bool retired = compact_proof ? (known_controls[node] & control_bits[pred]) != 0 :
+                                                     std::all_of(required.begin(), required.end(), [&](uint32_t row) {
+                                                         return prefix(node)[row_workers[row]] >= row + 1;
+                                                     });
+                if (retired) continue;
+            }
             kept[id][edge] = true;
             gate_waits[node - gate_base] = true;
-            merge(ordered, done_base + pred);
+            merge(node, done_base + pred);
         }
     }
 
@@ -206,12 +417,27 @@ inline bool plan_calendar_waits(
         }
     }
     std::vector<size_t> first_gate(task_count, parents.size());
-    for (size_t row = 0; row < row_count; ++row) {
-        const size_t gate = gate_of(row);
-        result.row_waits[row] = gate_waits[gate - gate_base];
-        if (!result.row_waits[row]) continue;
-        const auto task = gate_tasks[gate - gate_base];
-        first_gate[task] = std::min(first_gate[task], ranks[gate]);
+    std::vector<size_t> observed(task_count, worker_count);
+    for (size_t worker = 0; worker < worker_count; ++worker) {
+        for (size_t row = indexes[worker]; row < indexes[worker + 1]; ++row) {
+            const size_t gate = gate_of(row);
+            if (!gate_waits[gate - gate_base]) continue;
+            const auto task = gate_tasks[gate - gate_base];
+            const auto &shape = tasks[task];
+            const auto &inputs = result.task_fanins[task];
+            // A prior ordinary row only retires after observing its inputs.
+            // Reuse that proof on this same lane. A predicated row need not wait.
+            if (!shape.is_mix && !shape.sync_start && !shape.has_predicate) {
+                const bool already_observed = std::all_of(inputs.begin(), inputs.end(), [&](int32_t parent) {
+                    return observed[parent] == worker;
+                });
+                if (already_observed) continue;
+                for (const auto parent : inputs)
+                    observed[parent] = worker;
+            }
+            result.row_waits[row] = true;
+            first_gate[task] = std::min(first_gate[task], ranks[gate]);
+        }
     }
 
     std::vector<std::vector<uint32_t>> pollers(task_count);
@@ -240,6 +466,47 @@ inline bool plan_calendar_waits(
             result.row_assignments[pollers[task][i]] = {
                 static_cast<uint16_t>(begin), static_cast<uint16_t>(end - begin)
             };
+        }
+    }
+    plan_fused_fanin_credits(tasks, pollers, first_gate, parents.size(), result);
+    // Calendar workers are the AIC lanes followed by adjacent pairs of AIV
+    // lanes. A second block of the same ordinary task can acquire the first
+    // block's DONE or fan-in observation through the cluster's release token.
+    if (worker_count % PLATFORM_CORES_PER_BLOCKDIM != 0) return true;
+    const size_t cluster_count = worker_count / PLATFORM_CORES_PER_BLOCKDIM;
+    std::vector<uint32_t> first_lane_row(task_count, CALENDAR_NO_INPUT_OWNER);
+    const auto candidate = [&](size_t row) {
+        const auto task = static_cast<size_t>(percounter_order_task_id(rows[row].entry));
+        const auto &shape = tasks[task];
+        return result.row_waits[row] && shape.core_type_index == 1 && !shape.is_mix && !shape.sync_start &&
+               !shape.has_predicate && shape.active_mask != 0 && rows[row].local_join == CALENDAR_NO_JOIN &&
+               (result.task_fanins[task].size() == 1 || result.summarized_fanins[task]);
+    };
+    for (size_t worker = cluster_count; worker < worker_count; worker += 2) {
+        for (uint32_t row = indexes[worker]; row < indexes[worker + 1]; ++row) {
+            if (!candidate(row)) continue;
+            const auto task = percounter_order_task_id(rows[row].entry);
+            if (first_lane_row[task] == CALENDAR_NO_INPUT_OWNER) first_lane_row[task] = row;
+        }
+        for (uint32_t row = indexes[worker + 1]; row < indexes[worker + 2]; ++row) {
+            if (!candidate(row)) continue;
+            const auto task = percounter_order_task_id(rows[row].entry);
+            auto &other = first_lane_row[task];
+            if (other == CALENDAR_NO_INPUT_OWNER) continue;
+            // This extra edge follows the existing topological order, so
+            // it also composes with the edges from summarized fan-in helpers.
+            const uint32_t owner = ranks[gate_of(other)] < ranks[gate_of(row)] ? other : row;
+            const uint32_t follower = owner == row ? other : row;
+            // A helper must keep running its original resolver loop.
+            if (result.row_assignments[follower].count == 0) {
+                result.row_input_owners[owner] = owner;
+                result.row_input_owners[follower] = owner;
+            }
+            other = CALENDAR_NO_INPUT_OWNER;
+        }
+        for (uint32_t row = indexes[worker]; row < indexes[worker + 1]; ++row) {
+            const auto task = percounter_order_task_id(rows[row].entry);
+            first_lane_row[task] = CALENDAR_NO_INPUT_OWNER;
         }
     }
     return true;

@@ -39,9 +39,13 @@ public:
     explicit CompletionChains(CalendarCompletionPlan &plan) :
         plan_(plan) {}
 
-    bool append_phase(const CalendarPhase &phase, uint32_t body_base, uint32_t shell, uint64_t sink_credits) {
+    bool append_phase(
+        const CalendarPhase &phase, uint32_t body_base, uint32_t shell, uint64_t sink_credits,
+        const std::vector<bool> &fused_producers
+    ) {
         if (phase.tasks.empty() || phase.task_ids.size() != phase.tasks.size() ||
-            phase.fanins.size() != phase.tasks.size())
+            phase.fanins.size() != phase.tasks.size() ||
+            (!fused_producers.empty() && fused_producers.size() != phase.tasks.size()))
             return false;
         available_.resize(chains_.size());
         std::iota(available_.begin(), available_.end(), uint32_t{0});
@@ -55,6 +59,7 @@ public:
                 return false;
             for (int32_t pred : phase.fanins[task])
                 if (pred < 0 || static_cast<uint32_t>(pred) >= task) return false;
+            if (!fused_producers.empty() && fused_producers[task]) continue;
             const uint64_t credits = uint64_t{static_cast<uint32_t>(shape.block_num)} * shape.subtask_count;
             const bool deferred = shape.active_mask != 0;
             const uint32_t slot = find_ancestor(phase, slots, visited, task, credits, deferred);
@@ -97,7 +102,7 @@ private:
             const uint32_t ancestor = pending.top();
             pending.pop();
             const uint32_t slot = slots[ancestor];
-            if (chains_[slot].tip == ancestor && fits(slot, credits, deferred)) return slot;
+            if (slot != UINT32_MAX && chains_[slot].tip == ancestor && fits(slot, credits, deferred)) return slot;
             const auto &row = phase.fanins[ancestor];
             if (row.size() > edge_budget) continue;
             edge_budget -= row.size();

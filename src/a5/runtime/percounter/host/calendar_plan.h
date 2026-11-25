@@ -16,8 +16,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <queue>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -150,38 +152,73 @@ struct Placement {
     uint64_t free_at{0};
 };
 
-using Choices = std::array<std::vector<Placement>, mask_count>;
-
-inline Choices make_choices(const Shape &shape, uint32_t clusters) {
-    Choices choices;
-    for (const auto &task : shape.tasks) {
-        if (task.role_mask == 0 || !choices[task.role_mask].empty()) continue;
-        auto &list = choices[task.role_mask];
-        for (uint32_t cluster = 0; cluster < clusters; ++cluster) {
-            list.push_back({cluster, task.role_mask, 0});
-            // A standalone Vector's logical role is V0 on either physical Vector lane.
-            if (task.role_mask == 2U) list.push_back({cluster, 4U, 0});
-        }
+struct EarlierPlacement {
+    bool operator()(const Placement &a, const Placement &b) const {
+        if (a.free_at != b.free_at) return a.free_at < b.free_at;
+        if (a.cluster != b.cluster) return a.cluster < b.cluster;
+        return a.mask < b.mask;
     }
-    return choices;
-}
+};
 
-inline void update_choices(Choices *choices, const std::vector<uint64_t> &free_at, uint32_t clusters) {
-    for (auto &list : *choices) {
-        for (auto &place : list) {
-            place.free_at = 0;
-            for (uint32_t lane = 0; lane < lane_count; ++lane) {
-                if ((place.mask & (1U << lane)) == 0) continue;
-                place.free_at = std::max(place.free_at, free_at[worker_index(clusters, place.cluster, lane)]);
+class PlacementChoices {
+    using Placements = std::set<Placement, EarlierPlacement>;
+    static constexpr size_t max_width = 2U * PLATFORM_MAX_BLOCKDIM;
+
+public:
+    PlacementChoices(const Shape &shape, uint32_t clusters) :
+        clusters_(clusters) {
+        for (const auto &task : shape.tasks) {
+            const auto mask = task.role_mask;
+            if (mask == 0 || !ordered_[mask].empty()) continue;
+            for (uint32_t cluster = 0; cluster < clusters_; ++cluster) {
+                add(mask, {cluster, mask, 0});
+                // A standalone Vector can use either physical Vector lane.
+                if (mask == 2U) add(mask, {cluster, 4U, 0});
             }
         }
-        std::sort(list.begin(), list.end(), [](const Placement &a, const Placement &b) {
-            if (a.free_at != b.free_at) return a.free_at < b.free_at;
-            if (a.cluster != b.cluster) return a.cluster < b.cluster;
-            return a.mask < b.mask;
-        });
     }
-}
+
+    auto begin(uint32_t mask) const { return ordered_[mask].begin(); }
+
+    uint64_t ready_at(uint32_t mask, uint32_t width) const { return std::next(begin(mask), width - 1)->free_at; }
+
+    void update(uint32_t cluster, uint32_t changed, const std::vector<uint64_t> &free_at) {
+        for (uint32_t mask = 1; mask < mask_count; ++mask) {
+            if (ordered_[mask].empty()) continue;
+            refresh(mask, cluster, mask, changed, free_at);
+            if (mask == 2U) refresh(mask, cluster, 4U, changed, free_at);
+        }
+    }
+
+private:
+    uint32_t clusters_;
+    std::array<Placements, mask_count> ordered_;
+    std::array<std::array<Placements::iterator, max_width>, mask_count> positions_;
+
+    static size_t position(uint32_t cluster, uint32_t logical, uint32_t physical) {
+        return 2U * cluster + (logical != physical ? 1U : 0U);
+    }
+
+    void add(uint32_t mask, const Placement &choice) {
+        positions_[mask][position(choice.cluster, mask, choice.mask)] = ordered_[mask].insert(choice).first;
+    }
+
+    void refresh(
+        uint32_t mask, uint32_t cluster, uint32_t physical, uint32_t changed, const std::vector<uint64_t> &free_at
+    ) {
+        if ((physical & changed) == 0) return;
+        auto &current = positions_[mask][position(cluster, mask, physical)];
+        uint64_t updated = 0;
+        for (uint32_t lane = 0; lane < lane_count; ++lane) {
+            if ((physical & (1U << lane)) != 0)
+                updated = std::max(updated, free_at[worker_index(clusters_, cluster, lane)]);
+        }
+        if (current->free_at == updated) return;
+        auto node = ordered_[mask].extract(current);
+        node.value().free_at = updated;
+        current = ordered_[mask].insert(std::move(node)).position;
+    }
+};
 
 struct ReadyTask {
     uint32_t id;
@@ -306,156 +343,36 @@ inline bool read_table(const CalendarPlan &plan, uint32_t offset, uint32_t count
     return true;
 }
 
-struct Edge {
-    size_t successor;
-    uint64_t lag;
+struct CalendarLayout {
+    CalendarHeader header{};
+    std::vector<uint32_t> indices;
+    std::vector<CalendarRow> rows;
+    std::vector<CalendarLocalJoin> joins;
 };
 
-}  // namespace calendar_detail
-
-inline bool build_static_calendar(
-    const std::vector<TaskInput> &tasks, uint32_t cluster_count, const std::vector<CalendarRowCost> &costs,
-    CalendarPlan *out
+inline bool read_calendar_layout(
+    const std::vector<TaskInput> &tasks, uint32_t cluster_count, const Shape &shape, const CalendarPlan &plan,
+    CalendarLayout &layout
 ) {
-    using namespace calendar_detail;
-    Shape shape;
-    if (out == nullptr || !describe(tasks, cluster_count, costs, &shape)) return false;
-
-    std::vector<std::vector<uint32_t>> successors(tasks.size());
-    std::vector<uint32_t> prerequisites(tasks.size(), 0);
-    std::vector<uint32_t> next_block(tasks.size(), 0);
-    std::vector<uint64_t> priority(tasks.size(), 0);
-    std::vector<uint64_t> data_ready(tasks.size(), 0), task_complete(tasks.size(), 0);
-    for (uint32_t id = 0; id < tasks.size(); ++id) {
-        const auto &task = tasks[id];
-        if (task.inline_completed) continue;
-        for (int32_t edge = 0; edge < task.fanin_count; ++edge) {
-            const auto dep = static_cast<uint32_t>(task.fanin_ids[edge]);
-            if (tasks[dep].inline_completed) continue;
-            successors[dep].push_back(id);
-            ++prerequisites[id];
-        }
-    }
-    // Use bottom-level ranks only after measurement. The cold run has a stable task-ID tie break.
-    if (!costs.empty()) {
-        for (size_t id = tasks.size(); id-- > 0;) {
-            for (uint32_t child : successors[id])
-                priority[id] = std::max(priority[id], priority[child]);
-            priority[id] += shape.tasks[id].longest_output_latency;
-        }
-    }
-
-    // Tasks in each class have the same earliest available placement time.
-    std::map<std::pair<uint32_t, uint32_t>, ReadyTasks> ready;
-    const auto add_ready = [&](uint32_t id) {
-        const auto &task = tasks[id];
-        const uint32_t width = task.sync_start ? static_cast<uint32_t>(task.block_num) : 1;
-        ready[{shape.tasks[id].role_mask, width}].future.push({id, data_ready[id], priority[id]});
-    };
-    for (uint32_t id = 0; id < tasks.size(); ++id)
-        if (!tasks[id].inline_completed && prerequisites[id] == 0) add_ready(id);
-
-    Choices choices = make_choices(shape, cluster_count);
-    const auto worker_count = static_cast<size_t>(cluster_count) * lane_count;
-    PlacementState state{std::vector<std::vector<PackedRow>>(worker_count), std::vector<uint64_t>(worker_count, 0), {}};
-    uint64_t predicted = 0;
-    while (!ready.empty()) {
-        update_choices(&choices, state.free_at, cluster_count);
-        uint64_t start = UINT64_MAX;
-        auto picked = ready.end();
-        ReadyTask selected{};
-        for (auto group = ready.begin(); group != ready.end(); ++group) {
-            const auto [mask, width] = group->first;
-            const uint64_t resource_ready = choices[mask][width - 1U].free_at;
-            auto &queue = group->second;
-            // Lane availability only advances. Tasks below the resource
-            // frontier can stay ordered by priority for subsequent placements.
-            while (!queue.future.empty() && queue.future.top().data_ready <= resource_ready) {
-                queue.available.push(queue.future.top());
-                queue.future.pop();
-            }
-            const auto &candidate = queue.available.empty() ? queue.future.top() : queue.available.top();
-            const uint64_t earliest = std::max(candidate.data_ready, resource_ready);
-            if (picked == ready.end() || earliest < start ||
-                (earliest == start && LowerPriority{}(selected, candidate))) {
-                start = earliest;
-                picked = group;
-                selected = candidate;
-            }
-        }
-        const uint32_t id = selected.id;
-        const auto &task = tasks[id];
-        const auto [mask, width] = picked->first;
-        const auto &choices_for_task = choices[mask];
-        for (uint32_t i = 0; i < width; ++i) {
-            const uint32_t block = next_block[id]++;
-            const uint64_t complete = append_block(
-                &state, cluster_count, task, shape.tasks[id], id, block, choices_for_task[i], start, costs
-            );
-            task_complete[id] = std::max(task_complete[id], complete);
-        }
-        if (next_block[id] != static_cast<uint32_t>(task.block_num)) continue;
-        predicted = std::max(predicted, task_complete[id]);
-        auto &queue = picked->second;
-        if (queue.available.empty()) queue.future.pop();
-        else queue.available.pop();
-        if (queue.future.empty() && queue.available.empty()) ready.erase(picked);
-        for (uint32_t successor : successors[id]) {
-            data_ready[successor] = std::max(data_ready[successor], task_complete[id]);
-            if (--prerequisites[successor] == 0) add_ready(successor);
-        }
-    }
-
-    return pack(state, tasks, shape.row_count, predicted, out);
-}
-
-// Replay the packed order using the placement costs. Resource edges carry lane occupancy.
-// Fanin uses the maximum output latency over all rows of its producer.
-inline bool evaluate_static_calendar(
-    const std::vector<TaskInput> &tasks, uint32_t cluster_count, const CalendarPlan &plan,
-    const std::vector<CalendarRowCost> &costs, uint64_t *predicted_cycles
-) {
-    using namespace calendar_detail;
-    Shape shape;
-    if (predicted_cycles == nullptr || !describe(tasks, cluster_count, costs, &shape) ||
-        plan.bytes.size() < sizeof(CalendarHeader) || plan.logical_row_by_packed.size() != shape.row_count)
+    if (plan.bytes.size() < sizeof(CalendarHeader) || plan.logical_row_by_packed.size() != shape.row_count)
         return false;
-
-    CalendarHeader header{};
+    auto &header = layout.header;
+    auto &indices = layout.indices;
+    auto &rows = layout.rows;
+    auto &joins = layout.joins;
     std::memcpy(&header, plan.bytes.data(), sizeof(header));
     if (header.worker_count != cluster_count * lane_count || header.row_count != shape.row_count ||
         header.join_count > header.row_count)
         return false;
-    std::vector<uint32_t> indices;
-    std::vector<CalendarRow> rows;
-    std::vector<CalendarLocalJoin> joins;
     if (!read_table(plan, header.index_offset, header.worker_count + 1, &indices) ||
         !read_table(plan, header.row_offset, header.row_count, &rows) ||
         !read_table(plan, header.join_offset, header.join_count, &joins) || indices.front() != 0 ||
         indices.back() != header.row_count || !std::is_sorted(indices.begin(), indices.end()))
         return false;
 
-    const size_t graph_nodes = static_cast<size_t>(shape.group_count) + tasks.size();
-    std::vector<std::vector<Edge>> next(graph_nodes);
-    std::vector<size_t> pending(graph_nodes, 0);
     std::vector<bool> seen(shape.row_count, false);
-    const auto edge = [&](size_t src, size_t dst, uint64_t lag) {
-        next[src].push_back({dst, lag});
-        ++pending[dst];
-    };
-    for (size_t id = 0; id < tasks.size(); ++id) {
-        const auto &task = tasks[id];
-        if (task.inline_completed) continue;
-        const auto &s = shape.tasks[id];
-        for (uint32_t g = s.first_group; g < s.first_group + s.group_count; ++g) {
-            for (int32_t i = 0; i < task.fanin_count; ++i)
-                edge(shape.group_count + static_cast<size_t>(task.fanin_ids[i]), g, 0);
-        }
-    }
     uint32_t joined_rows = 0;
     for (uint32_t worker = 0; worker < header.worker_count; ++worker) {
-        size_t prev_group = graph_nodes;
-        uint64_t prev_occupancy = 0;
         const uint32_t lane = worker_lane(cluster_count, worker);
         const uint32_t cluster = worker_cluster(cluster_count, worker);
         for (uint32_t i = indices[worker]; i < indices[worker + 1]; ++i) {
@@ -491,18 +408,313 @@ inline bool evaluate_static_calendar(
             } else if (row.local_join != CALENDAR_NO_JOIN) {
                 return false;
             }
-            const size_t group = s.first_group + (task.sync_start ? 0 : block);
-            const auto cost = row_cost(costs, logical);
-            if (prev_group != graph_nodes) edge(prev_group, group, prev_occupancy);
-            edge(group, shape.group_count + static_cast<size_t>(id), cost.output_latency());
-            prev_group = group;
-            prev_occupancy = cost.occupancy_cycles;
         }
     }
     if (header.join_count > joined_rows || std::any_of(seen.begin(), seen.end(), [](bool v) {
             return !v;
         }))
         return false;
+
+    return true;
+}
+
+struct Edge {
+    size_t successor;
+    uint64_t lag;
+};
+
+}  // namespace calendar_detail
+
+enum class CalendarBlockOrder { SUBMISSION, LONGEST_OUTPUT_FIRST };
+enum class CalendarPriority { LONGEST_ROW, WORK_AND_WAIT };
+
+struct CalendarPriorityCosts {
+    uint64_t row_cycles{0};
+    uint64_t observation_cycles{0};
+    uint64_t credit_cycles{0};
+};
+
+inline bool calendar_placement_costs(
+    const std::vector<TaskInput> &tasks, uint32_t clusters, const std::vector<CalendarRowCost> &samples,
+    const CalendarPriorityCosts &overhead, std::vector<CalendarRowCost> *result
+) {
+    calendar_detail::Shape shape;
+    if (samples.empty() || !calendar_detail::describe(tasks, clusters, samples, &shape)) return false;
+    *result = samples;
+    for (uint32_t id = 0; id < tasks.size(); ++id) {
+        const auto &task = tasks[id];
+        const auto &s = shape.tasks[id];
+        if (s.role_count == 0) continue;
+        uint64_t fanins = 0;
+        for (int32_t i = 0; i < task.fanin_count; ++i)
+            fanins += !tasks[task.fanin_ids[i]].inline_completed;
+        const bool summarizes =
+            fanins >= 2 && !task.is_mix && !task.sync_start && task.block_num >= 2 &&
+            fanins <= CALENDAR_FANIN_TASKS_PER_LANE * std::min(static_cast<uint32_t>(task.block_num), 2U * clusters);
+        const uint64_t probes = summarizes ? (fanins + task.block_num - 1) / task.block_num : fanins;
+        if (overhead.row_cycles > UINT64_MAX - overhead.observation_cycles ||
+            (probes != 0 &&
+             overhead.credit_cycles > (UINT64_MAX - overhead.row_cycles - overhead.observation_cycles) / probes))
+            return false;
+        // Use local row and observation work to build the order. The complete
+        // wait plan is subsequently scored using the original kernel samples.
+        const auto delay =
+            overhead.row_cycles + (fanins == 0 ? 0 : overhead.observation_cycles) + probes * overhead.credit_cycles;
+        const auto row_count = static_cast<uint32_t>(task.block_num) * s.role_count;
+        for (uint32_t row = s.first_row; row < s.first_row + row_count; ++row) {
+            auto &cost = (*result)[row];
+            if (cost.occupancy_cycles > UINT64_MAX - delay) return false;
+            cost.occupancy_cycles += delay;
+        }
+    }
+    return true;
+}
+
+inline bool build_static_calendar(
+    const std::vector<TaskInput> &tasks, uint32_t cluster_count, const std::vector<CalendarRowCost> &costs,
+    CalendarPlan *out, CalendarBlockOrder order = CalendarBlockOrder::SUBMISSION, uint64_t priority_window_cycles = 0,
+    CalendarPriority ranking = CalendarPriority::LONGEST_ROW, bool fill_wait_gaps = false
+) {
+    using namespace calendar_detail;
+    Shape shape;
+    if (out == nullptr || !describe(tasks, cluster_count, costs, &shape)) return false;
+
+    std::vector<std::vector<uint32_t>> successors(tasks.size());
+    std::vector<uint32_t> prerequisites(tasks.size(), 0);
+    std::vector<uint32_t> next_block(tasks.size(), 0);
+    std::vector<uint64_t> priority(tasks.size(), 0);
+    std::vector<uint64_t> data_ready(tasks.size(), 0), task_complete(tasks.size(), 0);
+    for (uint32_t id = 0; id < tasks.size(); ++id) {
+        const auto &task = tasks[id];
+        if (task.inline_completed) continue;
+        for (int32_t edge = 0; edge < task.fanin_count; ++edge) {
+            const auto dep = static_cast<uint32_t>(task.fanin_ids[edge]);
+            if (tasks[dep].inline_completed) continue;
+            successors[dep].push_back(id);
+            ++prerequisites[id];
+        }
+    }
+    // Use bottom-level ranks only after measurement. The cold run has a stable task-ID tie break.
+    if (!costs.empty()) {
+        for (size_t id = tasks.size(); id-- > 0;) {
+            for (uint32_t child : successors[id])
+                priority[id] = std::max(priority[id], priority[child]);
+            const auto &s = shape.tasks[id];
+            uint64_t duration = s.longest_output_latency;
+            if (ranking == CalendarPriority::WORK_AND_WAIT && s.role_count != 0) {
+                const auto &task = tasks[id];
+                const uint32_t capacity = s.role_mask == 2U ? 2U * cluster_count : cluster_count;
+                for (uint32_t role = 0; role < s.role_count; ++role) {
+                    uint64_t work = 0;
+                    for (uint32_t block = 0; block < static_cast<uint32_t>(task.block_num); ++block) {
+                        const auto row = s.first_row + block * s.role_count + role;
+                        work += costs[row].occupancy_cycles;
+                    }
+                    const auto minimum = work / capacity + (work % capacity != 0);
+                    duration = std::max(duration, minimum);
+                }
+            }
+            priority[id] += duration;
+        }
+    }
+
+    std::vector<std::vector<std::pair<uint64_t, uint32_t>>> block_order;
+    if (!costs.empty() && order == CalendarBlockOrder::LONGEST_OUTPUT_FIRST) {
+        block_order.resize(tasks.size());
+        for (uint32_t id = 0; id < tasks.size(); ++id) {
+            const auto &task = tasks[id];
+            const auto &s = shape.tasks[id];
+            if (task.inline_completed || task.sync_start || task.block_num < 2) continue;
+            auto &blocks = block_order[id];
+            blocks.reserve(static_cast<size_t>(task.block_num));
+            for (uint32_t block = 0; block < static_cast<uint32_t>(task.block_num); ++block) {
+                uint64_t latency = 0;
+                for (uint32_t role = 0; role < s.role_count; ++role) {
+                    const uint32_t row = s.first_row + block * s.role_count + role;
+                    latency = std::max(latency, costs[row].output_latency());
+                }
+                blocks.emplace_back(latency, block);
+            }
+            std::sort(blocks.begin(), blocks.end(), [](const auto &a, const auto &b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+        }
+    }
+
+    // Tasks in each class have the same earliest available placement time.
+    std::map<std::pair<uint32_t, uint32_t>, ReadyTasks> ready;
+    const auto add_ready = [&](uint32_t id) {
+        const auto &task = tasks[id];
+        const uint32_t width = task.sync_start ? static_cast<uint32_t>(task.block_num) : 1;
+        ready[{shape.tasks[id].role_mask, width}].future.push({id, data_ready[id], priority[id]});
+    };
+    uint64_t predicted = 0;
+    const auto release_successors = [&](uint32_t id) {
+        predicted = std::max(predicted, task_complete[id]);
+        for (uint32_t successor : successors[id]) {
+            data_ready[successor] = std::max(data_ready[successor], task_complete[id]);
+            if (--prerequisites[successor] == 0) add_ready(successor);
+        }
+    };
+    for (uint32_t id = 0; id < tasks.size(); ++id)
+        if (!tasks[id].inline_completed && prerequisites[id] == 0) add_ready(id);
+
+    PlacementChoices choices(shape, cluster_count);
+    const auto worker_count = static_cast<size_t>(cluster_count) * lane_count;
+    PlacementState state{std::vector<std::vector<PackedRow>>(worker_count), std::vector<uint64_t>(worker_count, 0), {}};
+    struct GroupCandidate {
+        decltype(ready)::iterator group;
+        ReadyTask task;
+        uint64_t earliest;
+    };
+    std::vector<GroupCandidate> candidates;
+    while (!ready.empty()) {
+        candidates.clear();
+        uint64_t start = UINT64_MAX;
+        uint64_t earliest_any = UINT64_MAX;
+        auto picked = ready.end();
+        ReadyTask selected{};
+        for (auto group = ready.begin(); group != ready.end(); ++group) {
+            const auto [mask, width] = group->first;
+            const uint64_t resource_ready = choices.ready_at(mask, width);
+            auto &queue = group->second;
+            // Lane availability only advances. A priority window can admit a
+            // near-ready task while the dependency still limits its start.
+            const uint64_t ready_through =
+                resource_ready + std::min(priority_window_cycles, UINT64_MAX - resource_ready);
+            while (!queue.future.empty() && queue.future.top().data_ready <= ready_through) {
+                queue.available.push(queue.future.top());
+                queue.future.pop();
+            }
+            const auto &candidate = queue.available.empty() ? queue.future.top() : queue.available.top();
+            const uint64_t earliest = std::max(candidate.data_ready, resource_ready);
+            earliest_any = std::min(earliest_any, earliest);
+            candidates.push_back({group, candidate, earliest});
+        }
+        for (const auto &candidate : candidates) {
+            if (candidate.earliest - earliest_any > priority_window_cycles) continue;
+            if (picked == ready.end() || LowerPriority{}(selected, candidate.task)) {
+                start = candidate.earliest;
+                picked = candidate.group;
+                selected = candidate.task;
+            }
+        }
+        const auto [mask, width] = picked->first;
+        auto &queue = picked->second;
+        const ReadyTask reserved = selected;
+        const uint64_t reserved_start = start;
+        bool backfilled = false;
+        const uint64_t free_at = choices.ready_at(mask, width);
+        if (fill_wait_gaps && start > free_at && !queue.available.empty()) {
+            // Inspect a bounded number of the same placement class. They can
+            // run before the selected task if all its lanes still meet the
+            // original start time.
+            std::array<ReadyTask, 4> deferred;
+            size_t deferred_count = 0;
+            while (deferred_count < deferred.size() && !queue.available.empty()) {
+                const auto other = queue.available.top();
+                queue.available.pop();
+                const uint64_t other_start = std::max(free_at, other.data_ready);
+                if (other.id != selected.id && other_start < start) {
+                    const auto &other_shape = shape.tasks[other.id];
+                    uint64_t occupancy = 0;
+                    for (uint32_t i = 0; i < width; ++i) {
+                        uint32_t block = next_block[other.id] + i;
+                        if (!block_order.empty() && !block_order[other.id].empty())
+                            block = block_order[other.id][block].second;
+                        const auto first = other_shape.first_row + block * other_shape.role_count;
+                        for (uint32_t role = 0; role < other_shape.role_count; ++role)
+                            occupancy = std::max(occupancy, row_cost(costs, first + role).occupancy_cycles);
+                    }
+                    if (occupancy <= start - other_start) {
+                        selected = other;
+                        start = other_start;
+                        backfilled = true;
+                        break;
+                    }
+                }
+                deferred[deferred_count++] = other;
+            }
+            for (size_t i = 0; i < deferred_count; ++i)
+                queue.available.push(deferred[i]);
+        }
+        std::array<std::pair<uint32_t, uint32_t>, 2U * PLATFORM_MAX_BLOCKDIM> changed;
+        const auto place = [&](uint32_t id, uint64_t tick) {
+            auto choice = choices.begin(mask);
+            const bool reorder = !block_order.empty() && !block_order[id].empty();
+            for (uint32_t i = 0; i < width; ++i, ++choice) {
+                const uint32_t index = next_block[id]++;
+                const uint32_t block = reorder ? block_order[id][index].second : index;
+                const uint64_t complete =
+                    append_block(&state, cluster_count, tasks[id], shape.tasks[id], id, block, *choice, tick, costs);
+                task_complete[id] = std::max(task_complete[id], complete);
+                changed[i] = {choice->cluster, choice->mask};
+            }
+            return next_block[id] == static_cast<uint32_t>(tasks[id].block_num);
+        };
+        const bool selected_done = place(selected.id, start);
+        // Commit the reservation on the same placements before allowing a
+        // different resource class to compete for any overlapping lane.
+        const bool reserved_done = backfilled ? place(reserved.id, reserved_start) : selected_done;
+        for (uint32_t i = 0; i < width; ++i)
+            choices.update(changed[i].first, changed[i].second, state.free_at);
+        if (reserved_done) {
+            if (queue.available.empty()) queue.future.pop();
+            else queue.available.pop();
+        }
+        if (backfilled && !selected_done) queue.available.push(selected);
+        if (queue.future.empty() && queue.available.empty()) ready.erase(picked);
+        if (backfilled && selected_done) release_successors(selected.id);
+        if (reserved_done) release_successors(reserved.id);
+    }
+
+    return pack(state, tasks, shape.row_count, predicted, out);
+}
+
+// Replay the packed order using the placement costs. Resource edges carry lane occupancy.
+// Fanin uses the maximum output latency over all rows of its producer.
+inline bool evaluate_static_calendar(
+    const std::vector<TaskInput> &tasks, uint32_t cluster_count, const CalendarPlan &plan,
+    const std::vector<CalendarRowCost> &costs, uint64_t *predicted_cycles
+) {
+    using namespace calendar_detail;
+    Shape shape;
+    CalendarLayout layout;
+    if (predicted_cycles == nullptr || !describe(tasks, cluster_count, costs, &shape) ||
+        !read_calendar_layout(tasks, cluster_count, shape, plan, layout))
+        return false;
+
+    const size_t graph_nodes = static_cast<size_t>(shape.group_count) + tasks.size();
+    std::vector<std::vector<Edge>> next(graph_nodes);
+    std::vector<size_t> pending(graph_nodes, 0);
+    const auto edge = [&](size_t src, size_t dst, uint64_t lag) {
+        next[src].push_back({dst, lag});
+        ++pending[dst];
+    };
+    for (size_t id = 0; id < tasks.size(); ++id) {
+        const auto &task = tasks[id];
+        if (task.inline_completed) continue;
+        const auto &s = shape.tasks[id];
+        for (uint32_t g = s.first_group; g < s.first_group + s.group_count; ++g) {
+            for (int32_t i = 0; i < task.fanin_count; ++i)
+                edge(shape.group_count + static_cast<size_t>(task.fanin_ids[i]), g, 0);
+        }
+    }
+    for (uint32_t worker = 0; worker < layout.header.worker_count; ++worker) {
+        size_t prev_group = graph_nodes;
+        uint64_t prev_occupancy = 0;
+        for (uint32_t i = layout.indices[worker]; i < layout.indices[worker + 1]; ++i) {
+            const auto &row = layout.rows[i];
+            const auto id = static_cast<uint32_t>(percounter_order_task_id(row.entry));
+            const auto block = static_cast<uint32_t>(percounter_order_block_idx(row.entry));
+            const size_t group = shape.tasks[id].first_group + (tasks[id].sync_start ? 0 : block);
+            const auto cost = row_cost(costs, plan.logical_row_by_packed[i]);
+            if (prev_group != graph_nodes) edge(prev_group, group, prev_occupancy);
+            edge(group, shape.group_count + static_cast<size_t>(id), cost.output_latency());
+            prev_group = group;
+            prev_occupancy = cost.occupancy_cycles;
+        }
+    }
 
     std::vector<size_t> ready;
     for (size_t node = 0; node < graph_nodes; ++node)

@@ -21,7 +21,7 @@ percounter_calendar_table(const __gm__ uint8_t *image, uint64_t bytes, uint32_t 
 }
 
 template <typename Ready>
-inline __aicore__ bool percounter_calendar_wait(const LaneConfig &cfg, Ready ready) {
+inline __aicore__ bool percounter_calendar_wait(const LaneConfig &cfg, Ready ready, const uint32_t &retry_cycles = 0) {
     uint32_t pending = 0;
     for (; !ready(); ++pending) {
         if (pending % PERCOUNTER_SPIN_CHECK_INTERVAL == 0 && percounter_should_stop(cfg)) {
@@ -30,12 +30,51 @@ inline __aicore__ bool percounter_calendar_wait(const LaneConfig &cfg, Ready rea
             }
             return false;
         }
+#if defined(__CCE_AICORE__)
+        if (retry_cycles != 0 && pending >= 2) {
+            const uint64_t retry_start = get_sys_cnt_aicore();
+            while (get_sys_cnt_aicore() - retry_start < retry_cycles) {}
+        }
+#else
+        (void)retry_cycles;
+#endif
         SPIN_WAIT_HINT();
     }
     if constexpr (profile_compiled) {
         if (cfg.scalar != nullptr) cfg.scalar->poll_loops += pending;
     }
     return true;
+}
+
+inline __aicore__ uint32_t
+percounter_calendar_retry_cycles(const LaneConfig &cfg, uint32_t blocks, bool completion_helper) {
+    if (blocks < 16) return 0;
+    const auto offset = (static_cast<uint32_t>(cfg.cluster_index) & 7U) * 12U;
+    return (completion_helper ? 128U : 256U) + offset;
+}
+
+inline __aicore__ uint32_t percounter_calendar_retry_scale(uint32_t remaining) {
+    return (remaining > 2U) + (remaining > 8U) + (remaining > 16U);
+}
+
+inline __aicore__ bool percounter_calendar_wait_threshold(
+    const LaneConfig &cfg, uint64_t address, uint32_t target, uint32_t base_retry_cycles
+) {
+    auto *counter = reinterpret_cast<__gm__ volatile uint32_t *>(address);
+    uint32_t retry_cycles = 0;
+    return percounter_calendar_wait(
+        cfg,
+        [&]() __aicore__ {
+            const uint32_t observed = percounter_notify_query(*counter) & CALENDAR_COUNT_MASK;
+            if (observed >= target) return true;
+            const uint32_t remaining = target - observed;
+            // A large distance to the last credit can tolerate a longer retry
+            // interval. Observe the final credits with no added delay.
+            retry_cycles = base_retry_cycles * percounter_calendar_retry_scale(remaining);
+            return false;
+        },
+        retry_cycles
+    );
 }
 
 inline __aicore__ void percounter_calendar_add(uint64_t address) {
@@ -95,6 +134,18 @@ inline __aicore__ bool percounter_calendar_seal(
         if (source._pad != 0 || !percounter_completion_token_valid(token)) {
             percounter_fail(cfg, SchedulerGraphResult::ASYNC_COMPLETION_INVALID, task);
             return false;
+        }
+        // A single monotonic counter can already be ready when the kernel
+        // returns. Its read is non-consuming, so pending values still use the
+        // regular registration and any successor can settle that registration.
+        if (count == 1 && token.completion_type == COMPLETION_TYPE_COUNTER &&
+            percounter_poll_valid_completion(token).state == CompletionPollState::READY) {
+            scratch->count = 0;
+            dcci(scratch, SINGLE_CACHE_LINE, CACHELINE_OUT);
+            percounter_memory_barrier();
+            if (sample != nullptr) sample->end = get_sys_cnt_aicore();
+            *deferred = false;
+            return true;
         }
     }
 
@@ -223,8 +274,9 @@ inline __aicore__ bool percounter_calendar_service_defer(const LaneConfig &cfg, 
     return true;
 }
 
-inline __aicore__ CompletionPollState
-percounter_calendar_poll_completion(const LaneConfig &cfg, uint64_t command, uint64_t target, uint64_t *cursor) {
+inline __aicore__ CompletionPollState percounter_calendar_poll_completion(
+    const LaneConfig &cfg, uint64_t command, uint64_t target, uint64_t *cursor, uint32_t *remaining = nullptr
+) {
     const uint64_t tag = command & CALENDAR_WAIT_TAG_MASK;
     auto *counter = reinterpret_cast<__gm__ volatile uint32_t *>(command & ~CALENDAR_WAIT_TAG_MASK);
     if (tag == CALENDAR_WAIT_NOTIFY)
@@ -237,16 +289,18 @@ percounter_calendar_poll_completion(const LaneConfig &cfg, uint64_t command, uin
         return CompletionPollState::FAILED;
     }
     const uint32_t word = percounter_notify_query(*counter);
-    if ((word & CALENDAR_COUNT_MASK) >= (static_cast<uint32_t>(target) & CALENDAR_COUNT_MASK))
-        return CompletionPollState::READY;
-    if ((word & (uint32_t{1} << bit_index)) != 0 && !percounter_calendar_service_defer(cfg, task, cursor))
-        return CompletionPollState::FAILED;
+    const uint32_t observed = word & CALENDAR_COUNT_MASK;
+    const uint32_t required = static_cast<uint32_t>(target) & CALENDAR_COUNT_MASK;
+    if (observed >= required) return CompletionPollState::READY;
+    const bool needs_service = (word & (uint32_t{1} << bit_index)) != 0;
+    if (remaining != nullptr) *remaining = needs_service ? 0 : required - observed;
+    if (needs_service && !percounter_calendar_service_defer(cfg, task, cursor)) return CompletionPollState::FAILED;
     return CompletionPollState::PENDING;
 }
 
 inline __aicore__ bool percounter_calendar_wait_list(
     const LaneConfig &cfg, const __gm__ CalendarWait *waits, uint32_t count, uint64_t entry = 0,
-    uint64_t range_key = UINT64_MAX
+    uint64_t range_key = UINT64_MAX, uint32_t retry_cycles = 0
 ) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Fanin, entry);
     for (uint32_t i = 0; i < count; ++i) {
@@ -256,9 +310,13 @@ inline __aicore__ bool percounter_calendar_wait_list(
         const uint64_t address = command & ~CALENDAR_WAIT_TAG_MASK;
         auto *notify = reinterpret_cast<__gm__ volatile uint32_t *>(address);
         if (tag == CALENDAR_WAIT_NOTIFY) {
-            if (!percounter_calendar_wait(cfg, [&]() __aicore__ {
-                    return (percounter_notify_query(*notify) & CALENDAR_COUNT_MASK) >= target;
-                }))
+            if (!percounter_calendar_wait(
+                    cfg,
+                    [&]() __aicore__ {
+                        return (percounter_notify_query(*notify) & CALENDAR_COUNT_MASK) >= target;
+                    },
+                    retry_cycles
+                ))
                 return false;
         } else if (tag == CALENDAR_WAIT_GM_TARGET) {
             auto *watermark = reinterpret_cast<__gm__ volatile uint64_t *>(address);
@@ -274,13 +332,18 @@ inline __aicore__ bool percounter_calendar_wait_list(
         } else if (tag == CALENDAR_WAIT_DEFER) {
             uint64_t cursor = 0;
             bool failed = false;
+            uint32_t retry_delay = 0;
             if (!percounter_calendar_wait(
                     cfg,
                     [&]() __aicore__ {
-                        const auto state = percounter_calendar_poll_completion(cfg, command, target, &cursor);
+                        uint32_t remaining = 0;
+                        const auto state =
+                            percounter_calendar_poll_completion(cfg, command, target, &cursor, &remaining);
                         failed = state == CompletionPollState::FAILED;
+                        retry_delay = retry_cycles * percounter_calendar_retry_scale(remaining);
                         return state != CompletionPollState::PENDING;
-                    }
+                    },
+                    retry_delay
                 ) ||
                 failed)
                 return false;
@@ -292,18 +355,85 @@ inline __aicore__ bool percounter_calendar_wait_list(
     return true;
 }
 
+inline __aicore__ CompletionPollState percounter_calendar_poll_fused_fanin(
+    const LaneConfig &cfg, uint64_t address, uint32_t target, uint32_t task, uint32_t bit, uint64_t *cursor,
+    uint32_t *remaining = nullptr
+) {
+    auto *counter = reinterpret_cast<__gm__ volatile uint32_t *>(address);
+    const uint32_t word = percounter_notify_query(*counter);
+    const uint32_t observed = word & CALENDAR_COUNT_MASK;
+    if (observed >= target) return CompletionPollState::READY;
+    const bool has_defer = (word & bit) != 0;
+    if (remaining != nullptr) *remaining = has_defer ? 0 : target - observed;
+    if (has_defer && !percounter_calendar_service_defer(cfg, task, cursor)) return CompletionPollState::FAILED;
+    return CompletionPollState::PENDING;
+}
+
+inline __aicore__ bool percounter_calendar_wait_fused_fanin(
+    const LaneConfig &cfg, const __gm__ CalendarWait *waits, uint64_t address, uint64_t group_target, uint32_t begin,
+    uint32_t count, uint64_t entry, uint32_t retry_cycles
+) {
+    const auto target = static_cast<uint32_t>(group_target);
+    const auto producers = static_cast<uint32_t>(group_target >> 32);
+    if (address == 0 || target == 0 || target > CALENDAR_COUNT_MASK || producers < 2 ||
+        producers > CALENDAR_FUSED_FANIN_MAX_PRODUCERS || count > 1 || (count != 0 && begin >= producers)) {
+        percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, percounter_order_task_id(entry));
+        return false;
+    }
+
+    if (count == 0) return percounter_calendar_wait_threshold(cfg, address, target, retry_cycles);
+
+    uint32_t task = 0;
+    uint32_t bit = 0;
+    if (count != 0) {
+        // Each original helper observes its own producer and defer descriptor.
+        const auto *member = waits + 1 + begin;
+        const uint64_t member_command = member->read_cmd;
+        const uint64_t member_target = member->target;
+        task = static_cast<uint32_t>(member_target >> 32);
+        const uint32_t bit_index = 24 + begin;
+        if (member_command != (address | CALENDAR_WAIT_DEFER) || task >= cfg.task_count ||
+            static_cast<uint32_t>(member_target) != ((bit_index << 24) | target)) {
+            percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, task);
+            return false;
+        }
+        bit = uint32_t{1} << bit_index;
+    }
+
+    uint64_t cursor = 0;
+    bool failed = false;
+    uint32_t retry_delay = 0;
+    const bool finished = percounter_calendar_wait(
+        cfg,
+        [&]() __aicore__ {
+            uint32_t remaining = 0;
+            const auto state =
+                percounter_calendar_poll_fused_fanin(cfg, address, target, task, bit, &cursor, &remaining);
+            retry_delay = remaining > 2 ? retry_cycles : 0;
+            failed = state == CompletionPollState::FAILED;
+            return state != CompletionPollState::PENDING;
+        },
+        retry_delay
+    );
+    return finished && !failed;
+}
+
 inline __aicore__ bool percounter_calendar_wait_fanin(
-    const LaneConfig &cfg, const __gm__ CalendarWait *waits, uint32_t begin, uint32_t count, uint64_t entry
+    const LaneConfig &cfg, const __gm__ CalendarWait *waits, uint32_t begin, uint32_t count, uint64_t entry,
+    uint32_t retry_cycles = 0
 ) {
     ProfileScope scope(cfg.scalar, ProfilePhase::Fanin, entry);
     const uint64_t command = waits[0].read_cmd;
     const uint64_t target = waits[0].target;
+    const uint64_t tag = command & CALENDAR_WAIT_TAG_MASK;
+    const uint64_t address = command & ~CALENDAR_WAIT_TAG_MASK;
+    if (tag == CALENDAR_WAIT_FUSED_FANIN)
+        return percounter_calendar_wait_fused_fanin(cfg, waits, address, target, begin, count, entry, retry_cycles);
     if (count > CALENDAR_FANIN_TASKS_PER_LANE || begin > target || count > target - begin ||
-        (command & CALENDAR_WAIT_TAG_MASK) != CALENDAR_WAIT_NOTIFY) {
+        tag != CALENDAR_WAIT_NOTIFY) {
         percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, percounter_order_task_id(entry));
         return false;
     }
-    const uint64_t address = command & ~CALENDAR_WAIT_TAG_MASK;
     if (count != 0) {
         uint64_t cursors[CALENDAR_FANIN_TASKS_PER_LANE]{};
         uint32_t pending = (1U << count) - 1;
@@ -330,15 +460,13 @@ inline __aicore__ bool percounter_calendar_wait_fanin(
                         pending &= ~(1U << i);
                     }
                     return pending == 0;
-                }
+                },
+                retry_cycles
             ) ||
             failed)
             return false;
     }
-    auto *counter = reinterpret_cast<__gm__ volatile uint32_t *>(address);
-    return percounter_calendar_wait(cfg, [&]() __aicore__ {
-        return (percounter_notify_query(*counter) & CALENDAR_COUNT_MASK) >= target;
-    });
+    return percounter_calendar_wait_threshold(cfg, address, static_cast<uint32_t>(target), retry_cycles);
 }
 
 inline __aicore__ bool percounter_calendar_wait_range(
@@ -383,8 +511,11 @@ inline __aicore__ bool percounter_calendar_enter(
     const __gm__ CalendarWait *waits, uint32_t wait_count, uint32_t sequence_base, uint32_t blocks, bool sync,
     uint64_t entry
 ) {
+    // Keep the first probes immediate. Longer groups use a staggered
+    // retry interval so idle lanes do not flood one completion word.
+    const uint32_t retry_cycles = wait_count == 1 && !sync ? percounter_calendar_retry_cycles(cfg, blocks, true) : 0;
     if (join == nullptr) {
-        if (!percounter_calendar_wait_list(cfg, waits, wait_count, entry)) return false;
+        if (!percounter_calendar_wait_list(cfg, waits, wait_count, entry, UINT64_MAX, retry_cycles)) return false;
         percounter_record_task_event(
             cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg)
         );
@@ -423,10 +554,58 @@ inline __aicore__ bool percounter_calendar_enter(
         return false;
     // Only the selected role checks data dependencies after all local roles
     // have reached the same calendar block.
-    if (!percounter_calendar_wait_list(cfg, waits, wait_count, entry)) return false;
+    if (!percounter_calendar_wait_list(cfg, waits, wait_count, entry, UINT64_MAX, retry_cycles)) return false;
     percounter_record_task_event(cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg));
     if (sync && !percounter_calendar_start(cfg, *extra, blocks, entry)) return false;
     percounter_ssbuf_store_release(&signal->release[lane], arrivals[lane]);
+    return true;
+}
+
+template <bool Summarized = false>
+inline __aicore__ bool percounter_calendar_wait_cluster_input(
+    const LaneConfig &cfg, const __gm__ CalendarWait &wait, uint32_t sequence, uint64_t entry
+) {
+    const uint32_t peer = 3 - cfg.cluster_lane;
+    const uint64_t command = wait.read_cmd;
+    const uint64_t target = wait.target;
+    auto *summary = reinterpret_cast<__gm__ volatile uint32_t *>(command & ~CALENDAR_WAIT_TAG_MASK);
+    const uint32_t threshold = static_cast<uint32_t>(target);
+    if constexpr (Summarized) {
+        const uint64_t tag = command & CALENDAR_WAIT_TAG_MASK;
+        const uint32_t writers = static_cast<uint32_t>(target >> 32);
+        if (summary == nullptr || threshold == 0 || threshold > CALENDAR_COUNT_MASK ||
+            (tag == CALENDAR_WAIT_FUSED_FANIN ? (writers < 2 || writers > CALENDAR_FUSED_FANIN_MAX_PRODUCERS) :
+                                                (tag != CALENDAR_WAIT_NOTIFY || writers != 0))) {
+            percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, percounter_order_task_id(entry));
+            return false;
+        }
+    }
+    uint32_t attempts = 0;
+    uint64_t cursor = 0;
+    bool failed = false;
+    if (!percounter_calendar_wait(
+            cfg,
+            [&]() __aicore__ {
+                if (percounter_ssbuf_load_field(&cfg.ssbuf->mix.release[peer]) >= sequence) return true;
+                // Device communication may have dependencies outside this rank's
+                // calendar. Keep the original DONE observer as an escape path.
+                constexpr uint32_t interval =
+                    Summarized ? CALENDAR_FOLLOWER_FANIN_INTERVAL : CALENDAR_FOLLOWER_DONE_INTERVAL;
+                if (++attempts % interval != 0) return false;
+                if constexpr (Summarized) {
+                    // A follower has no assigned producer to service.
+                    return (percounter_notify_query(*summary) & CALENDAR_COUNT_MASK) >= threshold;
+                } else {
+                    const auto state = percounter_calendar_poll_completion(cfg, command, target, &cursor);
+                    failed = state == CompletionPollState::FAILED;
+                    return state != CompletionPollState::PENDING;
+                }
+            }
+        ) ||
+        failed)
+        return false;
+    // The memory barrier before kernel entry acquires either observation.
+    percounter_record_task_event(cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg));
     return true;
 }
 
@@ -493,7 +672,9 @@ inline __aicore__ bool percounter_calendar_execute_range(
         const auto *extra = reinterpret_cast<const __gm__ CalendarExecutionExtra *>(binding + dispatch->extra_offset);
         bool deferred = false;
         const uint32_t mix_delta = row->mix_delta;
-        const auto *join = mix_delta != 0 && (flags & CALENDAR_EXEC_FANIN) == 0 ?
+        constexpr uint16_t non_join_flags =
+            CALENDAR_EXEC_FANIN | CALENDAR_EXEC_INPUT_OWNER | CALENDAR_EXEC_INPUT_FOLLOWER;
+        const auto *join = mix_delta != 0 && (flags & non_join_flags) == 0 ?
                                reinterpret_cast<const __gm__ CalendarLocalJoin *>(
                                    reinterpret_cast<const __gm__ uint8_t *>(row) + mix_delta
                                ) :
@@ -508,8 +689,20 @@ inline __aicore__ bool percounter_calendar_execute_range(
                 );
         }
         percounter_record_task_event(cfg, PercounterTaskEventKind::RowBegin, entry, row_begin);
-        if ((flags & CALENDAR_EXEC_FANIN) != 0) {
-            if (!percounter_calendar_wait_fanin(cfg, waits, mix_delta, row->wait_count, entry)) return false;
+        if ((flags & CALENDAR_EXEC_INPUT_FOLLOWER) != 0) {
+            if (row->wait_count != 0) {
+                percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, percounter_order_task_id(entry));
+                return false;
+            }
+            const uint32_t sequence = sequence_base + mix_delta;
+            const bool ready = (flags & CALENDAR_EXEC_FANIN) != 0 ?
+                                   percounter_calendar_wait_cluster_input<true>(cfg, waits[0], sequence, entry) :
+                                   percounter_calendar_wait_cluster_input(cfg, waits[0], sequence, entry);
+            if (!ready) return false;
+        } else if ((flags & CALENDAR_EXEC_FANIN) != 0) {
+            const auto retry_cycles = percounter_calendar_retry_cycles(cfg, blocks, row->wait_count != 0);
+            if (!percounter_calendar_wait_fanin(cfg, waits, mix_delta, row->wait_count, entry, retry_cycles))
+                return false;
             percounter_record_task_event(
                 cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg)
             );
@@ -517,6 +710,10 @@ inline __aicore__ bool percounter_calendar_execute_range(
                        cfg, extra, join, waits, row->wait_count, sequence_base, blocks, sync, entry
                    )) {
             return false;
+        }
+        if ((flags & CALENDAR_EXEC_INPUT_OWNER) != 0) {
+            const uint32_t sequence = sequence_base + range.phase_row_offset + i + 1;
+            percounter_ssbuf_store_release(&cfg.ssbuf->mix.release[cfg.cluster_lane], sequence);
         }
         percounter_record_task_event(cfg, PercounterTaskEventKind::Ready, entry, percounter_task_event_clock(cfg));
         __gm__ CalendarTiming *sample = samples != nullptr ? samples + i : nullptr;
