@@ -18,8 +18,12 @@ from pathlib import Path
 def device_count(bundle, materialize=False, runtime=None):
     case_path = bundle / "case.json"
     case = json.loads(case_path.read_text()) if case_path.exists() else {}
-    if case.get("execution") == "full_wave_mix_chain" and runtime is not None and case.get("runtime") != runtime:
-        raise ValueError(f"Prepare the full-wave MIX bundle for {runtime}; the block-index ABI is runtime-specific")
+    if (
+        case.get("execution") in ("full_wave_mix_chain", "mpmd_diamond")
+        and runtime is not None
+        and case.get("runtime") != runtime
+    ):
+        raise ValueError(f"Prepare the synthetic bundle for {runtime}; the block-index ABI is runtime-specific")
     if case.get("execution") == "native_moe_host_control":
         if case.get("case") != "moe" or case.get("device_count") != 2:
             raise ValueError("Native MoE requires a two-device case descriptor")

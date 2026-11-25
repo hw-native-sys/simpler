@@ -22,7 +22,8 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-def test_export_keeps_native_plans_and_uses_host_entry_for_moe(monkeypatch, tmp_path):
+@pytest.mark.parametrize("selected", [None, ("swa", "c2a_full", "c1a_reindex", "c1a_reuse", "engram")])
+def test_export_keeps_native_plans_and_uses_host_entry_for_moe(monkeypatch, tmp_path, selected):
     flavor = "pypto_lib_latest"
     cases = json.loads((PRODUCTION.parent / "workloads" / flavor / "source.json").read_text())["cases"]
     by_first = {case["first_source_task"]: case for case in cases.values() if "first_source_task" in case}
@@ -45,9 +46,9 @@ def test_export_keeps_native_plans_and_uses_host_entry_for_moe(monkeypatch, tmp_
     monkeypatch.setattr(MODULE.subprocess, "check_output", record_detail)
     monkeypatch.setattr(MODULE.subprocess, "run", lambda *args, **kwargs: None)
     monkeypatch.setattr(MODULE, "_export_native", lambda destination, *args: native.append(destination))
-    paths = MODULE.export(bundle, capture, flavor, output, tmp_path / "tools")
-    assert {p.name for p in paths} == set(cases)
-    assert native == [output / flavor / "moe"]
+    paths = MODULE.export(bundle, capture, flavor, output, tmp_path / "tools", case_names=selected)
+    assert {p.name for p in paths} == set(cases if selected is None else selected)
+    assert native == ([output / flavor / "moe"] if selected is None else [])
     for case in (p for p in paths if p.name != "moe"):
         for rank in range(2):
             captured = (capture / f"rank{rank}/submissions.bin").read_bytes()

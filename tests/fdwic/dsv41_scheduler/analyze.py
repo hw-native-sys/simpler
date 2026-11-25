@@ -21,7 +21,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from production.ideal_bound import validate_full_wave_dag
+from production.ideal_bound import validate_synthetic_dag
 from production.timing import replay_launches, summarize_replay
 
 
@@ -139,7 +139,7 @@ def add_perfetto(details, path, names, trace, convert):
     details["perfetto"] = str(trace)
 
 
-def full_wave_report(bundle, case, run, destination, convert):
+def synthetic_report(bundle, case, run, destination, convert):
     rank = run / "rank0"
     result = load(rank / "result.json")
     if (
@@ -150,7 +150,7 @@ def full_wave_report(bundle, case, run, destination, convert):
         or not result["snapshot_inputs"]
         or not result["isolated_case"]
     ):
-        raise ValueError(f"Full-wave bundle and run disagree on runtime or rank count: {run}")
+        raise ValueError(f"Synthetic bundle and run disagree on runtime or rank count: {run}")
     stages = case["source"]["stages"]
     members = {
         (stage["task_id"], block, lane)
@@ -159,12 +159,14 @@ def full_wave_report(bundle, case, run, destination, convert):
         for lane, kernel in enumerate(stage["kernel_ids"])
         if kernel >= 0
     }
+    diamond = case["execution"] == "mpmd_diamond"
+    expected_tasks, expected_members, expected_edges = (4, 4, 4) if diamond else (6, 386, 5)
     if (
-        len(stages) != 6
-        or len(members) != 386
-        or any(not (bundle / "reference" / f"{index}.bin").is_file() for index in range(1, 7))
+        len(stages) != expected_tasks
+        or len(members) != expected_members
+        or any(not (bundle / "reference" / f"{index}.bin").is_file() for index in range(1, expected_tasks + 1))
     ):
-        raise ValueError(f"Incomplete full-wave bundle: {bundle}")
+        raise ValueError(f"Incomplete synthetic bundle: {bundle}")
     by_engine = Counter((task, "aic" if lane == 0 else "aiv") for task, _, lane in members)
     launches = replay_launches(rank, result)
     profiled = {i: level for i, _, level, _ in launches if level}
@@ -174,22 +176,22 @@ def full_wave_report(bundle, case, run, destination, convert):
         path = rank / f"run{iteration}" / "chip_swimlane_records.json"
         records = load(path)
         deps = load(path.with_name("deps.json"))
-        validate_full_wave_dag(deps, stages)
+        validate_synthetic_dag(deps, stages, case["source"].get("edges"))
         types = records["metadata"]["core_types"]
         actual = Counter((row[1], types[row[0]]) for row in records["aicore_tasks"])
-        if actual != by_engine or records["chip_swimlane_level"] != level or len(deps["edges"]) != 5:
-            raise ValueError(f"Incomplete full-wave capture: {path}")
+        if actual != by_engine or records["chip_swimlane_level"] != level or len(deps["edges"]) != expected_edges:
+            raise ValueError(f"Incomplete synthetic capture: {path}")
         if (
             case["runtime"] == "host_build_graph"
             and execution_durations(records, {t for t, _, _ in members}).keys() != members
         ):
-            raise ValueError(f"Full-wave physical executions differ from the expected blocks and lanes: {path}")
+            raise ValueError(f"Synthetic physical executions differ from the expected blocks and lanes: {path}")
         capture = {
             "capture": str(path),
             "level": level,
-            "tasks": 6,
+            "tasks": expected_tasks,
             "executions": sum(actual.values()),
-            "dependencies": 5,
+            "dependencies": expected_edges,
         }
         trace = destination / f"{case['case']}-{path.parent.name}-L{level}.json"
         add_perfetto(capture, path, bundle / "names.json", trace, convert)
@@ -209,8 +211,8 @@ def audit(root, cases, original, names, destination, convert):
     rows, details = [], []
     for case_dir in sorted(cases.iterdir()):
         case = load(case_dir / "case.json")
-        if case.get("execution") == "full_wave_mix_chain":
-            details.append(full_wave_report(case_dir, case, root / case["case"], destination, convert))
+        if case.get("execution") in ("full_wave_mix_chain", "mpmd_diamond"):
+            details.append(synthetic_report(case_dir, case, root / case["case"], destination, convert))
             continue
         if case.get("execution") == "native_moe_host_control":
             details.append(native_moe_reports(root, case))
