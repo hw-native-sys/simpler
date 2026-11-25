@@ -494,6 +494,24 @@ def _bounded_ranges(touches) -> list[_Range]:
     return ranges
 
 
+def _pack_proof(text, mode, min_tensors, mask, ranges, deadline=None):
+    prefix = struct.pack("<4sBBBB", b"HCP1", mode, len(ranges), min_tensors, mask)
+    records = b"".join(struct.pack("<BBHI", r.slot, r.scale, r.size, r.offset) for r in ranges).ljust(24, b"\0")
+    digest = 0xCBF29CE484222325
+    for segment in (text, prefix, records):
+        for offset in range(0, len(segment), 65536):
+            if deadline is not None and monotonic() >= deadline:
+                return text
+            for byte in segment[offset : offset + 65536]:
+                digest = ((digest ^ byte) * 0x100000001B3) & _MASK
+    return text + prefix + struct.pack("<Q", digest) + records
+
+
+def synchronous_registration(text: bytes, core: str) -> bytes:
+    """Encode the compiler's per-family result independently of the cache decoder."""
+    return _pack_proof(text, 0, 0, _CORE_MASK[core] << 2, [])
+
+
 def annotate_a5_hbg_text(text: bytes, core_type: str | None = None, *, deadline: float | None = None) -> bytes:
     """Append an HCP1 proof for the A5 execution families verified on these exact bytes.
 
@@ -510,6 +528,14 @@ def annotate_a5_hbg_text(text: bytes, core_type: str | None = None, *, deadline:
 
     if deadline is None:
         deadline = monotonic() + 15.0
+    original = text
+    sync_mask = 0
+    if len(text) >= 40 and text[-40:-36] == b"HCP1":
+        # An offline exporter may already have a compiler completion proof. Verify
+        # the original bytes before carrying its bits into the combined proof.
+        if core_type is None or synchronous_registration(text[:-40], core_type) != text:
+            return original
+        text, sync_mask = text[:-40], text[-33]
     decoder = Path(sdk) / "bin" / "llvm-objdump"
     mask, min_tensors = 0, 0
     ranges: list[_Range] = []
@@ -519,21 +545,15 @@ def annotate_a5_hbg_text(text: bytes, core_type: str | None = None, *, deadline:
             required, touches = _Verifier(text, _ELF_FLAGS[family], decoder, deadline).verify()
             ranges = _bounded_ranges([*ranges, *touches])
         except (TimeoutError, subprocess.TimeoutExpired):
-            return text
+            break
         except (ValueError, IndexError, OSError, subprocess.SubprocessError) as exc:
             _logger.debug("A5 %s HBG input cache proof unavailable: %s", family, exc)
             continue
         min_tensors = max(required, min_tensors)
         mask |= _CORE_MASK[family]
-    if not mask:
-        return text
-    prefix = struct.pack("<4sBBBB", b"HCP1", 2 if ranges else 1, len(ranges), min_tensors, mask)
-    records = b"".join(struct.pack("<BBHI", r.slot, r.scale, r.size, r.offset) for r in ranges).ljust(24, b"\0")
-    digest = 0xCBF29CE484222325
-    for segment in (text, prefix, records):
-        for offset in range(0, len(segment), 65536):
-            if monotonic() >= deadline:
-                return text
-            for byte in segment[offset : offset + 65536]:
-                digest = ((digest ^ byte) * 0x100000001B3) & _MASK
-    return text + prefix + struct.pack("<Q", digest) + records
+    mode = 2 if ranges else 1
+    if mask:
+        enriched = _pack_proof(text, mode, min_tensors, mask | sync_mask, ranges, deadline)
+        if len(enriched) > len(text):
+            return enriched
+    return original

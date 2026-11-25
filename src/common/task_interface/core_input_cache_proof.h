@@ -33,6 +33,10 @@ inline constexpr uint8_t CORE_INPUT_CACHE_AIC = 1;
 inline constexpr uint8_t CORE_INPUT_CACHE_AIV = 2;
 inline constexpr uint8_t CORE_INPUT_CACHE_BOTH = CORE_INPUT_CACHE_AIC | CORE_INPUT_CACHE_AIV;
 
+// Bits 2 and 3 independently prove that the entry cannot register deferred completion.
+inline constexpr uint8_t CORE_SYNC_AIC = CORE_INPUT_CACHE_AIC << 2;
+inline constexpr uint8_t CORE_SYNC_AIV = CORE_INPUT_CACHE_AIV << 2;
+
 // The compiler appends this footer to an extracted A5 image. CoreCallable packing moves
 // it into the aligned child header, outside the executable image. Legacy headers contain zeroes.
 struct CoreInputCacheProof {
@@ -40,7 +44,7 @@ struct CoreInputCacheProof {
     CoreInputCacheMode mode;
     uint8_t range_count;
     uint8_t min_tensor_count;  // Includes descriptor-only tensor reads in the kernel.
-    uint8_t core_mask;         // Executor families for which this footprint was proven.
+    uint8_t core_mask;         // Independent cache-footprint and synchronous-completion family masks.
     uint64_t digest;
     CoreInputCacheRange ranges[CORE_INPUT_CACHE_MAX_RANGES];
 };
@@ -60,11 +64,15 @@ inline uint64_t core_input_cache_proof_digest(const CoreInputCacheProof &proof, 
 
 inline bool core_input_cache_proof_matches_text(const CoreInputCacheProof &proof, const void *text, size_t size) {
     if (proof.magic != CORE_INPUT_CACHE_PROOF_MAGIC || proof.core_mask == 0 ||
-        proof.core_mask > CORE_INPUT_CACHE_BOTH || proof.min_tensor_count > CORE_MAX_TENSOR_ARGS ||
-        proof.range_count > CORE_INPUT_CACHE_MAX_RANGES || size == 0 || text == nullptr)
+        proof.core_mask > (CORE_INPUT_CACHE_BOTH | CORE_SYNC_AIC | CORE_SYNC_AIV) ||
+        proof.min_tensor_count > CORE_MAX_TENSOR_ARGS || proof.range_count > CORE_INPUT_CACHE_MAX_RANGES || size == 0 ||
+        text == nullptr)
         return false;
-    const auto expected_mode =
-        proof.range_count == 0 ? CoreInputCacheMode::NO_CACHED_READS : CoreInputCacheMode::SCALAR_RANGES;
+    if ((proof.core_mask & CORE_INPUT_CACHE_BOTH) == 0 && (proof.range_count != 0 || proof.min_tensor_count != 0))
+        return false;
+    const auto expected_mode = (proof.core_mask & CORE_INPUT_CACHE_BOTH) == 0 ? CoreInputCacheMode::UNKNOWN :
+                               proof.range_count == 0                         ? CoreInputCacheMode::NO_CACHED_READS :
+                                                                                CoreInputCacheMode::SCALAR_RANGES;
     if (proof.mode != expected_mode) return false;
     for (size_t i = 0; i < CORE_INPUT_CACHE_MAX_RANGES; ++i) {
         const auto &range = proof.ranges[i];

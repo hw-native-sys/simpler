@@ -1822,6 +1822,7 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
                     "host_platform": sys.platform,
                     "host_machine": host_platform.machine(),
                     "compiler": kc.incore_compile_cache_token(k["core_type"]),
+                    "hbg_registration": platform == "a5" and runtime == "host_build_graph",
                 },
                 k["source"],
                 include_dirs,
@@ -1863,6 +1864,8 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
         def compile_one_incore(k, extra, incore_artifact_key):
             def compile_missing_incore():
                 with compile_slot():
+                    if platform == "a5" and runtime == "host_build_graph":
+                        return kc.compile_hbg_registration(k["source"], k["core_type"], pto_isa_root, inc_dirs + extra)
                     binary = kc.compile_incore(
                         k["source"],
                         core_type=k["core_type"],

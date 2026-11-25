@@ -1790,10 +1790,14 @@ bool create_scheduler_state(
         input.block_count = metadata.logical_block_num;
         input.active_mask = metadata.active_mask;
         for (uint32_t lane = 0; lane < 3; ++lane) {
-            if (metadata.active_mask.has(static_cast<SubtaskSlot>(lane)))
-                input.capacities[lane] = MAX_COMPLETIONS_PER_TASK;
+            auto slot = static_cast<SubtaskSlot>(lane);
+            if (!metadata.active_mask.has(slot)) continue;
+            const auto *proof = runtime->get_function_input_cache_proof(metadata.kernel_ids[lane]);
+            const auto sync_bit = slot == SubtaskSlot::AIC ? CORE_SYNC_AIC : CORE_SYNC_AIV;
+            if (proof != nullptr && (proof->core_mask & sync_bit) != 0) continue;
+            input.capacities[lane] = MAX_COMPLETIONS_PER_TASK;
+            possible_async_lanes[ref].activate(slot);
         }
-        possible_async_lanes[ref] = metadata.active_mask;
         async_inputs.push_back(input);
     }
     std::string async_error;

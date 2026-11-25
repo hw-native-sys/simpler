@@ -112,7 +112,7 @@ void bind_registered_input_cache_proofs(Runtime &runtime, const std::vector<Core
 const CoreInputCacheProof *Runtime::get_function_input_cache_proof(int func_id) const {
     if (host_.callable_input_cache_proofs_ == nullptr || get_function_bin_addr(func_id) == 0) return nullptr;
     const auto &proof = host_.callable_input_cache_proofs_[func_id];
-    return proof.mode == CoreInputCacheMode::UNKNOWN ? nullptr : &proof;
+    return proof.core_mask == 0 ? nullptr : &proof;
 }
 
 void Runtime::set_callable_tables(

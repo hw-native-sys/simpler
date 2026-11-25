@@ -70,6 +70,12 @@ def build_bundle(output: Path, runtime: str, runner: Path) -> Path:
     includes = compiler.get_orchestration_include_dirs(runtime)
 
     def compile_member(core):
+        if runtime == "host_build_graph":
+            payload = compiler.compile_hbg_registration(
+                str(KERNELS / "full_wave_mix_member.cpp"), core, str(ROOT / "build/pto-isa"), includes
+            )
+            (output / f"{core}.bin").write_bytes(payload)
+            return
         device_elf = compiler.compile_incore(
             str(KERNELS / "full_wave_mix_member.cpp"),
             core_type=core,

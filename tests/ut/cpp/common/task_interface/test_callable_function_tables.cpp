@@ -279,8 +279,16 @@ TEST(CoreInputCacheProof, RejectsMalformedFieldsEvenWithMatchingDigest) {
     proof.magic = CORE_INPUT_CACHE_PROOF_MAGIC;
     proof.mode = CoreInputCacheMode::NO_CACHED_READS;
     EXPECT_FALSE(valid(proof));
-    proof.core_mask = 4;
+    proof.core_mask = CORE_SYNC_AIC;
     EXPECT_FALSE(valid(proof));
+    proof.mode = CoreInputCacheMode::UNKNOWN;
+    EXPECT_TRUE(valid(proof));
+    proof.core_mask = 0x80;
+    EXPECT_FALSE(valid(proof));
+    proof.core_mask = CORE_INPUT_CACHE_AIC | CORE_SYNC_AIV;
+    EXPECT_FALSE(valid(proof));
+    proof.mode = CoreInputCacheMode::NO_CACHED_READS;
+    EXPECT_TRUE(valid(proof));
     proof.core_mask = CORE_INPUT_CACHE_BOTH;
     EXPECT_TRUE(valid(proof));
     proof.min_tensor_count = CORE_MAX_TENSOR_ARGS + 1;

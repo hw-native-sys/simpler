@@ -585,7 +585,17 @@ A synchronous member can enter the kernel directly after that acquire when
 task timing, PMU and argument capture are off. A prebound async group or
 possible consumption of an async input keeps the pre-call DDR barrier.
 
-After the kernel returns, its async registration is sealed. A MIX member
+The Host plans a registration group for each active lane that could call
+`defer_wait`. A5 HBG compilation can certify the opposite for one executable
+and core family. The compiler follows uses of the packed argument vector in
+its own CCEC IR. It permits a read of `GlobalContext.sub_block_id` and requires
+proof that the entry cannot access any deferred-completion fields. The
+registration footer binds this result to the executable bytes. A bare kernel,
+an opaque access, or a family mismatch keeps full registration capacity.
+Consumer visibility is derived separately from the graph. A certified
+synchronous consumer still observes data produced by an asynchronous predecessor.
+
+After a kernel with a registration group returns, its async registration is sealed. A MIX member
 records the physical return even if sealing fails. On the CntNotify path each
 successful active member publishes its own physical credit P. An async-capable
 member also owes one condition credit Q, published at an empty seal or by the

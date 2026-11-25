@@ -3370,8 +3370,9 @@ NB_MODULE(_task_interface, m) {
                     const auto &child = parent.child(i);
                     const size_t size = child.binary_size();
                     const void *text = child.binary_data();
-                    if (size == 0 || core_input_cache_proof_matches_text(child.input_cache_proof(), text, size))
-                        continue;
+                    const auto existing = child.input_cache_proof();
+                    const bool verified = core_input_cache_proof_matches_text(existing, text, size);
+                    if (size == 0 || (verified && (existing.core_mask & CORE_INPUT_CACHE_BOTH) != 0)) continue;
                     const auto artifact = nb::cast<nb::bytes>(annotate(nb::bytes(text, size)));
                     if (artifact.size() != size + sizeof(CoreInputCacheProof) ||
                         std::memcmp(artifact.c_str(), text, size) != 0)
@@ -3379,6 +3380,10 @@ NB_MODULE(_task_interface, m) {
                     CoreInputCacheProof proof;
                     std::memcpy(&proof, artifact.c_str() + size, sizeof(proof));
                     if (!core_input_cache_proof_matches_text(proof, text, size)) continue;
+                    if (verified) {
+                        proof.core_mask |= existing.core_mask & (CORE_SYNC_AIC | CORE_SYNC_AIV);
+                        proof.digest = core_input_cache_proof_digest(proof, text, size);
+                    }
                     if (!copy) copy.emplace(self);
                     const size_t offset =
                         offsetof(ChipCallable, storage_) + parent.child_offset(i) + offsetof(CoreCallable, storage_);

@@ -137,6 +137,9 @@ class _FakeKernelCompiler:
             type(self).compile_barrier.wait()
         return Path(source).read_bytes()
 
+    def compile_hbg_registration(self, source, core_type, pto_isa_root, extra_include_dirs):
+        return self.compile_incore(source)
+
     def compile_incore(self, source, **kwargs):
         type(self).incore_compiles += 1
         if type(self).compile_barrier is not None:
@@ -618,6 +621,8 @@ def test_artifact_logic_token_covers_the_compilation_modules(monkeypatch):
 
     assert set(kernel_compiler._ARTIFACT_LOGIC_MODULES) == {
         "kernel_compiler.py",
+        "a5_completion.py",
+        "a5_input_cache.py",
         "toolchain.py",
         "compile_paths.py",
         "elf_parser.py",

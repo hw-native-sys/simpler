@@ -23,6 +23,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from simpler_setup.a5_completion import hbg_registration_text
 from simpler_setup.a5_input_cache import annotate_a5_hbg_text
 from simpler_setup.compile_pool import compile_slot, compile_worker_budget
 from simpler_setup.elf_parser import extract_text_section
@@ -96,7 +97,7 @@ def validate_device_image(data: bytes) -> None:
         raise ValueError("VPTO linked image requires a nonempty .text section")
 
 
-def compile_vector_functions(compiler, source, includes, helpers):
+def compile_vector_functions(compiler, source, includes, helpers, *, hbg):
     toolchain = compiler.ccec
     bisheng = Path(toolchain.cxx_path).with_name("bisheng")
     with tempfile.TemporaryDirectory() as tmp:
@@ -108,6 +109,7 @@ def compile_vector_functions(compiler, source, includes, helpers):
                 *toolchain.get_compile_flags(core_type="aiv"),
                 *compiler._incore_feature_defines(),
                 "-ffunction-sections",
+                *(["-Xclang", "-fembed-bitcode=all"] if hbg else []),
                 *(f"-I{path}" for path in includes),
                 "-o",
                 str(caller),
@@ -116,9 +118,12 @@ def compile_vector_functions(compiler, source, includes, helpers):
             check=True,
         )
         objects = []
+        vector_modules = []
         for i, helper in enumerate(helpers):
             obj = directory / f"helper{i}.o"
-            subprocess.run([bisheng, *VF_FLAGS, "-c", "-x", "ir", helper, "-o", obj], check=True)
+            module = helper.read_bytes()
+            subprocess.run([bisheng, *VF_FLAGS, "-c", "-x", "ir", "-", "-o", obj], input=module, check=True)
+            vector_modules.append(module.decode())
             objects.append(obj)
         order, elf = directory / "order.txt", directory / "kernel.elf"
         order.write_text("kernel_entry\n")
@@ -137,6 +142,8 @@ def compile_vector_functions(compiler, source, includes, helpers):
         )
         binary = elf.read_bytes()
         validate_device_image(binary)
+        if hbg:
+            return hbg_registration_text(binary, toolchain.cxx_path, "aiv", vector_modules=tuple(vector_modules))
         return extract_text_section(binary)
 
 
@@ -179,6 +186,7 @@ def build(flavor, output, tools, pto, jobs, runtime):
             "host_platform": sys.platform,
             "host_machine": platform.machine(),
             "compiler": compiler_tokens[kernel["core_type"]],
+            "hbg_registration": runtime == "host_build_graph",
         }
         helpers = [sources / path for path in kernel.get("vf_llvm", [])]
         if helpers:
@@ -200,7 +208,11 @@ def build(flavor, output, tools, pto, jobs, runtime):
             compiled = True
             with compile_slot():
                 if helpers:
-                    return compile_vector_functions(compiler, source, includes, helpers)
+                    return compile_vector_functions(
+                        compiler, source, includes, helpers, hbg=runtime == "host_build_graph"
+                    )
+                if runtime == "host_build_graph":
+                    return compiler.compile_hbg_registration(str(source), kernel["core_type"], str(pto), extra)
                 return extract_text_section(
                     compiler.compile_incore(
                         str(source),
@@ -214,13 +226,14 @@ def build(flavor, output, tools, pto, jobs, runtime):
         if binary.startswith(b"\x7fELF"):
             raise ValueError("CoreCallable requires raw instructions, not an ELF image")
         target = output / f"kernel-{kernel['func_id']}.bin"
-        target.write_bytes(binary)
         registration_file = target
         if runtime == "host_build_graph":
             annotated = annotate_a5_hbg_text(binary, kernel["core_type"])
-            if annotated != binary:
+            if annotated[-40:-36] == b"HCP1":
                 registration_file = target.with_suffix(".hbg")
                 registration_file.write_bytes(annotated)
+                binary = annotated[:-40]
+        target.write_bytes(binary)
         print(f"{flavor}: {'compiled' if compiled else 'cached'} {kernel['func_id']} {kernel['name']}", flush=True)
         return {
             "func_id": kernel["func_id"],

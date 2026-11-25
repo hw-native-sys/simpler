@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from simpler_setup import a5_input_cache as proof
+from simpler_setup.a5_completion import entry_is_synchronous
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 
@@ -188,3 +189,46 @@ def test_decoder_hang_uses_remaining_upload_budget(monkeypatch, tmp_path):
     # Allow a loaded CI host to spawn and reap the process. A missed timeout
     # still waits for the full 15-second sleep and fails this assertion.
     assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize(
+    ("read", "synchronous"),
+    [
+        ("%v = load i32, ptr addrspace(1) %ctx, align 4", True),
+        ("%field = getelementptr i8, ptr addrspace(1) %ctx, i64 4", False),
+        ("%word = load i64, ptr addrspace(1) %ctx, align 8", False),
+        ("call void @helper(ptr addrspace(1) %ctx)", False),
+        ("%escaped = ptrtoint ptr addrspace(1) %args to i64", False),
+        ("%wide = load <2 x i64>, ptr addrspace(1) %loc", False),
+        ("%slot = getelementptr inbounds i64, ptr addrspace(1) %args, i64 %id", False),
+        ('call void asm sideeffect "ld", ""()', False),
+    ],
+)
+def test_completion_proof_only_accepts_public_context_field(read, synchronous):
+    ir = f"""
+target triple = "hiipu64-hisilicon-cce"
+define dso_local void @kernel_entry(ptr addrspace(1) %args) {{
+  %loc = getelementptr inbounds i64, ptr addrspace(1) %args, i64 48
+  %local = load i64, ptr addrspace(1) %loc, align 8
+  %slot49 = getelementptr inbounds i64, ptr addrspace(1) %args, i64 49
+  %word49 = load i64, ptr addrspace(1) %slot49, align 8
+  %ctx = inttoptr i64 %word49 to ptr addrspace(1)
+  {read}
+  ret void
+}}
+"""
+    assert entry_is_synchronous(ir) is synchronous
+
+
+def test_compiler_completion_proof_is_independent_of_input_cache_decoder(tmp_path, monkeypatch):
+    sdk = os.environ.get("ASCEND_HOME_PATH")
+    pto = _ROOT / "build/pto-isa"
+    if not sdk or not (Path(sdk) / "bin/bisheng").is_file() or not (pto / "include/pto").is_dir():
+        pytest.skip("requires CANN's A5 compiler and PTO headers")
+    compiler = KernelCompiler("a5")
+    source = _ROOT / "tests/st/a5/host_build_graph/defer_wait_visibility/kernels/aiv/tail.cpp"
+    includes = compiler.get_orchestration_include_dirs("host_build_graph")
+    raw = extract_text_section(compiler.compile_incore(str(source), "aiv", str(pto), includes))
+    monkeypatch.setattr(proof, "_decode", lambda *args, **kwargs: pytest.fail("registration ran decoder"))
+    registered = compiler.compile_hbg_registration(str(source), "aiv", str(pto), includes)
+    assert registered == proof.synchronous_registration(raw, "aiv")

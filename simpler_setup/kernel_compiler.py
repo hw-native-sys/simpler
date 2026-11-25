@@ -22,6 +22,7 @@ from typing import Optional, Union
 
 from simpler import env_manager
 
+from .a5_completion import hbg_registration_text
 from .compile_paths import compiler_visible_path
 from .environment import PROJECT_ROOT
 from .pto_isa import ensure_pto_isa_root, read_pto_isa_pin
@@ -52,6 +53,8 @@ _COMPILE_CACHE_SCHEMA = 1
 _ARTIFACT_LOGIC_MODULES = (
     "kernel_compiler.py",
     "toolchain.py",
+    "a5_completion.py",
+    "a5_input_cache.py",
     "compile_paths.py",
     "elf_parser.py",
     "incore/cpu_sim_target.h",
@@ -726,6 +729,8 @@ class KernelCompiler:
         pto_isa_root: Optional[str] = None,
         extra_include_dirs: Optional[list[str]] = None,
         build_dir: Optional[str] = None,
+        *,
+        embed_bitcode: bool = False,
     ) -> bytes:
         """
         Compile a kernel source file. Dispatches based on platform:
@@ -737,6 +742,7 @@ class KernelCompiler:
             core_type: "aic" (cube), "aiv" (vector), or empty for a homogeneous simulator. Default: "aiv"
             pto_isa_root: Path to PTO-ISA root directory. Required for hardware;
                 simulator builds default to the managed pinned checkout.
+            embed_bitcode: Retain compiler IR in a non-loadable ELF section for HBG registration.
             extra_include_dirs: Additional include directories
 
         Returns:
@@ -800,6 +806,9 @@ class KernelCompiler:
             for inc_dir in extra_include_dirs:
                 cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
+        if embed_bitcode:
+            cmd.extend(["-Xclang", "-fembed-bitcode=all"])
+
         cmd.extend(["-o", output_path, str(compiler_visible_path(source_path))])
 
         # Execute compilation
@@ -819,6 +828,22 @@ class KernelCompiler:
         finally:
             if build_dir is None:
                 os.remove(output_path)
+
+    def compile_hbg_registration(
+        self, source_path: str, core_type: str, pto_isa_root: str, extra_include_dirs
+    ) -> bytes:
+        """Compile an A5 HBG child into registration bytes, including any verified kernel properties."""
+
+        if self.platform != "a5" or self.ccec is None:
+            raise ValueError("HBG execution proofs require the A5 hardware compiler")
+        try:
+            elf = self.compile_incore(source_path, core_type, pto_isa_root, extra_include_dirs, embed_bitcode=True)
+        except RuntimeError as exc:
+            if "fembed-bitcode" not in str(exc):
+                raise
+            # Older SDKs still produce fully functional, uncertified entries.
+            elf = self.compile_incore(source_path, core_type, pto_isa_root, extra_include_dirs)
+        return hbg_registration_text(elf, self.ccec.cxx_path, core_type)
 
     def _link_incore(self, object_path: str, build_dir: Optional[str] = None) -> bytes:
         """Link a compiled incore object into a self-contained AICore image.
