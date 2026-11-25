@@ -2443,9 +2443,9 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
     const std::string *aicore_tasks_extension = extension(ChipSwimlaneExtensionSection::AicoreTasks);
     const std::string *scheduler_tasks_extension = extension(ChipSwimlaneExtensionSection::SchedulerTasks);
     const std::string *aicpu_lifecycle_extension = extension(ChipSwimlaneExtensionSection::AicpuLifecycleRecords);
-    const std::string *execution_identity_extension =
-        extension(ChipSwimlaneExtensionSection::AicoreExecutionIdentities);
-    const std::string *protocol_extension = extension(ChipSwimlaneExtensionSection::AicoreProtocol);
+    constexpr bool calendar =
+        std::string_view{SIMPLER_RUNTIME_NAME} == "host_build_graph" &&
+        (std::string_view{SIMPLER_PLATFORM_NAME} == "a5" || std::string_view{SIMPLER_PLATFORM_NAME} == "a5sim");
 
     // Every stream is independently useful for DFX. In particular, a legal
     // HBG can contain only host-side dummy/hidden-allocation records and no
@@ -2532,6 +2532,7 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
     // runtime uses and nothing in the value says which, so a reader that decodes one
     // has to be told; the name is a compile-time property of this host_runtime.so.
     outfile << "    \"runtime\": \"" << SIMPLER_RUNTIME_NAME << "\",\n";
+    if constexpr (calendar) outfile << "    \"scheduler_model\": \"calendar\",\n";
     if (data.collection.present) {
         // Additive: a reader that does not know this key is unaffected, and the
         // default path never emits it.
@@ -2736,7 +2737,7 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << TaskId::to_uint64(r.task_token) << ", " << r.reg_task_id
                             << ", " << r.start_time << ", " << r.end_time << ", ";
-                    if constexpr (std::string_view{SIMPLER_RUNTIME_NAME} == "percounter") {
+                    if constexpr (calendar) {
                         outfile << "0, " << collected.run_epoch << ", " << (r.percounter_block_shape & 0xffffU) << ", "
                                 << (r.percounter_block_shape >> 16);
                     } else {
@@ -2752,14 +2753,8 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
             LOG_INFO("  aicore_tasks: %zu records", total);
         }
     }
-    if (execution_identity_extension != nullptr) {
-        outfile << ",\n  \"aicore_execution_identities\": " << *execution_identity_extension;
-    }
-    if (protocol_extension != nullptr) {
-        outfile << ",\n  \"aicore_protocol\": " << *protocol_extension;
-    }
-    if (const auto *task_events = extension(ChipSwimlaneExtensionSection::PercounterTaskEvents)) {
-        outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::PercounterTaskEvents)
+    if (const auto *task_events = extension(ChipSwimlaneExtensionSection::CalendarTaskEvents)) {
+        outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::CalendarTaskEvents)
                 << "\": " << *task_events;
     }
     if (data.level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
@@ -2768,13 +2763,7 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         if (scheduler_tasks_extension != nullptr) {
             outfile << *scheduler_tasks_extension;
         } else {
-            // The native A5 HBG owner publishes execution identities for this
-            // run. Its staged timing uses the AICPU pool only as transport;
-            // legacy scheduling and recorded windows retain their own contract.
-            const bool aicore_scheduler =
-                std::string_view(SIMPLER_RUNTIME_NAME) == "host_build_graph" && execution_identity_extension != nullptr;
-            outfile << "{\n    \"producer\": \"" << (aicore_scheduler ? "aicore" : "aicpu")
-                    << "\",\n    \"records\": [";
+            outfile << "{\n    \"producer\": \"aicpu\",\n    \"records\": [";
             bool first = true;
             size_t total = 0;
             for (size_t core_idx = 0; core_idx < data.perf_records.size(); core_idx++) {
@@ -2789,7 +2778,7 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
             }
             if (!first) outfile << "\n    ";
             outfile << "]\n  }";
-            LOG_INFO("  scheduler_tasks: %zu %s records", total, aicore_scheduler ? "AICore" : "AICPU");
+            LOG_INFO("  scheduler_tasks: %zu AICPU records", total);
         }
     }
 

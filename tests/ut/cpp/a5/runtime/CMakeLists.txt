@@ -9,4 +9,3 @@
 #
 add_subdirectory(host_build_graph)
 add_subdirectory(tensormap_and_ringbuffer)
-add_subdirectory(percounter)

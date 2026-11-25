@@ -44,13 +44,13 @@ def _detect(tmp_path, files=None, *, base_sha=None):
     ("files", "arches", "categories"),
     [
         ("docs/a.md", (False, False, False), (False, False)),
-        ("tests/fdwic/dsv41_scheduler/production/export_cases.py", (False, False, False), (False, False)),
         ("src/wse/docs/sram.md", (False, False, False), (False, False)),
         (".gitignore", (False, False, False), (False, False)),
         ("src/wse/platform/sim/host/device_runner.cpp", (False, False, True), (True, True)),
         ("tests/st/wse/host_build_graph/test_equivalence.py", (False, False, True), (True, False)),
         ("src/a5/platform/sim/host/device_runner.cpp", (False, True, False), (True, True)),
         ("tests/st/a5/host_build_graph/vector_example/test_vector_example.py", (False, True, False), (True, False)),
+        ("tests/support/a5/host_build_graph/spmd/kernels/record_slot_0.cpp", (False, True, False), (True, True)),
         ("src/a2a3/platform/sim/host/device_runner.cpp", (True, False, False), (True, True)),
         ("simpler_setup/kernel_compiler.py", (True, True, True), (True, True)),
         ("tools/foo.py", (True, True, True), (False, True)),
@@ -101,22 +101,6 @@ def test_workflow_consumers_use_declared_outputs():
     for path in (_ROOT / ".github/workflows").glob("*.yml"):
         consumer = path.read_text()
         assert set(re.findall(r"needs\.detect-changes\.outputs\.(\w+)", consumer)) <= outputs
-
-
-@pytest.mark.parametrize(
-    "files",
-    [
-        "tests/fdwic/dsv41_scheduler/production/record_tool.cpp",
-        "tests/fdwic/dsv41_scheduler/tests/test_dsv41_half_sync.py",
-        "tests/fdwic/dsv41_scheduler/production/requirements-bound.txt",
-        "tests/fdwic/dsv41_scheduler/production/sync_bound.py\ndocs/benchmark.md",
-    ],
-)
-def test_manual_only_keeps_precommit_but_no_automatic_test_jobs(tmp_path, files):
-    flags, _ = _detect(tmp_path, files)
-    assert flags["non_code_only"] == "false"
-    assert flags["tests_only"] == "true"
-    assert _selected_jobs(flags) == {"detect-changes", "pre-commit"}
 
 
 def _selected_jobs(flags):
@@ -275,28 +259,6 @@ def test_rename_from_hardware_to_cpu_preserves_both_architectures(tmp_path):
 def test_automatic_a5_framework_uses_actual_architecture_and_scene_flags(tmp_path, files, expected):
     flags, _ = _detect(tmp_path, files)
     assert ("st-framework-a5" in _selected_jobs(flags)) == expected
-
-
-@pytest.mark.parametrize(
-    ("other", "arches", "categories"),
-    [
-        ("src/a5/runtime/host_build_graph/runtime.h", (False, True, False), (True, True)),
-        ("tests/st/a2a3/vector/test_vector.py", (True, False, False), (True, False)),
-        ("tests/ut/py/test_buffer.py", (True, True, True), (False, True)),
-        ("simpler_setup/kernel_compiler.py", (True, True, True), (True, True)),
-        (".github/workflows/ci.yml", (True, True, True), (True, True)),
-        ("unclassified/new.cpp", (True, True, True), (True, True)),
-        ("tests/fdwic/dsv41_scheduler_other/new.py", (True, True, True), (True, True)),
-    ],
-)
-def test_manual_exclusion_does_not_hide_other_changes(tmp_path, other, arches, categories):
-    files = "tests/fdwic/dsv41_scheduler/production/export_cases.py\n" + other
-    flags, _ = _detect(tmp_path, files)
-    assert tuple(flags[arch + "_changed"] == "true" for arch in ("a2a3", "a5", "wse")) == arches
-    assert tuple(flags[category + "_affected"] == "true" for category in ("st", "ut")) == categories
-    if other == ".github/workflows/ci.yml":
-        workflow = yaml.safe_load((_ROOT / ".github/workflows/ci.yml").read_text())
-        assert _selected_jobs(flags) == set(workflow["jobs"])
 
 
 def test_unknown_diff_still_selects_every_automatic_job(tmp_path):

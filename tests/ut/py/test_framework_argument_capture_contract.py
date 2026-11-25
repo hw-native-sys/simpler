@@ -250,7 +250,7 @@ def transport(consumer, monkeypatch, tmp_path):
         refuse_dump=False,
         defect=None,
         active_stream=None,
-        scheduler_mode=1,
+        scheduler_mode=5,
         scheduler_publish=True,
     )
     stream = SimpleNamespace(npu_stream=17)
@@ -397,17 +397,17 @@ def test_whole_consumer_records_intended_modes_and_retirement(consumer, transpor
     result = consumer.run(runtime, 0, Path("recording.so"), transport.root, platform=platform)
     assert result["platform"] == platform
     assert result["payloads_verified"] and result["config_snapshot_verified"] and result["guards_verified"]
-    expected_modes = [None, 1, 1, None] if platform == "a5" and runtime == "host_build_graph" else [None] * 4
+    expected_modes = [None, 5, 5, None] if platform == "a5" and runtime == "host_build_graph" else [None] * 4
     assert result["scheduler_modes"] == expected_modes
     # This trace belongs to the synchronous recording enqueue, not to real Torch scheduling.
     assert transport.events == ["submit"] * 4 + ["boundary"] + ["retire"] * 4 + ["close"]
     assert not consumer._UNPROVEN
 
 
-@pytest.mark.parametrize("mode,publish", [(0, True), (2, True), (3, True), (4, True), (1, False)])
+@pytest.mark.parametrize("mode,publish", [(0, True), (1, True), (2, True), (3, True), (4, True), (5, False)])
 def test_a5_hbg_dump_requires_a_fresh_aicore_selection(consumer, transport, mode, publish):
     transport.state.scheduler_mode, transport.state.scheduler_publish = mode, publish
-    message = "RESIDENT_PENDING" if publish else "published no scheduler selection"
+    message = "requires calendar scheduling" if publish else "published no scheduler selection"
     with pytest.raises(AssertionError, match=message):
         consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform="a5")
     assert consumer._UNPROVEN and "close" not in transport.events
@@ -556,7 +556,7 @@ def _invoke_st(tmp_path, monkeypatch, summary, *, code=0, copies=1, platform="a2
 @pytest.mark.parametrize("platform", ["a2a3", "a5"])
 def test_actual_st_requires_complete_result(tmp_path, monkeypatch, platform):
     summary = _summary("host_build_graph", "1")
-    summary.update(platform=platform, scheduler_modes=[None, 1, 1, None] if platform == "a5" else [None] * 4)
+    summary.update(platform=platform, scheduler_modes=[None, 5, 5, None] if platform == "a5" else [None] * 4)
     _invoke_st(tmp_path, monkeypatch, summary, platform=platform)
 
 
@@ -573,9 +573,9 @@ def test_actual_st_rejects_obsolete_a5_hbg_refusal_contract(tmp_path, monkeypatc
 
 @pytest.mark.parametrize(
     "modes",
-    [[None, 0, 1, None], [None, 2, 1, None], [None, 3, 1, None], [None, 1, 4, None], [1, 1, 1, 1]],
+    [[None, 0, 5, None], [None, 1, 5, None], [None, 2, 5, None], [None, 3, 5, None], [None, 5, 4, None], [5, 5, 5, 5]],
 )
-def test_actual_st_rejects_non_aicore_a5_hbg_capture(tmp_path, monkeypatch, modes):
+def test_actual_st_rejects_wrong_a5_hbg_calendar_mode(tmp_path, monkeypatch, modes):
     summary = _summary("host_build_graph", "1")
     summary.update(platform="a5", scheduler_modes=modes)
     with pytest.raises(AssertionError):

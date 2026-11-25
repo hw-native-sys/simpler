@@ -36,7 +36,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from simpler_setup.tools._runtime_dispatch import get, normalize_task_id_int, resolve_runtime
+from simpler_setup.tools._runtime_dispatch import get, normalize_task_id_int
 
 # Alias so call sites read as "this file's own uint64 coercion" without duplicating
 # it: deps.json quotes uint64s (task_id, pred/succ) as strings so JavaScript-based
@@ -186,7 +186,7 @@ def parse_scheduler_from_json_phases(data):  # noqa: PLR0912
 
     # Which phases exist, which of them count as outer work, and how a Resolve is
     # told from a nested one are all the capture's runtime's own vocabulary.
-    runtime = get(resolve_runtime(data.get("runtime")))
+    runtime = get(data.get("runtime"), data.get("scheduler_model"))
     outer_phases = runtime.OUTER_PHASES
 
     # A logical task may emit one perf row per SPMD subtask/core. Select its
@@ -1066,7 +1066,7 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     # scheduler does publish measured idle records, but that producer is reported by
     # print_aicore_scheduler_phase_breakdown, which prints raw phase names and
     # reaches no label table -- so an idle row here is always the gap reconstruction.
-    runtime = get(resolve_runtime(data.get("runtime")))
+    runtime = get(data.get("runtime"), data.get("scheduler_model"))
     phase_labels = {
         "idle": "Idle (spinning, no progress — reconstructed from gaps)",
         **runtime.PHASE_REPORT_LABELS,

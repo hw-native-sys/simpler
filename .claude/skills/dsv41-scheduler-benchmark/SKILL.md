@@ -1,6 +1,6 @@
 ---
 name: dsv41-scheduler-benchmark
-description: Benchmark DeepSeek V4.1 Flash decode on Ascend A5 and export Percounter swimlanes to Perfetto. Use for pypto-lib main, daily CI or dev cases, DSpark 8K EP2/EP8, Simpler FDWIC, runtime A/B and stacked-PR comparisons.
+description: Benchmark DeepSeek V4.1 Flash decode on Ascend A5 and export HBG calendar swimlanes to Perfetto. Use for pypto-lib main, daily CI or dev cases, DSpark 8K EP2/EP8, runtime A/B and stacked-PR comparisons.
 ---
 
 # DeepSeek V4.1 scheduler benchmarks on A5
@@ -9,9 +9,8 @@ description: Benchmark DeepSeek V4.1 Flash decode on Ascend A5 and export Percou
 
 - Use [pypto-lib decode](references/pypto-lib.md) for Lib main, a dev branch, daily CI cases, or a no-graph A/B with live model kernels. Read the case manifest in the chosen Lib checkout.
 - Use [DSpark full decode at 8K](references/dspark-8k.md) for EP2/TP2 or EP8/TP8 target-plus-drafter benchmarks and separate capture and Perfetto export commands.
-- Use [Simpler FDWIC](references/simpler-fdwic.md) for vendored scheduler cases, the 18-case matrix, or reproducible scheduler traces with captured inputs. Use the suite README in the chosen Simpler checkout.
 - Use both when checking whether a runtime change generalizes. Report each suite with its own case inputs, timed region, and rank aggregation.
-- For [operator Percounter swimlanes](references/percounter-l1.md), capture the matching dependency graph and check that the timing records cover the executable tasks.
+- For [operator HBG calendar swimlanes](references/calendar-swimlane.md), capture the matching dependency graph and check that the timing records cover the executable tasks.
 
 ## Run a matched comparison
 

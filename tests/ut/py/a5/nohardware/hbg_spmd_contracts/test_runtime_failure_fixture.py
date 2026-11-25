@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Bad-record checks for the resident-timeout fixture, not device failure evidence."""
+"""Exercise the calendar timeout fixture with controlled evidence."""
 
 import copy
 import importlib.util
@@ -22,8 +22,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from simpler_setup.tools.hbg.native_causality import EXECUTABLE, MIX, SPMD, SYNC
-
 
 @pytest.fixture(scope="module")
 def native(request):
@@ -36,32 +34,6 @@ def native(request):
         patch.setitem(sys.modules, spec.name, module)
         spec.loader.exec_module(module)
         yield module
-
-
-@pytest.mark.parametrize("damage", (None, "schema", "missing_identity", "completion"))
-def test_successful_fault_fixture_run_requires_complete_protocol_evidence(native, damage):
-    from _native_protocol_builder import ProtocolBuilder  # noqa: PLC0415
-
-    protocol, identities = ProtocolBuilder([(2, 2, ()), (2, 1, (0,))]).run()
-    raw = {
-        "aicore_protocol": protocol,
-        "aicore_execution_identities": {
-            "schema": "hbg-execution-identity",
-            "producer": "aicore",
-            "records": identities,
-        },
-    }
-    if damage == "schema":
-        protocol["producer"] = "unknown"
-    elif damage == "missing_identity":
-        identities.pop()
-    elif damage == "completion":
-        protocol["task_controls"][0]["state"] = 0
-    if damage is None:
-        native._check_successful_capture(raw)
-    else:
-        with pytest.raises(ValueError):
-            native._check_successful_capture(raw)
 
 
 def test_failed_completion_proof_prints_owned_borrow_release(native, monkeypatch, tmp_path, capsys):
@@ -186,361 +158,56 @@ def test_resident_log_bind_failure_precedes_worker_creation(native, monkeypatch,
     assert events == ["compile", "bind"]
 
 
-def _capture(mask=3, lane=0, blocks=2, *, clusters=1, sync_start=False, epoch=2):
-    # The host normalizes a single AIV1 kernel into the AIV0 task slot.
-    slot = 1 if mask == 4 else lane
-    effective_mask = 2 if mask == 4 else mask
-    kernels = [index if mask & (1 << index) else 65535 for index in range(3)]
-    if mask == 4:
-        kernels[1], kernels[2] = kernels[2], kernels[1]
-    active_lanes = bin(effective_mask).count("1")
-    flags = EXECUTABLE | (MIX if active_lanes > 1 else 0) | (SPMD if blocks > 1 else 0)
-    if sync_start:
-        flags |= SYNC
-    workers = []
-    for index in range(clusters):
-        peers = [index, clusters + 2 * index, clusters + 2 * index + 1]
-        workers.extend(
-            dict(
-                index=worker, worker_index=worker, cluster_index=index, cluster_workers=peers, finished=2, error_flags=0
-            )
-            for worker in peers
-        )
-    workers.sort(key=lambda worker: worker["index"])
-    cluster_index = clusters - 1
-    cluster = workers[cluster_index]["cluster_workers"]
-    group_seq = 1 if flags & MIX else 0
-    owners = []
-    if flags & (MIX | SYNC):
-        owners.append(
-            {
-                "owner": {
-                    "task_ref": 0,
-                    "block_idx": 0,
-                    "worker_index": cluster[1] if flags & MIX else cluster[slot],
-                    "cluster_index": cluster_index,
-                    "run_epoch": epoch,
-                    "group_seq": group_seq,
-                    "claim_before": [70, 1],
-                    "claim_after": [80, 2],
-                },
-            }
-        )
-    total = blocks * active_lanes
+def _calendar_capture(epoch=2, *, returned=True):
+    start, end = 100, 2_500_000_100
+    kernel_end = {
+        "kind": "kernel_end",
+        "task_id": 0,
+        "run_epoch": epoch,
+        "worker_id": 0,
+        "cluster_index": 0,
+        "cluster_lane": 0,
+        "block_index": 0,
+        "block_count": 1,
+        "cycles": end,
+        "dispatch_cycles": start,
+        "kernel_start_cycles": start,
+        "finish_cycles": end,
+    }
     return {
-        "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": len(workers)},
-        "aicore_protocol": {
-            "schema": "hbg-native-protocol",
-            "producer": "aicore",
-            "scheduler_error": 10,
-            "first_error": {"site": 95},
-            "run_epoch": epoch,
-            "worker_count": len(workers),
-            "active_worker_count": len(workers),
-            "cluster_count": clusters,
-            "workers": workers,
-            "tasks": [
-                dict(
-                    task_ref=0,
-                    flags=flags,
-                    active_mask=effective_mask,
-                    kernel_ids=kernels,
-                    block_num=blocks,
-                    dependencies=[],
-                ),
-                dict(
-                    task_ref=1,
-                    flags=EXECUTABLE,
-                    active_mask=2,
-                    kernel_ids=[65535, 3, 65535],
-                    block_num=1,
-                    dependencies=[0],
-                ),
-            ],
-            "blocks": owners,
-            "executions": [
-                {
-                    "task_ref": 0,
-                    "block_idx": 0,
-                    "subtask_slot": slot,
-                    "worker_index": cluster[slot],
-                    "cluster_index": cluster_index,
-                    "run_epoch": epoch,
-                    "group_seq": group_seq,
-                    "entry": [100, 3],
-                    "returned": [2_500_000_100, 4],
-                    "visible": [2_500_000_101, 5],
-                }
-            ],
-            "task_controls": [
-                {
-                    "task_ref": 0,
-                    "state": 0,
-                    "completed_subtasks": total - 1,
-                    "canonical_total": total,
-                    "pending_compute": 1,
-                    "completion_debt": 1,
-                    "next_block": blocks,
-                    "claim_seal": blocks,
-                },
-                {
-                    "task_ref": 1,
-                    "state": 0,
-                    "completed_subtasks": 0,
-                    "canonical_total": 1,
-                    "pending_compute": 1,
-                    "completion_debt": 1,
-                    "next_block": 0,
-                    "claim_seal": 0,
-                },
-            ],
-            "resolved_task_count": 0,
-            "completion_counters": [],
+        "metadata": {"runtime": "host_build_graph", "scheduler_model": "calendar", "clock_freq_hz": 1_000_000_000},
+        "aicore_tasks": [[0, 0, 0, start, end, 0, epoch, 0, 1]],
+        "calendar_task_events": {
+            "records": [kernel_end if returned else {**kernel_end, "kind": "ready", "cycles": start}],
+            "range_records": [],
+            "dropped": 0,
+            "unmatched_deferred_updates": 0,
+            "folded_task_ids": [],
+            "inline_completed_task_ids": [],
         },
         "aicpu_lifecycle_records": [
             {
-                "aicpu_thread_id": 0,
-                "exit_signal_start_cycles": 2_000_000_100,
-                "exit_signal_end_cycles": 2_000_000_150,
-                "exit_wait_start_cycles": 2_000_000_200,
-                "exit_wait_end_cycles": 2_500_000_200,
-            },
-            {
-                "aicpu_thread_id": 1,
-                "exit_signal_start_cycles": 2_000_000_101,
-                "exit_signal_end_cycles": 2_000_000_151,
-                "exit_wait_start_cycles": 2_000_000_201,
-                "exit_wait_end_cycles": 2_500_000_200,
-            },
+                "aicpu_thread_id": thread,
+                "observe_start_cycles": 1000 if thread == 1 else 0,
+                "observe_end_cycles": end if thread == 1 else 0,
+                "sinks_observed_cycles": 0,
+            }
+            for thread in (0, 1)
         ],
     }
 
 
-@pytest.mark.parametrize("site", (95, 102))
-def test_both_real_timeout_writers_have_the_same_containment_requirements(native, site):
-    raw = _capture()
-    raw["aicore_protocol"]["first_error"]["site"] = site
-    native._check_failed_capture(raw, 2, 3, 0)
-
-
-@pytest.mark.parametrize("mask,lane", ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2)))
-@pytest.mark.parametrize("blocks", (1, 2, 3))
-def test_small_fault_capture_checks_sealed_supply(native, mask, lane, blocks):
-    raw = _capture(mask, lane, blocks, clusters=2)
-    native._check_failed_capture(raw, blocks, mask, lane)
-    raw["aicore_protocol"]["task_controls"][0]["next_block"] = blocks - 1
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, blocks, mask, lane)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 6, 7))
-def test_two_wave_fault_asks_the_device_for_its_own_claimant_population(native, mask):
-    # The host cannot read the cluster count before the run, so it asks with a
-    # negative sentinel and the orchestration launches two waves against the
-    # device's own topology. The host only sizes buffers, for the widest
-    # topology the platform admits.
-    assert native._TWO_WAVE_REQUEST < 0
-    assert native._two_wave_capacity(mask) == native._MAX_CLUSTERS * (4 if mask in (2, 4) else 2)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 6, 7))
-@pytest.mark.parametrize("fault", ("schema", "clusters", "blocks"))
-def test_two_wave_fault_cannot_silently_run_with_a_different_topology(native, mask, fault):
-    protocol = {"schema": "hbg-native-protocol", "cluster_count": 32}
-    blocks = 128 if mask in (2, 4) else 64
-    native._check_two_wave_topology(protocol, blocks, mask, True)
-    if fault == "schema":
-        protocol["schema"] = "wrong-protocol"
-    elif fault == "clusters":
-        protocol["cluster_count"] = 8
-    else:
-        blocks += 1
-    with pytest.raises(AssertionError):
-        native._check_two_wave_topology(protocol, blocks, mask, True)
-
-
-@pytest.mark.parametrize("mask,lane", ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2)))
-def test_two_wave_capture_allows_pending_supply(native, mask, lane):
-    blocks = 4 if mask in (2, 4) else 2
-    raw = _capture(mask, lane, blocks)
-    control = raw["aicore_protocol"]["task_controls"][0]
-    control.update(next_block=blocks - 1, claim_seal=0)
-    native._check_failed_capture(raw, blocks, mask, lane)
-    control["next_block"] = blocks + 1
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, blocks, mask, lane)
-
-
-@pytest.mark.parametrize("mask,lane", ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2)))
-def test_large_capture_accepts_bounded_supply(native, mask, lane):
-    native._check_failed_capture(_capture(mask, lane, 257), 257, mask, lane)
-
-
-@pytest.mark.parametrize("mask,lane", ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0)))
-@pytest.mark.parametrize("corruption", ("schema", "negative_supply", "past_end", "partial_seal", "consumer_past_end"))
-def test_large_capture_rejects_inconsistent_supply(native, mask, lane, corruption):
-    raw = _capture(mask, lane, 257)
-    protocol = raw["aicore_protocol"]
-    root, consumer = protocol["task_controls"]
-    if corruption == "schema":
-        protocol["schema"] = "wrong-protocol"
-    elif corruption == "negative_supply":
-        root.update(claim_seal=0, next_block=-1)
-    elif corruption == "past_end":
-        root.update(claim_seal=0, next_block=258)
-    elif corruption == "partial_seal":
-        root.update(claim_seal=256, next_block=256)
-    else:
-        consumer["next_block"] = 2
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 257, mask, lane)
-
-
-@pytest.mark.parametrize("mask,lane,sync", ((2, 1, True), (3, 0, False), (6, 2, False), (7, 1, True)))
-@pytest.mark.parametrize(
-    "damage", ("missing", "unfinished", "duplicate", "past_end", "wrong_worker", "cluster", "epoch", "sequence")
-)
-def test_stalled_cooperative_block_requires_its_own_acquisition(native, mask, lane, sync, damage):
-    raw = _capture(mask, lane, clusters=2, sync_start=sync)
-    protocol = raw["aicore_protocol"]
-    native._check_failed_capture(raw, 2, mask, lane)
-    rows = protocol["blocks"]
-    owner = rows[0]["owner"]
-    if damage == "missing":
-        rows.clear()
-    elif damage == "unfinished":
-        owner["claim_after"] = [0, 0]
-    elif damage == "duplicate":
-        rows.append(copy.deepcopy(rows[0]))
-    elif damage == "past_end":
-        rows.append({"owner": {**owner, "block_idx": 2}})
-    elif damage == "wrong_worker":
-        owner["worker_index"] = 0
-    elif damage == "cluster":
-        owner["cluster_index"] = 0
-    elif damage == "epoch":
-        owner["run_epoch"] -= 1
-    else:
-        owner["claim_before"] = owner["claim_after"]
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, mask, lane)
-
-
-@pytest.mark.parametrize(
-    "claim_generation,execution_generation,valid", ((1, 1, True), (3, 3, True), (2, 2, False), (3, 1, False))
-)
-def test_mix_timeout_requires_same_armed_generation(native, claim_generation, execution_generation, valid):
-    raw = _capture()
-    protocol = raw["aicore_protocol"]
-    protocol["blocks"][0]["owner"]["group_seq"] = claim_generation
-    protocol["executions"][0]["group_seq"] = execution_generation
-    if valid:
-        native._check_failed_capture(raw, 2, 3, 0)
+@pytest.mark.parametrize("damage", (None, "wrong_epoch", "missing_retire"))
+def test_completed_calendar_capture_requires_retirement(native, damage):
+    raw = _calendar_capture()
+    events = raw["calendar_task_events"]["records"]
+    if damage != "missing_retire":
+        events.append({**events[0], "kind": "local_retired", "run_epoch": 1 if damage == "wrong_epoch" else 2})
+    if damage is None:
+        native._check_successful_capture(raw)
     else:
         with pytest.raises(AssertionError):
-            native._check_failed_capture(raw, 2, 3, 0)
-
-
-def test_mix_claim_precedes_stalled_kernel_entry_across_workers(native):
-    raw = _capture()
-    protocol = raw["aicore_protocol"]
-    owner = protocol["blocks"][0]["owner"]
-    execution = protocol["executions"][0]
-    assert owner["worker_index"] != execution["worker_index"]
-    owner["claim_after"][1] = execution["entry"][1] + 10  # Worker-local sequence numbers are independent.
-    native._check_failed_capture(raw, 2, 3, 0)
-    owner["claim_after"][0] = execution["entry"][0] + 1
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, 3, 0)
-
-
-def test_pure_sync_claim_precedes_stalled_kernel_entry(native):
-    pure = _capture(1, 0, clusters=2, sync_start=True)
-    protocol = pure["aicore_protocol"]
-    protocol["blocks"][0]["owner"]["claim_after"] = protocol["executions"][0]["entry"]
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(pure, 2, 1, 0)
-
-
-def test_interrupted_acquisition_does_not_count_as_a_second_owner(native):
-    raw = _capture()
-    rows = raw["aicore_protocol"]["blocks"]
-    rows.extend([{"owner": None}, {"owner": {**rows[0]["owner"], "block_idx": 1, "claim_after": [0, 0]}}])
-    native._check_failed_capture(raw, 2, 3, 0)
-
-
-def test_ordinary_block_has_no_cooperative_owner_record(native):
-    raw = _capture(2, 1)
-    raw["aicore_protocol"]["blocks"] = _capture()["aicore_protocol"]["blocks"]
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, 2, 1)
-
-
-def test_failed_capture_distinguishes_missing_counter_snapshot_from_pending(native):
-    raw = _capture()
-    protocol = raw["aicore_protocol"]
-    control = protocol["task_controls"][0]
-    control.update(completion_backend=1, counter_index=0, counter_threshold=4, counter_limit=4)
-    protocol["completion_counters"] = [dict(index=0, value=0, valid=0, limit=4)]
-    protocol["resolved_task_count"] = None
-    native._check_failed_capture(raw, 2, 3, 0)
-    protocol["resolved_task_count"] = 0
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, 3, 0)
-
-
-@pytest.mark.parametrize("damage", ("enter_pending", "exit_done", "extra_resolved", "missing_exit"))
-def test_native_graph_fault_keeps_only_enter_resolved(native, damage):
-    raw = _capture(7, 2)
-    protocol = raw["aicore_protocol"]
-    root, consumer = protocol["tasks"]
-    root.update(task_ref=1, dependencies=[0])
-    consumer.update(task_ref=2, dependencies=[1])
-    protocol["executions"][0]["task_ref"] = protocol["blocks"][0]["owner"]["task_ref"] = 1
-    root_control, consumer_control = protocol["task_controls"]
-    root_control["task_ref"] = 1
-    # A dependent kernel can acquire supply while its dependency still prevents entry.
-    consumer_control.update(task_ref=2, next_block=1, claim_seal=1)
-    for ref, state, deps in ((0, 2, []), (3, 0, [2])):
-        task = dict(task_ref=ref, active_mask=0, flags=0, kernel_ids=[65535] * 3, block_num=1, dependencies=deps)
-        protocol["tasks"].insert(ref, task)
-        protocol["task_controls"].insert(ref, dict(task_ref=ref, state=state, claim_seal=0, next_block=0))
-    protocol["node_map"] = [dict(node_ref=ref, kind=kind) for ref, kind in enumerate((3, 1, 1, 4))]
-    protocol["resolved_task_count"] = 1
-    native._check_failed_capture(raw, 2, 7, 2)
-    if damage == "enter_pending":
-        protocol["task_controls"][0]["state"] = 0
-    elif damage == "exit_done":
-        protocol["task_controls"][3]["state"] = 2
-    elif damage == "extra_resolved":
-        protocol["resolved_task_count"] = 2
-    else:
-        protocol["node_map"].pop()
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, 7, 2)
-
-
-def test_failed_capture_requires_explicit_cluster_topology(native):
-    raw = _capture()
-    del raw["aicore_protocol"]["cluster_count"]
-    with pytest.raises(KeyError, match="cluster_count"):
-        native._check_failed_capture(raw, 2, 3, 0)
-
-
-@pytest.mark.parametrize("damage", ("cluster_count", "split_peers", "wrong_cluster"))
-def test_stalled_worker_requires_its_configured_cluster(native, damage):
-    raw = _capture(7, 0, clusters=2)
-    protocol = raw["aicore_protocol"]
-    worker = protocol["workers"][protocol["executions"][0]["worker_index"]]
-    if damage == "cluster_count":
-        protocol["cluster_count"] = 1
-    elif damage == "split_peers":
-        peer = worker["cluster_workers"][1]
-        protocol["workers"][peer]["cluster_workers"] = protocol["workers"][0]["cluster_workers"]
-    else:
-        protocol["executions"][0]["cluster_index"] = 0
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, 7, 0)
+            native._check_successful_capture(raw)
 
 
 def test_nonreturning_probe_is_hardware_only_and_covers_each_executing_lane(native):
@@ -562,171 +229,14 @@ def test_nonreturning_probe_is_hardware_only_and_covers_each_executing_lane(nati
             assert [(mark.name, mark.args[0]) for mark in entry.marks] == [("manual", ["a5"])]
 
 
-def _nonreturning_capture():
-    raw = _capture()
-    protocol = raw["aicore_protocol"]
-    protocol["workers"][0]["finished"] = 0
-    execution = protocol["executions"][0]
-    for field in ("returned", "visible", "completion_consumed", "trace_published"):
-        execution[field] = [0, 0]
-    raw["aicpu_lifecycle_records"][0]["exit_wait_end_cycles"] = 3_000_000_200
-    return raw
-
-
-def test_nonreturning_capture_proves_missing_return_and_exit_ack_timeout(native):
-    native._check_failed_capture(_nonreturning_capture(), 2, 3, 0, nonreturning=True)
-
-
-@pytest.mark.parametrize(
-    "corruption",
-    (
-        "missing_entry",
-        "return",
-        "visible",
-        "consumed",
-        "trace",
-        "fake_ack",
-        "extra_unfinished",
-        "wrong_partition",
-        "short_exit_wait",
-        "premature_exit",
-        "late_signal_end",
-        "consumer_entered",
-        "task_done",
-        "completed_subtasks",
-        "resolved_count",
-    ),
-)
-def test_nonreturning_capture_rejects_fabricated_completion_or_unrelated_failure(native, corruption):
-    raw = _nonreturning_capture()
-    protocol = raw["aicore_protocol"]
-    execution = protocol["executions"][0]
-    if corruption == "missing_entry":
-        execution["entry"] = [0, 0]
-    elif corruption in ("return", "visible", "consumed", "trace"):
-        field = {
-            "return": "returned",
-            "visible": "visible",
-            "consumed": "completion_consumed",
-            "trace": "trace_published",
-        }[corruption]
-        execution[field] = [2_500_000_100, 2]
-    elif corruption == "fake_ack":
-        protocol["workers"][0]["finished"] = 2
-    elif corruption == "extra_unfinished":
-        protocol["workers"][1]["finished"] = 0
-    elif corruption == "wrong_partition":
-        execution["worker_index"] = 2
-        protocol["workers"][0]["finished"] = 2
-        protocol["workers"][2]["finished"] = 0
-    elif corruption == "short_exit_wait":
-        raw["aicpu_lifecycle_records"][0]["exit_wait_end_cycles"] -= 1
-    elif corruption == "late_signal_end":
-        raw["aicpu_lifecycle_records"][0]["exit_signal_end_cycles"] = 3_100_000_000
+@pytest.mark.parametrize("returned", (False, True))
+def test_current_nonreturning_capture_requires_no_kernel_return(native, returned):
+    raw = _calendar_capture(returned=returned)
+    if returned:
+        with pytest.raises(AssertionError, match="non-returning kernel"):
+            native._check_failed_capture(raw, 0, 1, 1, 0, nonreturning=True)
     else:
-        _corrupt_shutdown(raw, corruption)
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, 3, 0, nonreturning=True)
-
-
-@pytest.mark.parametrize(
-    "corruption",
-    (
-        "no_error",
-        "wrong_site",
-        "unfinished_worker",
-        "missing_worker",
-        "duplicate_worker",
-        "truncated_topology",
-        "worker_error",
-        "dependency",
-        "wrong_mask",
-        "wrong_block",
-        "missing_return",
-        "return_sequence",
-        "short_stall",
-        "premature_exit",
-        "late_exit",
-        "late_signal_end",
-        "premature_retirement",
-        "wrong_partition",
-        "duplicate_partition",
-        "consumer_entered",
-        "task_done",
-        "completed_subtasks",
-        "duplicate_control",
-        "missing_control",
-        "resolved_count",
-    ),
-)
-def test_failed_capture_cannot_hide_missing_exit_or_successful_dependency_release(native, corruption):
-    raw = _capture()
-    protocol = raw["aicore_protocol"]
-    execution = protocol["executions"][0]
-    if corruption == "no_error":
-        protocol["scheduler_error"] = 0
-    elif corruption == "wrong_site":
-        protocol["first_error"]["site"] = 93
-    elif corruption == "unfinished_worker":
-        protocol["workers"][0]["finished"] = 0
-    elif corruption == "missing_worker":
-        protocol["workers"].pop()
-    elif corruption == "duplicate_worker":
-        protocol["workers"][1] = copy.deepcopy(protocol["workers"][0])
-    elif corruption == "truncated_topology":
-        protocol["workers"].pop()
-        protocol["active_worker_count"] = protocol["worker_count"] = 2
-    elif corruption == "worker_error":
-        protocol["workers"][0]["error_flags"] = 1
-    elif corruption == "dependency":
-        protocol["tasks"][1]["dependencies"] = []
-    elif corruption == "wrong_mask":
-        protocol["tasks"][0]["active_mask"] = 1
-    elif corruption == "wrong_block":
-        execution["block_idx"] = 1
-    elif corruption == "missing_return":
-        execution["returned"] = [0, 0]
-    elif corruption == "return_sequence":
-        execution["returned"][1] = execution["entry"][1]
-    elif corruption == "short_stall":
-        execution["returned"][0] -= 1
-    else:
-        _corrupt_shutdown(raw, corruption)
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, 3, 0)
-
-
-def _corrupt_shutdown(raw, corruption):
-    protocol = raw["aicore_protocol"]
-    execution = protocol["executions"][0]
-    if corruption == "premature_exit":
-        raw["aicpu_lifecycle_records"][0]["exit_signal_start_cycles"] = 99
-    elif corruption == "late_exit":
-        for record in raw["aicpu_lifecycle_records"]:
-            record["exit_signal_start_cycles"] = execution["returned"][0] + 1
-    elif corruption == "late_signal_end":
-        raw["aicpu_lifecycle_records"][0]["exit_signal_end_cycles"] = execution["returned"][0] + 1
-    elif corruption == "premature_retirement":
-        for record in raw["aicpu_lifecycle_records"]:
-            record["exit_wait_end_cycles"] = execution["returned"][0] - 1
-    elif corruption == "wrong_partition":
-        raw["aicpu_lifecycle_records"][0]["exit_wait_end_cycles"] = execution["returned"][0] - 1
-        raw["aicpu_lifecycle_records"][1]["exit_wait_end_cycles"] = execution["returned"][0] + 100
-    elif corruption == "duplicate_partition":
-        raw["aicpu_lifecycle_records"][1]["aicpu_thread_id"] = 0
-    elif corruption == "consumer_entered":
-        protocol["executions"].append({**execution, "task_ref": 1})
-    elif corruption == "task_done":
-        protocol["task_controls"][0]["state"] = 2
-    elif corruption == "completed_subtasks":
-        task = protocol["tasks"][0]
-        protocol["task_controls"][0]["completed_subtasks"] = task["block_num"] * bin(task["active_mask"]).count("1")
-    elif corruption == "duplicate_control":
-        protocol["task_controls"].append(copy.deepcopy(protocol["task_controls"][0]))
-    elif corruption == "missing_control":
-        protocol["task_controls"].pop()
-    else:
-        protocol["resolved_task_count"] = 1
+        native._check_failed_capture(raw, 0, 1, 1, 0, nonreturning=True)
 
 
 @pytest.mark.parametrize(
@@ -848,15 +358,19 @@ def test_native_graph_failure_budget_covers_failure_and_recovery(native, monkeyp
 
 
 def test_failed_capture_checks_the_actual_injected_stall(native):
-    raw = _capture()
-    execution = raw["aicore_protocol"]["executions"][0]
-    execution["returned"][0] = 12_500_000_100
-    execution["visible"][0] = 12_500_000_101
-    raw["aicpu_lifecycle_records"][0]["exit_wait_end_cycles"] = 12_500_000_200
-    native._check_failed_capture(raw, 2, 3, 0, stall_ms=12500)
-    execution["returned"][0] -= 1
+    raw = _calendar_capture()
+    native._check_failed_capture(raw, 0, 1, 7, 0)
+    raw["calendar_task_events"]["records"][0]["cycles"] -= 1
     with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, 3, 0, stall_ms=12500)
+        native._check_failed_capture(raw, 0, 1, 7, 0)
+
+
+def test_failed_capture_refuses_successor_execution(native):
+    raw = _calendar_capture()
+    events = raw["calendar_task_events"]["records"]
+    events.append({**events[0], "task_id": 1})
+    with pytest.raises(AssertionError, match="successor returned"):
+        native._check_failed_capture(raw, 0, 1, 7, 0)
 
 
 @pytest.mark.parametrize("platform,stall_ms", [("a5sim", 2500), ("a5", 2500), ("a5sim", -1), ("a5", -1)])
@@ -882,8 +396,8 @@ def test_partial_buffer_release_does_not_retry_a_confirmed_free(native, monkeypa
         ("a5sim", 507018, None, AssertionError),
         ("a5", 507018, "missing", FileNotFoundError),
         ("a5", 507018, "epoch", AssertionError),
-        ("a5", 507018, "scheduler", AssertionError),
-        ("a5", 507018, "site", AssertionError),
+        ("a5", 507018, "metadata", AssertionError),
+        ("a5", 507018, "dropped", AssertionError),
         ("a5", 507018, "returned", AssertionError),
         ("a5", 507018, "output", AssertionError),
     ],
@@ -941,7 +455,7 @@ def _check_fault_buffer_policy(
 
     class ControlledWorker:
         scheduler_mode_publish_count = 0
-        scheduler_runtime_mode = 1
+        scheduler_runtime_mode = 5
         poisoned = False
 
         def __init__(self, **kwargs):
@@ -1010,29 +524,17 @@ def _check_fault_buffer_policy(
 
     def capture(prefix):
         owner = owners[0]
-        if validate_records:
-            if owner.poisoned and damage == "missing":
-                raise FileNotFoundError("controlled missing owned capture")
-            raw = _capture(7, 0, 1, epoch=owner.scheduler_mode_publish_count)
-            protocol = raw["aicore_protocol"]
-            if not owner.poisoned or damage == "scheduler":
-                protocol["scheduler_error"] = 0
-            if owner.poisoned:
-                if damage == "epoch":
-                    protocol["run_epoch"] -= 1
-                elif damage == "site":
-                    protocol["first_error"]["site"] = 93
-                elif damage == "returned":
-                    protocol["executions"][0]["returned"] = [0, 0]
-            return prefix / "capture.bin", raw
-        return prefix / "capture.bin", {
-            "aicore_protocol": {
-                "schema": "hbg-native-protocol",
-                "run_epoch": owner.scheduler_mode_publish_count,
-                "scheduler_error": 100 if owner.poisoned else 0,
-                "first_error": {"site": 95 if owner.poisoned else 0},
-            }
-        }
+        if validate_records and owner.poisoned and damage == "missing":
+            raise FileNotFoundError("controlled missing owned capture")
+        epoch = owner.scheduler_mode_publish_count
+        if owner.poisoned and damage == "epoch":
+            epoch -= 1
+        raw = _calendar_capture(epoch=epoch, returned=not (owner.poisoned and damage == "returned"))
+        if owner.poisoned and damage == "metadata":
+            raw["metadata"]["scheduler_model"] = "unknown"
+        if owner.poisoned and damage == "dropped":
+            raw["calendar_task_events"]["dropped"] = 1
+        return prefix / "capture.json", raw
 
     if owned_wait_case is not None:
         logs = tmp_path / "owned-host-logs"
@@ -1067,7 +569,6 @@ def _check_fault_buffer_policy(
     monkeypatch.setattr(native, "_compile", lambda platform, *, native_graph=False: object())
     monkeypatch.setattr(native, "_args", lambda *args: args[-1])
     monkeypatch.setattr(native, "_capture", capture)
-    monkeypatch.setattr(native, "_root_block_num", lambda protocol: 1)
     monkeypatch.setattr(native, "_check_output", check_output)
     monkeypatch.setattr(native, "_check_failed_capture", failed_capture)
     monkeypatch.setattr(native, "_check_successful_capture", lambda raw: None)
@@ -1393,24 +894,3 @@ def test_owned_proof_partial_free_does_not_retry_a_confirmed_free(native, monkey
     _check_fault_buffer_policy(
         native, monkeypatch, tmp_path, "a5", case["stall_ms"], owned_wait_case=case, fail_second_free=True
     )
-
-
-@pytest.mark.parametrize("task", (0, 1))
-@pytest.mark.parametrize("value", (None, False, True, -1, 1 << 32, (1 << 64) - 1))
-def test_current_kernel_timeout_does_not_hide_invalid_claim_seal(native, task, value):
-    raw = _capture(7, 0, 257)
-    protocol = raw["aicore_protocol"]
-    native._check_failed_capture(raw, 257, 7, 0)
-    if value is None:
-        del protocol["task_controls"][task]["claim_seal"]
-    else:
-        protocol["task_controls"][task]["claim_seal"] = value
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 257, 7, 0)
-
-
-def test_current_nonreturning_capture_keeps_missing_returns(native):
-    raw = _nonreturning_capture()
-    protocol = raw["aicore_protocol"]
-    protocol["task_controls"][0]["claim_seal"] = 0
-    native._check_failed_capture(raw, 2, 3, 0, nonreturning=True)

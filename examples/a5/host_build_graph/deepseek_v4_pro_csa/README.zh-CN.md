@@ -4,10 +4,9 @@
 不依赖 PyPTO、模型仓库或其他 runtime 的用例。首次使用需要单独导入固定数据；
 数据、编译产物和泳道图不进入 Git。
 
-当前 A5 resident 实现支持普通 C/V 与 GM Mix 的原 N 分波，并通过原样 CSA 的
-数值、执行身份和原生协议严格 L4 验收。本 CSA 不设置 sync_start，该能力由独立
-测试覆盖，不能由本用例通过推导。Graph body 回退、多 block/Mix predicate 拒绝、
-deferred completion 未开放等边界见 [调度设计](../../../../tests/fdwic/pa_hbg/a5-hbg-spmd-design.md)。
+当前 A5 `host_build_graph` 使用每核日历执行 CSA，包括普通 C/V、MIX 和多 block
+任务。本用例覆盖七项输出校验、每个 block 的角色与执行区间，以及 L4 调度采集。
+本 CSA 未设置 `sync_start`，同步启动由独立测试覆盖。
 
 ## 1. 冻结负载与入口
 
@@ -86,7 +85,7 @@ python "$CSA_HBG/run.py" bench -d 0
 
 # 依赖图与计时分进程采集，两轮均检查 golden。
 python "$CSA_HBG/run.py" l1 -d 0
-python "$CSA_HBG/run.py" l4 -d 0 --require-aicore-scheduler
+python "$CSA_HBG/run.py" l4 -d 0
 ```
 
 七项输出为 `x_out`、`kv_cache`、`cmp_kv`、`compress_state`、
@@ -102,18 +101,16 @@ runtime 二进制 SHA256、实际命令和日志，最后打印 `result.json`。
 python "$CSA_HBG/test_deepseek_v4_pro_csa.py" -p a5 -d 0 --manual include --rounds 3
 ```
 
-严格 L4 不只检查数值：producer 必须是 `aicore`，每轮有新调度来源发布，
-2308 个 task/block/slot 身份与原图逐项对应，全部 fan-in 与独立 dep-gen 一致，
-原生协议因果审计通过，Host/scheduler 记录无丢弃或截断。
-成功结果包含 `block_identity_verified=true`、`protocol_verified=true`；
-历史缺少这些证据的捕获仍可读取，但不能通过严格门禁。核间时钟不当成全局顺序。
-`check`、`bench`、L1 和数值通过均不能替代这项证明。
+严格 L4 校验日历运行的调度来源和记录完整性。AICore 调度记录与 Worker 精确关联，
+2308 个 task/block/slot 身份逐项对应原图。依赖边由独立 dep-gen 冻结并校验，
+Worker 区间用于检查这些依赖的执行顺序。Host 及调度阶段记录必须完整。
+结果包含 `block_identity_verified=true` 和 `scheduler_producer=aicore`。
 
 ## 4. 业务变体与回归测试
 
-[业务测试](../../../../tests/fdwic/pa_hbg/csa/test_csa_business.py) 复用全部原 kernel、
-参数和七项比较器。`TestCSABusiness` 的 12 个用例允许 legacy，检查业务语义；
-`TestCSAResident` 的 3 个用例额外严格要求新发布的 resident 模式，不接受回退。
+[业务测试夹具](../../../../tests/support/a5/host_build_graph/csa/business.py) 复用全部原 kernel、
+参数和七项比较器。`TestCSABusiness` 的 12 个用例检查业务语义，并要求每次执行均有新的
+日历调度模式发布。
 
 物理页反转、循环移动和固定种子打乱会同步修改 pool、block table、slot mapping，
 普通 KV 同步修改 `window_swa_indices`，index payload/scale 始终使用同一映射。
@@ -122,24 +119,17 @@ python "$CSA_HBG/test_deepseek_v4_pro_csa.py" -p a5 -d 0 --manual include --roun
 物理 state 别名，旧 golden 不支持这种等价变换。
 
 ```bash
-python tests/fdwic/pa_hbg/csa/test_csa_business.py \
-  -p a5 -d 0 --manual include --case TestCSABusiness:: --rounds 3
-python tests/fdwic/pa_hbg/csa/test_csa_business.py \
-  -p a5 -d 0 --manual include --case TestCSAResident::
-python -m pytest -q tests/ut/py/a5/test_csa_*.py \
-  tests/ut/py/a5/nohardware/hbg_spmd_contracts/test_csa_protocol.py \
-  tests/fdwic/pa_hbg/csa/test_csa_snapshot.py
+python -m pytest -q tests/ut/py/a5/test_csa_*.py
 ```
 
 CPU 测试涵盖删除依赖边、缩减 block、漏掉 Mix lane、损坏 tensor view、错绑身份、
-陈旧来源和每轮七个缓冲区恢复。快照测试覆盖 NaN/Inf、越界写、输出损坏和 scale 漏写。
-协议模型不能代替 A5 缓存一致性或真实业务验收。
+陈旧来源和每轮七个缓冲区恢复。
 
 ## 5. 性能结论和口径
 
 最新保留优化的历史无泳道插桩 Device 中位数约 **2083.5975 us（2.084 ms）**。
 同卡 A/B/A/B、每臂 200 个样本，相对同轮负 Ready 探测复用前的 2245.264 us
-下降 7.20%。完整条件、逐批统计和复跑方法见 [性能说明](../../../../tests/fdwic/pa_hbg/spmd/performance.md)。
+下降 7.20%。完整条件、逐批统计和复跑方法见 [性能说明](https://github.com/hw-native-sys/simpler/blob/1ea06c2aee35993c288887582cb7f802b2724546/tests/fdwic/pa_hbg/spmd/performance.md)。
 这不是本次文档整理新测出的收益，也没有达到 1.5 ms。
 
 `device_us` 是完整 `chip.run.runner_run.device_wall` 窗口，不是首末 kernel span；
@@ -148,5 +138,4 @@ CPU 测试涵盖删除依赖边、缩减 block、漏掉 Mix lane、损坏 tensor
 Host/device 的 `bounded` 时钟对齐带不确定范围，不能视为精确同钟。
 
 已有 [2026-10-14 基线文件](baseline_20261014.json) 属于旧版本 AICPU 回退的历史资料，
-不重写为 resident 结果，也不作为当前优化的同版本 A/B 对照。后续比较固定输入、
-kernel、工具链、设备和计时范围，并先完成严格正确性验收。
+对照日历性能时，使用两次实测，固定输入、kernel、工具链、设备和计时范围，并先完成严格正确性验收。

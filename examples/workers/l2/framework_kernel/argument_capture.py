@@ -9,7 +9,7 @@
 """Capture task-time arguments after framework producers and before successors.
 
 Two dependent tasks use a runtime-owned intermediate. Supported runtimes check
-FULL bytes and HYBRID metadata/selected payloads. A5 HBG uses AICore scheduling.
+FULL bytes and HYBRID metadata/selected payloads. A5 HBG uses AICore calendar scheduling.
 Collection and admission may wait; this reference does not measure overlap.
 """
 
@@ -31,6 +31,7 @@ COUNT = 128 * 128
 OFFSET = 32
 GUARD = -909.0
 LEVELS = (0, 3, 2, 0)
+CALENDAR_MODE = 5
 _UNPROVEN = []
 
 
@@ -201,12 +202,12 @@ def _task_args(worker, backing, a, b, out):
 
 def _submit(frame, runs):
     worker = frame["worker"]
-    before = worker.scheduler_mode_publish_count if frame["requires_aicore_scheduler"] else None
+    before = worker.scheduler_mode_publish_count if frame["requires_calendar"] else None
     runs.append(worker.submit(frame["callable"], frame["args"], frame["config"], caller_stream=frame["raw_stream"]))
     if before is not None:
         assert worker.scheduler_mode_publish_count > before, "A5 HBG dump bind published no scheduler selection"
         frame["scheduler_mode"] = worker.scheduler_runtime_mode
-        assert frame["scheduler_mode"] == 1, "A5 HBG dump requires RESIDENT_PENDING AICore scheduling"
+        assert frame["scheduler_mode"] == CALENDAR_MODE, "A5 HBG dump requires calendar scheduling"
     frame["config"].enable_dump_args = 1
     frame["config"].output_prefix = str(frame["poison"])
 
@@ -270,7 +271,7 @@ def run(runtime, device, bridge_path, root, *, platform="a2a3"):
                         config=config,
                         raw_stream=stream.npu_stream,
                         poison=poison,
-                        requires_aicore_scheduler=platform == "a5" and runtime == "host_build_graph" and level != 0,
+                        requires_calendar=platform == "a5" and runtime == "host_build_graph" and level != 0,
                     )
                 )
                 backing.fill_(GUARD)

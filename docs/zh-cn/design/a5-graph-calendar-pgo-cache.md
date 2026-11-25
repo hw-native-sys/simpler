@@ -36,7 +36,7 @@ Graph Definition 的录制、复用与校验继续用 `graph_key` 和 Config 身
 
 当前标量值、张量地址、参数池偏移和通知地址由本次调用绑定。张量元数据变化仍需通过各自的 Definition 和参数校验，调度签名依据变化产生的实际 DAG 和任务形态判定。键的 hash 可用于加速查找，签名等值检查负责区分 hash 碰撞。
 
-同一 Callable 注册期间，同一 `graph_id` 和相等 Config 必须录出相同的 Graph 调度结构。A5 Percounter 在 Calendar 查找或训练前核对本次录制的结构，发现变化时返回 bind 错误并指出第一个不同的任务或字段。换桶或省略桶号都适用。Config 按类型和 `operator==` 判等，稳定身份独立于本次 bind 分配的 `graph_key`。
+同一 Callable 注册期间，同一 `graph_id` 和相等 Config 必须录出相同的 Graph 调度结构。A5 HBG 日历 在 Calendar 查找或训练前核对本次录制的结构，发现变化时返回 bind 错误并指出第一个不同的任务或字段。换桶或省略桶号都适用。Config 按类型和 `operator==` 判等，稳定身份独立于本次 bind 分配的 `graph_key`。
 
 4-block 和 8-block 结构由不同 Config 表达时，即使同桶，也各自训练并缓存对应的计划。后续提交分别命中各自的计划。
 
@@ -46,7 +46,7 @@ Graph Definition 的录制、复用与校验继续用 `graph_key` 和 Config 身
 
 冷路径继续使用现有初始 Calendar、设备采样和 Host PGO。待训练记录与已发布计划使用同一个完整键，兼容的并发准备可以共享已构造的初始计划，同一键由一个在途训练拥有采样。单次 bind 内有多个匹配调用时，沿用由最后一个匹配调用提供样本的规则。成功完成且样本有效后发布不可变的 `CalendarPlan`。bind 失败、执行失败或样本无效时，待训练记录随现有资源清理释放，后续提交可以重新训练。
 
-每个调用使用本次 Definition 独立物化实参、kernel entry 和 predicate，并使用本次准备的计数器，按现有 Graph 边界规则执行。可跨调用共享不可变的计划和调度行布局。已 bind 的运行和直接 replay 继续执行其已准备的镜像。实际 CntNotify 租约继续在 bind 时申请并校验。 [Graph 镜像与逐次绑定](https://github.com/hw-native-sys/simpler/blob/e5c0a697e90f100bb2d4445d1b8afda7f54ed3cb/src/a5/runtime/percounter/host/calendar_image.h#L313-L375) · [现有训练流程](https://github.com/hw-native-sys/simpler/blob/e5c0a697e90f100bb2d4445d1b8afda7f54ed3cb/src/a5/runtime/percounter/host/calendar_cache.h#L130-L170)
+每个调用使用本次 Definition 独立物化实参、kernel entry 和 predicate，并使用本次准备的计数器，按现有 Graph 边界规则执行。可跨调用共享不可变的计划和调度行布局。已 bind 的运行和直接 replay 继续执行其已准备的镜像。实际 SoC SRAM 计数槽租约继续在 bind 时申请并校验。 [Graph 镜像与逐次绑定](https://github.com/hw-native-sys/simpler/blob/e5c0a697e90f100bb2d4445d1b8afda7f54ed3cb/src/a5/runtime/percounter/host/calendar_image.h#L313-L375) · [现有训练流程](https://github.com/hw-native-sys/simpler/blob/e5c0a697e90f100bb2d4445d1b8afda7f54ed3cb/src/a5/runtime/percounter/host/calendar_cache.h#L130-L170)
 
 ## 实施落点
 
@@ -54,7 +54,7 @@ Graph Definition 的录制、复用与校验继续用 `graph_key` 和 Config 身
 2. 在 Calendar `state.h` 和 `calendar_cache.h` 接入显式桶查找。每个 bind 内对同一已解析 Definition 复用结构签名计算结果。复用现有训练中和训练完成的缓存容器，避免在 Worker 内额外保留每次调用的实参或 Definition 镜像。计划数量随实际访问的桶和结构变体数增长，因此节省量取决于 Lib 的桶划分。
 3. 沿用现有 `MISS`、`REUSE`、`HIT`、`STORE` 诊断，补足区分 Graph 阶段和结果归属所需的信息。单测直接核对 plan 和训练项数量，场景测试通过正常提交入口核对事件和结果。接口落地时同步更新 Graph 执行文档和 A5 Calendar PGO 文档。
 
-Calendar 调度器位于独立的 A5 `percounter` runtime。草稿 PR #3262 跟踪迁移到 A5 `host_build_graph`。 [A5 Calendar 迁移 PR #3262](https://github.com/hw-native-sys/simpler/pull/3262)
+A5 日历调度器位于 `host_build_graph` runtime。
 
 ## 验收
 

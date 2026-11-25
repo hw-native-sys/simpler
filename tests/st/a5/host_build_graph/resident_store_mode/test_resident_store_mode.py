@@ -92,7 +92,7 @@ def test_resident_entry_resets_prior_store_mode(st_platform, st_device_ids, tmp_
             worker.copy_to(buffers[1], target)
             args = _task_args(buffers, poison)
             worker.run(handle, args, CallConfig())
-            assert worker.scheduler_runtime_mode in (1, 2), "the run must use the resident scheduler"
+            assert worker.scheduler_runtime_mode == 5, "the run must use the calendar scheduler"
             worker.copy_from(target, buffers[1])
             active = target[:, 16] >= 0
             rows = target[active]

@@ -83,9 +83,9 @@ foreach(SRC_FILE ${ALL_SOURCES})
     list(APPEND ALL_AIC_OBJECTS ${OBJ_AIC})
     list(APPEND ALL_AIV_OBJECTS ${OBJ_AIV})
 
-    # Percounter's Cube calendar dispatch requires direct control flow.
+    # HBG's Cube calendar dispatch requires direct control flow.
     set(AIC_SOURCE_FLAGS "")
-    if(SRC_NAME STREQUAL "task_profiled" AND SRC_FILE MATCHES "/percounter/aicore/")
+    if(SRC_NAME STREQUAL "task_profiled" AND SRC_FILE MATCHES "/host_build_graph/aicore/")
         list(APPEND AIC_SOURCE_FLAGS "-fno-jump-tables")
     endif()
 

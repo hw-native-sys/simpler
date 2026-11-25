@@ -76,11 +76,13 @@
     {
       "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.cpp",
+      "source_commit": "c1c234667d54f4aea1582249448b24f9a08753f6",
       "sha256": "9772a4c98a63e7f032887a58ea8cf5fe791a9e2f437a7fe13f2573fb0030cd1b"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.h",
       "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.h",
+      "source_commit": "c1c234667d54f4aea1582249448b24f9a08753f6",
       "sha256": "76a1864a736d0f7e17994d116d2614b54e1c8a4f0edc8832a3ce5b4cf4bced47"
     },
     {
@@ -91,16 +93,19 @@
     {
       "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
+      "source_commit": "c1c234667d54f4aea1582249448b24f9a08753f6",
       "sha256": "c2eb077a58fd7355a91262ee76efc799b551c4fd4a16e1503742011ab0297daa"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
+      "source_commit": "c1c234667d54f4aea1582249448b24f9a08753f6",
       "sha256": "bda026c32b15f66ea5e59ade4a2d3871315c7f9d6a6836a77c58789bb86f3964"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/async_wait.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/async_wait.h",
+      "source_commit": "c1c234667d54f4aea1582249448b24f9a08753f6",
       "sha256": "29c0e675da693ce641ead62ef9689d84997d4a696b218e89f44b5cb032abddc4"
     },
     {
@@ -111,6 +116,7 @@
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler.h",
+      "source_commit": "c1c234667d54f4aea1582249448b24f9a08753f6",
       "sha256": "0c84cb695405dae868a61f21287819289b469ad7a468ad41167021d4d1f08af1"
     },
     {
@@ -121,16 +127,19 @@
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_binding.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_graph_binding.h",
+      "source_commit": "c1c234667d54f4aea1582249448b24f9a08753f6",
       "sha256": "db7d3261b300c386819ff8f8af7dc049faff35ba2143bfa0df86ece65f9a4105"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph.h",
+      "source_commit": "c1c234667d54f4aea1582249448b24f9a08753f6",
       "sha256": "5234ec24b54ea666076c4cdcbe71020687423c08a98d09a44919449dbcda72b2"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph_access.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph_access.h",
+      "source_commit": "c1c234667d54f4aea1582249448b24f9a08753f6",
       "sha256": "1241c06b43e7f8124360f9fcf305b070ab9300275227797355ac9884ad636686"
     },
     {

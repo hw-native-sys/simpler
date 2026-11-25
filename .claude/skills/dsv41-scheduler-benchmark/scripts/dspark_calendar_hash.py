@@ -12,7 +12,6 @@
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -142,8 +141,8 @@ def kernel_hashes(runtime_dir):
 
 def prepare(args, daily):
     frozen = read_json(args.fixture / "prepared.json")
-    if frozen["case"] != dspark.make_case(2) or set(frozen["artifact_runtimes"].values()) != {"percounter"}:
-        raise ValueError("expected the frozen DSpark 8K EP2 Percounter fixture")
+    if frozen["case"] != dspark.make_case(2) or set(frozen["artifact_runtimes"].values()) != {"host_build_graph"}:
+        raise ValueError("expected the frozen DSpark 8K EP2 HBG calendar fixture")
     if args.lib_commit != frozen["lib_commit"]:
         raise ValueError("use the Lib revision that produced the frozen fixture")
     original_build = Path(frozen["runtime_dir"])
@@ -173,7 +172,7 @@ def prepare(args, daily):
 def gate_runtime_scope(runtime):
     from simpler_setup.runtime_builder import RuntimeBuilder
 
-    original = RuntimeBuilder("a5").get_binaries("percounter")
+    original = RuntimeBuilder("a5").get_binaries("host_build_graph")
     identity = {
         "runtime_sha256": {
             name: file_hash(path.resolve(strict=True)) for name, path in vars(original).items() if path is not None
@@ -184,30 +183,26 @@ def gate_runtime_scope(runtime):
         yield identity
         return
 
-    gate_tool = Path(__file__).resolve().parents[4] / "tests/fdwic/dsv41_scheduler/production/device_start_gate.py"
-    spec = importlib.util.spec_from_file_location("dspark_device_start_gate", gate_tool)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load the device-start gate validator from {gate_tool}")
-    validator = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(validator)
-    manifest = validator.validate_runtime_gate(runtime, "percounter")
-    if any(validator.file_stamp(item["source"]) != item["stamp"] for item in manifest["original_binaries"].values()):
+    from device_start_gate import file_stamp, validate_runtime_gate
+
+    manifest = validate_runtime_gate(runtime, "host_build_graph")
+    if any(file_stamp(item["source"]) != item["stamp"] for item in manifest["original_binaries"].values()):
         raise ValueError("the original runtime changed after preparation of the device-start gate")
-    expected = Path(manifest["wrappers"]["percounter"]["original"]).resolve()
-    variant = runtime / "percounter"
+    expected = Path(manifest["wrappers"]["host_build_graph"]["original"]).resolve()
+    variant = runtime / "host_build_graph"
     if original.host_path.resolve() != expected:
         raise ValueError(f"device-start gate wraps {expected}, but the worker selected {original.host_path}")
     snapshot = runtime.parents[1]
     identity["gate_sha256"] = {
         path: file_hash(snapshot / path)
         for path in manifest["snapshot_files"]
-        if path.startswith("a5/onboard/percounter/")
+        if path.startswith("a5/onboard/host_build_graph/")
         or path in ("a5/dispatcher/libsimpler_aicpu_dispatcher.so", "pto_isa_build.json")
     }
     get_binaries = RuntimeBuilder.get_binaries
 
     def gated_binaries(builder, name, build=False, **kwargs):
-        if builder.platform != "a5" or name != "percounter":
+        if builder.platform != "a5" or name != "host_build_graph":
             return get_binaries(builder, name, build=build, **kwargs)
         if build:
             raise ValueError("prepare the runtime and the device-start gate before allocating devices")

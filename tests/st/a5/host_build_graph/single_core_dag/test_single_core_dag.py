@@ -11,7 +11,7 @@
 
 import ctypes
 import json
-from collections import Counter
+from collections import defaultdict
 
 import pytest
 import torch
@@ -32,7 +32,7 @@ GRAPH_CASES = {
 AUTOMATIC_CASES = {"aic_chain_64", "aiv_chain_64", "mixed_diamond_8"}
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestHbgSingleCoreDag(SceneTestCase):
     RTOL = 0
@@ -123,6 +123,7 @@ class TestHbgSingleCoreDag(SceneTestCase):
             output_prefix = max(matches, key=lambda path: path.stat().st_mtime_ns)
             perf_path = output_prefix / "chip_swimlane_records.json"
             raw = json.loads(perf_path.read_text())
+            assert raw["metadata"]["scheduler_model"] == "calendar"
             aicore_rows = raw["aicore_tasks"]
             assert aicore_rows, "AICore task records are missing"
             if level >= 2:
@@ -137,6 +138,21 @@ class TestHbgSingleCoreDag(SceneTestCase):
                     aicore_row = aicore_by_key[(int(core_id), int(reg_task_id))]
                     assert 0 < dispatch_cycles <= aicore_row[3] <= aicore_row[4] <= finish_cycles
                 assert raw["aicpu_lifecycle_records"], "AICPU lifecycle records are missing"
+                events = raw["calendar_task_events"]
+                assert events["dropped"] == events["unmatched_deferred_updates"] == 0
+                milestones = ("row_begin", "inputs_ready", "ready", "kernel_end", "completion_issue", "local_retired")
+                by_execution = defaultdict(dict)
+                for event in events["records"]:
+                    assert event["block_index"] == 0 and event["block_count"] == 1
+                    key = (event["worker_id"], event["task_id"], event["run_epoch"])
+                    assert event["kind"] not in by_execution[key]
+                    by_execution[key][event["kind"]] = event["cycles"]
+                assert by_execution.keys() == {(row[0], row[1], row[6]) for row in aicore_rows}
+                for worker, task, _, start, end, _, epoch, _, _ in aicore_rows:
+                    timing = by_execution[(worker, task, epoch)]
+                    assert timing.keys() == set(milestones)
+                    assert 0 < timing["row_begin"] <= timing["inputs_ready"] <= timing["ready"] <= start
+                    assert start <= end == timing["kernel_end"] <= timing["completion_issue"] <= timing["local_retired"]
             if level < 3:
                 continue
             streams = raw["scheduler_records"]["streams"]
@@ -147,32 +163,9 @@ class TestHbgSingleCoreDag(SceneTestCase):
             records = [record for stream in streams for record in stream["records"]]
             assert all(set(record) == record_fields for record in records)
             assert all(0 < record["start_cycles"] <= record["end_cycles"] for record in records)
-            required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "idle"}
+            assert all(stream["capture"]["dropped"] == 0 for stream in streams)
             emitted_kinds = {record["kind"] for record in records}
-            assert required_kinds <= emitted_kinds, f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
-            assert not ({"resolve", "refill", "worksteal"} & emitted_kinds)
-            profiled_task_ids = {int(row[1]) for row in raw["aicore_tasks"]}
-            launches_by_task = Counter(
-                int(record["task_id"])
-                for record in records
-                if record["kind"] == "dispatch" and record["task_id"] is not None
-            )
-            assert set(launches_by_task) == profiled_task_ids, (
-                "launch records do not cover every profiled task: "
-                f"missing={sorted(profiled_task_ids - set(launches_by_task))} "
-                f"unexpected={sorted(set(launches_by_task) - profiled_task_ids)}"
-            )
-            assert set(launches_by_task.values()) == {1}
-            completions_by_task = Counter(int(record["task_id"]) for record in records if record["kind"] == "complete")
-            assert completions_by_task == launches_by_task, "each execution token needs one completion record"
-            probes_by_task = Counter(int(record["task_id"]) for record in records if record["kind"] == "state_probe")
-            assert probes_by_task == launches_by_task, "each execution token needs one acquisition record"
-            probe_by_task = {int(record["task_id"]): record for record in records if record["kind"] == "state_probe"}
-            launch_by_task = {int(record["task_id"]): record for record in records if record["kind"] == "dispatch"}
-            assert all(
-                probe["end_cycles"] <= launch_by_task[task_id]["start_cycles"]
-                for task_id, probe in probe_by_task.items()
-            )
+            assert {"scalar_window", "scalar_trace_finish"} <= emitted_kinds
 
 
 if __name__ == "__main__":

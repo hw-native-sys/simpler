@@ -14,6 +14,7 @@
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/memory_barrier.h"
+#include "host_build_graph/runtime_types.h"
 #include "host_build_graph/tensor.h"
 
 namespace {
@@ -65,7 +66,7 @@ bool observe_graph_arguments(
     TaskId::assign(descriptor->task_id, task.task_id);
     for (uint32_t slot = 0; slot < SUBTASK_SLOT_COUNT; ++slot)
         descriptor->kernel_id[slot] = task.kernel_id[slot];
-    // Native child arguments are published by AICore bootstrap before a request.
+    // The materializer publishes child arguments before a request.
     // Both complete source regions are bounded before either cache observation.
     if (tensor_bytes != 0) cache_invalidate_range(payload->tensors, tensor_bytes);
     if (scalar_bytes != 0) cache_invalidate_range(payload->scalars, scalar_bytes);
@@ -118,11 +119,39 @@ bool initialize_resident_args_dump_outputs(void *base, uint64_t objects, uint64_
                  has_dump_arg_flag(task.dump_metadata.dump_arg_mask, arg)))
                 task.output_tensor_mask |= UINT64_C(1) << arg;
         }
-        // No child tensor value is read before AICore bootstrap binds it.
+        // Child tensor values are not needed to determine the output mask.
         // The mask lies outside the mutable GM-atomic state cache line.
         cache_flush_range(&task.task_id, sizeof(task) - offsetof(SchedulerArgsDumpTask, task_id));
     }
     wmb();
+    return true;
+}
+
+bool bind_calendar_args_dump_child(
+    void *base, uint64_t task_ref, const ChipTaskStorage &child, const void *argument_region, uint64_t bytes
+) {
+    if (base == nullptr) return true;
+    auto *image = static_cast<SchedulerArgsDumpHeader *>(base);
+    cache_invalidate_range(image, sizeof(*image));
+    rmb();
+    if (task_ref >= image->task_count) return false;
+    auto *index = image_array<uint32_t>(image, image->task_indices_offset) + task_ref;
+    cache_invalidate_range(index, sizeof(*index));
+    rmb();
+    if (*index == UINT32_MAX) return true;
+    if (*index >= image->selected_count) return false;
+    auto *task = image_array<SchedulerArgsDumpTask>(image, image->tasks_offset) + *index;
+    cache_invalidate_range(task, sizeof(*task));
+    rmb();
+    const auto &payload = child.payload;
+    if (task->task_ref != task_ref || task->task_id != child.task.task_id ||
+        task->tensor_count != payload.tensor_count || task->scalar_count != payload.scalar_count)
+        return false;
+    task->tensors_address = payload.tensor_count == 0 ? 0 : reinterpret_cast<uint64_t>(payload.tensor_data());
+    task->scalars_address = payload.scalar_count == 0 ? 0 : reinterpret_cast<uint64_t>(payload.scalar_data());
+    task->argument_region_base = reinterpret_cast<uint64_t>(argument_region);
+    task->argument_region_bytes = bytes;
+    cache_flush_range(&task->task_id, sizeof(*task) - offsetof(SchedulerArgsDumpTask, task_id));
     return true;
 }
 

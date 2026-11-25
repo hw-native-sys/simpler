@@ -15,7 +15,7 @@ from simpler.task_interface import ArgDirection as D
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestDeferWaitProgress(SceneTestCase):
     RTOL = 0
@@ -60,7 +60,7 @@ class TestDeferWaitProgress(SceneTestCase):
         args.out[64] = 1
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestDeferWaitReadyFairness(SceneTestCase):
     """Complete deferred waits alongside ready background work.
@@ -79,11 +79,12 @@ class TestDeferWaitReadyFairness(SceneTestCase):
         },
         "incores": [
             {
-                "func_id": 0,
+                "func_id": index,
                 "source": "kernels/aiv/ready_fairness.cpp",
-                "core_type": "aiv",
+                "core_type": core,
                 "signature": [D.INOUT, D.IN, D.IN, D.IN],
             }
+            for index, core in enumerate(("aiv", "aic"))
         ],
     }
     CASES = [{"name": "ready_work_handshake", "platforms": ["a5sim", "a5"], "manual": True, "params": {"count": 2048}}]

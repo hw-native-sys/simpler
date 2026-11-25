@@ -12,15 +12,15 @@ The Host does not become an additional rank, and the table needs no matching
 HBM allocation.
 
 This A5 implementation supports one machine. Synchronous MTE works with
-`tensormap_and_ringbuffer`, `host_build_graph`, and `percounter`; URMA requires
+`tensormap_and_ringbuffer` and `host_build_graph`; URMA requires
 `tensormap_and_ringbuffer`. Cross-machine Host windows and automatic
 table partitioning are outside its current support. A2/A3 uses the same domain
 API with MTE and SDMA; see [A2/A3 Host-source windows](comm-domain.md#a2a3-host-source-windows).
 
-| Host-source path | TMR | HBG | percounter | Workspace |
-| ---------------- | --- | --- | ---------- | --------- |
-| Synchronous peer MTE, A5 PR and DT | Supported | Supported | Supported | `()` |
-| Asynchronous peer URMA | DT qualified; PR unresolved | Unsupported | Unsupported | `("urma",)` |
+| Host-source path | TMR | HBG | Workspace |
+| ---------------- | --- | --- | --------- |
+| Synchronous peer MTE, A5 PR and DT | Supported | Supported | `()` |
+| Asynchronous peer URMA | DT qualified; PR unresolved | Unsupported | `("urma",)` |
 
 MTE mappings use `aclrtHostRegisterV2(..., ACL_HOST_REG_MAPPED)` followed by
 `aclrtHostGetDevicePointer` in the requesting rank's process. Each address belongs
@@ -305,7 +305,7 @@ domain.release()
 [`host_mte_domain`](../examples/a5/host_mte_domain/README.md) reads non-self Host
 windows into ordinary local HBM with a dependent consumer, reversed member order,
 independent domains, retained reuse and CPU updates. Its runtime selection covers
-TMR, HBG and percounter. Prepare its compiled artifacts before taking a device
+TMR and HBG. Prepare its compiled artifacts before taking a device
 allocation, then use its prepared execution mode on both PR and DT.
 
 [`host_comm_domain`](../examples/a5/tensormap_and_ringbuffer/host_comm_domain/README.md)

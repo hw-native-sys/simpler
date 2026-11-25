@@ -11,18 +11,19 @@
 
 #pragma once
 
-#include "task_image_types.h"
+#include <cstdint>
 
-inline constexpr uint32_t SCHEDULER_GRAPH_TASK_STORAGE_STRIDE = sizeof(TaskImageStorage);
-inline constexpr uint32_t SCHEDULER_GRAPH_DESCRIPTOR_OFFSET = offsetof(TaskImageStorage, task);
-inline constexpr uint32_t SCHEDULER_GRAPH_PAYLOAD_OFFSET = offsetof(TaskImageStorage, payload);
-inline constexpr uint32_t SCHEDULER_GRAPH_TASK_ID_OFFSET = offsetof(TaskImageDescriptor, task_id);
-inline constexpr uint32_t SCHEDULER_GRAPH_KERNEL_IDS_OFFSET = offsetof(TaskImageDescriptor, kernel_id);
-inline constexpr uint32_t SCHEDULER_GRAPH_FANIN_COUNT_OFFSET = offsetof(TaskImagePayload, fanin_count);
-inline constexpr uint32_t SCHEDULER_GRAPH_PREDICATE_OFFSET = offsetof(TaskImagePayload, predicate);
-inline constexpr uint32_t TASK_IMAGE_TENSOR_COUNT_OFFSET = offsetof(TaskImagePayload, tensor_count);
-inline constexpr uint32_t TASK_IMAGE_SCALAR_COUNT_OFFSET = offsetof(TaskImagePayload, scalar_count);
-inline constexpr uint32_t TASK_IMAGE_TENSORS_DELTA_OFFSET = offsetof(TaskImagePayload, tensors);
-inline constexpr uint32_t TASK_IMAGE_SCALARS_DELTA_OFFSET = offsetof(TaskImagePayload, scalars);
-inline constexpr uint32_t TASK_IMAGE_FANIN_DELTA_OFFSET = offsetof(TaskImagePayload, fanin);
-inline constexpr uint32_t TASK_IMAGE_ERROR_CODE_OFFSET = 0;
+// Percounter's AICPU Graph materializer constructs ChipTaskStorage records.
+inline constexpr uint32_t SCHEDULER_GRAPH_TASK_STORAGE_STRIDE = 320;
+inline constexpr uint32_t SCHEDULER_GRAPH_DESCRIPTOR_OFFSET = 0;
+inline constexpr uint32_t SCHEDULER_GRAPH_PAYLOAD_OFFSET = 128;
+inline constexpr uint32_t SCHEDULER_GRAPH_TASK_ID_OFFSET = 0;
+inline constexpr uint32_t SCHEDULER_GRAPH_KERNEL_IDS_OFFSET = 8;
+inline constexpr uint32_t SCHEDULER_GRAPH_FANIN_COUNT_OFFSET = 8;
+inline constexpr uint32_t SCHEDULER_GRAPH_PREDICATE_OFFSET = 128;
+inline constexpr uint32_t TASK_IMAGE_TENSOR_COUNT_OFFSET = 0;
+inline constexpr uint32_t TASK_IMAGE_SCALAR_COUNT_OFFSET = 4;
+inline constexpr uint32_t TASK_IMAGE_TENSORS_DELTA_OFFSET = 12;
+inline constexpr uint32_t TASK_IMAGE_SCALARS_DELTA_OFFSET = 16;
+inline constexpr uint32_t TASK_IMAGE_FANIN_DELTA_OFFSET = 20;
+inline constexpr uint32_t TASK_IMAGE_ERROR_CODE_OFFSET = 68;

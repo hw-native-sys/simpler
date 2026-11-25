@@ -147,6 +147,12 @@ extern "C" void set_chip_swimlane_enabled(bool enable) {
 }
 extern "C" bool is_chip_swimlane_enabled() { return g_enable_chip_swimlane; }
 
+static bool g_chip_swimlane_recorded_window = false;
+
+void set_chip_swimlane_recorded_window(bool recorded_window) { g_chip_swimlane_recorded_window = recorded_window; }
+
+bool is_chip_swimlane_recorded_window() { return g_chip_swimlane_recorded_window; }
+
 // Copy one producer's settled counters into its terminal entry and publish it.
 //
 // Called at that producer's last write of the run, after every path that can

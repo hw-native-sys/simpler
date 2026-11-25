@@ -21,7 +21,7 @@ from simpler_setup.tools.tmr.task_id import TaskId
 
 from .types import ContractViolation, require
 
-FIXTURE = Path(__file__).resolve().parents[5] / "fdwic/pa_hbg/spmd/fixtures/cla_workload.json"
+FIXTURE = Path(__file__).resolve().parents[5] / "support/a5/host_build_graph/spmd/fixtures/cla_workload.json"
 SOURCE_SHA256 = "a33e497915b499f2ee13b9ae8182f4cb358d62106f8d358bbae9bc67fb30d747"
 
 

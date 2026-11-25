@@ -61,7 +61,7 @@ def test_common_precompiler_prepares_all_host_mte_scenes(monkeypatch, tmp_path):
     clear_compile_cache()
     try:
         # The simulated compiler route bypasses hardware ELF extraction. No Worker is created.
-        assert compile_collected_scene_tests(items, "a5sim", max_workers=1) == (3, [])
+        assert compile_collected_scene_tests(items, "a5sim", max_workers=1) == (len(runner.RUNTIMES), [])
         clear_compile_cache()
 
         def forbidden(*_args, **_kwargs):

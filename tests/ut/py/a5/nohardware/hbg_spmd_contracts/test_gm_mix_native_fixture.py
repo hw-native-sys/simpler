@@ -17,6 +17,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from simpler_setup import SceneTestCase
+
 _MASKS = (3, 5, 6, 7)
 _PAIRS = ((3, 7), (7, 3), (6, 1), (1, 6), (5, 2), (2, 5), (6, 6), (7, 7))
 _ACTIVE_SLOTS = [(mask, slot) for mask in _MASKS for slot in range(3) if mask & (1 << slot)]
@@ -24,7 +26,7 @@ _ACTIVE_SLOTS = [(mask, slot) for mask in _MASKS for slot in range(3) if mask & 
 
 @pytest.fixture(scope="module")
 def gm_native():
-    path = Path(__file__).resolve().parents[5] / "fdwic/pa_hbg/spmd/test_gm_mix_execution.py"
+    path = Path(__file__).resolve().parents[5] / "support/a5/host_build_graph/spmd/gm_mix_execution.py"
     with pytest.MonkeyPatch.context() as patch:
         patch.syspath_prepend(str(path.parent))
         spec = importlib.util.spec_from_file_location("_gm_mix_native_fixture", path)
@@ -64,7 +66,7 @@ def _sample(native, params, *, overlap=None, reverse=False):
     else:
         sequence = [(row, column) for group in groups for row in group for column in (13, 14)]
     _stamp_events(actual, sequence)
-    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=2)
+    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=2)
     test._contract_publish_count = 1
     return test, actual, golden
 
@@ -188,8 +190,8 @@ def test_either_independent_task_may_enter_first_without_changing_the_overlap_co
     test.compare_outputs(actual, golden, ["records"], params)
 
 
-@pytest.mark.parametrize("mode,count", [(0, 2), (3, 2), (4, 2), (2, 1), (1, 1)])
-def test_gm_records_never_substitute_for_fresh_resident_provenance(gm_native, mode, count):
+@pytest.mark.parametrize("mode,count", [(0, 2), (3, 2), (4, 2), (5, 1), (5, 0)])
+def test_gm_records_never_substitute_for_fresh_calendar_provenance(gm_native, mode, count):
     params = {"scenario": "shape", "mask": 6, "blocks": 2}
     test, actual, golden = _sample(gm_native, params)
     test._contract_worker = SimpleNamespace(scheduler_runtime_mode=mode, scheduler_mode_publish_count=count)
@@ -205,12 +207,12 @@ def _install_cpu_run(monkeypatch, native, worker, callable_obj, observed, broken
         for _ in range(kwargs.get("rounds", 1)):
             step = len(observed)
             observed.append(params["blocks"])
-            worker.scheduler_runtime_mode = 3 if step == broken_step and failure == "legacy" else 2
+            worker.scheduler_runtime_mode = 3 if step == broken_step and failure == "legacy" else 5
             if step != broken_step or failure != "stale":
                 worker.scheduler_mode_publish_count += 1
             self.compare_outputs(actual, golden, ["records"], params)
 
-    monkeypatch.setattr(native.SceneTestCase, "_run_and_validate", run)
+    monkeypatch.setattr(SceneTestCase, "_run_and_validate", run)
 
 
 @pytest.mark.parametrize("mask", _MASKS)
@@ -218,7 +220,7 @@ def test_each_gm_reuse_shape_checks_every_round_with_the_same_worker_and_callabl
     case = next(
         case for case in gm_native.TestHbgGmMixExecution.CASES if case["name"] == f"mix_retained_large_small_mask{mask}"
     )
-    worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=7)
+    worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=7)
     callable_obj = object()
     observed = []
     _install_cpu_run(monkeypatch, gm_native, worker, callable_obj, observed)
@@ -234,11 +236,11 @@ def test_no_gm_reuse_round_may_use_stale_or_legacy_provenance(gm_native, monkeyp
     case = next(
         case for case in gm_native.TestHbgGmMixExecution.CASES if case["name"] == "mix_retained_large_small_mask6"
     )
-    worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=7)
+    worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=7)
     callable_obj = object()
     observed = []
     _install_cpu_run(monkeypatch, gm_native, worker, callable_obj, observed, broken_step, failure)
-    expected = "no fresh scheduler publication" if failure == "stale" else "resident required"
+    expected = "no fresh scheduler publication" if failure == "stale" else "calendar required"
     with pytest.raises(AssertionError, match=expected):
         gm_native.TestHbgGmMixExecution()._run_and_validate(worker, callable_obj, case, rounds=3)
     assert len(observed) == broken_step + 1

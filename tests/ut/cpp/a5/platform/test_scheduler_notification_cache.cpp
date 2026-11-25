@@ -263,13 +263,13 @@ TEST(SchedulerNotificationCache, CapacityFallbackKeepsWholeCounterPairsAndLease)
 }  // namespace
 
 TEST(SchedulerNotificationAddress, UnalignedSetMappingsDoNotExposeAnIncrementAlias) {
-    EXPECT_EQ(a5_cnt_notify_increment_address(0), 0u);
-    EXPECT_EQ(a5_cnt_notify_increment_address(UINT64_C(0x1004)), 0u);
-    EXPECT_EQ(a5_cnt_notify_increment_address(UINT64_C(0x101c)), 0u);
+    EXPECT_EQ(a5_soc_sram_add_address(0), 0u);
+    EXPECT_EQ(a5_soc_sram_add_address(UINT64_C(0x1004)), 0u);
+    EXPECT_EQ(a5_soc_sram_add_address(UINT64_C(0x101c)), 0u);
 }
 
 TEST(SchedulerNotificationAddress, AlignedSetMappingsKeepTheVerifiedSlotOffset) {
-    EXPECT_EQ(a5_cnt_notify_increment_address(UINT64_C(0x1000)), UINT64_C(0x1008));
-    EXPECT_EQ(a5_cnt_notify_increment_address(UINT64_C(0x1020)), UINT64_C(0x1028));
-    EXPECT_EQ(a5_cnt_notify_increment_address(UINT64_MAX - 31), UINT64_MAX - 23);
+    EXPECT_EQ(a5_soc_sram_add_address(UINT64_C(0x1000)), UINT64_C(0x1008));
+    EXPECT_EQ(a5_soc_sram_add_address(UINT64_C(0x1020)), UINT64_C(0x1028));
+    EXPECT_EQ(a5_soc_sram_add_address(UINT64_MAX - 31), UINT64_MAX - 23);
 }

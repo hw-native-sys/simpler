@@ -3,7 +3,7 @@
 This case measures one complete synthetic DSpark decode dispatch using
 PyPTO-Lib's V4.1 Flash target and drafter. Use Lib main for current upstream
 measurements or the requested dev branch for branch comparisons. Verify that
-the Lib HBG selection resolves to A5 Percounter on the selected PyPTO checkout.
+the Lib HBG selection loads the calendar scheduler under `host_build_graph`.
 Record the full Lib, PyPTO, loaded Simpler, and PTO ISA commits, any override of
 PyPTO's Simpler pin, and the PTOAS and CANN versions. Set up the selected PyPTO
 and Simpler in the active Python environment
@@ -87,7 +87,7 @@ durations and does not require synchronized device clocks.
 ## Graph Calendar key comparison on EP2
 
 Use [dspark_calendar_hash.py](../scripts/dspark_calendar_hash.py) with the frozen
-8K EP2 Percounter fixture. Its checked source transformation wraps the local
+8K EP2 HBG calendar fixture. Its checked source transformation wraps the local
 drafter Markov normalization and LM-head row selection in a Graph immediately
 before the existing TP push. The workload still executes the complete target
 and drafter on both ranks. Replays cycle through prefixes of 1, 6, 11 and 12
@@ -122,13 +122,13 @@ slower rank's wall time while it waits for its peer. For an aligned timing
 comparison, prepare the repository's test-only device-start gate around the
 same runtime binaries outside the device allocation. The gate build manifest
 records unchanged runtime executable sections.
-[Device start gate build and validation](../../../../tests/fdwic/dsv41_scheduler/README.md#prepare-and-run)
+[Device start gate source](../scripts/device_start_gate.py)
 
 ```bash
-GATE_TOOL="$SIMPLER_ROOT/tests/fdwic/dsv41_scheduler/production/device_start_gate.py"
+GATE_TOOL="$SIMPLER_ROOT/.claude/skills/dsv41-scheduler-benchmark/scripts/device_start_gate.py"
 "$PYTHON" "$GATE_TOOL" --runtime-dir "$SIMPLER_ROOT/build/lib/a5/onboard" --output-dir "$GATE_DIR"
 GATE_RUNTIME="$GATE_DIR/runtime/a5/onboard"
-"$PYTHON" "$GATE_TOOL" validate "$GATE_RUNTIME" percounter
+"$PYTHON" "$GATE_TOOL" validate "$GATE_RUNTIME" host_build_graph
 ```
 
 With `ADAPTER` pointing to `dspark_calendar_hash.py`, submit each arm and
@@ -170,8 +170,8 @@ task-submit --device auto --device-num "$EP" --timeout 3600 --max-time 1800 \
 ```
 
 L2 includes Worker View, Scheduler View, and AICPU Lifecycle. Use L3 for
-scalar scheduler phases or L4 for detailed CntNotify, GM, and SSBUF activity.
-See the [calendar DFX levels](../../../../docs/dfx/chip-swimlane-profiling.md#a5-percounter-calendar).
+scalar scheduler phases or L4 for detailed SoC SRAM, GM, and SSBUF activity.
+See the [calendar DFX levels](../../../../docs/dfx/chip-swimlane-profiling.md#a5-hbg-calendar).
 Use the converter from the Simpler checkout that ran the capture. Trace replay
 uses PyPTO's own graph and timing passes and restores frozen InOut tensors
 before both dispatches, including the decode position and KV caches.

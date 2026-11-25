@@ -15,6 +15,8 @@ import math
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from simpler_setup.tools.hbg.calendar.scheduler_view import calendar_subtask_slot
+
 
 def project_graph(deps):
     if deps.get("runtime") != "host_build_graph":
@@ -63,57 +65,34 @@ def validate_graph(deps):
 
 
 def _audit_block_identity(tasks, rows):
-    identity_fields = {"block_idx", "block_num", "subtask_slot", "executed"}
-    has_identity = any(identity_fields.intersection(row) for row in rows)
-    if has_identity:
-        expected_identities = {
-            (ref, block, slot)
-            for ref, task in tasks.items()
-            for block in range(task["block_num"])
-            for slot, kernel in enumerate(task["kernel_ids"])
-            if kernel >= 0
-        }
-        actual_identities = set()
-        for row in rows:
-            if not identity_fields.issubset(row):
-                raise ValueError("CSA execution identity is partially missing")
-            block, blocks, slot = (row[field] for field in ("block_idx", "block_num", "subtask_slot"))
-            ref = row["task_id"]
-            if (
-                any(type(value) is not int for value in (block, blocks, slot))
-                or row["executed"] is not True
-                or blocks != tasks[ref]["block_num"]
-                or not 0 <= block < blocks
-                or not 0 <= slot < 3
-                or ("aic" if slot == 0 else "aiv") != row["core_type"]
-            ):
-                raise ValueError("CSA execution identity contradicts the graph")
-            identity = (ref, block, slot)
-            if identity not in expected_identities or identity in actual_identities:
-                raise ValueError("CSA execution identity is duplicated or unexpected")
-            actual_identities.add(identity)
-        if actual_identities != expected_identities:
-            raise ValueError("CSA execution identity coverage is incomplete")
-    return has_identity
-
-
-def validate_native_graph(deps, protocol):
-    frozen = {task["task_ref"]: task for task in protocol["tasks"]}
-    expected = {int(task["task_id"]): task for task in deps["tasks"]}
-    device = {ref: task for ref, task in frozen.items() if task["flags"] & 1}
-    if device.keys() != expected.keys():
-        raise ValueError("CSA native protocol graph task set differs from dependency capture")
-    parents = defaultdict(set)
-    for edge in deps["edges"]:
-        parents[int(edge["succ"])].add(int(edge["pred"]))
-    for ref, task in device.items():
-        kernels = [kernel if kernel != 65535 else -1 for kernel in task["kernel_ids"]]
+    expected_identities = {
+        (ref, block, slot)
+        for ref, task in tasks.items()
+        for block in range(task["block_num"])
+        for slot, kernel in enumerate(task["kernel_ids"])
+        if kernel >= 0
+    }
+    actual_identities = set()
+    for row in rows:
+        if not {"block_idx", "block_num", "cluster_lane", "kernel_only"}.issubset(row):
+            raise ValueError("CSA calendar execution identity is missing")
+        ref = row["task_id"]
+        block, blocks = row["block_idx"], row["block_num"]
+        slot = calendar_subtask_slot(tasks[ref]["kernel_ids"], row["cluster_lane"])
         if (
-            kernels != expected[ref]["kernel_ids"]
-            or task["block_num"] != expected[ref]["block_num"]
-            or set(task["dependencies"]) != parents[ref]
+            any(type(value) is not int for value in (block, blocks))
+            or row["kernel_only"] is not True
+            or blocks != tasks[ref]["block_num"]
+            or not 0 <= block < blocks
+            or ("aic" if slot == 0 else "aiv") != row["core_type"]
         ):
-            raise ValueError(f"CSA native protocol graph shape/fanin mismatch: {ref}")
+            raise ValueError("CSA execution identity contradicts the graph")
+        identity = (ref, block, slot)
+        if identity not in expected_identities or identity in actual_identities:
+            raise ValueError("CSA execution identity is duplicated or unexpected")
+        actual_identities.add(identity)
+    if actual_identities != expected_identities:
+        raise ValueError("CSA execution identity coverage is incomplete")
 
 
 def _audit_dependency_timestamps(tasks, parents, starts, ends):
@@ -143,7 +122,7 @@ def _audit_dependency_timestamps(tasks, parents, starts, ends):
                     raise ValueError(f"CSA dependency started early: {pred} -> {succ}")
 
 
-def audit_execution(deps, rows, *, protocol=None):
+def audit_execution(deps, rows):
     tasks = {int(t["task_id"]): t for t in deps["tasks"]}
     if len(tasks) != len(deps["tasks"]):
         raise ValueError("duplicate CSA logical task")
@@ -161,7 +140,7 @@ def audit_execution(deps, rows, *, protocol=None):
     epochs = {row["run_epoch"] for row in rows}
     if len(epochs) != 1 or any(type(e) is not int or e <= 0 for e in epochs):
         raise ValueError("CSA capture must contain one positive run epoch")
-    has_identity = _audit_block_identity(tasks, rows)
+    _audit_block_identity(tasks, rows)
     starts, ends = {}, {}
     for row in rows:
         start, end = row["start_time_us"], row["end_time_us"]
@@ -177,18 +156,11 @@ def audit_execution(deps, rows, *, protocol=None):
             parents[succ].add(pred)
 
     _audit_dependency_timestamps(tasks, parents, starts, ends)
-    proof = {"protocol_verified": False}
-    if protocol is not None:
-        from simpler_setup.tools.hbg.native_causality import audit_native_protocol  # noqa: PLC0415
-
-        proof = audit_native_protocol(protocol, rows)
-        validate_native_graph(deps, protocol)
     return {
-        **proof,
         "execution_epoch": next(iter(epochs)),
         "per_kind_executions": dict(Counter(row["core_type"] for row in rows)),
         "dependency_edges_checked": sum(len(v) for v in parents.values()),
-        "block_identity_verified": has_identity,
-        "dependency_order_source": "native_protocol" if protocol is not None else "kernel_timestamps",
+        "block_identity_verified": True,
+        "dependency_order_source": "kernel_timestamps",
         "dependency_timing_guard": True,
     }

@@ -34,11 +34,6 @@ def test_program_hbg():
 def test_program_tmr():
     pass
 
-@pytest.mark.platforms(["a5"])
-@pytest.mark.runtime("percounter")
-def test_program_percounter():
-    pass
-
 @pytest.mark.runtime_product("kernel")
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.execution_mode("eager")

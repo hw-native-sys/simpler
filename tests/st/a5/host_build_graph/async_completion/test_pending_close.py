@@ -13,7 +13,7 @@ import pytest
 from .helpers import Case, CounterRunner, Scenario, error_log_cursor, failure_evidence, l3_case
 
 pytestmark = [
-    pytest.mark.manual,  # Acceptance contracts awaiting resident async integration; run with --manual include.
+    pytest.mark.manual,  # Extended async acceptance contracts; run with --manual include.
     pytest.mark.platforms(["a5sim", "a5"]),
     pytest.mark.runtime("host_build_graph"),
     pytest.mark.device_count(1),
@@ -23,7 +23,7 @@ pytestmark = [
 @l3_case
 def test_close_drains_an_accepted_async_run(st_platform, st_device_ids, tmp_path):
     case = Case(delay_ms=200)
-    # Close drains a live run; L1 retains resident execution identity without
+    # Close drains a live run; L1 retains calendar execution identity without
     # making the fence wait for every scalar poll in the delayed notification.
     with CounterRunner(st_platform, st_device_ids, tmp_path, case, profiling_level=1) as runner:
         runner.require_support()

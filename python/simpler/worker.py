@@ -85,7 +85,6 @@ import uuid
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
-from functools import cache
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, NamedTuple, NoReturn, cast
@@ -3541,64 +3540,13 @@ def _require_base_communicator(handle: int) -> int:
     return int(handle)
 
 
-def _startup_input_cache_analysis_deadline(startup_deadline: float | None) -> float:
-    now = _monotonic()
-    # All optional discovery in a startup snapshot shares at most 15 seconds
-    # and leaves at least half of the remaining time for uploads and INIT_READY.
-    budget = 15.0 if startup_deadline is None else min(15.0, (startup_deadline - now) / 2)
-    return now + budget
-
-
-def _chip_callable_for_upload(
-    target: ChipCallable, platform: str, runtime: str, *, analysis_deadline: float | None = None
-) -> ChipCallable:
-    """Keep the registered identity bytes immutable while specializing the A5 HBG upload."""
-    if platform != "a5" or runtime != "host_build_graph" or not os.environ.get("ASCEND_HOME_PATH"):
-        return target
-    # Post-READY register and prepare are synchronous. Limit discovery for the
-    # entire upload to 250 ms, including every child kernel and decoder pass.
-    deadline = _monotonic() + 0.25 if analysis_deadline is None else analysis_deadline
-    try:
-        from simpler_setup.a5_input_cache import annotate_a5_hbg_text  # noqa: PLC0415
-    except ImportError:
-        return target
-    if _monotonic() >= deadline:
-        return target
-
-    # Many func_ids share the same code. Discard this cache after the upload
-    # so a later registration can use a newly installed or replaced decoder.
-    @cache
-    def annotate(text: bytes) -> bytes:
-        if _monotonic() >= deadline:
-            raise TimeoutError
-        return annotate_a5_hbg_text(text, deadline=deadline)
-
-    try:
-        derived = target._with_input_cache_proofs(annotate)  # noqa: SLF001
-    except TimeoutError:
-        return target
-    return target if derived is None or _monotonic() >= deadline else derived
-
-
-def _ensure_prepared(
-    cw,
-    registry,
-    prepared,
-    cid: int,
-    *,
-    device_id: int,
-    platform: str = "",
-    runtime: str = "",
-    analysis_deadline: float | None = None,
-) -> None:
+def _ensure_prepared(cw, registry, prepared, cid: int, *, device_id: int) -> None:
     if cid in prepared:
         return
     callable_obj = registry.get(cid)
     if callable_obj is None:
         raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
-    cw.register_callable(
-        cid, _chip_callable_for_upload(callable_obj, platform, runtime, analysis_deadline=analysis_deadline)
-    )
+    cw.register_callable(cid, callable_obj)
     prepared.add(cid)
 
 
@@ -3785,9 +3733,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     raise RuntimeError(
                         f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
                     )
-                _ensure_prepared(
-                    cw, registry, prepared, int(cid), device_id=device_id, platform=chip_platform, runtime=chip_runtime
-                )
+                _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
             elif sub_cmd == _CTRL_REGISTER:
                 digest = _read_control_digest(buf)
                 payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
@@ -3822,8 +3768,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                             except Exception:  # noqa: BLE001
                                 pass
                             prepared.discard(int(cid))
-                        upload = _chip_callable_for_upload(callable_obj, chip_platform, chip_runtime)
-                        cw.register_callable_from_blob(int(cid), upload.buffer_ptr())
+                        cw.register_callable_from_blob(int(cid), callable_obj.buffer_ptr())
                         prepared.add(int(cid))
                 finally:
                     shm_buf.release()
@@ -4758,7 +4703,6 @@ def _chip_process_loop(  # noqa: PLR0913 -- chip-child entry receives binaries, 
     collect_across_runs: bool = False,
     pipeline_depth_request: int = 0,
     automatic_admission: bool = False,
-    startup_deadline: float | None = None,
     fork_inherited: bool = True,
     expected_parent_pid: int | None = None,
     shared_heap_files: tuple[tuple[bytes, int, tuple[int, ...]], ...] = (),
@@ -4823,20 +4767,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- chip-child entry receives binaries, 
     # before it dispatches. The parent therefore issues no post-READY
     # control_prepare for the initial snapshot.
     prepared: set[int] = set()
-    analysis_deadline = _startup_input_cache_analysis_deadline(startup_deadline)
     try:
         for cid, target in registry.items():
             if isinstance(target, ChipCallable):
-                _ensure_prepared(
-                    cw,
-                    registry,
-                    prepared,
-                    int(cid),
-                    device_id=device_id,
-                    platform=platform,
-                    runtime=runtime,
-                    analysis_deadline=analysis_deadline,
-                )
+                _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
     except Exception as e:
         _tb.print_exc()
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
@@ -8897,10 +8831,7 @@ class Worker:
         with self._registry_lock:
             slot_id = self._identity_registry[handle.digest].slot_id
         try:
-            self._chip_worker.register_callable(
-                slot_id,
-                _chip_callable_for_upload(target, self._config.get("platform", ""), self._config.get("runtime", "")),
-            )
+            self._chip_worker.register_callable(slot_id, target)
         except Exception:
             with self._registry_lock:
                 self._rollback_handle_locked(handle)
@@ -10035,7 +9966,6 @@ class Worker:
         runtime = self._config["runtime"]
         device_id = self._config.get("device_id", 0)
 
-        startup_deadline = _monotonic() + self._startup_timeout_s
         builder = RuntimeBuilder(platform)
         binaries = builder.get_binaries(runtime)
 
@@ -10069,12 +9999,9 @@ class Worker:
         # Pre-warm any registered ChipCallable so the first run(handle, …)
         # does not pay the H2D upload cost.
         assert self._chip_worker is not None
-        analysis_deadline = _startup_input_cache_analysis_deadline(startup_deadline)
         for cid, target in self._callable_registry.items():
             if isinstance(target, ChipCallable):
-                self._chip_worker.register_callable(
-                    cid, _chip_callable_for_upload(target, platform, runtime, analysis_deadline=analysis_deadline)
-                )
+                self._chip_worker.register_callable(cid, target)
 
     def _uses_exec_chip(self) -> bool:
         return (
@@ -10427,7 +10354,6 @@ class Worker:
                             self._device_endpoint_identities[(idx, DEVICE_AICPU)][0],
                             self._device_endpoint_identities[(idx, DEVICE_AICORE)][0],
                             log_level=chip_log_level,
-                            startup_deadline=deadline,
                             platform=str(self._config["platform"]),
                             runtime=str(self._config["runtime"]),
                             prewarm_config=self._prewarm_config,
@@ -11375,8 +11301,8 @@ class Worker:
                 if config.workspace_engines and not self._config.get("enable_sdma", False):
                     raise ValueError("A2/A3 Host-domain SDMA requires Worker(enable_sdma=True)")
                 return config
-            if runtime not in ("tensormap_and_ringbuffer", "host_build_graph", "percounter"):
-                raise ValueError("A5 Host-source MTE requires tensormap_and_ringbuffer, host_build_graph or percounter")
+            if runtime not in ("tensormap_and_ringbuffer", "host_build_graph"):
+                raise ValueError("A5 Host-source MTE requires tensormap_and_ringbuffer or host_build_graph")
             if any(engine != "urma" for engine in config.workspace_engines):
                 raise ValueError("Host-source domains support only the URMA workspace")
             if config.workspace_engines and runtime != "tensormap_and_ringbuffer":
@@ -16075,17 +16001,10 @@ class Worker:
     def scheduler_runtime_mode(self) -> int:
         """L2 only: which device-side scheduler the most recent bind selected.
 
-        A ``SCHEDULER_RUNTIME_MODE_*`` value: 1 = resident pending, 2 = resident
-        ready, 3 = legacy Graph capability fallback, 4 = legacy because a task
-        shape is unsupported by the resident scheduler. Supported Graph tasks
-        use resident mode. 0 means no selection was ever published.
-
-        Returns 0 on non-L2 workers, on every arch other than a5, and on the
-        tensormap_and_ringbuffer runtime -- only a5 host_build_graph chooses
-        between a resident AICore scheduler and the legacy AICPU one, so
-        elsewhere 0 means "not applicable" rather than "legacy". Pair it with
-        `scheduler_mode_publish_count` to tell a fresh selection apart from a
-        latched older one.
+        A5 ``host_build_graph`` publishes 5 for its AICore calendar.
+        A zero value means this runtime has not published a scheduler mode.
+        Pair it with `scheduler_mode_publish_count` to identify a fresh
+        publication.
         """
         if self.level != 2 or self._chip_worker is None:
             return 0

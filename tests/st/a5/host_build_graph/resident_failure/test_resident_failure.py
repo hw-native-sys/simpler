@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Real resident timeouts, retained caller buffers and failed-lane containment."""
+"""Calendar timeouts, retained caller buffers and failed-lane containment."""
 
 import argparse
 import hashlib
@@ -29,11 +29,10 @@ from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
-from simpler_setup.tools.hbg.native_causality import MIX, SYNC, audit_native_protocol
-from simpler_setup.tools.hbg.native_protocol import has_native_graph, read_native_protocol
+from simpler_setup.tools.hbg.calendar.scheduler_view import parse_capture
 
 _ROOT = Path(__file__).resolve().parents[5]
-_KERNELS = _ROOT / "tests/fdwic/pa_hbg/spmd/kernels"
+_KERNELS = _ROOT / "tests/support/a5/host_build_graph/spmd/kernels"
 _STALL_MS = 2500
 _TIMEOUT_MS = 2000
 _SIM_TIMEOUT_MS = 10000
@@ -41,9 +40,7 @@ _SHAPES = [(mask, lane) for mask in (1, 2, 4, 3, 5, 6, 7) for lane in range(3) i
 _TICKET_SHAPES = ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2))
 # The exhaustive mask/lane sweep is about silicon behaviour, and each case here
 # holds a device for its own process because a failed run poisons it. A
-# simulator tiers therefore cover two shapes: the lane the protocol reports in
-# slot 1, which the Per-PR capture check uses, and all three lanes together in
-# Daily.
+# simulator covers standalone Vector and the full MIX.
 _SIM_SHAPES = frozenset({(4, 2), (7, 0)})
 # On silicon, Per-PR keeps one shape per failed-lane position for every timeout
 # mode. The remaining mask/lane combinations run in Daily.
@@ -77,7 +74,7 @@ pytestmark = [
     pytest.mark.platforms(["a5sim", "a5"]),
     pytest.mark.device_count(1),
     pytest.mark.runtime("host_build_graph"),
-    pytest.mark.scheduler_mode("resident"),
+    pytest.mark.scheduler_mode("calendar"),
     pytest.mark.timeout(120),
 ]
 
@@ -140,13 +137,28 @@ def _capture(prefix):
     return paths[0], json.loads(paths[0].read_text())
 
 
+def _check_calendar_capture(raw, native_graph):
+    metadata = raw["metadata"]
+    assert metadata["runtime"] == "host_build_graph"
+    assert metadata["scheduler_model"] == "calendar"
+    events = parse_capture(raw["calendar_task_events"])
+    assert events["dropped"] == events["unmatched_deferred_updates"] == 0
+    assert any(row["kind"] == "graph_ready_observed" for row in events["range_records"]) == native_graph
+    epochs = {row["run_epoch"] for row in events["records"]}
+    assert len(epochs) == 1
+    return epochs.pop()
+
+
 def _check_successful_capture(raw):
-    # The timeout fixture needs completion/ownership evidence, not a rendered
-    # Scalar partition. Audit the retained wire capture without decoding it twice.
-    protocol = read_native_protocol(raw["aicore_protocol"])
-    identities = raw["aicore_execution_identities"]
-    assert identities["schema"] == "hbg-execution-identity" and identities["producer"] == "aicore"
-    assert audit_native_protocol(protocol, identities["records"])["protocol_verified"]
+    tasks = raw["aicore_tasks"]
+    records = raw["calendar_task_events"]["records"]
+    executed = {(row[0], row[1], row[6], row[7]) for row in tasks}
+    retired = {
+        (row["worker_id"], row["task_id"], row["run_epoch"], row["block_index"])
+        for row in records
+        if row["kind"] == "local_retired"
+    }
+    assert len(executed) == len(tasks) and executed <= retired
 
 
 def _check_output(values, capacity, blocks, mask, *, failed):
@@ -168,139 +180,30 @@ def _check_output(values, capacity, blocks, mask, *, failed):
     torch.testing.assert_close(values[1], summary, rtol=0, atol=0)
 
 
-def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_ms=_STALL_MS):
-    protocol = raw["aicore_protocol"]
-    assert protocol["producer"] == "aicore"
-    assert protocol["scheduler_error"] == 10
-    assert protocol["first_error"]["site"] in (95, 102)
-    worker_count = protocol["active_worker_count"]
-    assert worker_count > 0 and protocol["worker_count"] == worker_count == 3 * protocol["cluster_count"]
-    assert worker_count == raw["metadata"]["num_cores"]
-    assert len(protocol["workers"]) == worker_count
-    assert {worker["worker_index"] for worker in protocol["workers"]} == set(range(worker_count))
-    assert all(worker["error_flags"] == 0 for worker in protocol["workers"])
-    roots = [task for task in protocol["tasks"] if task["active_mask"] and 3 not in task["kernel_ids"]]
-    consumers = [task for task in protocol["tasks"] if 3 in task["kernel_ids"]]
-    assert len(roots) == len(consumers) == 1
-    root, consumer = roots[0], consumers[0]
-    assert root["task_ref"] in consumer["dependencies"]
-    assert root["block_num"] == blocks and root["active_mask"] == (2 if mask == 4 else mask)
-    expected_slot = 1 if mask == 4 else lane
-    stalled = [
-        entry
-        for entry in protocol["executions"]
-        if entry["task_ref"] == root["task_ref"] and entry["block_idx"] == 0 and entry["subtask_slot"] == expected_slot
-    ]
-    assert len(stalled) == 1
-    execution = stalled[0]
-    frequency = raw["metadata"]["clock_freq_hz"]
-    if nonreturning:
-        assert all(value > 0 for value in execution["entry"])
-        for field in ("returned", "visible", "completion_consumed", "trace_published"):
-            assert execution[field] == [0, 0]
-        assert all(
-            worker["finished"] == (0 if worker["worker_index"] == execution["worker_index"] else 2)
-            for worker in protocol["workers"]
-        )
-    else:
-        assert all(worker["finished"] == 2 for worker in protocol["workers"])
-        assert 0 < execution["entry"][1] < execution["returned"][1] < execution["visible"][1]
-        assert execution["entry"][0] <= execution["returned"][0] <= execution["visible"][0]
-        assert execution["returned"][0] - execution["entry"][0] >= stall_ms * frequency // 1000
-    lifecycle = raw["aicpu_lifecycle_records"]
-    assert len(lifecycle) == 2
-    assert {record["aicpu_thread_id"] for record in lifecycle} == {0, 1}
-    owners = [
-        record
-        for record in lifecycle
-        if record["aicpu_thread_id"] * worker_count // 2
-        <= execution["worker_index"]
-        < (record["aicpu_thread_id"] + 1) * worker_count // 2
-    ]
-    assert len(owners) == 1
-    owner = owners[0]
-    assert execution["entry"][0] < owner["exit_signal_start_cycles"] <= owner["exit_signal_end_cycles"]
-    assert owner["exit_signal_end_cycles"] <= owner["exit_wait_start_cycles"]
-    if nonreturning:
-        # The onboard A5 EXIT ACK budget is one second. No ACK/return may be
-        # invented when STARS, rather than the kernel, ends the operation.
-        assert owner["exit_wait_end_cycles"] - owner["exit_wait_start_cycles"] >= frequency
-    else:
-        assert owner["exit_signal_end_cycles"] < execution["returned"][0]
-        assert execution["visible"][0] <= owner["exit_wait_end_cycles"]
-    assert all(record["exit_wait_end_cycles"] >= record["exit_wait_start_cycles"] > 0 for record in lifecycle)
-    assert not any(entry["task_ref"] == consumer["task_ref"] for entry in protocol["executions"])
-    control_rows = protocol["task_controls"]
-    controls = {control["task_ref"]: control for control in control_rows}
-    assert len(controls) == len(control_rows) == len(protocol["tasks"])
-    assert set(controls) == {task["task_ref"] for task in protocol["tasks"]}
-    total_subtasks = blocks * bin(root["active_mask"]).count("1")
-    assert controls[root["task_ref"]]["completed_subtasks"] < total_subtasks
-    assert controls[consumer["task_ref"]]["completed_subtasks"] == 0
-    assert protocol.get("schema") == "hbg-native-protocol"
-    for task in protocol["tasks"]:
-        control = controls[task["task_ref"]]
-        seal = control.get("claim_seal")
-        assert type(seal) is int and seal >= 0
-        # Supply closure covers ordinary tasks too; it does not prove execution completion.
-        assert seal == 0 or seal == control["next_block"] == task["block_num"]
-        assert 0 <= control["next_block"] <= task["block_num"]
-    _check_failed_block_claim(protocol, root, execution)
-    if has_native_graph(protocol):
-        enters = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 3]
-        exits = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 4]
-        assert len(enters) == len(exits) == 1
-        assert controls[enters[0]]["state"] == 2 and controls[exits[0]]["state"] == 0
-    unknown = any(counter["valid"] == 0 for counter in protocol["completion_counters"])
-    expected_resolved = None if unknown else int("node_map" in protocol)
-    assert protocol["resolved_task_count"] == expected_resolved
-    assert all(controls[ref]["state"] == 0 for ref in (root["task_ref"], consumer["task_ref"]))
-
-
-def _check_failed_block_claim(protocol, root, execution):
-    flags = root["flags"]
-    assert bool(flags & MIX) == (bin(root["active_mask"]).count("1") > 1)
-    workers = {row["index"]: row for row in protocol["workers"]}
-    worker = workers[execution["worker_index"]]
-    cluster = worker["cluster_workers"]
-    assert worker["worker_index"] == worker["index"] and worker["index"] in cluster
-    assert len(cluster) == len(set(cluster)) == 3
-    assert all(
-        peer in workers
-        and workers[peer]["cluster_index"] == worker["cluster_index"]
-        and workers[peer]["cluster_workers"] == cluster
-        for peer in cluster
+def _check_failed_capture(raw, root_id, blocks, mask, lane, *, nonreturning=False, stall_ms=_STALL_MS):
+    events = raw["calendar_task_events"]["records"]
+    returns = [row for row in events if row["kind"] == "kernel_end"]
+    assert all(row["task_id"] == root_id and row["block_count"] == blocks for row in returns), (
+        "a successor returned after the injected root timeout"
     )
-    assert 0 <= worker["cluster_index"] == execution["cluster_index"] < protocol["cluster_count"]
-    assert execution["run_epoch"] == protocol["run_epoch"]
-    # An interrupted claim may only have its before stamp. Only a published
-    # acquisition can account for the block that actually reached the kernel.
-    claims = [
-        row["owner"]
-        for row in protocol["blocks"]
-        if row["owner"] is not None and row["owner"]["task_ref"] == root["task_ref"] and row["owner"]["claim_after"][1]
-    ]
-    if not flags & (MIX | SYNC):
-        assert not claims
-        return
-    by_block = {claim["block_idx"]: claim for claim in claims}
-    assert len(by_block) == len(claims) and all(0 <= block < root["block_num"] for block in by_block)
-    assert execution["block_idx"] in by_block
-    claim = by_block[execution["block_idx"]]
-    assert claim["run_epoch"] == execution["run_epoch"] and claim["cluster_index"] == worker["cluster_index"]
-    assert 0 < claim["claim_before"][1] < claim["claim_after"][1]
-    if flags & MIX:
-        assert claim["worker_index"] == cluster[1]
-        generation = claim["group_seq"]
-        assert generation == execution["group_seq"] and generation > 0 and generation % 2 == 1
-        # The proxy and executing lane share the device counter. Their stamp sequences are local to each worker.
-        assert 0 < claim["claim_before"][0] <= claim["claim_after"][0] < execution["entry"][0]
+    stalled_lanes = {1, 2} if mask in (2, 4) else {lane}
+    stalled = [row for row in returns if row["block_index"] == 0 and row["cluster_lane"] in stalled_lanes]
+    if nonreturning:
+        assert not stalled, "the non-returning kernel produced a return record"
     else:
-        assert claim["worker_index"] == execution["worker_index"]
-        assert claim["claim_after"][1] < execution["entry"][1]
+        assert len(stalled) == 1, stalled
+        (execution,) = stalled
+        frequency = raw["metadata"]["clock_freq_hz"]
+        assert execution["cycles"] - execution["kernel_start_cycles"] >= stall_ms * frequency // 1000
+    lifecycle = raw["aicpu_lifecycle_records"]
+    assert {row["aicpu_thread_id"] for row in lifecycle} == {0, 1}
+    observers = [row for row in lifecycle if row.get("observe_start_cycles")]
+    assert observers and all(
+        row["observe_end_cycles"] >= row["observe_start_cycles"] and row["sinks_observed_cycles"] == 0
+        for row in observers
+    )
 
 
-# Compilation, healthy/fault/recovery runs and diagnostic decoding share this case budget.
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("mask,lane", _shape_params(_SHAPES))
 @pytest.mark.parametrize("blocks", (1, 2))
@@ -390,18 +293,20 @@ def _two_wave_capacity(mask):
     return _MAX_CLUSTERS * _lane_positions_per_cluster(mask) * 2
 
 
-def _root_block_num(protocol):
-    roots = [task for task in protocol["tasks"] if task["active_mask"] and 3 not in task["kernel_ids"]]
-    assert len(roots) == 1, roots
-    return int(roots[0]["block_num"])
+def _root_block_num(raw):
+    rows = raw["aicore_tasks"]
+    root_id = min(row[1] for row in rows)
+    counts = {row[8] for row in rows if row[1] == root_id}
+    assert len(counts) == 1
+    return root_id, counts.pop()
 
 
-def _check_two_wave_topology(protocol, blocks, mask, required):
+def _check_two_wave_topology(raw, blocks, mask, required):
     if not required:
         return
-    assert protocol.get("schema") == "hbg-native-protocol"
-    positions = protocol["cluster_count"] * _lane_positions_per_cluster(mask)
-    assert blocks == positions * 2, "two-wave fault must use the actual device topology"
+    streams = raw["scheduler_records"]["streams"]
+    clusters = {row["cluster_index"] for row in streams if row["producer"] == "aicore"}
+    assert blocks == len(clusters) * _lane_positions_per_cluster(mask) * 2
 
 
 @pytest.mark.parametrize("mask,lane", _shape_params(_TICKET_SHAPES))
@@ -680,13 +585,14 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
             # Wall time is diagnostic only; containment and recovery checks gate this case.
             elapsed = time.monotonic() - started
             assert worker.scheduler_mode_publish_count > before
-            assert worker.scheduler_runtime_mode in (1, 2)
+            assert worker.scheduler_runtime_mode == 5
             path, raw = _capture(prefix)
-            proof_call.update(capture=str(path), capture_run_epoch=raw["aicore_protocol"]["run_epoch"])
-            assert raw["aicore_protocol"].get("schema") == "hbg-native-protocol"
-            assert has_native_graph(raw["aicore_protocol"]) == native_graph
-            launched = _root_block_num(raw["aicore_protocol"])
-            assert blocks < 0 or launched == blocks
+            run_epoch = _check_calendar_capture(raw, native_graph)
+            proof_call.update(capture=str(path), capture_run_epoch=run_epoch)
+            if not failed:
+                root_id, launched = _root_block_num(raw)
+                assert blocks < 0 or launched == blocks
+                _check_two_wave_topology(raw, launched, mask, two_wave)
             # A STARS-killed op can poison device access; its D2H output is
             # not readable evidence. Host-exported failure records remain
             # mandatory and must not masquerade as a successful capture.
@@ -695,10 +601,9 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
                 for buffer, value in zip(buffers, values):
                     worker.copy_from(value, buffer)
                 _check_output(values, capacity, launched, mask, failed=failed)
-            _check_two_wave_topology(raw["aicore_protocol"], launched, mask, two_wave)
             if failed:
-                assert raw["aicore_protocol"]["run_epoch"] > evidence[-1]["run_epoch"]
-                _check_failed_capture(raw, launched, mask, lane, nonreturning=nonreturning, stall_ms=stall_ms)
+                assert run_epoch > evidence[-1]["run_epoch"]
+                _check_failed_capture(raw, root_id, launched, mask, lane, nonreturning=nonreturning, stall_ms=stall_ms)
                 if not nonreturning:
                     assert values[0].view(-1, 16)[lane, 0] == 1
                 rejected_count = worker.scheduler_mode_publish_count
@@ -733,9 +638,7 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
                 {
                     "capture": str(path.relative_to(artifacts)),
                     "failed": failed,
-                    "scheduler_error": raw["aicore_protocol"]["scheduler_error"],
-                    "error_site": raw["aicore_protocol"]["first_error"]["site"],
-                    "run_epoch": raw["aicore_protocol"]["run_epoch"],
+                    "run_epoch": run_epoch,
                     "output_verified": not (failed and nonreturning),
                     "native_error": str(error.value) if failed else None,
                     "run_seconds": elapsed,
@@ -822,7 +725,7 @@ def _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatc
     output_root.mkdir(exist_ok=True)
     artifacts = Path(
         tempfile.mkdtemp(
-            prefix=f"resident-failure-{failure_kind}-{st_platform}-m{mask}-l{lane}-n{blocks}-", dir=output_root
+            prefix=f"calendar-failure-{failure_kind}-{st_platform}-m{mask}-l{lane}-n{blocks}-", dir=output_root
         )
     )
     device_id = int(st_device_ids[0])

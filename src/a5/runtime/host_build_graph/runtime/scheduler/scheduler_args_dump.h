@@ -12,7 +12,7 @@
 #pragma once
 
 #include "common/args_dump.h"
-#include "scheduler_memory.h"
+#include "gm.h"
 #include "scheduler_types.h"
 
 enum class SchedulerArgsDumpStatus : uint64_t { Idle = 0, WouldBlock = 1, InProgress = 2, Sealed = 3, Aborted = 4 };
@@ -63,12 +63,6 @@ struct alignas(64) SchedulerArgsDumpTask {
 // A selected output snapshot cannot precede deferred completion. The existing
 // async context check refuses the request before a kernel can submit work.
 inline constexpr uint32_t SCHEDULER_ARGS_DUMP_ASYNC_OUTPUT_REFUSED = 1;
-
-inline __aicore__ void
-scheduler_args_dump_limit_async_output(__gm__ const SchedulerArgsDumpTask *task, __gm__ GlobalContext &context) {
-    if (task != nullptr && task->output_tensor_mask != 0 && context.async_present == 1)
-        context.async_output_capture_refused = SCHEDULER_ARGS_DUMP_ASYNC_OUTPUT_REFUSED;
-}
 
 struct alignas(64) SchedulerArgsDumpRequest {
     uint64_t run_epoch;
@@ -122,8 +116,8 @@ inline __aicore__ SchedulerArgsDumpStatus scheduler_args_dump_ack_status(const S
 namespace {
 
 struct SchedulerArgsDumpAckReader {
-    inline __aicore__ uint64_t load(__gm__ uint64_t &word) const { return scheduler_gm_query(word); }
-    inline __aicore__ void barrier() const { scheduler_cache_barrier(); }
+    inline __aicore__ uint64_t load(__gm__ uint64_t &word) const { return percounter_gm_read(word); }
+    inline __aicore__ void barrier() const { percounter_memory_barrier(); }
 };
 
 }  // namespace
@@ -307,9 +301,9 @@ inline __aicore__ uint64_t scheduler_args_dump_publisher(uint32_t worker) {
 // read. AICPU only reads its invalidated copy and never mutates this line.
 static inline __aicore__ uint64_t scheduler_args_dump_load(__gm__ volatile uint64_t &word) {
 #if defined(__CCE_AICORE__)
-    return scheduler_gm_fetch_add(word, UINT64_C(0));
+    return percounter_gm_fetch_add(word, UINT64_C(0));
 #else
-    return scheduler_gm_query(word);
+    return percounter_gm_read(word);
 #endif
 }
 
@@ -322,7 +316,7 @@ static inline __aicore__ bool scheduler_args_dump_task_valid(__gm__ SchedulerArg
 // BEFORE does not await future blocks: a task may occupy more than one wave.
 static inline __aicore__ SchedulerArgsDumpArrival scheduler_args_dump_enter(__gm__ SchedulerArgsDumpTask *task) {
     if (!scheduler_args_dump_task_valid(task)) return SchedulerArgsDumpArrival::Invalid;
-    const uint64_t prior = scheduler_gm_compare_exchange(task->before_state, UINT64_C(0), UINT64_C(1));
+    const uint64_t prior = percounter_gm_compare_exchange(task->before_state, UINT64_C(0), UINT64_C(1));
     if (prior == 0) return SchedulerArgsDumpArrival::Publisher;
     if (prior == 1) return SchedulerArgsDumpArrival::Waiting;
     return prior == 2 ? SchedulerArgsDumpArrival::Ready : SchedulerArgsDumpArrival::Invalid;
@@ -330,7 +324,7 @@ static inline __aicore__ SchedulerArgsDumpArrival scheduler_args_dump_enter(__gm
 
 static inline __aicore__ bool scheduler_args_dump_can_execute(__gm__ SchedulerArgsDumpTask *task) {
     if (!scheduler_args_dump_task_valid(task) || scheduler_args_dump_load(task->before_state) != 2) return false;
-    scheduler_cache_barrier();
+    percounter_memory_barrier();
     return true;
 }
 
@@ -341,14 +335,14 @@ static inline __aicore__ SchedulerArgsDumpArrival
 scheduler_args_dump_return(__gm__ SchedulerArgsDumpTask *task, Publish publish) {
     if (!scheduler_args_dump_can_execute(task)) return SchedulerArgsDumpArrival::Invalid;
     if (!publish()) {
-        scheduler_gm_store(task->aborted, UINT64_C(1));
+        percounter_gm_store(task->aborted, UINT64_C(1));
         return SchedulerArgsDumpArrival::Invalid;
     }
-    scheduler_cache_barrier();
-    const uint64_t prior = scheduler_gm_fetch_add(task->returned_participants, UINT64_C(1));
-    scheduler_cache_barrier();
+    percounter_memory_barrier();
+    const uint64_t prior = percounter_gm_fetch_add(task->returned_participants, UINT64_C(1));
+    percounter_memory_barrier();
     if (prior >= task->expected_participants) {
-        scheduler_gm_store(task->aborted, UINT64_C(1));
+        percounter_gm_store(task->aborted, UINT64_C(1));
         return SchedulerArgsDumpArrival::Invalid;
     }
     return prior + 1 == task->expected_participants ? SchedulerArgsDumpArrival::Publisher :
@@ -370,8 +364,8 @@ static inline __aicore__ bool scheduler_args_dump_seal(
                   !scheduler_args_dump_can_execute(task) ||
                       scheduler_args_dump_load(task->returned_participants) != task->expected_participants))
         return false;
-    scheduler_cache_barrier();
-    scheduler_gm_store(before ? task->before_state : task->after_sealed, before ? UINT64_C(2) : UINT64_C(1));
+    percounter_memory_barrier();
+    percounter_gm_store(before ? task->before_state : task->after_sealed, before ? UINT64_C(2) : UINT64_C(1));
     return true;
 }
 

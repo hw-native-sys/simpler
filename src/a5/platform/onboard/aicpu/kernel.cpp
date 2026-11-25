@@ -91,6 +91,9 @@ static void bind_platform_task(KernelArgs *k_args) {
     set_platform_chip_swimlane_run_terminal_bank(k_args->chip_swimlane_run_terminal_bank);
     set_platform_chip_swimlane_aicore_rotation_table(k_args->chip_swimlane_aicore_rotation_table);
     set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
+    set_chip_swimlane_recorded_window(
+        SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_SWIMLANE_RECORDED_WINDOW)
+    );
     set_platform_pmu_base(k_args->pmu_data_base);
     set_platform_pmu_run_terminal(k_args->pmu_run_terminal_bank);
     set_pmu_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU));

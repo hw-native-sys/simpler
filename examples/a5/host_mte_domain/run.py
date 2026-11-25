@@ -26,7 +26,7 @@ else:
 
 ROOT = Path(__file__).resolve().parent
 ARTIFACTS = ROOT.parents[2] / "build/host_mte_domain"
-RUNTIMES = ("tensormap_and_ringbuffer", "host_build_graph", "percounter")
+RUNTIMES = ("tensormap_and_ringbuffer", "host_build_graph")
 COUNT = 16384
 NBYTES = COUNT * 4
 PREFIX_BYTES = 256

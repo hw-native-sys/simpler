@@ -58,7 +58,7 @@ REPEATS = 30000
 UNWRITTEN = -1.0
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestSpmdReleasesSpmd(SceneTestCase):
     RTOL = 0

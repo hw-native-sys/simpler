@@ -17,7 +17,6 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
-from simpler_setup.tools.hbg.native_protocol import has_native_graph
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 from . import helpers
@@ -73,26 +72,15 @@ def _compile_omitted_registration(platform, runtime="host_build_graph"):
 def _require_completed_empty_capture(runner):
     captures = list(runner.capture.rglob("chip_swimlane_records.json"))
     assert len(captures) == 1, captures
-    raw = json.loads(captures[0].read_text())
-    protocol = raw["aicore_protocol"]
-    assert protocol.get("schema") == "hbg-native-protocol" and not has_native_graph(protocol)
     decoded = read_perf_data(captures[0])
-    assert decoded["protocol_audit"]["protocol_verified"]
-    assert protocol["scheduler_error"] == protocol["error_claimed"] == 0
-    assert all(worker["error_flags"] == 0 for worker in protocol["workers"])
-    tasks = protocol["tasks"]
-    assert len(tasks) == len(decoded["tasks"]) == len(protocol["executions"]) == 2
-    waiter, consumer = tasks
-    assert waiter["task_ref"] == 0 and waiter["kernel_ids"] == [65535, 1, 65535]
-    assert consumer["task_ref"] == 1 and consumer["kernel_ids"] == [65535, 5, 65535]
-    assert waiter["dependencies"] == [] and consumer["dependencies"] == [0]
+    assert decoded["scheduler_model"] == "calendar"
+    assert len(decoded["tasks"]) == 2
     assert {task["task_id"] for task in decoded["tasks"]} == {0, 1}
-    # Zero actual registrations use the synchronous completion path. No CHECK
-    # or FINISH is required; successful ordinary completion alone cannot prove
-    # that a business-condition registration was present.
-    (runner.capture / "omitted-registration-audit.json").write_text(
-        json.dumps(decoded["protocol_audit"], indent=2) + "\n"
-    )
+    events = decoded["calendar_task_events"]
+    assert not events["dropped"] and not events["unmatched_deferred_updates"]
+    assert not any("defer" in row["kind"] for row in events["records"])
+    assert {row["task_id"] for row in events["records"] if row["kind"] == "completion_issue"} == {0, 1}
+    (runner.capture / "omitted-registration-audit.json").write_text(json.dumps(events, indent=2) + "\n")
 
 
 def _require_only_early_consumer_failure(runner):

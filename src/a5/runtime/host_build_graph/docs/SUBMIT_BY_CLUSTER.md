@@ -24,19 +24,11 @@ same mixed-task contract.
 
 ## Task Representation
 
-Host orchestration initializes common `ChipTaskStorage` scratch records. Default
-A5 HBG publishes an 80-byte `TaskImageStorage` per top-level task: its descriptor
-contains the task ID and kernel IDs, and its payload contains argument counts,
-field-relative pool deltas and a predicate. It publishes no `ChipTaskSlotState`
-or task-state array. Resident metadata holds shape and block counts; resident
-control records hold progress and completion. A separate 64-byte image header
-holds the first-error atomic.
-
-Host planning constructs Calls and Graph child arguments before launch. Device
-execution tokens select prepared Calls and block/lane geometry. The argument
-pools remain available to dependency/predicate access and output diagnostics.
-Percounter selects its own current image representation for AICPU Graph
-materialization; the default HBG reader only accepts its compact format.
+Host orchestration writes the task, common argument pools and explicit fanin
+IDs. Bind generates calendar rows for the task's blocks. Each row names the
+kernel role, a bound argument vector, its waits and its completion target.
+Graph child kernel bindings are filled by AICPU while device execution is in
+progress.
 
 ## Resource Shapes
 
@@ -49,8 +41,8 @@ materialization; the default HBG reader only accepts its compact format.
 | `MIX` | Two or three active lanes in one physical cluster |
 | `DUMMY` | Dependency-only task with no AICore dispatch |
 
-A single-AIV task is normalized to the AIV0 submit slot. MIX dispatch still
-uses the full active mask so unused lanes do not block placement.
+A standalone Vector kernel can use either physical Vector lane. MIX roles
+remain fixed to their requested cluster lanes.
 
 ## Logical Blocks and Validation
 
@@ -82,48 +74,17 @@ describes the rendezvous itself and what the cohort is scoped to.
 
 ## Dependency and Readiness Flow
 
-1. Host orchestration allocates a task slot and builds its payload.
-2. TensorMap and explicit dependencies append producer local IDs to the payload's
-   fanin region.
-3. Submit publishes only the finished graph data; it does not push ready tasks.
-4. Host prepares immutable AIC/MIX and AIV catalogs, Calls, execution controls
-   and canonical completion gates. The unified graph view maps top-level fanins
-   through completion references and Graph child fanins through Definition-local
-   indices; roots depend on ENTER and EXIT depends on every sink.
-5. After bootstrap, workers scan their engine catalogs in bounded slices to
-   claim execution tokens. A token may wait for dependencies before occupying a
-   dispatch slot; it advances its fanin prefix only after observing each
-   producer's canonical DONE gate. Readiness requires both remaining computation
-   and async debt to be zero for every producer.
-6. Workers scan ENTER, EXIT and inline control nodes separately. After all fanins
-   are DONE, a unique completion CAS settles the node. Consumers observe this
-   gate directly; dependency resolution uses no dynamic ready inbox, fanout
-   decrement or per-successor notification.
+TensorMap and explicit dependencies determine the DAG. The Host places every
+logical block and attaches the dependencies that still need a runtime check.
+MIX places all participating roles on one cluster and uses the SSBUF
+rendezvous. The Host places a synchronized SPMD cohort on distinct compatible
+lanes. Each block enters when its lane and dependencies are ready. The kernel
+handles synchronization inside the cohort.
 
-## Dispatch and Completion
-
-Resident workers use one ordinary slot and one MIX member slot each. They
-participate in cooperative admission when the task shape requires it. Pure AIC tasks use the
-immutable AIC catalog. MIX and pure AIV tasks use the AIV catalog. These catalogs have no
-enqueue operation or shared queue head. Ready execution tokens transfer into a
-worker's private slots; its local ready mask/head orders those slots. The
-[resident walkthrough](../../../../../docs/zh-cn/a5-hbg-aicore-walkthrough/README.md)
-describes membership, physical placement and the completion resolver.
-
-Every executed block/lane contributes once to the packed completion gate,
-decrementing remaining computation and compute debt together. Async groups keep
-additional debt until their unique FINISH. A valid gate with zero computation
-and debt proves DONE to dependent tokens and control scans. The unique last
-return or async join records logical completion. MIX cluster release retires
-resources; it is not another completion contribution.
-
-## Executor Model
-
-The host executes orchestration synchronously and publishes the complete graph.
-AICore owns dependency resolution, ready scheduling and kernel execution. AICPU
-owns discovery, topology/context publication, supervision and partitioned EXIT/ACK
-retirement. Invalid startup descriptors enter failure retirement without
-executing tasks or reading an unpublished scheduler backing.
+Each lane retires a row after kernel return and the output fence. With no
+defer registration it publishes its DONE credit. A deferred registration
+keeps logical completion pending until the polling lane observes its signals
+and publishes the credit. See the [calendar execution contract](../README.md).
 
 ## Capacity
 
@@ -143,6 +104,6 @@ pytest examples tests/st --platform a5sim --runtime host_build_graph
 ```
 
 The A5 HBG SPMD, sync-start capacity, MIX and empty-lifecycle scenes cover
-resident shape selection and retirement. The `spmd_shape_selection` scene checks
-that both ordinary and sync-start multi-block AIC tasks publish a fresh resident
+calendar shape selection and retirement. The `spmd_shape_selection` scene checks
+that both ordinary and sync-start multi-block AIC tasks publish a fresh calendar
 mode and produce the expected output.

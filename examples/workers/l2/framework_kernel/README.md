@@ -332,12 +332,10 @@ config and prefix must not change the selected capture or export destination.
 Unknown outcomes retain every caller/runtime owner. This qualifies the bounded
 reference workload, not capture/replay or arbitrary task graphs.
 
-A5 HBG uses the AICore scheduler for this workload. Each enabled capture checks
-a fresh scheduler selection with `RESIDENT_PENDING` mode, and the result reports
-`scheduler_modes=[null,1,1,null]`. AICPU fallback scheduling does not support
-argument dumping; it is not qualified by this reference. A refused supported
-call is a failure, not a successful capture result. The same exact payload and
-metadata checks apply to both runtimes and architectures.
+A5 HBG uses AICore calendar scheduling for this workload. Each enabled capture
+checks a fresh scheduler selection with calendar mode, and the result reports
+`scheduler_modes=[null,5,5,null]`. The same exact payload and metadata checks
+apply to both runtimes and architectures.
 
 ## Native submission reference
 

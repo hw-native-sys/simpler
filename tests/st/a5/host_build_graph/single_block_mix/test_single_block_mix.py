@@ -24,7 +24,7 @@ TILE_ELEMS = MATMUL_SIZE * MATMUL_SIZE
 TASK_COUNT = 16
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestSingleBlockMixHostBuildGraphA5(SceneTestCase):
     RTOL = 1e-3

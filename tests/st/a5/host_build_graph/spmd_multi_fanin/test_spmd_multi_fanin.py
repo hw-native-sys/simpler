@@ -53,7 +53,7 @@ SPMD_AIV_VALUE_BASE = 20
 UNWRITTEN = -1.0
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestSpmdMultiFanin(SceneTestCase):
     RTOL = 0

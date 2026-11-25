@@ -67,17 +67,15 @@ def _invoke_fixture(monkeypatch, native, case, mode, increments, *, corrupt=Fals
     return test, worker
 
 
-@pytest.mark.parametrize("mode,increments", [(1, (1,)), (2, (1, 1, 1))])
-def test_predicate_fixture_accepts_fresh_resident_rounds(
-    monkeypatch, predicate_native, predicate_case, mode, increments
-):
-    test, worker = _invoke_fixture(monkeypatch, predicate_native, predicate_case, mode, increments)
+@pytest.mark.parametrize("increments", [(1,), (1, 1, 1)])
+def test_predicate_fixture_accepts_fresh_calendar_rounds(monkeypatch, predicate_native, predicate_case, increments):
+    test, worker = _invoke_fixture(monkeypatch, predicate_native, predicate_case, 5, increments)
     assert test._selection_publish_count == worker.scheduler_mode_publish_count == 10 + sum(increments)
 
 
-@pytest.mark.parametrize("mode", [0, 3, 4, 5, -1])
+@pytest.mark.parametrize("mode", [0, 2, 3, 4, -1])
 def test_predicate_fixture_rejects_other_modes_with_correct_golden(monkeypatch, predicate_native, predicate_case, mode):
-    with pytest.raises(AssertionError, match="requires resident scheduling"):
+    with pytest.raises(AssertionError, match="requires calendar scheduling"):
         _invoke_fixture(monkeypatch, predicate_native, predicate_case, mode, (1,))
 
 
@@ -86,17 +84,17 @@ def test_predicate_fixture_rejects_stale_selection_each_round(
     monkeypatch, predicate_native, predicate_case, increments
 ):
     with pytest.raises(AssertionError, match="no fresh scheduler selection"):
-        _invoke_fixture(monkeypatch, predicate_native, predicate_case, 2, increments)
+        _invoke_fixture(monkeypatch, predicate_native, predicate_case, 5, increments)
 
 
 def test_predicate_fixture_still_rejects_wrong_values(monkeypatch, predicate_native, predicate_case):
     with pytest.raises(AssertionError):
-        _invoke_fixture(monkeypatch, predicate_native, predicate_case, 2, (1,), corrupt=True)
+        _invoke_fixture(monkeypatch, predicate_native, predicate_case, 5, (1,), corrupt=True)
 
 
 def test_predicate_fixture_cannot_skip_value_and_provenance_checks(monkeypatch, predicate_native, predicate_case):
-    with pytest.raises(AssertionError, match="requires outputs and fresh resident provenance"):
-        _invoke_fixture(monkeypatch, predicate_native, predicate_case, 2, (1,), skip_golden=True)
+    with pytest.raises(AssertionError, match="requires outputs and fresh calendar provenance"):
+        _invoke_fixture(monkeypatch, predicate_native, predicate_case, 5, (1,), skip_golden=True)
 
 
 def test_predicate_refusal_matrix_covers_mix_and_pure_multiblock(predicate_refusal):

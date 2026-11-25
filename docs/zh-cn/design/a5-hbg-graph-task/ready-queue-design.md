@@ -1,5 +1,7 @@
 # A5 HBG 工作目录与 execution token
 
+> **历史文档。** 本页保留旧版A5 HBG resident 调度设计及其测量。文中的“当前”指当时的版本。现行协议见 [A5 HBG 日历调度](../../../../src/a5/runtime/host_build_graph/README.md)。
+
 **共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前 DONE 使用 CntNotify SRAM，其他拟修改后端分别标明。
 
 当前 resident 按不可变 engine catalog 有序发放工作，由每个 AIC/AIV 管理原位执行记录。

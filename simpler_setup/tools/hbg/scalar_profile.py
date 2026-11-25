@@ -107,7 +107,7 @@ SCALAR_OPERATIONS = {
     "scalar_dsb_ddr": ("MEM", "DSB: DDR completion wait"),
     "scalar_bypass_load": ("MEM", "ld_dev: return ready"),
     "scalar_gm_load": ("MEM", "ld_dev(GM): return ready"),
-    "scalar_cnt_notify_load": ("MEM", "ld_dev(CntNotify): return ready"),
+    "scalar_cnt_notify_load": ("MEM", "ld_dev(SoC SRAM): return ready"),
     "scalar_bypass_store": ("MEM", "st_dev: issue"),
 }
 
@@ -247,12 +247,8 @@ def partition(records, kernels, *, nested_kernels=False):
     }
 
 
-def analyze_streams(streams, metadata, task_rows, execution_identities=None, *, nested_kernels=False):
+def analyze_streams(streams, metadata, task_rows, *, nested_kernels=False):
     """Join same-worker, same-run L1 kernel intervals to the detailed L3 records."""
-    identities = {
-        (r["core_id"], r["reg_task_id"], r["run_epoch"]): r["executed"]
-        for r in (execution_identities or {}).get("records", [])
-    }
     kernels = defaultdict(list)
     for row in task_rows:
         worker, task, registration, begin, end, _, epoch = row[:7]
@@ -263,9 +259,7 @@ def analyze_streams(streams, metadata, task_rows, execution_identities=None, *, 
                 "start_cycles": begin,
                 "end_cycles": end,
                 "run_epoch": epoch,
-                "kind": "scalar_task_skip"
-                if identities.get((worker, registration, epoch)) is False
-                else "scalar_kernel",
+                "kind": "scalar_kernel",
             }
         )
     profiles = []
@@ -335,7 +329,7 @@ def apply_l3_detail_policy(profile):
             row["hbg_stage"] = "CLAIM_EXECUTE"
             return True
         if kind == "scalar_bypass_load":
-            raise ValueError("HBG L3 requires an explicit GM or CntNotify load source")
+            raise ValueError("HBG L3 requires an explicit GM or SoC SRAM load source")
         stage = row.get("hbg_stage") or SCALAR_OPERATIONS.get(kind, (None,))[0]
         return stage not in ("TRACE", "CONTROL") and kind not in (
             "scalar_dcci_out",
@@ -460,7 +454,12 @@ def main():
             rows[metric["record_index"]].update({k: v for k, v in metric.items() if k != "record_index"})
         streams.append(rows)
         metadata.append(stream)
-    profiles = analyze_streams(streams, metadata, raw["aicore_tasks"], raw.get("aicore_execution_identities"))
+    from simpler_setup.tools._runtime_dispatch import CALENDAR_MODEL, get  # noqa: PLC0415
+
+    capture_meta = raw["metadata"]
+    model = capture_meta.get("scheduler_model")
+    get(capture_meta.get("runtime"), model)
+    profiles = analyze_streams(streams, metadata, raw["aicore_tasks"], nested_kernels=model == CALENDAR_MODEL)
     report = {
         "complete": bool(profiles) and all(p["complete"] for p in profiles),
         "clock_freq_hz": raw["metadata"]["clock_freq_hz"],

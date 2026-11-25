@@ -1,5 +1,7 @@
 # A5 HBG 异步完成待验证选型
 
+> **历史文档。** 本页保留旧版A5 HBG resident 调度的异步完成设计及其验证。文中的“当前”指当时的版本。现行协议见 [A5 HBG 日历调度](../../../../src/a5/runtime/host_build_graph/README.md)。
+
 **共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
 
 [返回总览](../a5-hbg-async-completion.md)。本文列出会影响实现的未决问题及替代方案，不重复定义基础协议。实现先遵守[基础设计](protocol.md)；候选只有满足相同语义和验收条件后才能替换对应部分。

@@ -53,6 +53,8 @@ extern "C" uint64_t get_platform_chip_swimlane_base();
 extern "C" void set_platform_chip_swimlane_run_terminal_bank(uint64_t bank_addr);
 extern "C" void set_chip_swimlane_enabled(bool enable);
 extern "C" bool is_chip_swimlane_enabled();
+void set_chip_swimlane_recorded_window(bool recorded_window);
+bool is_chip_swimlane_recorded_window();
 
 // AICore head-table device pointer (= KernelArgs::chip_swimlane_aicore_rotation_table).
 // Published by the host before AICPU init runs; AICPU init fills the table

@@ -57,13 +57,12 @@ public:
             check(rc, "create");
             check(aclrtCntNotifyGetId(notification.handle, &notification.mapping.resId), "get id");
             map(notification.mapping, notification.address, notification.mapped);
-            if (required_ && a5_cnt_notify_increment_address(notification.address) == 0)
-                throw std::runtime_error("scheduler requires an aligned CntNotify SET slot");
+            if (required_ && a5_soc_sram_add_address(notification.address) == 0)
+                throw std::runtime_error("scheduler requires an aligned SoC SRAM SET slot");
             if (counter_) {
-                // A5 CntNotify owns a 32-byte register slot. Its ADD register
-                // is offset 8 from the mapped SET/read base and shares the SET
-                // mapping and handle lifetime; it has no independent unmap.
-                notification.add_address = a5_cnt_notify_increment_address(notification.address);
+                // The SDK handle leases one SoC SRAM word. The ADD alias
+                // shares the SET/read mapping and handle lifetime.
+                notification.add_address = a5_soc_sram_add_address(notification.address);
             }
         }
         size_t unavailable_counters = 0;
@@ -77,9 +76,7 @@ public:
             }
         }
         if (unavailable_counters != 0)
-            LOG_WARN(
-                "A5 HBG: %zu CntNotify mappings have no aligned INC alias; use SET/GM completion", unavailable_counters
-            );
+            LOG_WARN("A5 HBG: %zu optional SoC SRAM mappings have no aligned ADD alias", unavailable_counters);
         return result;
     }
 

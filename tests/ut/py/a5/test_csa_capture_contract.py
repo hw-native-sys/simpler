@@ -29,10 +29,37 @@ def capture(tmp_path, monkeypatch):
         "edges": [{"pred": "0", "succ": "1"}, {"pred": "1", "succ": "2"}],
     }
     rows = [
-        {"task_id": 0, "core_type": kind, "run_epoch": 1, "start_time_us": 1, "end_time_us": 3}
-        for kind in ("aic", "aiv", "aic", "aiv")
-    ] + [{"task_id": 2, "core_type": "aiv", "run_epoch": 1, "start_time_us": 4, "end_time_us": 5}]
-    raw = {"chip_swimlane_level": 1, "metadata": {"clock_freq_hz": 1000000000}, "aicore_tasks": [[0]] * 5}
+        dict(
+            task_id=0,
+            core_type=kind,
+            run_epoch=1,
+            start_time_us=1,
+            end_time_us=3,
+            block_idx=block,
+            block_num=2,
+            cluster_lane=lane,
+            kernel_only=True,
+        )
+        for block in range(2)
+        for lane, kind in enumerate(("aic", "aiv"))
+    ] + [
+        dict(
+            task_id=2,
+            core_type="aiv",
+            run_epoch=1,
+            start_time_us=4,
+            end_time_us=5,
+            block_idx=0,
+            block_num=1,
+            cluster_lane=2,
+            kernel_only=True,
+        )
+    ]
+    raw = {
+        "chip_swimlane_level": 1,
+        "metadata": {"clock_freq_hz": 1000000000, "runtime": "host_build_graph", "scheduler_model": "calendar"},
+        "aicore_tasks": [[0]] * 5,
+    }
     raw_path, deps_path = tmp_path / "raw.json", tmp_path / "deps.json"
     raw_path.write_text(json.dumps(raw))
     deps_path.write_text(json.dumps(deps))
@@ -59,4 +86,14 @@ def test_same_count_corruption_cannot_pass_capture_validation(tmp_path, monkeypa
     else:
         rows[-1]["start_time_us"] = 2
     with pytest.raises(ValueError):
+        runner.validate_task_capture(raw, deps, 1)
+
+
+@pytest.mark.parametrize("field,value", [("runtime", "tensormap_and_ringbuffer"), ("scheduler_model", None)])
+def test_capture_requires_calendar_scheduler(tmp_path, monkeypatch, field, value):
+    raw, deps, _ = capture(tmp_path, monkeypatch)
+    data = json.loads(raw.read_text())
+    data["metadata"][field] = value
+    raw.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="HBG calendar trace"):
         runner.validate_task_capture(raw, deps, 1)

@@ -181,8 +181,7 @@ trivial example) is simply not emitted.
 
 ## Selective task-timing slots (implemented)
 
-A lightweight way to measure a specific task's (or an interval's) AICPU
-dispatch→finish window **without** enabling the chip swimlane — no collector
+A lightweight way to measure a specific task's window **without** enabling the chip swimlane — no collector
 threads, no per-task AICore records, works in `SIMPLER_DFX=0`. See
 [l2-timing.md](l2-timing.md) for how it relates to the swimlane's `finish_time`.
 
@@ -203,14 +202,18 @@ threads, no per-task AICore records, works in `SIMPLER_DFX=0`. See
   The tail is a distinct record type (dispatch/finish, not start/end) reduced by
   **min(dispatch) / max(finish)**, not an `AicpuPhase`
   (those fire once per run/thread; a slot takes many block/subtask events).
-* **Boundaries (match the chip swimlane).** `dispatch` = the earliest Scheduler
+* **AICPU scheduler boundaries.** `dispatch` = the earliest Scheduler
   publication of `DATA_MAIN_BASE` (after payload publish, immediately before the
   register write; the initial gated publication for early/speculative dispatch,
   not the doorbell release). `finish` = the latest Scheduler FIN observation
   across every required block/subtask (after the COND load + `rmb()`, before
-  fanin/fanout/**deferred-completion** processing) — not the AICore kernel-end.
-* **Aggregation is intentional.** For each slot the host reduces
-  `min(dispatch)` / `max(finish)` across Scheduler threads. **Reusing one slot**
+  fanin/fanout/**deferred-completion** processing).
+* **A5 HBG calendar boundaries.** Each tagged execution contributes its
+  AICore kernel entry and return cycles. Each lane owns its slot records.
+  The final AICPU thread reduces them into the device-phase tail once all
+  lanes have acknowledged retirement.
+* **Aggregation is intentional.** Each slot uses
+  `min(dispatch)` / `max(finish)` across the contributing executions. **Reusing one slot**
   for several tagged tasks yields the window from the earliest tagged dispatch to
   the latest tagged finish (**duplicate-slot** = merged window). **Distinct
   slots** keep each task's own window, so tooling recovers

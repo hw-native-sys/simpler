@@ -362,7 +362,7 @@ int main(int argc, char **argv) {
                         original.working_address && eager.working_address == original.working_address,
                         "shared-runtime-workspace"
                     );
-                    // Resident A5 workers have a second writable region for their scheduler.
+                    // A5 calendar workers share a separate writable control region.
                     const auto worker_base = submission.launches.at(0).worker_context_base;
                     if (worker_base)
                         require(

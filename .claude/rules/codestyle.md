@@ -39,7 +39,7 @@
    **AICore polling may use bounded cycle-based staggering.** Use it when
    an on-device A/B comparison on a representative workload shows a
    performance gain from reducing contention for a shared resource such
-   as a CntNotify counter. The synchronization protocol must remain correct
+   as a SoC SRAM counter. The synchronization protocol must remain correct
    under any polling order.
 
    **Initialization and teardown paths are exempt** and may poll with a

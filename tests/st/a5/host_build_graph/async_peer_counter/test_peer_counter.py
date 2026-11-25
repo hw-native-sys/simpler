@@ -22,7 +22,7 @@ pytestmark = [
 
 
 @l3_case
-@pytest.mark.parametrize("diagnostics", [0, 4])
+@pytest.mark.parametrize("diagnostics", [0, 2])
 def test_peer_counter_epoch_boundaries(st_platform, st_device_ids, tmp_path, diagnostics):
     with PeerCounterRunner(st_platform, st_device_ids, tmp_path, diagnostics=diagnostics) as runner:
         for epoch, value_tag, reset in ((1, 101, True), (2, 102, False), (1, 103, True)):
@@ -30,7 +30,7 @@ def test_peer_counter_epoch_boundaries(st_platform, st_device_ids, tmp_path, dia
 
 
 @l3_case
-@pytest.mark.parametrize("diagnostics", [0, 4])
+@pytest.mark.parametrize("diagnostics", [0, 2])
 def test_peer_counter_c_plus_one_progress(st_platform, st_device_ids, tmp_path, diagnostics):
     with PeerCounterRunner(st_platform, st_device_ids, tmp_path, pressure=True, diagnostics=diagnostics) as runner:
         runner.run(1, 201, reset=True)

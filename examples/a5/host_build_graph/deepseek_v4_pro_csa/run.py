@@ -34,6 +34,9 @@ def validate_task_capture(raw_path, deps_path, level):
     raw = json.loads(raw_path.read_text())
     deps = json.loads(deps_path.read_text())
     parsed = read_perf_data(str(raw_path))
+    metadata = raw["metadata"]
+    if metadata.get("runtime") != workload.RUNTIME or metadata.get("scheduler_model") != "calendar":
+        raise ValueError("Expected an A5 HBG calendar trace")
     if raw["chip_swimlane_level"] != level:
         raise ValueError("Wrong chip swimlane collection level")
     expected = Counter(
@@ -44,7 +47,7 @@ def validate_task_capture(raw_path, deps_path, level):
         raise ValueError("CSA task capture is incomplete or the workload changed")
     if len(raw["aicore_tasks"]) != len(parsed["tasks"]):
         raise ValueError("AICore rows were lost during parsing")
-    obligations = graph_contract.audit_execution(deps, parsed["tasks"], protocol=raw.get("aicore_protocol"))
+    obligations = graph_contract.audit_execution(deps, parsed["tasks"])
     summary = {
         "logical_tasks": len(actual),
         "physical_tasks": len(parsed["tasks"]),
@@ -55,19 +58,17 @@ def validate_task_capture(raw_path, deps_path, level):
     return raw, parsed, summary
 
 
-def validate_trace(raw_path, deps_path, level, *, require_aicore=False):
+def validate_trace(raw_path, deps_path, level):
     raw, parsed, summary = validate_task_capture(raw_path, deps_path, level)
     metadata = raw["metadata"]
-    if metadata.get("runtime") != workload.RUNTIME:
-        raise ValueError("Expected a host-built graph trace")
     producer = None
     if level == 4:
         if metadata.get("orchestrator_source") != "host":
             raise ValueError("Expected host orchestration phases")
         scheduler = raw.get("scheduler_tasks", {})
         producer = scheduler.get("producer")
-        if producer not in ("aicpu", "aicore"):
-            raise ValueError("Missing scheduler producer identity")
+        if producer != "aicore":
+            raise ValueError("Expected AICore scheduler records")
         if len(scheduler.get("records", [])) != len(parsed["tasks"]):
             raise ValueError("Scheduler/AICore records do not match")
         if any(task["dispatch_time_us"] is None or task["finish_time_us"] is None for task in parsed["tasks"]):
@@ -93,24 +94,11 @@ def validate_trace(raw_path, deps_path, level, *, require_aicore=False):
             or sum(len(phases) for phases in raw["host_orchestrator_phases"]) != host["recorded_records"]
         ):
             raise ValueError("Host orchestration capture is incomplete")
-        print(f"[CSA HBG] scheduler producer: {producer}", flush=True)
-        if producer == "aicpu":
-            print(
-                "[CSA HBG] AICPU scheduling: this run does NOT validate the distributed AICore scheduler.", flush=True
-            )
-    if require_aicore and producer != "aicore":
-        raise ValueError("Distributed scheduler required: need an L4 trace with scheduler producer=aicore")
-    if require_aicore and summary.get("block_identity_verified") is not True:
-        raise ValueError("Distributed scheduler requires verified explicit block identity")
-    if require_aicore and summary.get("protocol_verified") is not True:
-        raise ValueError("Distributed scheduler requires verified native protocol")
     timeline = parsed.get("timeline_metadata", {})
     return {
         **summary,
         "runtime": workload.RUNTIME,
         "scheduler_producer": producer,
-        "distributed_scheduler_verified": producer == "aicore" and summary.get("protocol_verified") is True,
-        "require_aicore_scheduler": require_aicore,
         "host_capture": metadata.get("host_capture"),
         "clock_alignment_status": timeline.get("clock_alignment", {}).get("status"),
         "cross_domain_latency_available": timeline.get("cross_domain_latency_available", False),
@@ -121,14 +109,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="HBG CSA correctness, performance and L1/L4 traces.")
     parser.add_argument("mode", choices=("check", "bench", "l1", "l4"))
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument(
-        "--require-aicore-scheduler",
-        action="store_true",
-        help="L4 only: require AICore identities and native causal proof",
-    )
     args = parser.parse_args(argv)
-    if args.require_aicore_scheduler and args.mode != "l4":
-        parser.error("--require-aicore-scheduler requires l4; other modes cannot establish scheduler provenance")
     os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     os.environ.setdefault("OMP_NUM_THREADS", "16")
     os.environ.setdefault("MKL_NUM_THREADS", "16")
@@ -199,7 +180,7 @@ def main(argv=None):
             for pattern in ("name_map_*.json", "host_clock_alignment.*.log", "dispatch_identity.json"):
                 for companion in timing_dir.glob(pattern):
                     shutil.copyfile(companion, result_dir / companion.name)
-            report["trace"] = validate_trace(raw_path, deps_path, level, require_aicore=args.require_aicore_scheduler)
+            report["trace"] = validate_trace(raw_path, deps_path, level)
             trace = result_dir / f"L{level}.json"
             command = [
                 sys.executable,

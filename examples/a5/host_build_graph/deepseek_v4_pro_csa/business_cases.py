@@ -70,7 +70,7 @@ def remap_indices(value, old_to_new, block_size=1):
 
 def validate_params(params):
     # Requests 0 and 2 alias state page 2; swapping requests changes read-after-write order.
-    if set(params) - {"pages", "poison_scale", "resident"}:
+    if set(params) - {"pages", "poison_scale"}:
         raise ValueError("unsupported CSA transformation; batch permutation is not equivalent for this snapshot")
 
 

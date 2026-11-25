@@ -91,7 +91,7 @@ TEST(ResidentArgsDumpBoundary, MixFinalWriterCannotSealBeforeAllBlocksAndSubtask
     for (size_t i = 0; i < writes.size(); ++i) {
         writes[i] = static_cast<int>(i + 1);
         const auto arrived = scheduler_args_dump_return(&task, [&] {
-            EXPECT_EQ(scheduler_gm_query(task.returned_participants), i);
+            EXPECT_EQ(scheduler_args_dump_load(task.returned_participants), i);
             EXPECT_EQ(writes[i], static_cast<int>(i + 1));
             return true;
         });

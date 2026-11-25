@@ -139,7 +139,7 @@ runs:
 
         if [[ "$platform" == "a5" ]]; then
           start_job "chip_swimlane (host_build_graph)" \
-            tests/st/a5/host_build_graph/dfx/chip_swimlane/test_scheduler_phases.py::TestConsecutiveClockAlignment::test_run \
+            tests/st/a5/host_build_graph/dfx/chip_swimlane/test_clock_alignment.py::TestConsecutiveClockAlignment::test_run \
             --manual include --enable-chip-swimlane 4
         fi
 

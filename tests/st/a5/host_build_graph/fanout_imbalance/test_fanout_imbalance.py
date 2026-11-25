@@ -9,10 +9,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """One root fanning out to many independent consumers — a deliberately unbalanced graph.
 
-Every consumer becomes ready inside one root-completion wake-list walk. The
-ready pool must make that work globally reachable by eligible cores, regardless
-of which Scheduler publishes it. Each consumer burns `repeats` iterations so
-the backlog outlives the moment it is created.
+Every consumer depends on the same root. The calendar should spread the
+independent consumers across the eligible cores. Each consumer burns `repeats`
+iterations so the swimlane captures a sustained fanout.
 
 This differs from `single_core_dag::mixed_fanout_63`, which is the same graph
 shape, in the two things that make the imbalance observable: scale (up to 1024
@@ -59,21 +58,14 @@ WORKER_SOURCE = os.path.join(HERE, "kernels", "fanout_worker.cpp")
 # published, and few enough that 1024 of them stay well inside the op timeout.
 REPEATS = 2048
 
-# The spread assertion runs a smaller graph than the functional cases. Level-3
-# swimlane records cost the Scheduler per task, and at 1024 tasks that cost is
-# itself enough to trip the device scheduler timeout
-# (SIMPLER_ERROR_SCHEDULER_TIMEOUT, surfaced as finalize code -100) — the
-# profiling would destroy the very run it was added to observe. 256 consumers
-# oversubscribe every core several times on any supported topology, which is
-# all the distribution claim needs.
+# 256 tasks still oversubscribe every supported A5 topology.
 SPREAD_COUNT = 256
 
-# Level 3 is SCHED_PHASES: the level that carries the per-Scheduler records the
-# spread assertion reads.
-SWIMLANE_SCHED_PHASES = 3
+# The per-task calendar milestones are exported at L2.
+SWIMLANE_SCHEDULE_TIMING = 2
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestFanoutImbalance(SceneTestCase):
     """Functional guard: every consumer observes the root and runs exactly once."""
@@ -183,7 +175,7 @@ def test_fanout_spread_is_wide(st_platform, st_device_ids, tmp_path):
         output_prefix = tmp_path / "fanout_spread"
         output_prefix.mkdir(parents=True, exist_ok=True)
         config = CallConfig()
-        config.enable_chip_swimlane = SWIMLANE_SCHED_PHASES
+        config.enable_chip_swimlane = SWIMLANE_SCHEDULE_TIMING
         config.output_prefix = str(output_prefix)
         worker.run(handle, args, config)
 
@@ -213,16 +205,22 @@ def _assert_fanout_spread(raw: dict, count: int) -> None:
     assert active > 0, f"swimlane metadata reports no cores: {raw['metadata']}"
     cores = {int(row[0]) for row in rows}
     # The graph oversubscribes every supported topology. This floor detects
-    # concentration in a publishing cluster or directory shard without requiring
-    # a particular queue topology or a worksteal event for global claims.
+    # a calendar that concentrates the fanout on a subset of the eligible cores.
     minimum = min(count, (active + 1) // 2)
     assert len(cores) >= minimum, (
         f"fanout reached only {len(cores)} of {active} cores (floor {minimum}): {sorted(cores)}"
     )
-    streams = raw["scheduler_records"]["streams"]
-    assert streams, "no Scheduler records"
-    kinds = {record["kind"] for stream in streams for record in stream["records"]}
-    assert {"dispatch", "complete"} <= kinds, f"missing dispatch/completion records: {sorted(kinds)}"
+    milestones = raw["calendar_task_events"]
+    assert milestones["dropped"] == 0
+    expected = {(row[0], row[1], row[6]) for row in rows}
+    assert len(expected) == count
+    for kind in ("ready", "completion_issue"):
+        records = [
+            (record["worker_id"], record["task_id"], record["run_epoch"])
+            for record in milestones["records"]
+            if record["kind"] == kind
+        ]
+        assert len(records) == count and set(records) == expected, f"incomplete fanout {kind} coverage"
 
 
 def _find_swimlane_records(output_prefix: Path) -> Path:

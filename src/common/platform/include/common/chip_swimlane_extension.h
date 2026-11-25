@@ -21,10 +21,8 @@ enum class ChipSwimlaneExtensionSection : uint32_t {
     SchedulerTasks = 1,
     SchedulerRecords = 2,
     AicpuLifecycleRecords = 3,
-    AicoreExecutionIdentities = 4,
-    AicoreProtocol = 5,
-    PercounterTaskEvents = 6,
-    Count = 7,
+    CalendarTaskEvents = 4,
+    Count = 5,
 };
 
 inline constexpr bool chip_swimlane_extension_section_is_valid(ChipSwimlaneExtensionSection section) {
@@ -41,12 +39,8 @@ inline constexpr const char *chip_swimlane_extension_section_name(ChipSwimlaneEx
         return "scheduler_records";
     case ChipSwimlaneExtensionSection::AicpuLifecycleRecords:
         return "aicpu_lifecycle_records";
-    case ChipSwimlaneExtensionSection::AicoreExecutionIdentities:
-        return "aicore_execution_identities";
-    case ChipSwimlaneExtensionSection::AicoreProtocol:
-        return "aicore_protocol";
-    case ChipSwimlaneExtensionSection::PercounterTaskEvents:
-        return "percounter_task_events";
+    case ChipSwimlaneExtensionSection::CalendarTaskEvents:
+        return "calendar_task_events";
     case ChipSwimlaneExtensionSection::Count:
         break;
     }
@@ -56,9 +50,7 @@ inline constexpr const char *chip_swimlane_extension_section_name(ChipSwimlaneEx
 inline constexpr bool chip_swimlane_extension_section_is_object(ChipSwimlaneExtensionSection section) {
     return section == ChipSwimlaneExtensionSection::SchedulerTasks ||
            section == ChipSwimlaneExtensionSection::SchedulerRecords ||
-           section == ChipSwimlaneExtensionSection::AicoreExecutionIdentities ||
-           section == ChipSwimlaneExtensionSection::AicoreProtocol ||
-           section == ChipSwimlaneExtensionSection::PercounterTaskEvents;
+           section == ChipSwimlaneExtensionSection::CalendarTaskEvents;
 }
 
 /** Validate the bounded payload envelope; payload contents come only from internal serializers. */

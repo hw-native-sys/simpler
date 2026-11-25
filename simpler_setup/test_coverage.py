@@ -54,8 +54,6 @@ def features(item, platform, environment):
             raise ValueError(f"{item.nodeid}: execution_mode is Kernel-only")
         mode = None
     supported_runtimes = (*RUNTIMES, "common")
-    if platform == "a5" and environment == "default" and product != "kernel":
-        supported_runtimes += ("percounter",)
     runtimes = {
         _declaration(item, "runtime", supported_runtimes),
         _declaration(item, "coverage_runtime", supported_runtimes),
@@ -134,8 +132,6 @@ def policy(config, cases):
     runtime = config.getoption("--runtime")
     required = set()
     gaps = set()
-    if platform == "a5" and environment == "default" and runtime in (None, "percounter"):
-        required.add("program/percounter")
     for rt in RUNTIMES:
         if runtime and rt != runtime:
             continue

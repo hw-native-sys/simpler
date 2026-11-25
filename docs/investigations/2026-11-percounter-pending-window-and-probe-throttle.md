@@ -156,7 +156,7 @@ failure mode when it does not apply, so its first A/B measured two identical
 arms and returned the null one would expect from a real change with no effect.
 The observability that settled it had to be added on purpose, and had to be
 `LOG_WARN`: the benchmark runner pins the host log threshold at `TIMING`
-(`tests/fdwic/dsv41_scheduler/production/runner.cpp`), so a `LOG_INFO` line
+([historical runner.cpp](https://github.com/hw-native-sys/simpler/blob/1ea06c2aee35993c288887582cb7f802b2724546/tests/fdwic/dsv41_scheduler/production/runner.cpp)), so a `LOG_INFO` line
 never reaches the captured host log. **A gated optimization needs a published
 signal saying whether its gate opened, before its A/B means anything.**
 

@@ -44,10 +44,10 @@ Details + measurement provenance in
 sits in
 [docs/investigations/2026-06-aicore-mmio-to-spr.md](../../docs/investigations/2026-06-aicore-mmio-to-spr.md).
 
-## A5 Percounter execution constraints
+## A5 HBG calendar execution constraints
 
 - Graph invocations execute serially. A `defer_wait` must settle within its
-  invocation. See the [Graph boundary contract](../../src/a5/runtime/percounter/README.md#graph-boundaries).
-- Exhausting CntNotify quota fails calendar bind before launch. Use the
-  requested slot count to investigate resource demand. See the
-  [CntNotify capacity contract](../../src/a5/runtime/percounter/README.md#cntnotify-capacity).
+  invocation. See the [Graph boundary contract](../../src/a5/runtime/host_build_graph/README.md#graph-boundaries).
+- Exhausting the SoC SRAM counter quota fails calendar bind before launch.
+  Use the requested slot count to investigate resource demand. See the
+  [SoC SRAM capacity contract](../../src/a5/runtime/host_build_graph/README.md#soc-sram-capacity).

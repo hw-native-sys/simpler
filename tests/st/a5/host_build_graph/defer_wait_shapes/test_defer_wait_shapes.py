@@ -15,7 +15,7 @@ from simpler.task_interface import ArgDirection as D
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestDeferWaitShapes(SceneTestCase):
     RTOL = 0

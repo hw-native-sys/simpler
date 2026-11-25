@@ -246,10 +246,7 @@ def test_common_converter_draws_one_typed_scalar_hierarchy(tmp_path, level):
         )
     capture.aicore_sched_phase(phase="idle", start=30, end=40, scheduler_id=0, worker_id=0, physical_core_id=9)
     raw = tmp_path / "raw.json"
-    document = capture.build()
-    for stream in document["scheduler_records"]["streams"]:
-        stream.update(cluster_index=7, cluster_lane=1)
-    raw.write_text(json.dumps(document))
+    raw.write_text(json.dumps(capture.build()))
     data = read_perf_data(raw)
     assert data["scalar_profiles"][0]["nonkernel_cycles"] == 60
     output = tmp_path / "trace.json"
@@ -265,12 +262,9 @@ def test_common_converter_draws_one_typed_scalar_hierarchy(tmp_path, level):
     )
     events = json.loads(output.read_text())["traceEvents"]
     names = {e["args"]["name"] for e in events if e["ph"] == "M" and e["name"] == "thread_name" and e["pid"] == 2}
-    assert names == {"Cluster 07 / V0 / AIV_0 (physical 9)"}
+    assert names == {"AIV_0 (physical 9)"}
     assert not any(e.get("pid") == 3 for e in events)
-    assert any(
-        e.get("pid") == 4 and e.get("name") == "thread_name" and e["args"]["name"] == "Cluster 07 / V0 / AIV_0"
-        for e in events
-    )
+    assert any(e.get("pid") == 4 and e.get("name") == "thread_name" and e["args"]["name"] == "AIV_0" for e in events)
     detail = [e for e in events if e["ph"] == "X" and e["pid"] == 2]
     assert {e["tid"] for e in detail} == {30000}
     assert all(e["name"].startswith(e["cat"] + " · ") and "cname" in e for e in detail)
@@ -315,20 +309,6 @@ def test_kernel_labels_follow_worker_registration_and_epoch():
         (30020, 2, "EXECUTE · q_aic(t7) [b1]"),
         (30030, 1, "EXECUTE · q_aiv(t7) [b0]"),
     ]
-
-
-def test_predicated_skip_is_not_counted_as_kernel_execution():
-    stream = {
-        "producer": "aicore",
-        "worker_id": 2,
-        "scheduler_id": 3,
-        "capture": {"committed": 1, "dropped": 0, "truncated": False},
-    }
-    identities = {"records": [{"core_id": 2, "reg_task_id": 4, "run_epoch": 1, "executed": False}]}
-    result = analyze_streams([[window()]], [stream], [[2, 7, 4, 30, 40, 0, 1]], identities)[0]
-    assert result["kernel_cycles"] == 0
-    assert result["exclusive_cycles"]["scalar_task_skip"] == 10
-    assert result["nonkernel_cycles"] == 90
 
 
 @pytest.mark.parametrize(

@@ -14,10 +14,13 @@ import pytest
 
 from simpler_setup.tools import _runtime_dispatch as rd
 from simpler_setup.tools import hbg, tmr
+from simpler_setup.tools.hbg import calendar
 
 
 def test_get_resolves_the_named_runtime_to_its_package():
     assert rd.get(rd.HBG_RUNTIME) is hbg
+    assert rd.get(rd.HBG_RUNTIME, rd.CALENDAR_MODEL) is calendar
+    assert calendar.task_id_fields is hbg.task_id_fields
     assert rd.get(rd.TMR_RUNTIME) is tmr
 
 
@@ -29,6 +32,7 @@ def test_get_resolves_the_named_runtime_to_its_package():
         "   ",
         "host_build_grpah",  # a typo, one letter from the real thing
         "future_runtime",
+        "percounter",
     ],
 )
 def test_a_runtime_this_tool_cannot_decode_is_refused(runtime_name):
@@ -41,6 +45,12 @@ def test_a_runtime_this_tool_cannot_decode_is_refused(runtime_name):
         rd.resolve_runtime(runtime_name)
     with pytest.raises(ValueError, match="runtime"):
         rd.get(runtime_name)
+
+
+@pytest.mark.parametrize(("runtime", "model"), [(rd.TMR_RUNTIME, rd.CALENDAR_MODEL), (rd.HBG_RUNTIME, "unknown")])
+def test_scheduler_model_must_match_runtime(runtime, model):
+    with pytest.raises(ValueError, match="scheduler_model"):
+        rd.get(runtime, model)
 
 
 def test_resolve_runtime_names_its_source_in_the_message():

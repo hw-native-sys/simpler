@@ -9,7 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: PLC0415
 # Resolve Lib before importing its harness. Keep report-only commands independent of Torch.
-"""Benchmark the A5 DSpark 8K Lib case and export its Percounter swimlanes."""
+"""Benchmark the A5 DSpark 8K Lib case and export its HBG calendar swimlanes."""
 
 import argparse
 import ast
@@ -34,7 +34,7 @@ ENTRY = Path("models/deepseek_v4_1_flash/decode_fwd_dspark.py")
 BATCH = 12
 START_POSITION = 8192
 TARGET_ROWS = 72
-ARTIFACT_RUNTIME = {"host_build_graph": "percounter", "tensormap_and_ringbuffer": "tensormap_and_ringbuffer"}
+ARTIFACT_RUNTIME = {"host_build_graph": "host_build_graph", "tensormap_and_ringbuffer": "tensormap_and_ringbuffer"}
 
 
 def daily_runner(lib):
@@ -396,8 +396,8 @@ def capture_trace(args, daily, meta):
 
     from pypto.runtime import runner
 
-    if set(meta["artifact_runtimes"].values()) != {"percounter"}:
-        raise ValueError("DSpark trace replay requires a prepared A5 Percounter artifact")
+    if set(meta["artifact_runtimes"].values()) != {"host_build_graph"}:
+        raise ValueError("DSpark trace replay requires a prepared A5 HBG calendar artifact")
     build = Path(meta["runtime_dir"])
     raw = build / "dfx_outputs"
     captures = args.output / "traces"
@@ -423,8 +423,8 @@ def worker_span_us(records, deps):
     clock = records["metadata"]["clock_freq_hz"]
     if not blocks or clock <= 0 or any(not 0 < block[3] <= block[4] for block in blocks):
         raise ValueError("Missing or invalid AICore block timing")
-    if records.get("percounter_task_events", {}).get("dropped", 0):
-        raise ValueError("Percounter scheduler records were dropped")
+    if records.get("calendar_task_events", {}).get("dropped", 0):
+        raise ValueError("HBG calendar scheduler records were dropped")
     expected = Counter()
     for task in deps["tasks"]:
         slots = sum(kernel >= 0 for kernel in task["kernel_ids"])

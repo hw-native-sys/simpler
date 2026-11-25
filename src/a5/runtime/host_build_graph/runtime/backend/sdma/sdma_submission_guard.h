@@ -12,7 +12,7 @@
 #pragma once
 
 #include "async_condition_writer.h"
-#include "scheduler/scheduler_memory.h"
+#include "scheduler/gm.h"
 
 namespace pto2::resident {
 
@@ -20,9 +20,9 @@ enum class SdmaGuardResult : uint8_t { ACQUIRED, BUSY, FAILED };
 
 // One attempt only; the submission adapter owns the bounded contention wait.
 static inline __aicore__ SdmaGuardResult sdma_try_acquire(__gm__ AsyncSdmaSubmissionGuard &guard) {
-    const uint64_t previous = scheduler_gm_compare_exchange(guard.word, UINT64_C(0), UINT64_C(1));
+    const uint64_t previous = percounter_gm_compare_exchange(guard.word, UINT64_C(0), UINT64_C(1));
     if (previous == 0) {
-        scheduler_cache_barrier();
+        percounter_memory_barrier();
         return SdmaGuardResult::ACQUIRED;
     }
     return previous == 1 ? SdmaGuardResult::BUSY : SdmaGuardResult::FAILED;
@@ -31,9 +31,10 @@ static inline __aicore__ SdmaGuardResult sdma_try_acquire(__gm__ AsyncSdmaSubmis
 static inline __aicore__ bool sdma_release(__gm__ AsyncSdmaSubmissionGuard &guard, bool success) {
     // SDK SQ tails and the persisted post ID must be visible before a successor
     // rebuilds its session. Failed submissions poison this run's channel group.
-    scheduler_cache_barrier();
-    const uint64_t result = scheduler_gm_compare_exchange(guard.word, UINT64_C(1), success ? UINT64_C(0) : UINT64_C(2));
-    scheduler_cache_barrier();
+    percounter_memory_barrier();
+    const uint64_t result =
+        percounter_gm_compare_exchange(guard.word, UINT64_C(1), success ? UINT64_C(0) : UINT64_C(2));
+    percounter_memory_barrier();
     return result == 1;
 }
 

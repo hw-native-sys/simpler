@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-_FIXTURE_PATH = Path(__file__).resolve().parents[5] / "fdwic/pa_hbg/spmd/test_spmd_contract.py"
+_FIXTURE_PATH = Path(__file__).resolve().parents[5] / "support/a5/host_build_graph/spmd/spmd_contract.py"
 
 
 @pytest.fixture(scope="module")
@@ -30,25 +30,25 @@ def native():
     return module
 
 
-@pytest.mark.parametrize("mode", [0, 3, 4, 5, -1])
-def test_native_gate_rejects_non_resident_even_when_values_are_correct(native, mode):
+@pytest.mark.parametrize("mode", [0, 2, 3, 4, -1])
+def test_native_gate_rejects_noncalendar_even_when_values_are_correct(native, mode):
     worker = SimpleNamespace(scheduler_runtime_mode=mode, scheduler_mode_publish_count=2)
-    with pytest.raises(AssertionError, match="resident required"):
-        native.require_fresh_resident(worker, 1)
+    with pytest.raises(AssertionError, match="calendar required"):
+        native.require_fresh_calendar(worker, 1)
 
 
-@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("mode", [5])
 @pytest.mark.parametrize("count", [0, 1])
 def test_native_gate_rejects_stale_successful_latch(native, mode, count):
     worker = SimpleNamespace(scheduler_runtime_mode=mode, scheduler_mode_publish_count=count)
     with pytest.raises(AssertionError, match="no fresh scheduler publication"):
-        native.require_fresh_resident(worker, 1)
+        native.require_fresh_calendar(worker, 1)
 
 
-@pytest.mark.parametrize("mode", [1, 2])
-def test_native_gate_accepts_fresh_resident_selection(native, mode):
+@pytest.mark.parametrize("mode", [5])
+def test_native_gate_accepts_fresh_calendar_selection(native, mode):
     worker = SimpleNamespace(scheduler_runtime_mode=mode, scheduler_mode_publish_count=2)
-    assert native.require_fresh_resident(worker, 1) == 2
+    assert native.require_fresh_calendar(worker, 1) == 2
 
 
 @pytest.mark.parametrize("mask", [1, 2, 3, 5, 6, 7])
@@ -86,7 +86,7 @@ def test_native_comparator_rejects_each_distinct_failure(native, corruption):
         actual.records[2 * 3 * 16] = 1
     else:
         actual.summary[1] = 1
-    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=2)
+    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=2)
     test._contract_publish_count = 1
     with pytest.raises(AssertionError):
         test.compare_outputs(actual, golden, ["records", "summary"], params)
@@ -99,7 +99,7 @@ def test_native_matrix_has_unique_names_and_no_silent_skip_or_xfail(native):
 
 
 @pytest.mark.parametrize("mask", [1, 2, 4, 3, 5, 6, 7])
-@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("mode", [5])
 def test_sync_golden_requires_every_arrival_and_rejects_barrier_timeout(native, mask, mode):
     test = native.TestHbgSpmdContract()
     params = {"mask": mask, "blocks": 2, "tasks": 2, "tail_delay": 0, "sync_mode": mode}
@@ -110,7 +110,7 @@ def test_sync_golden_requires_every_arrival_and_rejects_barrier_timeout(native, 
     assert torch.count_nonzero(guards[:, 3]).item() == 0
     actual = golden.clone()
     actual.records.view(2, 7, 16)[0, -1, 3] = 1
-    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=2)
+    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=2)
     test._contract_publish_count = 1
     with pytest.raises(AssertionError):
         test.compare_outputs(actual, golden, ["records", "summary"], params)

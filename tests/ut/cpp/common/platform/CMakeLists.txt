@@ -1056,8 +1056,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 if(TARGET test_a5_hbg_native_admission)
     target_sources(test_a5_hbg_native_admission PRIVATE
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/graph_validation.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/profiling.cpp)
 endif()
 tmr_case(test_native_admission.cpp
     SOURCES ${NATIVE_ADMISSION_SOURCES}
@@ -1227,7 +1227,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 platform_case(test_abort_aicore_startup.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
-        ${SIMPLER_SRC}/@arch@/runtime/@runtime@/aicore/aicore_executor.cpp
         ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/platform_regs.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/aicpu/inner_platform_regs.cpp
         ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
@@ -1237,16 +1236,20 @@ platform_case(test_abort_aicore_startup.cpp PER_ARCH PER_RUNTIME
         ${SIMPLER_SRC}/@arch@/runtime/@runtime@/common
         ${SIMPLER_SRC}/@arch@/platform/sim/aicore
         ${SIMPLER_SRC}/common/platform/sim/aicpu)
-target_sources(test_a5_hbg_abort_aicore_startup PRIVATE
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary.cpp
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native.cpp
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_profiled.cpp
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_profiled.cpp
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_timing.cpp
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_timing.cpp)
-target_compile_definitions(test_a5_hbg_abort_aicore_startup PRIVATE TEST_RESIDENT_STARTUP=1)
 foreach(arch a2a3 a5)
     foreach(tag hbg tmr)
+        simpler_runtime_from_tag("${tag}" runtime)
+        set(aicore_dir ${SIMPLER_SRC}/${arch}/runtime/${runtime}/aicore)
+        if(arch STREQUAL "a5" AND tag STREQUAL "hbg")
+            target_sources(test_a5_hbg_abort_aicore_startup PRIVATE
+                ${aicore_dir}/entry.cpp
+                ${aicore_dir}/unprofiled.cpp
+                ${aicore_dir}/profiled.cpp
+                ${aicore_dir}/task_profiled.cpp)
+            target_compile_definitions(test_a5_hbg_abort_aicore_startup PRIVATE TEST_CALENDAR_STARTUP=1)
+        else()
+            target_sources(test_${arch}_${tag}_abort_aicore_startup PRIVATE ${aicore_dir}/aicore_executor.cpp)
+        endif()
         target_link_options(test_${arch}_${tag}_abort_aicore_startup PRIVATE
             -Wl,--wrap=pthread_setspecific -Wl,--wrap=_Z29platform_aicore_exit_deadlinev)
         set_tests_properties(test_${arch}_${tag}_abort_aicore_startup PROPERTIES TIMEOUT 30)

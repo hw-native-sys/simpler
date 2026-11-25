@@ -24,8 +24,8 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/native_invocation_evidence.h"
 #include "aicore/aicore_profiling_state.h"
-#ifdef TEST_RESIDENT_STARTUP
-#include "scheduler/scheduler_types.h"
+#ifdef TEST_CALENDAR_STARTUP
+#include "scheduler/wire_types.h"
 #endif
 
 void aicore_execute(Runtime *, int, CoreType);
@@ -50,11 +50,13 @@ int32_t finish(int32_t index, int32_t rc) {
 void rejected_launch(uint32_t mode, bool valid_base = true) {
     auto runtime = std::make_unique<Runtime>();
     runtime->dev.worker_count = 1;
-#ifdef TEST_RESIDENT_STARTUP
-    SchedulerWorkerContext context{};
-    SchedulerRunControl control{};
-    context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&control);
-    runtime->publish_scheduler_bootstrap(mode, valid_base ? reinterpret_cast<uint64_t>(&context) : 0);
+#ifdef TEST_CALENDAR_STARTUP
+    simpler::percounter::PercounterControl control{};
+    alignas(32) uint32_t lifecycle = UINT32_MAX;
+    runtime->publish_scheduler_bootstrap(
+        mode, valid_base ? reinterpret_cast<uint64_t>(&control) : 0, reinterpret_cast<uint64_t>(&lifecycle),
+        reinterpret_cast<uint64_t>(control.rejected_exit)
+    );
 #else
     (void)mode;
     (void)valid_base;
@@ -125,11 +127,11 @@ TEST(AbortAicoreStartupDeathTest, BindingFailureRetiresRealCoreBeforeLastCallbac
     for (bool final_bind : {false, true}) {
         final_bind_only = final_bind;
         EXPECT_EXIT(rejected_launch(0), testing::ExitedWithCode(0), "");
-#ifdef TEST_RESIDENT_STARTUP
-        EXPECT_EXIT(rejected_launch(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING), testing::ExitedWithCode(0), "");
+#ifdef TEST_CALENDAR_STARTUP
+        EXPECT_EXIT(rejected_launch(SCHEDULER_RUNTIME_MODE_CALENDAR), testing::ExitedWithCode(0), "");
         for (uint32_t mode : {3U, 4U, UINT32_MAX})
             EXPECT_EXIT(rejected_launch(mode), testing::ExitedWithCode(0), "");
-        EXPECT_EXIT(rejected_launch(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, false), testing::ExitedWithCode(0), "");
+        EXPECT_EXIT(rejected_launch(SCHEDULER_RUNTIME_MODE_CALENDAR, false), testing::ExitedWithCode(0), "");
 #endif
     }
 }

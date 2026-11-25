@@ -493,8 +493,10 @@ constexpr uint32_t REG_SPR_CTRL_OFFSET = 0x0;             // AICore internal CTR
 // Exit signal for AICore shutdown
 constexpr uint32_t AICORE_EXIT_SIGNAL = 0x7FFFFFF0;
 // A calendar lifecycle word advances to a new even START token on each launch.
-// EXIT sets its low bit, including on a failed launch that never issued START.
+// EXIT sets the low bit. Async input visibility is sticky in the high bit.
 constexpr uint32_t AICORE_LIFECYCLE_EXIT_BIT = 1U;
+constexpr uint32_t AICORE_LIFECYCLE_ASYNC_INPUT_BIT = 1U << 31;
+constexpr uint32_t AICORE_LIFECYCLE_GENERATION_MASK = AICORE_LIFECYCLE_ASYNC_INPUT_BIT - 2U;
 
 // Physical core ID mask for get_coreid()
 constexpr uint32_t AICORE_COREID_MASK = 0x0FFF;

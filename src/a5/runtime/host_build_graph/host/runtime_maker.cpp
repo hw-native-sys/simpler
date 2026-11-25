@@ -57,6 +57,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -71,31 +72,22 @@
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "image_pack.h"
-#include "native_graph_plan.h"
-#include "prepared_execution_plan.h"
-#include "async_completion_plan.h"
-#include "task_catalog_plan.h"
-#include "host_build_graph/host/completion_counter_plan.h"
-#include "dependency_plan.h"
+#include "graph_validation.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_args_dump.h"
-#include "aicpu/args_dump_aicpu.h"
 #include "scheduler/scheduler_types.h"
-#include "scheduler_protocol_export.h"
-#include "scheduler_protocol_graph_source.h"
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host_build_graph/host/retained_prepare_plan.h"
 #include "host_build_graph/host/graph_host_state.h"
 #include "host_build_graph/host/host_phase_trace.h"
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/host/orch_ops.h"
-#include "host_build_graph/host/ready_queue_sizing.h"
 #include "host_build_graph/host/graph_recorder_pool.h"
 #include "host_build_graph/runtime_core.h"
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/types.h"
 #include "host_build_graph/runtime.h"
-#include "scheduler_extension.h"
+#include "state.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "../../../../common/worker/runtime_c_api.h"
@@ -127,13 +119,6 @@ static_assert(
         PTO_RUNTIME_ERR_BASE < -PTO_RUNTIME_LATCHED_CODE_MAX,
     "host-side C API codes must stay below the negation of every latched device code"
 );
-static_assert(
-    SCHEDULER_PROFILING_TASK_TIMING_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::TASK_TIMING) &&
-        SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::SCHEDULE_TIMING) &&
-        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::SCHED_PHASES),
-    "AICore Scheduler profiling levels must match the chip-swimlane contract"
-);
-
 /**
  * Run-resource sets a kernel-mode context of this runtime declares.
  *
@@ -448,484 +433,11 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
     );
 }
 
-// Declined unless a runtime that schedules AICore differently links its own.
-// Outside the anonymous namespace below: an internal-linkage symbol cannot be
-// the weak half of an override.
-__attribute__((weak)) SchedulerExtensionResult scheduler_extension_select(
-    Runtime *, const HostApi *, SharedMemoryHandle &, int32_t, const std::vector<SchedulerTaskMetadata> &,
-    const std::vector<int64_t> &, const std::map<int32_t, simpler::hbg::GraphCalendarHint> &,
-    const sm_layout::SegmentOffsets &, const void *
-) {
-    return SchedulerExtensionResult::DECLINED;
-}
-
-__attribute__((weak)) bool scheduler_extension_publish_profiling(Runtime *) { return true; }
-__attribute__((weak)) void scheduler_extension_release(Runtime *) {}
-__attribute__((weak)) bool scheduler_extension_retains_graph_config_id() { return false; }
-
 namespace {
-
-// The swimlane JSON's own schema key. Spelled out here rather than inline so a
-// rename of the C++ identifier cannot reach it: downstream tools parse this
-// name, so it is a wire contract and not a variable.
-constexpr const char *kSchedulerJsonTaskKey = "\"task_id\":";
-
-// Profiling retains a run-specific readback target and its frozen host graph.
-struct SchedulerStateOwner {
-    void *state_base;
-    std::vector<uint64_t> public_task_ids;
-    AicoreSchedulerLayout layout;
-    const HostApi *api;
-    std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
-    std::string protocol_source;
-};
-
-std::mutex scheduler_state_owners_mutex;
-std::unordered_map<Runtime *, SchedulerStateOwner> scheduler_state_owners;
-
-struct SchedulerJsonRecord {
-    uint64_t start_cycles;
-    uint64_t end_cycles;
-    uint64_t loop_iter;
-    SchedPhaseKind kind;
-    uint64_t tasks_processed;
-    uint64_t task_ref;
-    bool has_task;
-    uint32_t scalar_calls{0};
-    uint32_t scalar_depth{0};
-};
-
-const char *scheduler_core_type_name(int32_t core_type) {
-    return core_type == static_cast<int32_t>(CoreType::AIC) ? "aic" : "aiv";
-}
-
-void append_scheduler_record(
-    std::vector<SchedulerJsonRecord> *records, uint64_t start_cycles, uint64_t end_cycles, uint64_t loop_iter,
-    SchedPhaseKind kind, uint64_t tasks_processed, uint64_t task_ref = 0, bool has_task = true
-) {
-    if (records == nullptr || start_cycles == 0 || end_cycles < start_cycles) return;
-    records->push_back({start_cycles, end_cycles, loop_iter, kind, tasks_processed, task_ref, has_task});
-}
-
-bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
-    const uint32_t level = runtime->dev.chip_swimlane_level;
-    if (level == 0) return true;
-
-    SchedulerStateOwner owner{};
-    {
-        std::scoped_lock lock(scheduler_state_owners_mutex);
-        auto it = scheduler_state_owners.find(runtime);
-        if (it == scheduler_state_owners.end()) return true;
-        owner = it->second;
-    }
-
-    std::vector<uint8_t> storage(static_cast<size_t>(owner.layout.total_size + SCHEDULER_STATE_BASE_ALIGNMENT - 1));
-    const uintptr_t aligned_address =
-        (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_BASE_ALIGNMENT - 1) &
-        ~(static_cast<uintptr_t>(SCHEDULER_STATE_BASE_ALIGNMENT) - 1);
-    void *host_base = reinterpret_cast<void *>(aligned_address);
-    if (api->copy_from_device(host_base, owner.state_base, static_cast<size_t>(owner.layout.total_size)) != 0) {
-        LOG_WARN("A5 HBG: failed to copy AICore Scheduler profiling state");
-        return false;
-    }
-
-    if (owner.layout.protocol_layout_offset != 0) {
-        try {
-            const auto payload = scheduler_export_protocol(
-                host_base, static_cast<size_t>(owner.layout.total_size), owner.layout, api->run_epoch(),
-                owner.protocol_tasks, owner.protocol_source
-            );
-            if (!api->publish_chip_swimlane_extension(
-                    ChipSwimlaneExtensionSection::AicoreProtocol, payload.c_str(), payload.size()
-                )) {
-                LOG_WARN("A5 HBG: failed to publish native protocol records");
-                return false;
-            }
-        } catch (const std::exception &error) {
-            LOG_WARN("A5 HBG: invalid native protocol image: %s", error.what());
-            return false;
-        }
-    }
-
-    const auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, owner.layout.worker_contexts_offset);
-    const auto public_id = [&](uint64_t ref) {
-        return ref < owner.public_task_ids.size() ? owner.public_task_ids[ref] : UINT64_MAX;
-    };
-    const auto *traces = scheduler_state_at<SchedulerTaskTrace>(host_base, owner.layout.trace_cells_offset);
-    const auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, owner.layout.run_control_offset);
-    const uint64_t active_workers = run_control->active_worker_count;
-    if (active_workers > SCHEDULER_WORKER_CAPACITY) return false;
-
-    const bool need_scheduler_timing = level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
-
-    // One eligibility pass, before either section is written. The reader requires
-    // Scheduler timing for every AICore task it sees (swimlane_converter.py's
-    // level>=2 join is `set(aicore) - set(scheduler)` and must be empty), so a
-    // task that cannot appear in both sections must appear in neither. Deciding
-    // per-section instead means a single incomplete trace costs this run its
-    // whole Scheduler timing, its AICPU lifecycle records and its Scheduler
-    // activity streams -- every section after the one that gave up -- while
-    // leaving the already-published AicoreTasks in the one shape the reader
-    // rejects.
-    std::vector<uint64_t> emitted_traces;
-    emitted_traces.reserve(static_cast<size_t>(owner.layout.executable_subtask_count));
-    for (uint64_t trace_index = 0; trace_index < owner.layout.executable_subtask_count; ++trace_index) {
-        const SchedulerTaskTrace &trace = traces[trace_index];
-        const uint64_t task_ref = trace.task_ref;
-        if (trace.valid == 0 || trace.kernel_start_cycles == 0 || trace.kernel_end_cycles < trace.kernel_start_cycles ||
-            trace.worker_id >= active_workers)
-            continue;
-        if (need_scheduler_timing &&
-            (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles)) {
-            LOG_WARN(
-                "A5 HBG: dropping task ref=%" PRIu64 " from this run's swimlane — incomplete Scheduler timing "
-                "(dispatch_end=%" PRIu64 ", complete_start=%" PRIu64 ", kernel_end=%" PRIu64 ")",
-                task_ref, trace.dispatch_end_cycles, trace.complete_start_cycles, trace.kernel_end_cycles
-            );
-            continue;
-        }
-        emitted_traces.push_back(trace_index);
-    }
-
-    const uint64_t swimlane_run_epoch = api->run_epoch();
-    std::ostringstream identities_json;
-    const bool capture_l2 = level == static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
-    identities_json << "{\"schema\":\"hbg-execution-identity\",\"version\":" << (capture_l2 ? 3 : 2)
-                    << ",\"producer\":\"aicore\",\"records\":[";
-    bool first_identity = true;
-    for (uint64_t trace_index : emitted_traces) {
-        const SchedulerTaskTrace &trace = traces[trace_index];
-        const uint32_t flags = trace.execution_identity_flags;
-        if ((flags & SCHEDULER_TRACE_IDENTITY_CAPTURED) == 0 || (flags & ~UINT32_C(31)) != 0 ||
-            trace.execution_run_epoch != swimlane_run_epoch) {
-            LOG_WARN("A5 HBG: missing or stale execution identity at trace=%" PRIu64, trace_index);
-            return false;
-        }
-        if (!first_identity) identities_json << ",";
-        first_identity = false;
-        identities_json << "\n{\"run_epoch\":" << trace.execution_run_epoch << ",\"core_id\":" << trace.worker_id
-                        << ",\"reg_task_id\":" << trace_index << ",\"task_id\":" << public_id(trace.task_ref)
-                        << ",\"block_idx\":" << trace.execution_block_idx
-                        << ",\"block_num\":" << trace.execution_block_num
-                        << ",\"subtask_slot\":" << trace.execution_subtask_slot
-                        << ",\"pending_slot\":" << trace.execution_pending_slot
-                        << ",\"cluster_index\":" << trace.execution_cluster_index
-                        << ",\"cluster_lane\":" << trace.execution_cluster_lane << ",\"order_key\":";
-        identities_json << trace.execution_order_key;
-        identities_json << ",\"group_seq\":";
-        if ((flags & SCHEDULER_TRACE_GROUP) != 0) identities_json << trace.execution_group_seq;
-        else identities_json << "null";
-        identities_json << ",\"group_kind\":" << ((flags & SCHEDULER_TRACE_CLUSTER_GROUP) != 0 ? 2 : 0)
-                        << ",\"executed\":" << ((flags & SCHEDULER_TRACE_EXECUTED) != 0 ? "true" : "false");
-        if (capture_l2) {
-            identities_json << ",\"schedule_cycles\":[" << trace.state_probe_start_cycles << ","
-                            << trace.state_probe_end_cycles << "," << trace.dispatch_start_cycles << ","
-                            << trace.complete_end_cycles;
-            if (trace.l2_proxy_begin_cycles != 0)
-                identities_json << "," << trace.l2_proxy_begin_cycles << "," << trace.l2_proxy_arm_cycles;
-            identities_json << "]";
-            if (trace.l2_claim_begin_cycles != 0)
-                identities_json << ",\"mix_claim_cycles\":[" << trace.l2_previous_complete_cycles << ","
-                                << trace.l2_previous_retired_cycles << "," << trace.l2_claim_begin_cycles << ","
-                                << trace.l2_claim_end_cycles << "]";
-            if (trace.l2_first_pending_cycles != 0)
-                identities_json << ",\"pending_fanin\":[" << public_id(trace.l2_first_predecessor) << ","
-                                << trace.l2_first_pending_cycles << "]";
-        }
-        identities_json << "}";
-    }
-    identities_json << "]}";
-    const std::string identities_payload = identities_json.str();
-    if (!api->publish_chip_swimlane_extension(
-            ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identities_payload.c_str(),
-            identities_payload.size()
-        )) {
-        LOG_WARN("A5 HBG: failed to publish execution identities");
-        return false;
-    }
-
-    if (need_scheduler_timing) {
-        const auto *lifecycle =
-            scheduler_state_at<AicpuThreadLifecycleTrace>(host_base, owner.layout.aicpu_lifecycle_traces_offset);
-        std::ostringstream lifecycle_json;
-        lifecycle_json << "[";
-        bool first = true;
-        for (uint64_t thread = 0; thread < PLATFORM_MAX_AICPU_THREADS; ++thread) {
-            const AicpuThreadLifecycleTrace &trace = lifecycle[thread];
-            if (trace.handshake_start_cycles == 0) continue;
-            if (!first) lifecycle_json << ",";
-            lifecycle_json << "\n    {\"aicpu_thread_id\": " << trace.aicpu_thread_id
-                           << ", \"handshake_start_cycles\": " << trace.handshake_start_cycles
-                           << ", \"handshake_complete_cycles\": " << trace.handshake_complete_cycles
-                           << ", \"config_start_cycles\": " << trace.config_start_cycles
-                           << ", \"topology_complete_cycles\": " << trace.topology_complete_cycles
-                           << ", \"context_publish_start_cycles\": " << trace.context_publish_start_cycles
-                           << ", \"context_publish_complete_cycles\": " << trace.context_publish_complete_cycles
-                           << ", \"bootstrap_wait_start_cycles\": " << trace.bootstrap_wait_start_cycles
-                           << ", \"bootstrap_complete_cycles\": " << trace.bootstrap_complete_cycles
-                           << ", \"register_release_start_cycles\": " << trace.register_release_start_cycles
-                           << ", \"register_release_end_cycles\": " << trace.register_release_end_cycles
-                           << ", \"exit_signal_start_cycles\": " << trace.exit_signal_start_cycles
-                           << ", \"exit_signal_end_cycles\": " << trace.exit_signal_end_cycles
-                           << ", \"exit_wait_start_cycles\": " << trace.exit_wait_start_cycles
-                           << ", \"exit_wait_end_cycles\": " << trace.exit_wait_end_cycles << "}";
-            first = false;
-        }
-        if (!first) lifecycle_json << "\n  ";
-        lifecycle_json << "]";
-        const std::string lifecycle_payload = lifecycle_json.str();
-        if (!api->publish_chip_swimlane_extension(
-                ChipSwimlaneExtensionSection::AicpuLifecycleRecords, lifecycle_payload.c_str(), lifecycle_payload.size()
-            )) {
-            LOG_WARN("A5 HBG: failed to publish AICPU lifecycle records");
-            return false;
-        }
-    }
-
-    if (level < static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES)) return true;
-
-    std::vector<std::vector<SchedulerJsonRecord>> records(active_workers);
-    for (uint64_t worker = 0; worker < active_workers; ++worker) {
-        const SchedulerWorkerContext &context = contexts[worker];
-        if (context.worker_index != worker) return false;
-        append_scheduler_record(
-            &records[context.worker_index], context.bootstrap_start_cycles, context.target_bootstrap_end_cycles, 0,
-            SchedPhaseKind::Bootstrap, context.bootstrap_task_count, 0, false
-        );
-    }
-    for (uint64_t trace_index = 0; trace_index < owner.layout.executable_subtask_count; ++trace_index) {
-        const SchedulerTaskTrace &trace = traces[trace_index];
-        const uint64_t task_ref = trace.task_ref;
-        if (trace.worker_id < active_workers) {
-            append_scheduler_record(
-                &records[trace.worker_id], trace.state_probe_start_cycles, trace.state_probe_end_cycles,
-                trace.dispatch_loop_iter, SchedPhaseKind::StateProbe, 1, task_ref
-            );
-            append_scheduler_record(
-                &records[trace.worker_id], trace.dispatch_start_cycles, trace.dispatch_end_cycles,
-                trace.dispatch_loop_iter, SchedPhaseKind::Dispatch, 1, task_ref
-            );
-            append_scheduler_record(
-                &records[trace.worker_id], trace.complete_start_cycles, trace.complete_end_cycles,
-                trace.complete_loop_iter, SchedPhaseKind::Complete, 1, task_ref
-            );
-        }
-    }
-
-    std::vector<uint32_t> dropped_by_worker(active_workers);
-    if (owner.layout.activity_buffers_offset != 0) {
-        const auto *activity =
-            scheduler_state_at<SchedulerActivityBuffer>(host_base, owner.layout.activity_buffers_offset);
-        for (uint64_t worker = 0; worker < active_workers; ++worker) {
-            const SchedulerActivityBuffer &buffer = activity[worker];
-            const uint32_t committed = buffer.committed;
-            if (!scheduler_activity_record_count_valid(committed)) {
-                LOG_WARN("A5 HBG: invalid Scheduler activity count for worker=%" PRIu64 ": %u", worker, committed);
-                return false;
-            }
-            for (uint32_t index = 0; index < committed; ++index) {
-                const SchedulerIdleRecord &record = buffer.records[index];
-                append_scheduler_record(
-                    &records[worker], record.start_time, record.end_time, record.loop_iter, SchedPhaseKind::Idle, 0, 0,
-                    false
-                );
-            }
-            const uint64_t scalar_offset = owner.layout.scalar_records_offset +
-                                           worker * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord);
-            if (buffer.scalar_committed > SCHEDULER_SCALAR_RECORD_CAPACITY ||
-                buffer.scalar_records_offset != scalar_offset ||
-                buffer.scalar_storage_slots < buffer.scalar_committed ||
-                buffer.scalar_storage_slots > 2 * buffer.scalar_committed) {
-                LOG_WARN("A5 HBG: invalid Scalar record count for worker=%" PRIu64, worker);
-                return false;
-            }
-            const auto *scalar_slots = scheduler_state_at<SchedulerScalarStorageSlot>(host_base, scalar_offset);
-            uint32_t slot_cursor = 0;
-            for (uint32_t index = 0; index < buffer.scalar_committed; ++index) {
-                SchedulerScalarRecord record{};
-                if (!scheduler_decode_scalar_storage(scalar_slots, buffer.scalar_storage_slots, slot_cursor, record)) {
-                    LOG_WARN("A5 HBG: invalid compact Scalar row for worker=%" PRIu64, worker);
-                    return false;
-                }
-                const uint32_t kind = record.kind & UINT32_C(0xffff);
-                if (kind < static_cast<uint32_t>(SchedPhaseKind::ScalarWindow) || kind > UINT8_MAX ||
-                    std::strcmp(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind)), "unknown") == 0 ||
-                    record.start_time == 0 || record.end_time < record.start_time) {
-                    LOG_WARN("A5 HBG: invalid Scalar interval for worker=%" PRIu64, worker);
-                    return false;
-                }
-                append_scheduler_record(
-                    &records[worker], record.start_time, record.end_time, 0, static_cast<SchedPhaseKind>(kind), 0,
-                    static_cast<uint64_t>(record.task_ref), record.task_ref >= 0
-                );
-                records[worker].back().scalar_calls = record.count;
-                records[worker].back().scalar_depth = record.kind >> 16;
-            }
-            if (slot_cursor != buffer.scalar_storage_slots) {
-                LOG_WARN("A5 HBG: trailing compact Scalar storage for worker=%" PRIu64, worker);
-                return false;
-            }
-            const uint64_t dropped = static_cast<uint64_t>(buffer.dropped) + buffer.scalar_dropped;
-            dropped_by_worker[worker] = static_cast<uint32_t>(std::min(dropped, uint64_t{UINT32_MAX}));
-        }
-    }
-
-    std::ostringstream scheduler_json;
-    scheduler_json << "{\n    \"streams\": [";
-    bool first_stream = true;
-    for (uint64_t worker = 0; worker < active_workers; ++worker) {
-        const SchedulerWorkerContext &context = contexts[worker];
-        const uint32_t dropped = dropped_by_worker[worker];
-        if (records[worker].empty() && dropped == 0) continue;
-        std::sort(records[worker].begin(), records[worker].end(), [](const auto &lhs, const auto &rhs) {
-            if (lhs.start_cycles != rhs.start_cycles) return lhs.start_cycles < rhs.start_cycles;
-            if (lhs.end_cycles != rhs.end_cycles) return lhs.end_cycles < rhs.end_cycles;
-            // Ordered by the name a report spells, not by the enumerator value: the
-            // tie-break exists only to make the output deterministic, and the
-            // enumerators are numbered by producer grouping rather than alphabetically.
-            return std::strcmp(sched_phase_kind_name(lhs.kind), sched_phase_kind_name(rhs.kind)) < 0;
-        });
-        if (!first_stream) scheduler_json << ",";
-        uint32_t cluster_lane = 0;
-        while (cluster_lane < PLATFORM_CORES_PER_BLOCKDIM && context.cluster_worker_ids[cluster_lane] != worker)
-            ++cluster_lane;
-        const bool cluster_valid =
-            context.cluster_index < context.cluster_count && cluster_lane < PLATFORM_CORES_PER_BLOCKDIM;
-        scheduler_json << "\n      {\"platform\": \"a5\", \"producer\": \"aicore\", "
-                          "\"scheduler_id\": "
-                       << worker << ", \"worker_id\": " << worker << ", \"core_type\": \""
-                       << scheduler_core_type_name(context.core_type)
-                       << "\", \"physical_core_id\": " << context.physical_core_id << ", \"cluster_index\": ";
-        if (cluster_valid) scheduler_json << context.cluster_index;
-        else scheduler_json << "null";
-        scheduler_json << ", \"cluster_lane\": ";
-        if (cluster_valid) scheduler_json << cluster_lane;
-        else scheduler_json << "null";
-        scheduler_json << ", \"capture\": {\"committed\": " << records[worker].size() << ", \"dropped\": " << dropped
-                       << ", \"truncated\": " << (dropped == 0 ? "false" : "true") << "}, \"records\": [";
-        for (size_t index = 0; index < records[worker].size(); ++index) {
-            const SchedulerJsonRecord &record = records[worker][index];
-            if (index != 0) scheduler_json << ",";
-            scheduler_json << "\n{\"start_cycles\":" << record.start_cycles << ",\"end_cycles\":" << record.end_cycles
-                           << ",\"run_epoch\":" << api->run_epoch() << ",\"loop_iter\":" << record.loop_iter
-                           << ",\"kind\":\"" << sched_phase_kind_name(record.kind)
-                           << "\",\"tasks_processed\":" << record.tasks_processed << "," << kSchedulerJsonTaskKey;
-            if (record.has_task) scheduler_json << public_id(record.task_ref);
-            else scheduler_json << "null";
-            scheduler_json << "}";
-        }
-        if (!records[worker].empty()) scheduler_json << "\n      ";
-        scheduler_json << "], \"metrics\": [";
-        bool first_metric = true;
-        for (size_t index = 0; index < records[worker].size(); ++index) {
-            const auto &record = records[worker][index];
-            if (record.scalar_calls == 0) continue;
-            if (!first_metric) scheduler_json << ",";
-            first_metric = false;
-            scheduler_json << "{\"record_index\":" << index << ",\"scalar_calls\":" << record.scalar_calls
-                           << ",\"scalar_depth\":" << record.scalar_depth;
-            if (record.kind == SchedPhaseKind::ScalarWindow) {
-                const auto &buffer = scheduler_state_at<SchedulerActivityBuffer>(
-                    host_base, owner.layout.activity_buffers_offset
-                )[worker];
-                scheduler_json << ",\"batch_write_cycles\":" << buffer.scalar_write_cycles
-                               << ",\"no_progress_loops\":" << buffer.scalar_poll_loops
-                               << ",\"short_function_intervals_omitted\":" << buffer.scalar_short_intervals
-                               << ",\"function_min_cycles\":" << buffer.scalar_function_min_cycles
-                               << ",\"scalar_storage_bytes\":"
-                               << uint64_t{buffer.scalar_storage_slots} * sizeof(SchedulerScalarStorageSlot)
-                               << ",\"scalar_logical_records\":" << buffer.scalar_committed
-                               << ",\"iterations_detailed\":"
-                               << (level >= static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES) ? "true" : "false");
-            }
-            scheduler_json << "}";
-        }
-        scheduler_json << "]}";
-        first_stream = false;
-    }
-    if (!first_stream) scheduler_json << "\n    ";
-    scheduler_json
-        << "],\n    \"prepared_calls\":{\"schema\":\"hbg-prepared-calls\",\"run_epoch\":" << swimlane_run_epoch
-        << ",\"source\":\"host\",\"columns\":[\"execution_index\",\"node_ref\",\"task_id\","
-           "\"block_idx\",\"subtask_slot\",\"owner\",\"phase\","
-           "\"raw_phase\",\"return_inferred\",\"completion_state\",\"mix_owned\",\"mix_kernel_entered\"],\"records\":[";
-    const auto &prepared =
-        owner.layout.prepared_layout_offset == 0 ?
-            owner.layout.prepared :
-            *scheduler_state_at<SchedulerPreparedLayout>(host_base, owner.layout.prepared_layout_offset);
-    const auto *prepared_controls = scheduler_state_at<SchedulerPreparedControl>(host_base, prepared.controls_offset);
-    const auto *calls = scheduler_state_at<SchedulerPreparedCall>(host_base, prepared.calls_offset);
-    const auto *execution_plans = scheduler_state_at<SchedulerExecutionPlan>(host_base, prepared.plans_offset);
-    const auto *task_controls = scheduler_state_at<SchedulerTaskControl>(host_base, prepared.task_controls_offset);
-    bool first_call = true;
-    for (uint64_t index = 0; index < prepared.execution_count; ++index) {
-        const uint64_t state = prepared_controls[index].state;
-        const auto raw_phase = scheduler_prepared_phase(state);
-        if (raw_phase < SchedulerPreparedPhase::BUILT || raw_phase > SchedulerPreparedPhase::ENTERED) continue;
-        const auto &call = calls[index];
-        const uint32_t executor = scheduler_prepared_owner(state);
-        if (call.execution_index != index || call.run_epoch != swimlane_run_epoch || call.task_ref < 0 ||
-            static_cast<uint64_t>(call.task_ref) >= prepared.task_count ||
-            (executor != UINT32_MAX && executor >= SCHEDULER_WORKER_CAPACITY)) {
-            LOG_WARN("A5 HBG: invalid prepared call identity at index=%" PRIu64, index);
-            return false;
-        }
-        const uint64_t completion = task_controls[call.task_ref].completion_state;
-        const auto &plan = execution_plans[call.task_ref];
-        const bool inferred = scheduler_prepared_retirement_inferred(state, prepared, index, call, plan, completion);
-        const auto phase = inferred ? SchedulerPreparedPhase::RETURNED : raw_phase;
-        if (!first_call) scheduler_json << ',';
-        scheduler_json << '[' << index << ',' << call.task_ref << ',' << public_id(call.task_ref) << ','
-                       << call.block_idx << ',' << static_cast<unsigned>(call.subtask_slot) << ',';
-        if (executor == UINT32_MAX) scheduler_json << "null";
-        else scheduler_json << executor;
-        scheduler_json << ',' << static_cast<unsigned>(phase) << ',' << static_cast<unsigned>(raw_phase) << ','
-                       << (inferred ? "true" : "false") << ',' << completion << ',';
-        if (plan.active_lane_count > 1 && raw_phase == SchedulerPreparedPhase::BUILT) scheduler_json << "null,";
-        else scheduler_json << ((state & SCHEDULER_PREPARED_MIX_OWNED) != 0 ? "true," : "false,");
-        scheduler_json << scheduler_prepared_mix_entry(state, "null");
-        scheduler_json << ']';
-        first_call = false;
-    }
-    scheduler_json
-        << "]},\n    \"mix_proxies\":{\"run_epoch\":" << swimlane_run_epoch
-        << ",\"columns\":[\"worker\",\"physical_core_id\",\"cluster\",\"bank\",\"node_ref\",\"task_id\",\"block_idx\","
-           "\"phase\"],\"records\":[";
-    bool first_proxy = true;
-    for (uint64_t worker = 0; worker < active_workers; ++worker) {
-        const auto &context = contexts[worker];
-        scheduler_visit_mix_proxy_records(context, [&](int32_t bank, uint64_t state) {
-            const uint32_t ref = scheduler_mix_proxy_task_ref(state);
-            if (!first_proxy) scheduler_json << ',';
-            scheduler_json << '[' << worker << ',' << context.physical_core_id << ',' << context.cluster_index << ','
-                           << bank << ',' << ref << ',' << public_id(ref) << ',' << scheduler_mix_proxy_block_idx(state)
-                           << ",\"published\"]";
-            first_proxy = false;
-        });
-    }
-    scheduler_json << "]}\n  }";
-    const std::string scheduler_payload = scheduler_json.str();
-    if (!api->publish_chip_swimlane_extension(
-            ChipSwimlaneExtensionSection::SchedulerRecords, scheduler_payload.c_str(), scheduler_payload.size()
-        )) {
-        LOG_WARN("A5 HBG: failed to publish AICore Scheduler records");
-        return false;
-    }
-    return true;
-}
 
 extern "C" bool publish_runtime_chip_swimlane_extensions(Runtime *runtime) noexcept {
     try {
-        if (runtime == nullptr) return true;
-        if (!scheduler_extension_publish_profiling(runtime)) return false;
-        const HostApi *api = nullptr;
-        {
-            std::scoped_lock lock(scheduler_state_owners_mutex);
-            auto it = scheduler_state_owners.find(runtime);
-            if (it == scheduler_state_owners.end()) return true;
-            api = it->second.api;
-        }
-        return api != nullptr && publish_aicore_scheduler_profiling(runtime, api);
+        return runtime == nullptr || simpler::percounter::publish_calendar_profiling(runtime);
     } catch (...) {
         return false;
     }
@@ -1001,14 +513,14 @@ struct HostOrchEntryPoints {
 // host staging, each as [GraphImageHeader][Definition image] at the offset it
 // claimed, so this pass writes the headers, copies in whatever did not fit, and
 // records the used prefix for synchronous publication.
+using GraphCalendarHints = std::map<int32_t, simpler::hbg::GraphCalendarHint>;
+
 bool bind_graph_definitions(
-    Runtime *runtime, const HostApi *api, GraphHostState &graph_state, NativeGraphHostPlan *native_plan,
-    int32_t total_tasks
+    Runtime *runtime, const HostApi *api, GraphHostState &graph_state, int32_t total_tasks,
+    GraphCalendarHints &calendar_hints
 ) {
-    *native_plan = NativeGraphHostPlan{};
-    std::vector<uint32_t> invocation_definitions;
-    if (graph_host_upload_count(graph_state) != 0)
-        invocation_definitions.resize(static_cast<size_t>(total_tasks), SCHEDULER_NATIVE_NO_INSTANCE);
+    std::vector<bool> bound_invocations;
+    if (graph_host_upload_count(graph_state) != 0) bound_invocations.resize(static_cast<size_t>(total_tasks), false);
     const size_t count = graph_host_upload_count(graph_state);
     std::vector<GraphHostImage> definitions = graph_host_definitions(graph_state);
     const auto align_up = [](size_t value) {
@@ -1019,7 +531,6 @@ bool bind_graph_definitions(
         size_t image_bytes;     // the Definition image alone
         const std::byte *copy;  // the image to copy in, or nullptr when built in place
         uint64_t execution_bytes{0};
-        uint32_t native_index{SCHEDULER_NATIVE_NO_INSTANCE};
     };
     std::unordered_map<uint64_t, PackedDefinition> packed;
     // Objects the recorders built already occupy the arena's used prefix at the
@@ -1088,22 +599,12 @@ bool bind_graph_definitions(
     for (auto &[key, object] : packed) {
         const auto *image = staging + object.object_offset + sizeof(GraphImageHeader);
         std::string error;
-        if constexpr (task_image::native_graph_plan) {
-            NativeGraphPlan definition;
-            if (!native_graph_plan_definition(image, object.image_bytes, key, &definition, &error)) {
-                LOG_ERROR("host-orch: invalid native Graph Definition: %s", error.c_str());
-                return false;
-            }
-            object.execution_bytes = definition.args_bytes;
-            object.native_index = static_cast<uint32_t>(native_plan->definitions.size());
-            native_plan->definitions.push_back(std::move(definition));
-        } else if (!native_graph_validate_definition(image, object.image_bytes, key, &error)) {
+        if (!validate_graph_image(image, object.image_bytes, key, &error)) {
             LOG_ERROR("host-orch: invalid Graph Definition: %s", error.c_str());
             return false;
         }
         const auto &definition = *reinterpret_cast<const Graph *>(image);
-        if constexpr (!task_image::native_graph_plan)
-            if (!task_image::graph_storage_bytes(definition, &object.execution_bytes)) return false;
+        if (!task_image::graph_storage_bytes(definition, &object.execution_bytes)) return false;
         for (int32_t task = 0; task < definition.task_count; ++task) {
             SubTaskDefinition child{};
             std::memcpy(
@@ -1166,27 +667,13 @@ bool bind_graph_definitions(
         upload->outer_slot->graph_context = nullptr;
         const TaskId shell_id = upload->outer_slot->to_descriptor().task_id;
         if (!shell_id.is_global() || shell_id.local_id() < 0 || shell_id.local_id() >= total_tasks ||
-            invocation_definitions[static_cast<size_t>(shell_id.local_id())] != SCHEDULER_NATIVE_NO_INSTANCE) {
+            bound_invocations[static_cast<size_t>(shell_id.local_id())]) {
             LOG_ERROR("host-orch: invalid or duplicate Graph shell identity");
             return false;
         }
-        if constexpr (task_image::native_graph_plan) {
-            invocation_definitions[static_cast<size_t>(shell_id.local_id())] = object_it->second.native_index;
-        } else {
-            invocation_definitions[static_cast<size_t>(shell_id.local_id())] = 0;
-            if (upload->calendar_hint) native_plan->calendar_hints.emplace(shell_id.local_id(), *upload->calendar_hint);
-        }
+        bound_invocations[static_cast<size_t>(shell_id.local_id())] = true;
+        if (upload->calendar_hint) calendar_hints.emplace(shell_id.local_id(), *upload->calendar_hint);
     }
-    if (task_image::native_graph_plan && !invocation_definitions.empty()) {
-        std::string error;
-        if (!native_graph_plan_nodes(invocation_definitions, native_plan, &error)) {
-            LOG_ERROR("host-orch: invalid native Graph node map: %s", error.c_str());
-            return false;
-        }
-    }
-    if (task_image::native_graph_plan && block_bytes != 0 &&
-        api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES))
-        native_plan->original_definition_section.assign(staging, staging + block_bytes);
     return true;
 }
 
@@ -1208,11 +695,7 @@ struct GraphHostStateBinding {
 // the profiling lookup and the descriptor's references to that target.
 void release_scheduler_state(Runtime *runtime) {
     if (runtime == nullptr) return;
-    scheduler_extension_release(runtime);
-    {
-        std::scoped_lock lock(scheduler_state_owners_mutex);
-        scheduler_state_owners.erase(runtime);
-    }
+    simpler::percounter::release_calendar_profiling(runtime);
     runtime->publish_scheduler_bootstrap(0, 0);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
         runtime->get_workers()[i].aicpu_ready = 0;
@@ -1220,227 +703,10 @@ void release_scheduler_state(Runtime *runtime) {
     }
 }
 
-bool plan_scheduler_args_dump(
-    Runtime *runtime, const void *uploaded_sm, const sm_layout::SegmentOffsets &segments,
-    const SharedMemoryHandle &host_sm_handle, const std::vector<SchedulerTaskMetadata> &metadata,
-    const NativeGraphHostPlan &native_plan, std::vector<SchedulerArgsDumpTask> *selected
-) {
-    const auto level = static_cast<DumpArgsLevel>(runtime->dev.dump_args_level);
-    if (level == DumpArgsLevel::OFF) return true;
-    const uint64_t device_sm = reinterpret_cast<uint64_t>(runtime->dev.gm_sm_ptr_);
-    const auto image_address = [&](const void *address) {
-        return address == nullptr ?
-                   UINT64_C(0) :
-                   device_sm + (static_cast<const char *>(address) - static_cast<const char *>(uploaded_sm));
-    };
-    for (uint64_t ref = 0; ref < metadata.size(); ++ref) {
-        const auto &shape = metadata[ref];
-        if (!scheduler_task_is_executable(shape.flags) || scheduler_task_is_inline(shape.flags)) continue;
-        SchedulerArgsDumpTask task{};
-        task.task_ref = ref;
-        for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
-            task.kernel_id[lane] = shape.kernel_ids[lane];
-            if (shape.active_mask.has(static_cast<SubtaskSlot>(lane))) task.active_mask |= UINT64_C(1) << lane;
-        }
-        task.expected_participants = static_cast<uint64_t>(shape.logical_block_num) * shape.active_mask.count();
-        if (task.expected_participants == 0 || task.expected_participants > INT16_MAX) return false;
-        const SchedulerNodeBinding *binding = native_plan.instances.empty() ? nullptr : &native_plan.bindings[ref];
-        if (binding != nullptr && binding->kind == SchedulerNodeKind::CHILD_KERNEL) {
-            const auto &instance = native_plan.instances[binding->instance_index];
-            const auto &definition = native_plan.definitions[instance.definition_index];
-            const auto &child = definition.children[binding->source_index];
-            const auto *definitions = reinterpret_cast<const SubTaskDefinition *>(
-                definition.image.data() + definition.definition.off_sub_tasks
-            );
-            task.dump_metadata = definitions[binding->source_index].dump_metadata;
-            task.task_id = TaskId::make_sub_task(instance.original_shell_id, binding->source_index);
-            task.tensor_count = child.tensor_count;
-            task.scalar_count = child.scalar_count;
-            task.tensors_address = child.tensor_count == 0 ? 0 : instance.args_base + child.tensors_offset;
-            task.scalars_address = child.scalar_count == 0 ? 0 : instance.args_base + child.scalars_offset;
-            task.argument_region_base = instance.args_base;
-            task.argument_region_bytes = definition.args_bytes;
-        } else {
-            if (binding != nullptr && binding->kind != SchedulerNodeKind::TOP_KERNEL) continue;
-            const uint64_t original = binding == nullptr ? ref : binding->source_index;
-            const auto &payload = task_image::payload(uploaded_sm, segments, original);
-            const auto &source = host_sm_handle.header->tasks.storage_at(original);
-            if (payload.tensor_count < 0 || payload.tensor_count > CORE_MAX_TENSOR_ARGS || payload.scalar_count < 0 ||
-                payload.scalar_count > CORE_MAX_SCALAR_ARGS)
-                return false;
-            task.dump_metadata = source.payload.dump_metadata;
-            task.task_id = source.task.task_id;
-            task.tensor_count = payload.tensor_count;
-            task.scalar_count = payload.scalar_count;
-            task.tensors_address = task.tensor_count == 0 ? 0 : image_address(payload.tensor_data());
-            task.scalars_address = task.scalar_count == 0 ? 0 : image_address(payload.scalar_data());
-            task.argument_region_base = device_sm;
-            task.argument_region_bytes = runtime->dev.sm_image_bytes;
-        }
-        if ((task.tensor_count != 0 || task.scalar_count != 0) &&
-            dump_args_task_selected(level, task.dump_metadata.dump_arg_mask))
-            selected->push_back(task);
-    }
-    return true;
-}
-
-bool prepare_scheduler_calls(
-    Runtime *runtime, void *host_base, const AicoreSchedulerLayout &layout, uint64_t device_base,
-    const void *uploaded_sm, const sm_layout::SegmentOffsets &segments, const NativeGraphHostPlan &native_plan
-) {
-    if (layout.prepared_layout_offset == 0) return true;
-    const char *platform = get_platform();
-    if (std::strcmp(platform, "a5") != 0 && std::strcmp(platform, "a5sim") != 0) return false;
-    const auto address_space = std::strcmp(platform, "a5sim") == 0 ? SchedulerCallableAddressSpace::HOST :
-                                                                     SchedulerCallableAddressSpace::DEVICE;
-    const uint64_t host_image = reinterpret_cast<uint64_t>(uploaded_sm);
-    const uint64_t device_image = reinterpret_cast<uint64_t>(runtime->dev.gm_sm_ptr_);
-    const auto image_address = [&](const void *address, uint64_t bytes, uint64_t &device_address) {
-        device_address = 0;
-        if (bytes == 0) return true;
-        const uint64_t source = reinterpret_cast<uint64_t>(address);
-        if (source < host_image || source - host_image > runtime->dev.sm_image_bytes ||
-            bytes > runtime->dev.sm_image_bytes - (source - host_image) ||
-            source - host_image > UINT64_MAX - device_image)
-            return false;
-        device_address = device_image + (source - host_image);
-        return true;
-    };
-    std::vector<uint8_t *> instance_arguments(native_plan.instances.size(), nullptr);
-    for (size_t i = 0; i < native_plan.instances.size(); ++i) {
-        const auto &instance = native_plan.instances[i];
-        const auto &definition = native_plan.definitions[instance.definition_index];
-        if (definition.args_bytes > SIZE_MAX - 63) return false;
-        std::vector<uint8_t> bytes(static_cast<size_t>(definition.args_bytes) + 63);
-        auto *arguments =
-            reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(bytes.data()) + 63) & ~uintptr_t{63});
-        const auto &boundary = task_image::payload(uploaded_sm, segments, instance.original_shell_id);
-        if (boundary.tensor_count < 0 || boundary.scalar_count < 0 ||
-            instance.args_base < definition.definition.required_heap)
-            return false;
-        const NativeGraphArguments binding_arguments{
-            boundary.tensor_data(),
-            boundary.scalar_data(),
-            static_cast<uint32_t>(boundary.tensor_count),
-            static_cast<uint32_t>(boundary.scalar_count),
-            instance.args_base - definition.definition.required_heap,
-            instance.args_base
-        };
-        for (uint32_t child = 0; child < instance.child_count; ++child) {
-            const int64_t ref = instance.child_begin + child;
-            if (native_plan.bindings[ref].kind != SchedulerNodeKind::CHILD_KERNEL) continue;
-            const auto error = native_graph_bind_arguments(definition, child, binding_arguments, arguments);
-            if (error != NativeGraphBindingError::NONE) {
-                LOG_ERROR(
-                    "A5 HBG: Host Graph binding failed node=%" PRId64 " error=%u", ref, static_cast<unsigned>(error)
-                );
-                return false;
-            }
-        }
-        if (definition.args_bytes != 0) {
-            instance_arguments[i] = arguments;
-            runtime->add_pending_metadata(
-                reinterpret_cast<void *>(instance.args_base), arguments, static_cast<size_t>(definition.args_bytes),
-                HostPhaseKind::Count, {}, std::move(bytes)
-            );
-        }
-    }
-    const auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
-    const bool flat_index =
-        native_plan.instances.empty() && layout.prepared.execution_count <= UINT64_C(1) + UINT32_MAX;
-    uint64_t prepared_count = 0;
-    uint64_t skip_cache = 0, range_cache = 0, full_cache = 0;
-    for (uint64_t ref = 0; ref < layout.task_count; ++ref) {
-        const auto &meta = metadata[ref];
-        if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
-        if (flat_index && meta.trace_index_base != prepared_count) {
-            LOG_ERROR("A5 HBG: flat Call prefix disagrees with trace index at node=%" PRIu64, ref);
-            return false;
-        }
-        uint64_t functions[SUBTASK_SLOT_COUNT]{};
-        for (uint8_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane)
-            if (meta.active_mask.has(static_cast<SubtaskSlot>(lane)))
-                functions[lane] = scheduler_resolve_callable_entry(
-                    runtime->get_function_bin_addr(meta.kernel_ids[lane]), address_space
-                );
-        uint64_t tensors_address = 0;
-        const void *bound_tensors = nullptr;
-        const uint64_t *scalars = nullptr;
-        uint32_t tensor_count = 0, scalar_count = 0;
-        const auto *binding = native_plan.instances.empty() ? nullptr : &native_plan.bindings[ref];
-        if (binding != nullptr && binding->kind == SchedulerNodeKind::CHILD_KERNEL) {
-            const auto &instance = native_plan.instances[binding->instance_index];
-            const auto &child = native_plan.definitions[instance.definition_index].children[binding->source_index];
-            tensor_count = child.tensor_count;
-            scalar_count = child.scalar_count;
-            if (tensor_count != 0) {
-                tensors_address = instance.args_base + child.tensors_offset;
-                bound_tensors = instance_arguments[binding->instance_index] + child.tensors_offset;
-            }
-            if (scalar_count != 0)
-                scalars = reinterpret_cast<const uint64_t *>(
-                    instance_arguments[binding->instance_index] + child.scalars_offset
-                );
-        } else {
-            if (binding != nullptr && binding->kind != SchedulerNodeKind::TOP_KERNEL) return false;
-            const auto &payload =
-                task_image::payload(uploaded_sm, segments, binding == nullptr ? ref : binding->source_index);
-            if (payload.tensor_count < 0 || payload.scalar_count < 0) return false;
-            tensor_count = static_cast<uint32_t>(payload.tensor_count);
-            scalar_count = static_cast<uint32_t>(payload.scalar_count);
-            bound_tensors = payload.tensor_data();
-            uint64_t scalars_address = 0;
-            if (!image_address(
-                    payload.tensor_data(), uint64_t{tensor_count} * TASK_IMAGE_TENSOR_STRIDE, tensors_address
-                ) ||
-                !image_address(payload.scalar_data(), uint64_t{scalar_count} * sizeof(uint64_t), scalars_address))
-                return false;
-            scalars = payload.scalar_data();
-        }
-        SchedulerHostInputCache input_cache[SUBTASK_SLOT_COUNT]{};
-        const bool may_read_async = (meta.flags & SCHEDULER_TASK_ASYNC_INPUT) != 0;
-        if (may_read_async) {
-            for (uint8_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
-                if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-                input_cache[lane] = scheduler_bind_input_cache(
-                    runtime->get_function_input_cache_proof(meta.kernel_ids[lane]), bound_tensors, tensor_count,
-                    static_cast<SubtaskSlot>(lane)
-                );
-                const uint8_t count = input_cache[lane].count;
-                if (count == SCHEDULER_INPUT_CACHE_SKIP) {
-                    skip_cache += meta.logical_block_num;
-                } else {
-                    (count == SCHEDULER_INPUT_CACHE_FULL ? full_cache : range_cache) += meta.logical_block_num;
-                }
-            }
-        }
-        if (!scheduler_prepare_host_calls(
-                host_base, layout, device_base, static_cast<int64_t>(ref), functions, tensors_address, scalars,
-                tensor_count, scalar_count, may_read_async ? input_cache : nullptr
-            )) {
-            LOG_ERROR("A5 HBG: Host Call preparation failed node=%" PRIu64, ref);
-            return false;
-        }
-        prepared_count += static_cast<uint64_t>(meta.logical_block_num) * meta.active_mask.count();
-    }
-    LOG_TIMING(
-        "A5 HBG: async consumer cache plans skip=%" PRIu64 " range=%" PRIu64 " full=%" PRIu64, skip_cache, range_cache,
-        full_cache
-    );
-    return prepared_count == layout.prepared.execution_count;
-}
-
-struct NativeGraphPlacement {
-    std::byte *host_base{nullptr};
-    uint64_t device_base{0};
-    uint64_t bytes{0};
-    uint64_t header_offset{0};
-};
-
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
-    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
-    void *uploaded_sm, const NativeGraphPlacement &native_image
+    uint64_t task_window_size, const GraphCalendarHints &calendar_hints,
+    const sm_layout::SegmentOffsets &device_segments, void *uploaded_sm
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1449,24 +715,6 @@ bool create_scheduler_state(
         );
         return false;
     }
-    const SchedulerGraphView host_graph = scheduler_ordinary_graph_view(
-        reinterpret_cast<uint64_t>(static_cast<const char *>(uploaded_sm) + device_segments.storage),
-        static_cast<uint32_t>(total_tasks), task_window_size - 1
-    );
-    if (!scheduler_graph_view_valid(host_graph) || device_segments.fanin_pool > device_segments.tensor_pool)
-        return false;
-    const SchedulerOrdinaryFaninPool pool{
-        reinterpret_cast<int32_t *>(static_cast<char *>(uploaded_sm) + device_segments.fanin_pool),
-        (device_segments.tensor_pool - device_segments.fanin_pool) / sizeof(int32_t)
-    };
-    const bool native_graph = !native_plan.instances.empty();
-    const bool collect_fanin = task_image::native_graph_plan && !native_graph;
-    SchedulerDependencyPlan dependencies;
-    if (collect_fanin) {
-        dependencies.fanin.resize(total_tasks);
-        dependencies.host_done.assign(total_tasks, false);
-    }
-    const uint64_t node_count = native_graph ? native_plan.bindings.size() : static_cast<uint64_t>(total_tasks);
     const int32_t worker_count = runtime->get_worker_count();
     if (worker_count <= 0 || worker_count > static_cast<int32_t>(SCHEDULER_WORKER_CAPACITY) ||
         worker_count % PLATFORM_CORES_PER_BLOCKDIM != 0) {
@@ -1475,17 +723,7 @@ bool create_scheduler_state(
     }
     std::vector<int64_t> inline_completed_task_refs;
     std::vector<SchedulerTaskMetadata> task_metadata(static_cast<size_t>(total_tasks));
-    uint64_t control_task_count = 0;
-    uint64_t graph_shell_count = 0;
-    bool sampled_task_timing_enabled = false;
-    uint64_t executable_task_count = 0;
-    uint64_t executable_subtask_count = 0;
-    uint64_t cooperative_task_count = 0;
-    uint64_t mix_task_count = 0;
-    uint64_t sync_mix_task_count = 0;
-    uint64_t aic_worker_demand = 0;
-    uint64_t aiv_worker_demand = 0;
-    int64_t trace_overflow_task_ref = -1;
+    uint64_t classified = 0;
     // The progress byte is PENDING or COMPLETED throughout this walk, never
     // PUBLISHED: that value is stored only by the device dispatch path, which
     // has not run yet, and orch::prepare_task resets every claimed slot this
@@ -1494,48 +732,40 @@ bool create_scheduler_state(
     for (int64_t task_ref = 0; task_ref < total_tasks; ++task_ref) {
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_ref);
         if (slot.task_kind == TaskKind::GRAPH) {
-            ++graph_shell_count;
+            ++classified;
             continue;
         }
-        SchedulerTaskShape shape{};
-        const auto status = task_image::native_graph_plan ? scheduler_classify_host_task(
-                                                                host_graph, task_ref, &shape, pool,
-                                                                collect_fanin ? &dependencies.fanin[task_ref] : nullptr
-                                                            ) :
-                                                            scheduler_classify_task_shape(host_graph, task_ref, &shape);
+        const auto &packed = task_image::task_at(uploaded_sm, device_segments, task_ref);
+        const auto &payload = packed.payload;
         bool inline_dispatch_task = false;
-        if (status != SchedulerGraphResult::OK) {
-            bool inline_completed_task =
-                status == SchedulerGraphResult::UNSUPPORTED_SHAPE && slot.active_mask.is_empty() &&
-                slot.logical_block_num == 1 && slot.total_required_subtasks == 0 &&
-                host_sm_handle.header->tasks.is_completed(task_ref) && slot.task_attrs.allow_early_resolve() &&
-                !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
-            if (inline_completed_task) {
-                if (collect_fanin) {
-                    dependencies.host_done[task_ref] = true;
-                    dependencies.fanin[task_ref].clear();
-                }
+        if (packed.task.task_id != TaskId::make_global(task_ref) || payload.fanin_count < 0 ||
+            payload.fanin_count > CHIP_MAX_FANIN || (payload.fanin_count > 0 && payload.fanin_data() == nullptr)) {
+            LOG_ERROR("A5 HBG calendar: invalid task or fanin count at ref=%" PRId64, task_ref);
+            return false;
+        }
+        const auto *fanins = payload.fanin_data();
+        for (int32_t i = 0; i < payload.fanin_count; ++i) {
+            if (fanins[i] < 0 || fanins[i] >= task_ref || std::find(fanins, fanins + i, fanins[i]) != fanins + i) {
+                LOG_ERROR("A5 HBG calendar: invalid fanin at task ref=%" PRId64, task_ref);
+                return false;
+            }
+        }
+        LaneMask active_mask = slot.active_mask;
+        if (slot.active_mask.is_empty()) {
+            const bool control_shape = slot.logical_block_num == 1 && slot.total_required_subtasks == 0 &&
+                                       !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
+            const bool completed = host_sm_handle.header->tasks.is_completed(task_ref);
+            if (control_shape && completed && slot.task_attrs.allow_early_resolve()) {
                 inline_completed_task_refs.push_back(task_ref);
                 continue;
             }
-            inline_dispatch_task = status == SchedulerGraphResult::UNSUPPORTED_SHAPE && slot.active_mask.is_empty() &&
-                                   slot.logical_block_num == 1 && slot.total_required_subtasks == 0 &&
-                                   !host_sm_handle.header->tasks.is_completed(task_ref) &&
-                                   !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
-            if (!inline_dispatch_task) {
-                LOG_ERROR(
-                    "A5 HBG AICore scheduler: invalid task ref=%" PRId64 " status=%" PRIu64, task_ref,
-                    static_cast<uint64_t>(status)
-                );
+            if (!control_shape || completed) {
+                LOG_ERROR("A5 HBG calendar: invalid no-kernel task ref=%" PRId64, task_ref);
                 return false;
             }
-            shape.active_mask = LaneMask::aiv0();
+            inline_dispatch_task = true;
+            active_mask = LaneMask::aiv0();
         }
-        // An inline control task routes through AIV0 with no kernel execution
-        // or trace cell, so it contributes no physical subtask count.
-        const LaneMask classified_active_mask = shape.active_mask;
-        const LaneMask metadata_active_mask = inline_dispatch_task ? classified_active_mask : slot.active_mask;
-        const LaneMask active_mask = metadata_active_mask;
         const uint32_t active_subtasks = static_cast<uint32_t>(active_mask.count());
         if (slot.logical_block_num <= 0) {
             LOG_ERROR(
@@ -1554,7 +784,7 @@ bool create_scheduler_state(
             );
             return false;
         }
-        if ((!inline_dispatch_task && (slot.active_mask != classified_active_mask ||
+        if ((!inline_dispatch_task && (!slot.active_mask.is_valid() ||
                                        static_cast<uint32_t>(slot.total_required_subtasks) != expected_subtasks)) ||
             host_sm_handle.header->tasks.is_completed(task_ref) ||
             (slot.task_attrs.has_predicate() && (active_subtasks != 1 || logical_block_num != 1))) {
@@ -1566,9 +796,11 @@ bool create_scheduler_state(
             return false;
         }
         for (uint32_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
-            if (!active_mask.has(static_cast<SubtaskSlot>(subtask_slot)) || inline_dispatch_task) continue;
-            const int32_t kernel_id = shape.kernel_ids[subtask_slot];
-            if (kernel_id < 0 || kernel_id >= CHIP_MAX_FUNC_ID || runtime->get_function_bin_addr(kernel_id) == 0) {
+            const bool enabled = slot.active_mask.has(static_cast<SubtaskSlot>(subtask_slot));
+            const int32_t kernel_id = packed.task.kernel_id[subtask_slot];
+            if ((!enabled && kernel_id != INVALID_KERNEL_ID) ||
+                (enabled &&
+                 (kernel_id < 0 || kernel_id >= CHIP_MAX_FUNC_ID || runtime->get_function_bin_addr(kernel_id) == 0))) {
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: task ref=%" PRId64 " kernel id %d has no registered callable", task_ref,
                     kernel_id
@@ -1576,9 +808,10 @@ bool create_scheduler_state(
                 return false;
             }
         }
-        const auto *predicate = scheduler_node_predicate(host_graph, task_ref);
-        if (predicate == nullptr ||
-            !scheduler_dispatch_predicate_metadata_valid(predicate->addr, predicate->elem_size, predicate->op)) {
+        const auto &predicate = payload.predicate;
+        if (!scheduler_dispatch_predicate_metadata_valid(
+                predicate.addr, predicate.elem_size, static_cast<uint8_t>(predicate.op)
+            )) {
             LOG_ERROR("A5 HBG AICore scheduler: task ref=%" PRId64 " has malformed predicate metadata", task_ref);
             return false;
         }
@@ -1586,622 +819,25 @@ bool create_scheduler_state(
             LOG_ERROR("A5 HBG AICore scheduler: sync-start task ref=%" PRId64 " must have block_num > 1", task_ref);
             return false;
         }
-        if (!scheduler_resident_task_shape_supported(
-                active_subtasks, logical_block_num, slot.task_attrs.requires_sync_start()
-            )) {
-            LOG_ERROR("A5 HBG AICore scheduler: task ref=%" PRId64 " has an unsupported shape", task_ref);
-            return false;
-        }
-        uint64_t next_subtask_count = executable_subtask_count;
-        if (!inline_dispatch_task &&
-            !scheduler_trace_count_checked(executable_subtask_count, expected_subtasks, &next_subtask_count)) {
-            if (trace_overflow_task_ref < 0) trace_overflow_task_ref = task_ref;
-            if (!scheduler_layout_checked_add(executable_subtask_count, expected_subtasks, &next_subtask_count)) {
-                LOG_ERROR("A5 HBG AICore scheduler: task ref=%" PRId64 " overflows the subtask count", task_ref);
-                return false;
-            }
-        }
         SchedulerTaskMetadata &metadata = task_metadata[static_cast<size_t>(task_ref)];
         for (uint32_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
-            metadata.kernel_ids[subtask_slot] = active_mask.has(static_cast<SubtaskSlot>(subtask_slot)) ?
-                                                    static_cast<uint16_t>(shape.kernel_ids[subtask_slot]) :
-                                                    UINT16_MAX;
+            metadata.kernel_ids[subtask_slot] = static_cast<uint16_t>(packed.task.kernel_id[subtask_slot]);
         }
         metadata.active_mask = active_mask;
-        metadata.flags = scheduler_task_metadata_flags_from_submit_state(
-            metadata_active_mask, slot.task_attrs, slot.logical_block_num, inline_dispatch_task
-        );
-        metadata.trace_index_base =
-            executable_subtask_count <= UINT32_MAX ? static_cast<uint32_t>(executable_subtask_count) : 0;
-        metadata.timing_slot = inline_dispatch_task ? -1 : static_cast<int16_t>(slot.task_attrs.timing_slot());
+        metadata.inline_task = inline_dispatch_task;
         metadata.logical_block_num = static_cast<uint16_t>(logical_block_num);
-        sampled_task_timing_enabled =
-            sampled_task_timing_enabled ||
-            (metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT);
-        auto demand = scheduler_minimum_worker_demand(active_mask);
-        if (slot.task_attrs.requires_sync_start() &&
-            !scheduler_resident_worker_demand_checked(active_mask, logical_block_num, true, worker_count, &demand)) {
-            LOG_ERROR(
-                "A5 HBG AICore scheduler: sync-start task ref=%" PRId64
-                " block_num=%u lanes=aic%d/aiv0%d/aiv1%d exceeds distinct execution positions in %d workers",
-                task_ref, logical_block_num, active_mask.has_aic(), active_mask.has_aiv0(), active_mask.has_aiv1(),
-                worker_count
-            );
-            return false;
-        }
-        aic_worker_demand = std::max<uint64_t>(aic_worker_demand, demand.aic);
-        aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, demand.aiv);
-        if (!inline_dispatch_task) {
-            if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
-            if (slot.task_attrs.requires_sync_start()) {
-                ++cooperative_task_count;
-                if (scheduler_task_is_mix(metadata.flags)) ++sync_mix_task_count;
-            }
-        }
-        executable_subtask_count = next_subtask_count;
-        ++executable_task_count;
+        ++classified;
     }
 
-    if (executable_task_count + inline_completed_task_refs.size() + graph_shell_count !=
-            static_cast<uint64_t>(total_tasks) ||
-        (task_image::native_graph_plan && graph_shell_count != native_plan.instances.size())) {
-        LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
-        return false;
-    }
-    // An extension receives the validated top-level graph before native Graph
-    // expansion and owns the remaining bind when it accepts the graph.
-    const auto extension = scheduler_extension_select(
-        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs,
-        native_plan.calendar_hints, device_segments, uploaded_sm
+    if (classified + inline_completed_task_refs.size() != static_cast<uint64_t>(total_tasks)) return false;
+    return simpler::percounter::publish_calendar_state(
+        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs, calendar_hints,
+        device_segments, uploaded_sm
     );
-    if (extension != SchedulerExtensionResult::DECLINED) return extension == SchedulerExtensionResult::TAKEN;
-    if (native_graph) {
-        std::vector<SchedulerTaskMetadata> expanded(node_count);
-        for (uint64_t ref = 0; ref < node_count; ++ref) {
-            auto &binding = native_plan.bindings[ref];
-            auto &metadata = expanded[ref];
-            if (binding.instance_index == SCHEDULER_NATIVE_NO_INSTANCE) {
-                const uint32_t original = binding.source_index;
-                metadata = task_metadata[original];
-                if (host_sm_handle.header->tasks.is_completed(original)) {
-                    binding.kind = SchedulerNodeKind::HOST_DONE;
-                } else if (scheduler_task_is_inline(metadata.flags)) {
-                    binding.kind = SchedulerNodeKind::CONTROL_DUMMY;
-                    metadata.active_mask = LaneMask::none();
-                    metadata.flags = 0;
-                    --executable_task_count;
-                    ++control_task_count;
-                }
-                continue;
-            }
-            const auto &instance = native_plan.instances[binding.instance_index];
-            const auto &definition = native_plan.definitions[instance.definition_index];
-            if (binding.kind != SchedulerNodeKind::CHILD_KERNEL) {
-                metadata.active_mask = LaneMask::none();
-                metadata.logical_block_num = 1;
-                metadata.flags = 0;
-                metadata.timing_slot = -1;
-                for (auto &kernel : metadata.kernel_ids)
-                    kernel = UINT16_MAX;
-                ++control_task_count;
-                continue;
-            }
-            metadata = definition.children[binding.source_index].metadata;
-            metadata.trace_index_base = static_cast<uint32_t>(executable_subtask_count);
-            const uint32_t lanes = static_cast<uint32_t>(metadata.active_mask.count());
-            uint32_t executions = 0;
-            uint64_t next_count = 0;
-            if (!scheduler_subtask_count_checked(metadata.logical_block_num, lanes, &executions) ||
-                !scheduler_trace_count_checked(executable_subtask_count, executions, &next_count)) {
-                LOG_ERROR("A5 HBG: native child trace count overflow ref=%" PRIu64, ref);
-                return false;
-            }
-            executable_subtask_count = next_count;
-            sampled_task_timing_enabled = sampled_task_timing_enabled || metadata.timing_slot >= 0;
-            auto demand = scheduler_minimum_worker_demand(metadata.active_mask);
-            if (scheduler_task_requires_sync_start(metadata.flags) &&
-                !scheduler_resident_worker_demand_checked(
-                    metadata.active_mask, metadata.logical_block_num, true, worker_count, &demand
-                )) {
-                LOG_ERROR("A5 HBG: native child exceeds sync-start worker capacity ref=%" PRIu64, ref);
-                return false;
-            }
-            aic_worker_demand = std::max<uint64_t>(aic_worker_demand, demand.aic);
-            aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, demand.aiv);
-            if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
-            if (scheduler_task_requires_sync_start(metadata.flags)) {
-                ++cooperative_task_count;
-                if (scheduler_task_is_mix(metadata.flags)) ++sync_mix_task_count;
-            }
-            ++executable_task_count;
-        }
-        for (auto &ref : inline_completed_task_refs)
-            ref = native_plan.completion_refs[ref];
-        task_metadata = std::move(expanded);
-        if (executable_task_count + control_task_count + inline_completed_task_refs.size() != node_count) {
-            LOG_ERROR("A5 HBG: native metadata does not cover all nodes");
-            return false;
-        }
-    }
-    if (trace_overflow_task_ref >= 0) {
-        LOG_ERROR(
-            "A5 HBG AICore scheduler: task ref=%" PRId64 " exceeds the uint32 trace index capacity",
-            trace_overflow_task_ref
-        );
-        return false;
-    }
-
-    const SchedulerSpmdRequirements spmd{
-        static_cast<uint64_t>(worker_count),
-        static_cast<uint64_t>(worker_count / PLATFORM_CORES_PER_BLOCKDIM),
-        cooperative_task_count,
-        mix_task_count,
-        sync_mix_task_count,
-    };
-    for (auto &metadata : task_metadata)
-        if (scheduler_is_exact_owner_wave(metadata, spmd.cluster_count)) metadata.flags |= SCHEDULER_TASK_FIXED_OWNER;
-    const bool protocol_profiling = api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES);
-    std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
-    std::string protocol_source;
-    AicoreSchedulerLayout layout{};
-    if (!scheduler_plan_layout(
-            node_count, &layout,
-            runtime->dev.chip_swimlane_level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
-            executable_subtask_count, spmd, protocol_profiling, api->pmu_enabled()
-        ) ||
-        layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) {
-        LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
-        return false;
-    }
-    // Reserve the wire image before forming the dependency graph. Project once
-    // from the final topological order of actual instance nodes below.
-    SchedulerTaskCatalogPlan task_catalog_plan;
-    if (!scheduler_size_task_catalog(
-            task_metadata, static_cast<uint32_t>(spmd.cluster_count), layout.total_size, &task_catalog_plan
-        )) {
-        LOG_ERROR("A5 HBG: task catalog layout overflow or invalid topology");
-        return false;
-    }
-    layout.total_size = task_catalog_plan.total_size;
-    // Keep the dump image in the published prefix, before the reserved async suffix.
-    std::vector<SchedulerArgsDumpTask> dump_tasks;
-    SchedulerArgsDumpLayout dump_layout{};
-    uint64_t dump_offset = 0;
-    if (!plan_scheduler_args_dump(
-            runtime, uploaded_sm, device_segments, host_sm_handle, task_metadata, native_plan, &dump_tasks
-        ) ||
-        !scheduler_args_dump_plan_layout(
-            node_count, dump_tasks.size(), worker_count, !dump_tasks.empty(), &dump_layout
-        ) ||
-        (dump_layout.total_size != 0 &&
-         (!scheduler_layout_reserve(
-              &layout.total_size, dump_layout.total_size, alignof(SchedulerArgsDumpHeader), &dump_offset
-          ) ||
-          !scheduler_layout_checked_align(
-              layout.total_size, pto2::resident::ASYNC_RECORD_ALIGNMENT, &layout.total_size
-          )))) {
-        LOG_ERROR("A5 HBG: task argument diagnostic image overflow");
-        return false;
-    }
-
-    AsyncCompletionHostPlan async_plan;
-    std::vector<AsyncTaskPlanInput> async_inputs;
-    std::vector<LaneMask> possible_async_lanes(task_metadata.size());
-    for (uint32_t ref = 0; ref < task_metadata.size(); ++ref) {
-        const auto &metadata = task_metadata[ref];
-        if ((metadata.flags & SCHEDULER_TASK_EXECUTABLE) == 0 || scheduler_task_is_inline(metadata.flags)) continue;
-        AsyncTaskPlanInput input;
-        input.task_ref = ref;
-        input.block_count = metadata.logical_block_num;
-        input.active_mask = metadata.active_mask;
-        for (uint32_t lane = 0; lane < 3; ++lane) {
-            if (metadata.active_mask.has(static_cast<SubtaskSlot>(lane)))
-                input.capacities[lane] = MAX_COMPLETIONS_PER_TASK;
-        }
-        possible_async_lanes[ref] = metadata.active_mask;
-        async_inputs.push_back(input);
-    }
-    std::string async_error;
-    if (!plan_async_completion(
-            layout.total_size, api->run_epoch(), static_cast<uint32_t>(node_count), async_inputs, &async_plan,
-            &async_error, static_cast<uint32_t>(spmd.cluster_count)
-        )) {
-        LOG_ERROR("A5 HBG: async completion layout failed: %s", async_error.c_str());
-        return false;
-    }
-    layout.total_size = async_plan.total_bytes;
-    layout.async_layout_offset = async_plan.layout_offset;
-    layout.executable_subtask_count = executable_subtask_count;
-
-    if (!scheduler_plan_scalar_storage(&layout)) {
-        LOG_ERROR("A5 HBG: Scalar record storage overflow");
-        return false;
-    }
-
-    if (layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) return false;
-    const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_BASE_ALIGNMENT - 1;
-    // The host staging and device target are aligned with at least total_size
-    // behind it. Handed over uninitialized and never carrying anything between
-    // runs: initialization publishes the current metadata prefix. Reserved
-    // async storage remains hidden until its first runtime publication.
-    void *device_state = nullptr;
-    void *host_base = nullptr;
-    if (api->acquire_scheduler_state_storage(
-            static_cast<size_t>(layout.total_size), static_cast<size_t>(SCHEDULER_STATE_BASE_ALIGNMENT), &device_state,
-            &host_base
-        ) != 0 ||
-        device_state == nullptr || host_base == nullptr) {
-        LOG_ERROR(
-            "A5 HBG AICore scheduler: failed to obtain %" PRIu64 " scheduler state bytes (%" PRIu64 " with alignment)",
-            layout.total_size, allocation_size
-        );
-        return false;
-    }
-    const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
-    const uint64_t initialized_bytes =
-        async_plan.layout_offset == 0 ?
-            (layout.scalar_records_offset == 0 ? layout.total_size : layout.scalar_records_offset) :
-            async_plan.initialized_bytes;
-    if (!scheduler_init_data_from_layout(host_base, layout, aligned_address, initialized_bytes)) {
-        LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
-        return false;
-    }
-
-    if (layout.async_layout_offset != 0 && !initialize_async_completion(host_base, layout.total_size, async_plan)) {
-        LOG_ERROR("A5 HBG: failed to initialize async completion storage");
-        return false;
-    }
-    if (layout.async_layout_offset != 0)
-        scheduler_state_at<SchedulerAsyncLayout>(host_base, layout.async_layout_offset)->image_bytes =
-            layout.total_size;
-
-    if (dump_layout.total_size != 0) {
-        void *dump_image = static_cast<char *>(host_base) + dump_offset;
-        if (!scheduler_args_dump_init_image(
-                dump_image, dump_layout.total_size, dump_layout, api->run_epoch(),
-                static_cast<DumpArgsLevel>(runtime->dev.dump_args_level)
-            ))
-            return false;
-        for (const auto &task : dump_tasks) {
-            if (!scheduler_args_dump_select_task(dump_image, task)) return false;
-            if (native_plan.instances.empty() ||
-                native_plan.bindings[task.task_ref].kind == SchedulerNodeKind::TOP_KERNEL) {
-                const auto *selected = scheduler_args_dump_task(dump_image, task.task_ref);
-                if (selected == nullptr) return false;
-            }
-        }
-    }
-    if (native_graph) {
-        auto *header =
-            scheduler_state_at<SchedulerNativeGraphHeader>(native_image.host_base, native_image.header_offset);
-        header->run_epoch = api->run_epoch();
-        std::memcpy(
-            native_image.host_base + header->bindings_offset, native_plan.bindings.data(),
-            native_plan.bindings.size() * sizeof(SchedulerNodeBinding)
-        );
-        std::memcpy(
-            native_image.host_base + header->instances_offset, native_plan.instances.data(),
-            native_plan.instances.size() * sizeof(SchedulerGraphInstance)
-        );
-    }
-    SchedulerGraphView dependency_graph = host_graph;
-    if (native_graph) {
-        dependency_graph.task_count = node_count;
-        dependency_graph.native_graph_address = reinterpret_cast<uint64_t>(native_image.host_base);
-        dependency_graph.native_graph_bytes = native_image.bytes;
-        dependency_graph.native_header_offset = native_image.header_offset;
-    }
-    std::string task_order_error;
-    const bool defer_side_tasks = scheduler_can_defer_side_tasks(
-        native_graph, async_plan.layout.group_count != 0, task_catalog_plan.header.control_count, task_metadata
-    );
-    if ((!collect_fanin &&
-         !scheduler_plan_dependencies(
-             dependency_graph, task_metadata, inline_completed_task_refs, dependencies, &task_order_error
-         )) ||
-        !scheduler_order_task_catalog(
-            dependencies, task_metadata, &task_catalog_plan, &task_order_error, defer_side_tasks,
-            !native_graph && async_plan.layout.group_count != 0 ? &possible_async_lanes : nullptr
-        )) {
-        LOG_ERROR("A5 HBG: task ordering failed: %s", task_order_error.c_str());
-        return false;
-    }
-    if (!native_graph &&
-        !scheduler_prepare_ordinary_fanin(
-            reinterpret_cast<task_image::Storage *>(static_cast<char *>(uploaded_sm) + device_segments.storage),
-            pool.data, pool.capacity, task_metadata, inline_completed_task_refs, task_catalog_plan, dependencies,
-            &task_order_error
-        )) {
-        LOG_ERROR("A5 HBG: ordinary fanin preparation failed: %s", task_order_error.c_str());
-        return false;
-    }
-    if (!native_graph) {
-        scheduler_plan_static_supply(dependencies, task_metadata, task_catalog_plan);
-        scheduler_elide_proven_mix_floors(dependencies, task_metadata, possible_async_lanes, task_catalog_plan);
-        task_catalog_plan.header.terminal_mix_begin =
-            scheduler_terminal_mix_begin(dependencies, task_metadata, task_catalog_plan);
-        if (async_plan.layout.group_count == 0)
-            scheduler_plan_terminal_mix_calls(dependencies, task_metadata, task_catalog_plan);
-    }
-    std::vector<uint32_t> counter_credits(node_count, 0);
-    for (uint64_t ref = 0; ref < node_count; ++ref) {
-        const auto &metadata = task_metadata[ref];
-        if ((metadata.flags & SCHEDULER_TASK_EXECUTABLE) == 0 || scheduler_task_is_inline(metadata.flags)) continue;
-        uint32_t executions = 0;
-        if (!scheduler_subtask_count_checked(
-                metadata.logical_block_num, scheduler_task_lanes(metadata).count(), &executions
-            ))
-            return false;
-        const uint64_t credits =
-            executions + static_cast<uint64_t>(metadata.logical_block_num) * possible_async_lanes[ref].count();
-        if (credits > UINT32_MAX) {
-            LOG_ERROR("A5 HBG: completion credit count overflows for task=%" PRIu64, ref);
-            return false;
-        }
-        counter_credits[ref] = static_cast<uint32_t>(credits);
-    }
-    // Fresh metadata has no async-input flags. Propagate them only when an async producer exists.
-    if (async_plan.layout.group_count != 0 &&
-        !async_mark_input_visibility(
-            dependencies.fanin, task_catalog_plan.task_order, possible_async_lanes, &task_metadata
-        )) {
-        LOG_ERROR("A5 HBG: invalid dependency order for async input visibility");
-        return false;
-    }
-    SchedulerCompletionCounterPlan counter_plan;
-    if (!scheduler_plan_completion_counters(
-            dependencies.fanin, task_catalog_plan.task_order, counter_credits, &counter_plan, &task_order_error
-        )) {
-        LOG_ERROR("A5 HBG: completion counter plan failed: %s", task_order_error.c_str());
-        return false;
-    }
-    const bool onboard = std::strcmp(get_platform(), "a5") == 0;
-    auto acquire_notifications = [&](SchedulerNotificationPurpose purpose, size_t count,
-                                     SchedulerDoneNotifications &out) {
-        try {
-            if (api->acquire_scheduler_notifications(purpose, count, &out) != 0 || out.addresses.size() != count ||
-                out.add_addresses.size() != count)
-                throw std::runtime_error("incomplete CntNotify allocation");
-            if (onboard) {
-                for (size_t i = 0; i < count; ++i) {
-                    if (purpose == SchedulerNotificationPurpose::BOOTSTRAP_ARRIVAL && out.addresses[i] == 0) continue;
-                    const uint64_t increment = a5_cnt_notify_increment_address(out.addresses[i]);
-                    if (purpose == SchedulerNotificationPurpose::CLAIM_SUPPLY && out.addresses[i] == 0) continue;
-                    if (increment == 0 || (purpose == SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER &&
-                                           out.add_addresses[i] != increment))
-                        throw std::runtime_error("missing or invalid CntNotify slot at index " + std::to_string(i));
-                }
-            }
-        } catch (const std::exception &error) {
-            LOG_ERROR("A5 HBG: cannot prepare %zu scheduler notifications: %s", count, error.what());
-            return false;
-        }
-        if (out.owner != nullptr) runtime->retain_pending_resource(std::move(out.owner));
-        return true;
-    };
-    SchedulerDoneNotifications counter_notifications;
-    if (!acquire_notifications(
-            SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER, counter_plan.chains.size(),
-            counter_notifications
-        ))
-        return false;
-    auto *counter_descriptors =
-        scheduler_state_at<SchedulerTaskCompletionCounter>(host_base, layout.completion_counters_offset);
-    std::vector<uint64_t> legacy_done_refs;
-    uint64_t mapped_counter_tasks = 0;
-    for (uint64_t ref = 0; ref < node_count; ++ref) {
-        const uint32_t chain = counter_plan.task_chains[ref];
-        if (chain != UINT32_MAX && counter_notifications.addresses[chain] != 0 &&
-            counter_notifications.add_addresses[chain] != 0) {
-            counter_descriptors[ref] = {
-                counter_notifications.addresses[chain], counter_notifications.add_addresses[chain],
-                counter_plan.thresholds[ref], counter_plan.chains[chain].limit
-            };
-            ++mapped_counter_tasks;
-        } else if (!dependencies.host_done[ref]) {
-            legacy_done_refs.push_back(ref);
-        }
-    }
-    SchedulerDoneNotifications notifications;
-    if (!acquire_notifications(
-            SchedulerNotificationPurpose::HBG_REQUIRED_TASK_STATE, legacy_done_refs.size(), notifications
-        ))
-        return false;
-    for (size_t index = 0; index < legacy_done_refs.size(); ++index)
-        counter_descriptors[legacy_done_refs[index]] = scheduler_set_completion_source(notifications.addresses[index]);
-    const size_t eligible_counter_tasks =
-        std::count_if(counter_credits.begin(), counter_credits.end(), [](uint32_t credits) {
-            return credits != 0;
-        });
-    const size_t mapped_counter_chains = std::count_if(
-        counter_notifications.add_addresses.begin(), counter_notifications.add_addresses.end(), [](uint64_t address) {
-            return address != 0;
-        }
-    );
-    LOG_TIMING(
-        "A5 HBG: completion counters backend=SET-slot-offset planned_chains=%zu mapped_chains=%zu eligible_tasks=%zu "
-        "mapped_tasks=%" PRIu64 " done_notification_requests=%zu host_completed=%zu",
-        counter_plan.chains.size(), mapped_counter_chains, eligible_counter_tasks, mapped_counter_tasks,
-        legacy_done_refs.size(), inline_completed_task_refs.size()
-    );
-
-    if (protocol_profiling) {
-        try {
-            SchedulerGraphView snapshot = host_graph;
-            if (native_graph) {
-                snapshot.task_count = node_count;
-                snapshot.native_graph_address = reinterpret_cast<uint64_t>(native_image.host_base);
-                snapshot.native_graph_bytes = native_image.bytes;
-                snapshot.native_header_offset = native_image.header_offset;
-                std::vector<SchedulerProtocolSourceTask> sources;
-                sources.reserve(total_tasks);
-                for (int64_t ref = 0; ref < total_tasks; ++ref) {
-                    const auto &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(ref);
-                    const uint32_t kind = slot.task_kind == TaskKind::GRAPH              ? 1 :
-                                          host_sm_handle.header->tasks.is_completed(ref) ? 3 :
-                                          slot.active_mask.is_empty()                    ? 2 :
-                                                                                           0;
-                    sources.push_back({kind, slot.to_descriptor().graph_definition_offset});
-                }
-                protocol_source =
-                    scheduler_protocol_freeze_source(host_graph, sources, native_plan.original_definition_section);
-            }
-            protocol_tasks = scheduler_protocol_freeze_graph(snapshot, task_metadata);
-            for (size_t ref = 0; ref < protocol_tasks.size(); ++ref) {
-                protocol_tasks[ref].order = task_catalog_plan.order_rows[ref];
-                protocol_tasks[ref].topological_level = task_catalog_plan.task_levels[ref];
-                protocol_tasks[ref].bottom_level = task_catalog_plan.task_bottom_levels[ref];
-            }
-        } catch (const std::exception &error) {
-            LOG_ERROR("A5 HBG: failed to freeze protocol graph: %s", error.what());
-            return false;
-        }
-    }
-    scheduler_init_task_catalog(host_base, task_catalog_plan);
-    scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset)->task_catalog_offset =
-        task_catalog_plan.header_offset;
-    auto *task_controls = scheduler_state_at<SchedulerTaskControl>(host_base, layout.task_controls_offset);
-    // A word is shared by independent tasks but each bit has a single lifetime
-    // between bootstrap and resident exit. Bound optional leases for large graphs.
-    if (onboard && !native_graph) {
-        constexpr size_t max_supply_words = 16;
-        struct SupplyField {
-            uint32_t task;
-            uint32_t word;
-            uint32_t mask;
-        };
-        std::vector<SupplyField> fields;
-        uint32_t bit = 0;
-        for (uint32_t ref = 0; ref < node_count; ++ref) {
-            const auto &task = task_metadata[ref];
-            const auto flags = task.flags;
-            if (!scheduler_task_is_executable(flags) || scheduler_task_is_inline(flags) ||
-                scheduler_task_has_fixed_owners(flags) || scheduler_task_has_predicate(flags) ||
-                dependencies.host_done[ref] || task.logical_block_num < 2)
-                continue;
-            const uint32_t width = std::min<uint32_t>(task.logical_block_num, SCHEDULER_CLAIM_SECTOR_COUNT);
-            if (bit % 32 + width > 32) bit += 32 - bit % 32;
-            if (bit / 32 == max_supply_words) break;
-            fields.push_back({ref, bit / 32, ((1U << width) - 1) << (bit % 32)});
-            bit += width;
-        }
-        SchedulerDoneNotifications supply;
-        if (!acquire_notifications(SchedulerNotificationPurpose::CLAIM_SUPPLY, (bit + 31) / 32, supply)) return false;
-        for (const auto &field : fields) {
-            auto &control = task_controls[field.task];
-            control.supply_address = supply.addresses[field.word];
-            control.supply_mask = field.mask;
-        }
-    }
-    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
-    std::copy(task_metadata.begin(), task_metadata.end(), metadata);
-    if (!scheduler_init_spmd_task_records(host_base, layout, api->run_epoch())) {
-        LOG_ERROR("A5 HBG AICore scheduler: invalid cooperative task metadata or run epoch");
-        return false;
-    }
-    // Generic initialization assigns live gates first; Host-completed nodes
-    // override their virtual contribution afterward and cannot be reset live.
-    for (int64_t task_ref : inline_completed_task_refs) {
-        task_controls[task_ref].completion_state = scheduler_completion_completed_state(1);
-    }
-    if (!prepare_scheduler_calls(
-            runtime, host_base, layout, aligned_address, uploaded_sm, device_segments, native_plan
-        ))
-        return false;
-
-    const uint64_t device_sm_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
-    auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, layout.run_control_offset);
-    uint64_t context_ready_address = 0;
-    if (onboard && spmd.cluster_count > 0 && spmd.cluster_count <= 32) {
-        SchedulerDoneNotifications arrival;
-        const bool uses_ssbuf = spmd.mix_task_count != 0;
-        if (!acquire_notifications(SchedulerNotificationPurpose::BOOTSTRAP_ARRIVAL, uses_ssbuf ? 3 : 2, arrival))
-            return false;
-        context_ready_address = arrival.addresses.back();
-        run_control->bootstrap_arrival_address = arrival.addresses.front();
-        if (uses_ssbuf && arrival.addresses[1] != 0) {
-            run_control->bootstrap_init_address = arrival.addresses[1];
-            // Peers wait for INIT in SRAM. Seed the GM DONE accumulator at its existing base.
-            auto *gates = scheduler_state_at<SchedulerBootstrapCluster>(host_base, layout.bootstrap_clusters_offset);
-            for (uint32_t cluster = 0; cluster < spmd.cluster_count; ++cluster)
-                gates[cluster].state = SCHEDULER_BOOTSTRAP_CLUSTER_INIT;
-        }
-    }
-    run_control->sink_count = dependencies.sinks.size();
-    auto *sinks = scheduler_state_at<uint32_t>(host_base, layout.sinks_offset);
-    std::copy(dependencies.sinks.begin(), dependencies.sinks.end(), sinks);
-    run_control->inline_completed_count = inline_completed_task_refs.size();
-    run_control->aic_worker_demand = aic_worker_demand;
-    run_control->aiv_worker_demand = aiv_worker_demand;
-    run_control->chip_swimlane_level = runtime->dev.chip_swimlane_level;
-    run_control->sampled_task_timing_enabled = sampled_task_timing_enabled ? 1 : 0;
-    run_control->graph_summary_offset = layout.graph_summary_offset;
-    run_control->scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
-    run_control->error_task_ref = UINT64_MAX;
-    run_control->error_core_id = UINT64_MAX;
-    run_control->error_core_type = UINT64_MAX;
-    auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, layout.worker_contexts_offset);
-    int32_t aic_rank = 0;
-    int32_t aiv_rank = 0;
-    for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        SchedulerWorkerContext &context = contexts[i];
-        context.core_type = static_cast<int32_t>(runtime->core_type_rule(i));
-        context.physical_core_id = -1;
-        context.type_rank = context.core_type == static_cast<int32_t>(CoreType::AIC) ? aic_rank++ : aiv_rank++;
-        context.run_control_offset = layout.run_control_offset;
-        context.task_controls_offset = layout.task_controls_offset;
-        context.task_metadata_offset = layout.task_metadata_offset;
-        context.completion_counters_offset = mapped_counter_tasks == 0 ? 0 : layout.completion_counters_offset;
-        context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
-        context.worker_contexts_offset = layout.worker_contexts_offset;
-        context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
-        context.graph_summary_offset = layout.graph_summary_offset;
-        context.graph_storage_address = device_sm_address + device_segments.storage;
-        context.scheduler_state_base_address = aligned_address;
-        context.trace_cells_offset = layout.trace_cells_offset;
-        context.pmu_cells_offset = layout.pmu_cells_offset;
-        context.args_dump_address = dump_layout.total_size == 0 ? 0 : aligned_address + dump_offset;
-        context.prepared_layout_offset = layout.prepared_layout_offset;
-        context.task_window_last_index = task_window_size - 1;
-        context.graph_task_count = node_count;
-        context.native_header_offset = native_image.header_offset;
-        context.native_graph_address = native_image.device_base;
-        context.native_graph_bytes = native_image.bytes;
-        context.original_task_count = static_cast<uint64_t>(total_tasks);
-        context.scheduler_state_bytes = layout.total_size;
-        context.worker_index = static_cast<uint64_t>(i);
-    }
-
-    std::vector<uint64_t> public_task_ids;
-    if (runtime->dev.chip_swimlane_level != 0) {
-        public_task_ids.resize(node_count);
-        for (uint64_t ref = 0; ref < node_count; ++ref)
-            if (scheduler_node_identity(dependency_graph, ref, &public_task_ids[ref]) != SchedulerGraphResult::OK)
-                return false;
-    }
-    runtime->publish_scheduler_bootstrap(
-        SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, aligned_address + layout.worker_contexts_offset, context_ready_address
-    );
-    api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
-    {
-        std::scoped_lock lock(scheduler_state_owners_mutex);
-        scheduler_state_owners.emplace(
-            runtime, SchedulerStateOwner{
-                         reinterpret_cast<void *>(aligned_address), std::move(public_task_ids), layout, api,
-                         std::move(protocol_tasks), std::move(protocol_source)
-                     }
-        );
-    }
-    runtime->add_pending_metadata(
-        reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(initialized_bytes),
-        HostPhaseKind::Count, {}
-    );
-    LOG_INFO("A5 HBG: selected AICore Scheduler for %d tasks", total_tasks);
-    return true;
 }
 
 struct HostPreparePlan : RetainedHostPrepareState {
-    NativeGraphHostPlan native_graph;
+    GraphCalendarHints calendar_hints;
 };
 
 int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &plan) {
@@ -2211,21 +847,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     const uint64_t image_bytes = plan.image_bytes;
     const int32_t total_tasks = plan.total_tasks;
     const auto &bind_usage = plan.bind_usage;
-    NativeGraphReadonlyImage native_image;
-    uint64_t native_offset = image_bytes;
-    if (!plan.native_graph.instances.empty()) {
-        std::string error;
-        if (!native_graph_plan_readonly_image(plan.native_graph, &native_image, &error)) {
-            LOG_ERROR("A5 HBG: native graph image failed: %s", error.c_str());
-            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-        }
-        if (!scheduler_layout_checked_align(image_bytes, SCHEDULER_STATE_ALIGNMENT, &native_offset) ||
-            native_offset > SIZE_MAX || native_image.bytes.size() > SIZE_MAX - native_offset) {
-            LOG_ERROR("A5 HBG: native graph image exceeds the task arena size range");
-            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-        }
-    }
-    const uint64_t upload_bytes = native_offset + native_image.bytes.size();
+    const uint64_t upload_bytes = image_bytes;
     const sm_layout::SegmentOffsets device_segments =
         task_image::layout(static_cast<const char *>(host_sm), task_capacity, bind_usage);
     const BindPhaseMark static_arena_phase = bind_phase_begin();
@@ -2303,34 +925,10 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         reinterpret_cast<uint64_t>(device_sm)
     );
     always_assert(compacted == image_bytes);
-    NativeGraphPlacement native_placement;
-    if (!native_image.bytes.empty()) {
-        auto *native_host = reinterpret_cast<std::byte *>(upload_base) + native_offset;
-        std::memset(upload_base + image_bytes, 0, native_offset - image_bytes);
-        std::memcpy(native_host, native_image.bytes.data(), native_image.bytes.size());
-        native_placement = {
-            native_host, reinterpret_cast<uint64_t>(device_sm) + native_offset, native_image.bytes.size(),
-            native_image.header_offset
-        };
-    }
-
-    for (auto &instance : plan.native_graph.instances) {
-        const auto &source = host_sm_handle.header->tasks.storage_at(instance.original_shell_id);
-        const auto &definition = plan.native_graph.definitions[instance.definition_index].definition;
-        const uint64_t heap_base =
-            sm_layout::rebased_heap_addr(reinterpret_cast<uint64_t>(source.task.packed_buffer_base), heap_rebase);
-        if (definition.required_heap > UINT64_MAX - heap_base) return PTO_RUNTIME_ERR_INTERNAL;
-        instance.args_base = heap_base + definition.required_heap;
-    }
     if (!create_scheduler_state(
-            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph, upload_base,
-            native_placement
-        )) {
+            runtime, api, host_sm_handle, total_tasks, task_capacity, plan.calendar_hints, device_segments, upload_base
+        ))
         return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    if (runtime->dev.dump_args_level != static_cast<uint32_t>(DumpArgsLevel::OFF) &&
-        runtime->dev.scheduler_bootstrap.runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING)
-        return PTO_RUNTIME_ERR_UNSUPPORTED;
 
     // Prepared, not published: `publish_run_image_impl` stages this write for
     // the launch-owned upload and records its host staging cost. The pool counters travel
@@ -2384,7 +982,7 @@ int32_t run_host_orchestration(
     storage.swap_storage(orchestrator);
     OrchContext orch_ctx{};
     orch_ctx.orchestrator = &orchestrator;
-    orch_ctx.retain_graph_config_id = scheduler_extension_retains_graph_config_id();
+    orch_ctx.retain_graph_config_id = true;
     RAIIScopeGuard retained_storage_return([&storage, &orchestrator]() {
         storage.swap_storage(orchestrator);
     });
@@ -2538,7 +1136,7 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    if (!bind_graph_definitions(runtime, api, *graph_state, &plan.native_graph, total_tasks)) {
+    if (!bind_graph_definitions(runtime, api, *graph_state, total_tasks, plan.calendar_hints)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
@@ -2991,9 +1589,7 @@ extern "C" int bind_callable_to_runtime_impl(
     api->get_retained_temp_buffer(&plan->staging_backing, &staging_capacity);
     runtime->set_orch_args(device_args);
 
-    // host_build_graph host-orch: run the orchestrator on the host now, against
-    // a host SM mirror. Commit stages the compact task image and resident state
-    // for the launch-owned publication.
+    // Record host tasks into the SM mirror before building their device calendar.
     // register_callable_impl guarantees host_orch_func_ptr is non-null on success
     // (it fails the whole prepare otherwise), so this is an assertion-style
     // guard, not a fallback path.

@@ -3,7 +3,7 @@
 ## Execution Boundary
 
 `host_build_graph` executes orchestration on the host before device launch.
-Resident AIC/AIV workers schedule and execute tasks; AICPU handles startup,
+AIC/AIV workers execute their calendar rows; AICPU handles startup,
 supervision, argument-dump services and retirement. Device logs therefore contain
 no orchestration-thread block or device-side orchestration `dlopen` timing.
 Host construction and bind timing belong in host diagnostics.
@@ -29,7 +29,7 @@ AICPU does not emit a per-task dispatch-loop summary for A5 HBG. Do not expect
 `tasks_scheduled`, `sched_start`, or old AICPU scan/pop/setup breakdowns from
 this runtime.
 
-Scheduler task timing and phases live in the resident capture. At level 2 and
+Scheduler task timing and phases live in the calendar capture. At level 2 and
 above, AICPU lifecycle records describe handshake, configuration, context
 publication, bootstrap wait, gate release and exit. Per-task Completion,
 Resolve, StateProbe, Dispatch and Refill belong to the AICore scheduler.
@@ -55,5 +55,5 @@ Missing task records must not be interpreted as a successful empty run.
 - Chip swimlane and the independent native protocol inspect scheduling,
   execution identities and dependency causality.
 - `simpler_setup.tools.core_swimlane` reconstructs a captured task's intra-core
-  execution from resident argument dumps.
+  execution from argument dumps.
 - The repository's DFX workflow combines timing, dependencies and task records.

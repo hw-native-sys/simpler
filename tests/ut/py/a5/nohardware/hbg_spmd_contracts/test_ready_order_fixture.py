@@ -20,7 +20,7 @@ import torch
 
 @pytest.fixture(scope="module")
 def ready_native():
-    path = Path(__file__).resolve().parents[5] / "fdwic/pa_hbg/spmd/test_ready_order_execution.py"
+    path = Path(__file__).resolve().parents[5] / "support/a5/host_build_graph/spmd/ready_order_execution.py"
     with pytest.MonkeyPatch.context() as patch:
         patch.syspath_prepend(str(path.parent))
         spec = importlib.util.spec_from_file_location("_ready_order_hbg_fixture", path)
@@ -83,7 +83,7 @@ def _sample(native, params, mode="valid", *, b_before_p=False):
         events = start + finish(b[-b_tail_count:]) + enter(a[1:]) + finish(a)
     for ordinal, (row, column) in enumerate(events, 1):
         rows[row, column] = ordinal
-    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=2)
+    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=2)
     test._contract_publish_count = 1
     return test, actual, golden
 

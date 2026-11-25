@@ -30,7 +30,6 @@ Runtime::Runtime() {
     dev.scheduler_bootstrap.runtime_mode = 0;
     dev.scheduler_bootstrap.reserved_ = 0;
     dev.scheduler_bootstrap.worker_context_base = 0;
-    dev.scheduler_bootstrap.context_ready_address = 0;
     dev.scheduler_bootstrap.lifecycle_notify_address = 0;
     dev.scheduler_bootstrap.rejected_exit_address = 0;
     dev.worker_count = 0;

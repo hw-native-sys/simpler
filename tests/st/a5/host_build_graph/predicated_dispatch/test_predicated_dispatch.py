@@ -39,7 +39,7 @@ POISON = 999.0  # what the clobber writes if the predicate lets it dispatch
 INIT_VAL = -1.0
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestPredicatedDispatchA5(SceneTestCase):
     """predicated_dispatch: scheduler evaluates the dispatch predicate at dispatch time."""
@@ -124,7 +124,7 @@ class TestPredicatedDispatchA5(SceneTestCase):
 
     def _run_and_validate(self, worker, *args, **kwargs):
         assert not kwargs.get("skip_golden", False), (
-            "predicate acceptance requires outputs and fresh resident provenance"
+            "predicate acceptance requires outputs and fresh calendar provenance"
         )
         self._selection_worker = worker
         self._selection_publish_count = worker.scheduler_mode_publish_count
@@ -134,7 +134,7 @@ class TestPredicatedDispatchA5(SceneTestCase):
         count = self._selection_worker.scheduler_mode_publish_count
         assert count > self._selection_publish_count, "no fresh scheduler selection for this invocation"
         mode = self._selection_worker.scheduler_runtime_mode
-        assert mode in (1, 2), f"predicate acceptance requires resident scheduling, invocation mode={mode}"
+        assert mode == 5, f"predicate acceptance requires calendar scheduling, invocation mode={mode}"
         self._selection_publish_count = count
         super().compare_outputs(test_args, golden_args, output_names, params)
 

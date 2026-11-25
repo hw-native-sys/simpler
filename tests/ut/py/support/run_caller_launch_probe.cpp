@@ -32,6 +32,7 @@
 #include "native_run_context.h"
 #include "task_args.h"
 #include "common/support/native_run_execution_peer.h"
+#include "support/calendar_notification_lease.h"
 #include "device_runner.h"
 #include "shared_memory.h"
 #include "common/host_span.h"
@@ -784,12 +785,9 @@ static DfxRunConfig requested_native_result() {
 class CpuTransportRunner : public DeviceRunner {
 public:
     int acquire_scheduler_notifications(
-        uint32_t, SchedulerNotificationPurpose, size_t count, SchedulerDoneNotifications *out
+        uint32_t, SchedulerNotificationPurpose purpose, size_t count, SchedulerDoneNotifications *out
     ) override {
-        if (out == nullptr) return -1;
-        // This CPU transport has no notification SRAM; exercise the GM fallback.
-        *out = {std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
-        return 0;
+        return scheduler_test::acquire_notifications(purpose, count, out);
     }
 };
 
@@ -1465,7 +1463,7 @@ static void check_observation(const std::string &scenario, uint32_t mode) {
         assert(output_reads == 0);
     }
     if (scenario == "success-record-error" && mode == 0) check_proof_identity_widths();
-    std::puts("PASS: real resident observer and Program delivery contract");
+    std::puts("PASS: real runtime observer and Program delivery contract");
 }
 
 static void check_owned_unknown_close(const std::string &scenario) {

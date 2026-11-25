@@ -1,5 +1,7 @@
 # 协作任务的 Host 准备与 Device 校验
 
+> **历史文档。** 本页保留旧版A5 HBG resident 调度设计及其测量。文中的“当前”指当时的版本。现行协议见 [A5 HBG 日历调度](../../../../src/a5/runtime/host_build_graph/README.md)。
+
 普通图和 native Graph 展开后的每个任务实例都有独立的 `task_ref`。Host 在发布设备镜像前固定依赖、执行形状和调度顺序。Device 按实际拓扑、领取结果和本轮执行进度确定谁能进入 kernel。
 
 ## Host 发布什么

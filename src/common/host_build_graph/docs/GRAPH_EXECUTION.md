@@ -1,9 +1,9 @@
 # Graph Execution
 
-Graph recording and replay are shared by `host_build_graph` and A5 `percounter`.
-This page describes the common recording/cache contracts and the A2/A3 HBG
-`GraphExecution` materializer. Default A5 HBG uses Host-prepared Calls and compact
-native topology; WSE and percounter have their own execution contracts.
+Graph recording and replay share the `host_build_graph` submission API.
+A2/A3 and A5 materialize recorded child arguments on AICPU. This page describes
+the shared recording and localization contracts. A5 executes the materialized
+tasks with its [calendar scheduler](../../../a5/runtime/host_build_graph/README.md).
 
 A Graph is a composite incore task: it occupies one task window slot and completes once,
 like any other task of the run, but contains a recorded DAG of sub-tasks. It
@@ -148,7 +148,7 @@ and Graph after checking the current task structure and available cores. Each
 invocation binds its own Definition and arguments. The Definition cache uses
 the Graph identity and Config independently of the Calendar bucket.
 
-A5 Percounter also checks the recorded body structure across binds of the
+A5 HBG also checks the recorded body structure across binds of the
 same Callable. Equal Configs for a Graph ID must produce the same task layout.
 If a tensor shape controls a construction choice such as the block count,
 include that choice in the Config. A mismatch fails bind before Calendar
@@ -681,19 +681,16 @@ the end of orchestration, the Host copies one bind image containing the
 compacted shared-memory task window and argument pools, then launches the
 Scheduler. Slot task and payload references remain self-relative.
 
-### Default A5 HBG native execution
+### A5 HBG calendar execution
 
-The recorded `Graph` images and boundary binding inputs stay on Host. Host expands
-ENTER/child/EXIT refs, binds tensors, scalars and predicates, and constructs every
-block/lane Call before launch. The native scheduler image carries child plans,
-fanin rows/indices, sinks and per-instance argument bases; it contains no recorded
-Graph image, fanout/root tables, relocation records or scalar-inheritance table.
-Resident AIC/AIV workers claim prepared executions and observe completion gates;
-they do not localize `GraphExecution` or materialize child arguments.
-See the [A5 native layout and binding contract](../../../../docs/zh-cn/design/a5-hbg-graph-task/data-layout.md).
-WSE and percounter retain their supported executors; see
-[WSE Graph replay](../../../wse/docs/deployment.md#graph-recording-and-replay) and
-[percounter payload preparation](../../../a5/runtime/percounter/README.md).
+The Host validates each recorded Graph and creates a range for each invocation.
+Each invocation has its own relocated arguments and completion counters.
+AICPU materializes child bindings in slices and publishes the available prefix.
+AICore waits for the range's predecessor gates and the required prefix before
+executing its rows. A Graph shell completes when every sink has published all of
+its credits, including any deferred completion. See the
+[A5 range and defer contracts](../../../a5/runtime/host_build_graph/README.md)
+and [WSE Graph replay](../../../wse/docs/deployment.md#graph-recording-and-replay).
 
 ### A2/A3 HBG launch-package materialization
 

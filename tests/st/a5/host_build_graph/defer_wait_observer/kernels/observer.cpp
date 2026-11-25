@@ -15,7 +15,7 @@
 inline __aicore__ uint64_t get_sys_cnt_aicore() { return get_sys_cnt(); }
 #endif
 
-#include "scheduler/scheduler_async_control.h"
+#include "scheduler/async_completion.h"
 #include "tensor.h"
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
@@ -27,18 +27,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     auto *results = reinterpret_cast<__gm__ int32_t *>(result_tensor->buffer.addr) + result_tensor->start_offset;
     const uint32_t counter_count = counter_tensor->shapes[0];
     const uint32_t post_count = post_tensor->shapes[0];
-#if defined(__DAV_CUBE__)
-    constexpr uint32_t observer_mask = 1;
-#else
-    constexpr uint32_t observer_mask = 2;
-#endif
-    const SchedulerAsyncCompletionObserver observer;
     for (uint32_t row = 0; row < counter_count; ++row) {
         const CompletionToken token{
             reinterpret_cast<uint64_t>(counters + 2 * row), counters[2 * row + 1], COMPLETION_ENGINE_SDMA,
             COMPLETION_TYPE_COUNTER, 0
         };
-        const auto result = observer(token, observer_mask);
+        const auto result = percounter_poll_valid_completion(token);
         results[row] = result.error_code == 0 ? static_cast<int32_t>(result.state) : -1;
     }
     for (uint32_t row = 0; row < post_count; ++row) {
@@ -46,7 +40,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
             reinterpret_cast<uint64_t>(posts + 2 * row), 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD,
             posts[2 * row + 1]
         };
-        const auto result = observer(token, observer_mask);
+        const auto result = percounter_poll_valid_completion(token);
         results[counter_count + row] = result.error_code == 0 ? static_cast<int32_t>(result.state) : -1;
     }
 #ifndef PTO_CPUSTUB_HPP

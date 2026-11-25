@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Per-task argument-dump payloads and A5 HBG AICore scheduler selection."""
+"""Per-task argument-dump payloads and A5 HBG calendar scheduler selection."""
 
 import json
 import os
@@ -82,6 +82,6 @@ def test_framework_argument_dump_contract(runtime, task_queue, framework_module,
     assert len(epochs) == 4 and epochs[0] is None and epochs[3] is None
     assert all(type(epoch) is int and epoch > 0 for epoch in epochs[1:3]) and epochs[1] != epochs[2]
     if platform == "a5" and runtime == "host_build_graph":
-        assert summary["scheduler_modes"] == [None, 1, 1, None]
+        assert summary["scheduler_modes"] == [None, 5, 5, None]
     assert len(summary["callback_threads"]) == 4
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

@@ -136,6 +136,9 @@ void platform_signal_aicore_exit(uint64_t reg_addr);
 // One absolute timeout deadline shared by a group of exiting cores.
 uint64_t platform_aicore_exit_deadline();
 
+#define SIMPLER_HAS_AICORE_SOC_SRAM_LIFECYCLE 1
+void publish_aicore_lifecycle_word(volatile uint32_t *word, uint32_t value);
+
 // Quiesce a core whose COND the caller has already observed as EXITED: dispatch
 // back to idle, with that posted store read back so it is complete. The readback
 // targets DATA_MAIN_BASE, the register just written: nR orders accesses within
@@ -148,15 +151,15 @@ void platform_close_aicore_window(uint64_t reg_addr);
 struct AicoreExitTarget {
     uint64_t reg_addr;
     AicoreTeardownControl *teardown;
-    bool uses_dispatch_register{true};  // False when EXIT was broadcast by CntNotify.
+    bool uses_dispatch_register{true};  // False when EXIT was broadcast through SoC SRAM.
     bool retain_until_all_ack{false};   // A peer can still write this core until its own EXIT ACK.
 };
 
 // Enable exit signalling without releasing a core into normal initialization.
 void platform_open_aicore_exit_window(uint64_t reg_addr);
 
-// Retires one exclusively claimed set of cores. CntNotify users have already
-// signalled EXIT and leave the dispatch register alone through return. Each target's request and
+// Retires one exclusively claimed set of cores. Callers using the SoC SRAM
+// lifecycle gate have already signalled EXIT and leave dispatch untouched. Each target's request and
 // release gate must be reset before READY or any EXIT; Native and unstamped
 // launches use the same reserved COND nonce protocol. Each core echoes its
 // current request once after quiescence and makes no subsequent SPR writes.

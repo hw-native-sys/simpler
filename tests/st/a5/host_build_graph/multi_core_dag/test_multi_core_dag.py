@@ -29,7 +29,7 @@ def _case(name, graph_case, task_count):
     return case
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestHbgMultiCoreDag(SceneTestCase):
     RTOL = 0

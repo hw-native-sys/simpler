@@ -12,8 +12,8 @@
 
 #include <cstdint>
 
-// Only a complete aligned SET slot has the verified A5 INC alias.
-// Zero leaves completion on the SET/GM fallback path.
-inline constexpr uint64_t a5_cnt_notify_increment_address(uint64_t set_address) {
+// A complete, aligned SoC SRAM SET/read slot exposes the A5 atomic ADD alias.
+// Return zero when the supplied address has no verified ADD alias.
+inline constexpr uint64_t a5_soc_sram_add_address(uint64_t set_address) {
     return set_address != 0 && (set_address & UINT64_C(0x1f)) == 0 ? set_address + UINT64_C(0x08) : 0;
 }

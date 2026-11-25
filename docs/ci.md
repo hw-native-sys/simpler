@@ -596,10 +596,6 @@ Coverage groups are `program/<runtime>`, `auxiliary/<runtime>` and
 `kernel/<runtime>/eager|capture_replay`. The policy in
 `simpler_setup/test_coverage.py` requires Program and Kernel eager
 for HBG and TMR in default onboard sweeps, plus native HBG capture on A2/A3 and A5.
-A5 default sweeps additionally require `program/percounter`, including all applicable
-non-exempt members. Percounter classification accepts scene declarations, runtime markers,
-coverage-runtime markers and runtime parameters for Program or auxiliary tests on A5.
-It does not qualify Kernel or framework coverage, and adds no requirements on A2/A3.
 Framework sweeps require Kernel eager for both runtimes and the graph-capture
 groups declared in the applicable corpus, including their mandatory members.
 The stock Torch-NPU native-capture tests declare Kernel capture/replay separately

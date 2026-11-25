@@ -20,10 +20,9 @@
 #include "aicpu_executor.h"
 #include "aicpu/abort_aicore_startup.h"
 #include "args_dump_service.h"
+#include "calendar_task_timing.h"
+#include "supervisor.h"
 #include "aicore_scheduler_error.h"
-#include "aicore_scheduler_state.h"
-#include "scheduler_ready_watchdog.h"
-#include "scheduler_sink_observer.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
@@ -35,7 +34,6 @@
 #include "task_image_status.h"
 #include "runtime.h"
 #include "scheduler/scheduler_types.h"
-#include "scheduler/scheduler_task_catalog.h"
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"
 
@@ -62,7 +60,7 @@ extern "C" int32_t aicpu_release_callables() {
     return g_aicpu_executor.init_done_.load(std::memory_order_acquire) ? -1 : 0;
 }
 
-static uint64_t resident_scheduler_timeout_cycles() {
+static uint64_t scheduler_timeout_cycles() {
     const int32_t timeout_ms = get_scheduler_timeout_ms();
     return timeout_ms > 0 ? static_cast<uint64_t>(timeout_ms) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000) :
                             SCHEDULER_TIMEOUT_CYCLES;
@@ -71,7 +69,7 @@ static uint64_t resident_scheduler_timeout_cycles() {
 template <typename Predicate>
 static bool wait_with_scheduler_timeout(Predicate predicate) {
     const uint64_t start = get_sys_cnt_aicpu();
-    const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
+    const uint64_t timeout_cycles = scheduler_timeout_cycles();
     while (!predicate()) {
         if (scheduler_watchdog_expired(start, get_sys_cnt_aicpu(), timeout_cycles)) return false;
         SPIN_WAIT_HINT();
@@ -79,217 +77,18 @@ static bool wait_with_scheduler_timeout(Predicate predicate) {
     return true;
 }
 
-static void log_resident_task_catalog(void *base, const SchedulerWorkerContext &context) {
-    const uint64_t state_bytes = context.scheduler_state_bytes;
-    const auto address = reinterpret_cast<uintptr_t>(base);
-    auto range_valid = [&](uint64_t offset, uint64_t count, uint64_t stride, uint64_t alignment, uint64_t limit) {
-        return offset != 0 && offset % alignment == 0 && offset <= limit && count <= (limit - offset) / stride;
-    };
-    if (base == nullptr || address % alignof(SchedulerGraphSummary) != 0 || state_bytes > UINTPTR_MAX - address ||
-        !range_valid(
-            context.graph_summary_offset, 1, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), state_bytes
-        )) {
-        LOG_ERROR("A5 HBG task catalog snapshot: invalid state or graph summary range");
-        return;
-    }
-    const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, context.graph_summary_offset);
-    cache_invalidate_range(summary, sizeof(*summary));
-    rmb();
-    const uint64_t pool_offset = summary->task_catalog_offset;
-    if (!range_valid(
-            pool_offset, 1, sizeof(SchedulerTaskCatalogHeader), alignof(SchedulerTaskCatalogHeader), state_bytes
-        )) {
-        LOG_ERROR("A5 HBG task catalog snapshot: invalid header offset=%" PRIu64, pool_offset);
-        return;
-    }
-    const auto *shared_pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base, pool_offset);
-    cache_invalidate_range(shared_pool, sizeof(*shared_pool));
-    rmb();
-    const auto pool = *shared_pool;
-    const uint64_t limit = pool.storage_end_offset;
-    const uint64_t descriptor_bytes = SCHEDULER_EXECUTION_ENGINE_COUNT * sizeof(SchedulerTaskCatalogDescriptor);
-    if (pool.task_count != context.graph_task_count || pool.entry_count > pool.task_count ||
-        pool.control_count > pool.task_count - pool.entry_count || limit > state_bytes ||
-        pool.descriptors_offset < pool_offset + sizeof(pool) ||
-        !range_valid(
-            pool.descriptors_offset, SCHEDULER_EXECUTION_ENGINE_COUNT, sizeof(SchedulerTaskCatalogDescriptor),
-            SCHEDULER_STATE_ALIGNMENT, limit
-        )) {
-        LOG_ERROR("A5 HBG task catalog snapshot: invalid header or catalog table");
-        return;
-    }
-    const auto *shared_descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(base, pool.descriptors_offset);
-    cache_invalidate_range(shared_descriptors, descriptor_bytes);
-    rmb();
-    SchedulerTaskCatalogDescriptor descriptors[SCHEDULER_EXECUTION_ENGINE_COUNT]{};
-    uint64_t cursor = pool.descriptors_offset + descriptor_bytes;
-    uint64_t entries = 0;
-    for (uint32_t queue = 0; queue < SCHEDULER_EXECUTION_ENGINE_COUNT; ++queue) {
-        descriptors[queue] = shared_descriptors[queue];
-        const auto &descriptor = descriptors[queue];
-        if (descriptor.capacity > pool.task_count - entries || descriptor.entries_offset < cursor ||
-            !range_valid(
-                descriptor.entries_offset, descriptor.capacity, sizeof(SchedulerCatalogEntry),
-                alignof(SchedulerCatalogEntry), limit
-            )) {
-            LOG_ERROR("A5 HBG task catalog snapshot: invalid engine=%u descriptor", queue);
-            return;
-        }
-        entries += descriptor.capacity;
-        cursor = descriptor.entries_offset + descriptor.capacity * sizeof(SchedulerCatalogEntry);
-    }
-    if (entries != pool.entry_count) {
-        LOG_ERROR("A5 HBG task catalog snapshot: inconsistent entry count");
-        return;
-    }
-    for (uint32_t engine = 0; engine < SCHEDULER_EXECUTION_ENGINE_COUNT; ++engine) {
-        const auto &descriptor = descriptors[engine];
-        const auto *refs = scheduler_state_at<SchedulerCatalogEntry>(base, descriptor.entries_offset);
-        cache_invalidate_range(refs, descriptor.capacity * sizeof(SchedulerCatalogEntry));
-        rmb();
-        for (uint64_t index = 0; index < descriptor.capacity; ++index) {
-            const int64_t ref = refs[index].ref;
-            if (ref < 0 || static_cast<uint64_t>(ref) >= pool.task_count) {
-                LOG_ERROR("A5 HBG task catalog: invalid engine=%u index=%" PRIu64, engine, index);
-                return;
-            }
-        }
-        LOG_ERROR(
-            "A5 HBG task catalog: engine=%u entries=%" PRIu64 " control_nodes=%" PRIu64, engine, descriptor.capacity,
-            pool.control_count
-        );
-    }
-}
-
-// The AICores may still advance while these non-owning snapshots are collected.
-static void log_unfinished_tasks(Runtime *runtime) {
-    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-    if (context == nullptr) return;
-    void *scheduler_state_base = aicore_scheduler_state_base(context);
-    const uint64_t count = context->graph_task_count;
-    const uint64_t bytes = context->scheduler_state_bytes;
-    const auto address = reinterpret_cast<uintptr_t>(scheduler_state_base);
-    auto fits = [&](uint64_t offset, uint64_t stride, uint64_t alignment) {
-        return offset != 0 && offset <= bytes && (address + offset) % alignment == 0 &&
-               count <= (bytes - offset) / stride;
-    };
-    if (!scheduler_state_base || bytes > UINTPTR_MAX - address ||
-        !fits(context->task_controls_offset, sizeof(SchedulerTaskControl), alignof(SchedulerTaskControl)) ||
-        !fits(context->task_metadata_offset, sizeof(SchedulerTaskMetadata), alignof(SchedulerTaskMetadata)) ||
-        (context->completion_counters_offset != 0 &&
-         !fits(
-             context->completion_counters_offset, sizeof(SchedulerTaskCompletionCounter),
-             alignof(SchedulerTaskCompletionCounter)
-         ))) {
-        LOG_ERROR("A5 HBG: unfinished-task snapshot unavailable for invalid table ranges");
-        return;
-    }
-    const auto *controls =
-        scheduler_state_at<SchedulerTaskControl>(scheduler_state_base, context->task_controls_offset);
-    const auto *metadata =
-        scheduler_state_at<SchedulerTaskMetadata>(scheduler_state_base, context->task_metadata_offset);
-    const auto *counters = context->completion_counters_offset == 0 ?
-                               nullptr :
-                               scheduler_state_at<SchedulerTaskCompletionCounter>(
-                                   scheduler_state_base, context->completion_counters_offset
-                               );
-    const auto graph = aicore_scheduler_graph_view(*context);
-    struct TaskSnapshot {
-        uint64_t task;
-        uint64_t completion;
-        uint64_t next_block;
-        uint64_t source_value;
-        bool done;
-    };
-    auto snapshot_task = [&](uint64_t task) {
-        const uint64_t completion = aicpu_observe_gm(controls[task].completion_state);
-        TaskSnapshot snapshot{
-            task, completion, aicpu_claimed_supply(controls[task], metadata[task].logical_block_num), completion,
-            scheduler_completion_done(completion)
-        };
-        if (counters != nullptr && (counters[task].add_address != 0 || counters[task].read_address != 0)) {
-            const auto &counter = counters[task];
-            snapshot.source_value = counter.read_address == 0 ?
-                                        UINT64_MAX :
-                                        *reinterpret_cast<const volatile uint32_t *>(counter.read_address);
-            snapshot.done = counter.read_address != 0 && counter.threshold != 0 && counter.threshold <= counter.limit &&
-                            scheduler_classify_completion_counter(
-                                static_cast<uint32_t>(snapshot.source_value), counter.threshold, counter.limit
-                            ) == 1;
-        }
-        return snapshot;
-    };
-    TaskSnapshot snapshots[64];
-    uint64_t snapshot_count = 0;
-    for (uint64_t task = 0; task < count && snapshot_count < 64; ++task) {
-        if (graph.native_header_offset == 0 && !scheduler_task_is_executable(metadata[task].flags)) continue;
-        const TaskSnapshot snapshot = snapshot_task(task);
-        if (snapshot.done) continue;
-        if (counters != nullptr && counters[task].add_address != 0) {
-            LOG_ERROR(
-                "A5 HBG ADD task=%" PRIu64 " count=%" PRIu64 " target=%u limit=%u", task, snapshot.source_value,
-                counters[task].threshold, counters[task].limit
-            );
-        }
-        if (graph.native_header_offset != 0) {
-            const auto identity = aicore_scheduler_public_identity(graph, task);
-            LOG_ERROR("A5 HBG native node=%" PRIu64 " public_id=%" PRIu64, task, TaskId::to_uint64(identity));
-        }
-        const uint64_t completion = snapshot.completion;
-        snapshots[snapshot_count++] = snapshot;
-        LOG_ERROR(
-            "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " total=%" PRIu64 " remaining=%" PRIu64 " debt=%" PRIu64
-            " next_block=%" PRIu64 " active_mask=0x%x flags=0x%x",
-            task, scheduler_completion_total(completion), scheduler_completion_remaining(completion),
-            scheduler_completion_debt(completion), snapshot.next_block, metadata[task].active_mask.raw(),
-            metadata[task].flags
-        );
-    }
-    log_resident_task_catalog(scheduler_state_base, *context);
-    uint64_t moved = 0;
-    for (uint64_t index = 0; index < snapshot_count; ++index) {
-        const auto &before = snapshots[index];
-        const uint64_t task = before.task;
-        const TaskSnapshot after = snapshot_task(task);
-        if (after.source_value == before.source_value && after.completion == before.completion &&
-            after.next_block == before.next_block)
-            continue;
-        ++moved;
-        LOG_ERROR(
-            "A5 HBG AICore scheduler: task=%" PRIu64 " moved: source %" PRIu64 "->%" PRIu64 " completion %" PRIu64
-            "->%" PRIu64 " next_block %" PRIu64 "->%" PRIu64,
-            task, before.source_value, after.source_value, before.completion, after.completion, before.next_block,
-            after.next_block
-        );
-    }
-    LOG_ERROR(
-        "A5 HBG AICore scheduler: second snapshot: %" PRIu64 " of %" PRIu64 " sampled tasks moved", moved,
-        snapshot_count
-    );
-}
-
-static void record_resident_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
-    log_unfinished_tasks(runtime);
-    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-    if (context != nullptr) {
-        SchedulerRunControl *run_control = aicore_scheduler_run_control(context);
-        if (run_control != nullptr &&
-            record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site)) {
-            wmb();
-        }
-    }
+static void record_lifecycle_timeout(Runtime *runtime, const char *site) {
     if (runtime != nullptr && runtime->get_gm_sm_ptr() != nullptr) {
         auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
-        (void)settle_aicore_runtime_status(aicore_scheduler_run_control(context), error_code);
         (void)latch_aicore_scheduler_runtime_error(error_code, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
     }
-    LOG_ERROR("A5 HBG AICore Scheduler timeout site=%" PRIu64, static_cast<uint64_t>(error_site));
+    LOG_ERROR("A5 HBG AICore lifecycle timeout at %s", site);
 }
 
 template <typename Predicate>
 static void join_initialization_phase(Runtime *runtime, Predicate predicate, std::atomic<bool> &failed) {
     if (wait_with_scheduler_timeout(predicate)) return;
-    record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
+    record_lifecycle_timeout(runtime, "initialization barrier");
     failed.store(true, std::memory_order_release);
     // Phase owners may still write lifecycle state. Retirement and destruction
     // require their completion even when the run has already failed.
@@ -302,54 +101,6 @@ static int32_t read_runtime_status(Runtime *runtime) {
     auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
     int32_t sched_error_code = error_code->load(std::memory_order_acquire);
     return runtime_status_from_error_code(sched_error_code);
-}
-
-static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime, const char *phase = nullptr) {
-    if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return 0;
-    auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
-    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-    SchedulerRunControl *run_control = nullptr;
-    if (context != nullptr) {
-        run_control = aicore_scheduler_run_control(context);
-    }
-    if (phase != nullptr) {
-        log_aicore_scheduler_error_identity(run_control, phase);
-        if (std::strcmp(phase, "execution") == 0) log_aicore_prepared_error(context, run_control);
-    }
-    return settle_aicore_runtime_status(run_control, error_code);
-}
-
-static void publish_aicore_task_timing(Runtime *runtime) {
-    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-    if (context == nullptr) return;
-    void *scheduler_state_base = aicore_scheduler_state_base(context);
-    if (scheduler_state_base == nullptr) return;
-    TaskTimingRecord *records = aicpu_task_timing_records(get_platform_phase_base(), 0);
-    if (records == nullptr) return;
-
-    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state_base, context->task_metadata_offset);
-    auto *traces = scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->trace_cells_offset);
-
-    for (uint64_t task_id = 0; task_id < context->graph_task_count; ++task_id) {
-        const int32_t slot = metadata[task_id].timing_slot;
-        if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) continue;
-        if (!scheduler_task_is_executable(metadata[task_id].flags)) continue;
-        for (uint32_t block = 0; block < metadata[task_id].logical_block_num; ++block) {
-            for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-                if (!metadata[task_id].active_mask.has(static_cast<SubtaskSlot>(subtask))) continue;
-                auto &trace = traces[scheduler_task_trace_index(
-                    metadata[task_id].trace_index_base, metadata[task_id].active_mask,
-                    static_cast<SubtaskSlot>(subtask), block
-                )];
-                const uint64_t start = trace.kernel_start_cycles;
-                const uint64_t end = trace.kernel_end_cycles;
-                if (start == 0 || end <= start) continue;
-                if (start < records[slot].dispatch_cycle) records[slot].dispatch_cycle = start;
-                if (end > records[slot].finish_cycle) records[slot].finish_cycle = end;
-            }
-        }
-    }
-    aicpu_publish_task_timing_tail_usage(1);
 }
 
 // ===== AicpuExecutor Method Implementations =====
@@ -432,7 +183,6 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
         hs_arrived_.store(0, std::memory_order_relaxed);
         hs_release_arrived_.store(0, std::memory_order_relaxed);
-        hs_bootstrap_done_.store(false, std::memory_order_relaxed);
         if (aicore_lifecycle_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }
@@ -474,12 +224,18 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             }
             init_failed_.store(true, std::memory_order_release);
         }
-        if (!init_failed_.load(std::memory_order_acquire) && post_handshake_init(runtime) != 0) {
+        if (!init_failed_.load(std::memory_order_acquire) &&
+            (post_handshake_init(runtime) != 0 || aicore_lifecycle_.initialize_pmu(runtime) != 0)) {
             init_failed_.store(true, std::memory_order_release);
         }
         if (!init_failed_.load(std::memory_order_acquire)) {
-            const auto *context = aicore_scheduler_bootstrap_context(runtime);
-            if (context != nullptr && context->args_dump_address != 0) {
+            auto *control = simpler::percounter::percounter_control(runtime);
+            if (control != nullptr && control->args_dump_offset != 0) {
+                auto *dump_image = simpler::percounter::percounter_region<void>(control, control->args_dump_offset);
+                if (!initialize_resident_args_dump_outputs(
+                        dump_image, runtime->dev.callable_table_addr_, runtime->dev.callable_table_len_
+                    ))
+                    init_failed_.store(true, std::memory_order_release);
                 args_dump_services_ = new (std::nothrow) ResidentArgsDumpService[nthreads];
                 if (args_dump_services_ == nullptr) init_failed_.store(true, std::memory_order_release);
                 else {
@@ -487,8 +243,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
                     args_dump_services_allocated_this_init_ = true;
                     for (int32_t thread = 0; thread < nthreads; ++thread)
                         if (!args_dump_services_[thread].initialize(
-                                reinterpret_cast<void *>(context->args_dump_address), runtime->dev.callable_table_addr_,
-                                runtime->dev.callable_table_len_, thread, nthreads
+                                dump_image, runtime->dev.callable_table_addr_, runtime->dev.callable_table_len_, thread,
+                                nthreads
                             ))
                             init_failed_.store(true, std::memory_order_release);
                 }
@@ -505,35 +261,12 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         );
     }
 
-    // The resident path publishes contexts before its bootstrap acknowledgement.
-    // The calendar leader can release the lanes here: all reports are accepted
-    // and its topology and dependency counters are already visible.
+    // The leader publishes START in SoC SRAM after topology, dependency counters and diagnostics are ready.
     if (!init_failed_.load(std::memory_order_acquire)) {
         publish_partition(runtime, tidx, nthreads);
     }
 
-    // Only the leader polls GM bootstrap state; peers acquire its local
-    // completion flag before any partition can enter failure cleanup.
-    aicore_lifecycle_.begin_bootstrap_wait(tidx);
-    if (is_leader) {
-        if (!init_failed_.load(std::memory_order_acquire) && awaits_bootstrap() &&
-            aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
-            init_failed_.store(true, std::memory_order_release);
-        }
-        hs_bootstrap_done_.store(true, std::memory_order_release);
-    } else {
-        join_initialization_phase(
-            runtime,
-            [this] {
-                return hs_bootstrap_done_.load(std::memory_order_acquire);
-            },
-            init_failed_
-        );
-    }
-    aicore_lifecycle_.end_bootstrap_wait(tidx);
-
-    // Release the resident dispatch registers, or retire the failed launch
-    // through the transport its host prepared.
+    // Failed initialization signals EXIT and joins the per-core retirement acknowledgements.
     const bool started = !init_failed_.load(std::memory_order_acquire);
     int32_t shutdown_rc = aicore_lifecycle_.release_partition(runtime, tidx, started);
     if (shutdown_rc != 0) {
@@ -551,7 +284,6 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             },
             init_failed_
         );
-        if (!init_failed_.load(std::memory_order_acquire)) ready_watchdog_.reset(get_sys_cnt_aicpu());
         init_done_.store(true, std::memory_order_release);
         if (!init_failed_.load(std::memory_order_acquire)) LOG_INFO("AicpuExecutor: Init complete");
     } else {
@@ -598,14 +330,12 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime, int32_t shutdown_rc)
         (void)aicore_lifecycle_.settle_run_diagnostics(runtime, false);
         aicore_lifecycle_.deinit();
         completion_gate_.reset();
-        ready_watchdog_.reset();
         shutdown_ready_.store(false, std::memory_order_relaxed);
         shutdown_signaled_.store(0, std::memory_order_relaxed);
         run_status_.store(0, std::memory_order_relaxed);
         init_done_.store(false, std::memory_order_relaxed);
         hs_setup_done_.store(false, std::memory_order_relaxed);
         hs_config_done_.store(false, std::memory_order_relaxed);
-        hs_bootstrap_done_.store(false, std::memory_order_relaxed);
         hs_arrived_.store(0, std::memory_order_relaxed);
         hs_release_arrived_.store(0, std::memory_order_relaxed);
         hs_thread_seq_.store(0, std::memory_order_relaxed);
@@ -617,111 +347,13 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime, int32_t shutdown_rc)
     } else if (!wait_with_scheduler_timeout([this] {
                    return !init_failed_.load(std::memory_order_acquire);
                })) {
-        record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
+        record_lifecycle_timeout(runtime, "initialization barrier");
     }
     return init_rc;
 }
 
-__attribute__((weak)) bool AicpuExecutor::schedules_on_aicore(const Runtime *runtime) const {
-    return aicore_scheduler_runtime_enabled(runtime);
-}
-
-__attribute__((weak)) bool AicpuExecutor::awaits_bootstrap() const { return true; }
-
-__attribute__((weak)) bool AicpuExecutor::uses_kernel_work_window() const { return true; }
-
-__attribute__((weak)) int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
-    return aicore_lifecycle_.post_handshake_init(runtime);
-}
-
-__attribute__((weak)) void AicpuExecutor::publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
-    (void)nthreads;
-    aicore_lifecycle_.publish_context_partition(runtime, tidx);
-}
-
-void AicpuExecutor::service_args_dump(int32_t thread_idx) {
-    if (__builtin_expect(args_dump_services_ != nullptr, false) && args_dump_services_[thread_idx].step())
-        ready_watchdog_.record_progress(get_sys_cnt_aicpu());
-}
-
-__attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t thread_idx) {
-    auto *context = aicore_scheduler_bootstrap_context(runtime);
-    auto *run = aicore_scheduler_run_control(context);
-    if (run == nullptr || runtime->dev.host_total_tasks < 0) {
-        LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
-        return -1;
-    }
-
-    // init() has waited for bootstrap_complete, including empty graphs, and
-    // released the execution gate after resetting this run's MMIO registers.
-    AicpuSinkObserver sinks;
-    int status = sinks.initialize(*context, *run) ? 0 : -1;
-    const uint64_t timeout = resident_scheduler_timeout_cycles();
-    AicpuSinkWatchdog watchdog;
-    uint32_t error_polls = 0;
-    while (status == 0) {
-        service_args_dump(thread_idx);
-        const uint64_t previous = sinks.resolved();
-        status = sinks.poll();
-        if (status != 0) break;
-        if (++error_polls == 64) {
-            error_polls = 0;
-            if (aicpu_observe_gm(run->scheduler_error) != 0) break;
-        }
-        const uint64_t now = get_sys_cnt_aicpu();
-        if (sinks.resolved() != previous) ready_watchdog_.record_progress(now);
-        if (watchdog.stalled(ready_watchdog_, now, timeout, [&] {
-                return sinks.fingerprint(*context);
-            })) {
-            LOG_ERROR(
-                "A5 HBG: no graph progress, completed sinks=%" PRIu64 "/%" PRIu64, sinks.resolved(), run->sink_count
-            );
-            record_resident_timeout(runtime, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT);
-            const int32_t error = publish_aicore_scheduler_runtime_error(runtime, "execution");
-            return error != 0 ? error : -SIMPLER_ERROR_SCHEDULER_TIMEOUT;
-        }
-        SPIN_WAIT_HINT();
-    }
-
-    if (status < 0) {
-        LOG_ERROR("A5 HBG: invalid completion source at sink=%" PRIu64 "/%" PRIu64, sinks.resolved(), run->sink_count);
-        (void)record_aicore_scheduler_runtime_error(
-            run, SchedulerGraphResult::INVALID_ARGUMENTS, SchedulerErrorSite::BLOCK_COMPLETION_INVALID
-        );
-    }
-    // Order the final error sample after the last GM or MMIO sink proof.
-    // snapshot_run_terminal() samples again after every core retires.
-    rmb();
-    if (aicpu_observe_gm(run->scheduler_error) != 0) {
-        LOG_ERROR("A5 HBG: graph failed, completed sinks=%" PRIu64 "/%" PRIu64, sinks.resolved(), run->sink_count);
-        const int32_t error = publish_aicore_scheduler_runtime_error(runtime, "execution");
-        return error != 0 ? error : -SIMPLER_ERROR_INVALID_ARGS;
-    }
-    return status == 1 ? 0 : -SIMPLER_ERROR_INVALID_ARGS;
-}
-
-__attribute__((weak)) int32_t AicpuExecutor::settle_run_error(Runtime *runtime) {
-    return publish_aicore_scheduler_runtime_error(runtime, "terminal");
-}
-
-__attribute__((weak)) bool AicpuExecutor::await_shutdown(Runtime *runtime, int32_t thread_idx) {
-    if (!ready_watchdog_.wait_until_ready(
-            [this] {
-                return shutdown_ready_.load(std::memory_order_acquire);
-            },
-            [] {
-                return get_sys_cnt_aicpu();
-            },
-            [&] {
-                service_args_dump(thread_idx);
-                SPIN_WAIT_HINT();
-            },
-            resident_scheduler_timeout_cycles()
-        )) {
-        record_resident_timeout(runtime, SchedulerErrorSite::AICPU_SHUTDOWN_BARRIER_TIMEOUT);
-        return true;
-    }
-    return false;
+bool AicpuExecutor::service_args_dump(int32_t thread_idx) {
+    return args_dump_services_ != nullptr && args_dump_services_[thread_idx].step();
 }
 
 int32_t AicpuExecutor::run(Runtime *runtime) {
@@ -734,23 +366,21 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         );
         return -1;
     }
-    bool shutdown_wait_timed_out = false;
     if (thread_idx == aicpu_thread_num_ - 1) {
         run_status_.store(supervise(runtime, thread_idx), std::memory_order_release);
         shutdown_ready_.store(true, std::memory_order_release);
     } else {
-        shutdown_wait_timed_out = await_shutdown(runtime, thread_idx);
+        await_shutdown(runtime, thread_idx);
     }
 
-    int32_t run_rc =
-        shutdown_wait_timed_out ? -SIMPLER_ERROR_SCHEDULER_TIMEOUT : run_status_.load(std::memory_order_acquire);
+    int32_t run_rc = run_status_.load(std::memory_order_acquire);
     if (args_dump_services_ != nullptr) args_dump_services_[thread_idx].stop();
     aicore_lifecycle_.signal_shutdown_partition(thread_idx);
     shutdown_signaled_.fetch_add(1, std::memory_order_acq_rel);
     if (!wait_with_scheduler_timeout([this] {
             return shutdown_signaled_.load(std::memory_order_acquire) >= aicpu_thread_num_;
         })) {
-        record_resident_timeout(runtime, SchedulerErrorSite::AICPU_SHUTDOWN_BARRIER_TIMEOUT);
+        record_lifecycle_timeout(runtime, "retirement barrier");
         if (run_rc == 0) run_rc = -SIMPLER_ERROR_SCHEDULER_TIMEOUT;
     }
     int32_t shutdown_rc = aicore_lifecycle_.finish_shutdown_partition(thread_idx, runtime);
@@ -778,8 +408,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // that failure and still arrives here.
         const bool cores_retired = aicore_lifecycle_.cores_retired();
         (void)aicore_lifecycle_.settle_run_diagnostics(
-            runtime,
-            run_status_.load(std::memory_order_acquire) == 0 && !shutdown_wait_timed_out && args_dump_services_stopped()
+            runtime, run_status_.load(std::memory_order_acquire) == 0 && args_dump_services_stopped()
         );
         // The record is published either way — a run the host cannot read a
         // verdict for is worse than one that reports a failure — but a run
@@ -788,10 +417,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         snapshot_run_terminal(runtime, cores_retired);
         if (cores_retired) {
             AicoreWorkWindow work_window{};
-            if (aicore_lifecycle_.retired_work_window(work_window, uses_kernel_work_window())) {
+            if (aicore_lifecycle_.retired_work_window(work_window, true)) {
                 device_phase_set_aicore_work_window(work_window);
             }
-            publish_aicore_task_timing(runtime);
+            simpler::percounter::publish_calendar_task_timing(
+                simpler::percounter::percounter_control(runtime), runtime->get_worker_count()
+            );
         } else {
             // Device-owned trace cells, written by the cores. Reading them
             // while one of them may still be writing would publish this run's
@@ -842,7 +473,6 @@ void AicpuExecutor::reset_entry_state() {
     completion_gate_.reset();
     terminal_.reset();
     normal_path_claims_.store(0, std::memory_order_release);
-    ready_watchdog_.reset();
     shutdown_ready_.store(false, std::memory_order_release);
     shutdown_signaled_.store(0, std::memory_order_release);
     run_status_.store(0, std::memory_order_release);
@@ -851,7 +481,6 @@ void AicpuExecutor::reset_entry_state() {
     init_failed_.store(false, std::memory_order_release);
     hs_setup_done_.store(false, std::memory_order_release);
     hs_config_done_.store(false, std::memory_order_release);
-    hs_bootstrap_done_.store(false, std::memory_order_release);
     hs_arrived_.store(0, std::memory_order_release);
     hs_release_arrived_.store(0, std::memory_order_release);
     hs_thread_seq_.store(0, std::memory_order_release);
@@ -914,7 +543,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     const int32_t init_rc = g_aicpu_executor.init(runtime);
     if (init_rc != 0) {
         LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
-        const int32_t runtime_rc = publish_aicore_scheduler_runtime_error(runtime);
+        const int32_t runtime_rc = g_aicpu_executor.settle_run_error(runtime);
         return runtime_rc != 0 ? runtime_rc : init_rc;
     }
 

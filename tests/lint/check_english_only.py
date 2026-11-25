@@ -24,7 +24,6 @@ DEFAULT_EXCLUDED_PATTERNS = [
     "reference",
     "docs/zh-cn",
     "README.zh-CN.md",
-    "tests/fdwic/dsv41_scheduler/RESULTS.md",
 ]
 
 

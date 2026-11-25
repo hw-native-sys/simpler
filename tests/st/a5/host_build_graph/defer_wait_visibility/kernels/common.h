@@ -19,8 +19,10 @@ inline __aicore__ __gm__ int32_t *data(__gm__ int64_t *args, uint32_t index) {
     return reinterpret_cast<__gm__ int32_t *>(tensor->buffer.addr) + tensor->start_offset;
 }
 inline __aicore__ void publish(__gm__ int32_t *data, uint32_t words) {
+    // Drain the scalar stores before cleaning their cache lines to GM.
+    dsb(DSB_DDR);
     pto2::detail::defer_flush_range(data, words * sizeof(int32_t));
-    dsb((mem_dsb_t)0);
+    dsb(DSB_DDR);
     pipe_barrier(PIPE_ALL);
 }
 inline __aicore__ void run(__gm__ int64_t *args) {

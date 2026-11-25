@@ -90,6 +90,7 @@ def urma_lifecycle_binary(tmp_path_factory):
             "-ldl",
             "-lrt",
             "-pthread",
+            "-lgcc_s",
             "-o",
             str(binary),
         ],

@@ -70,10 +70,11 @@ void submit_source(const ChipTaskArgs &args, int64_t context, int64_t epoch, int
 }
 
 void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, int64_t tag, int64_t pressure) {
-    const int64_t capacity = rt_available_aiv_count();
+    const int64_t capacity = rt_available_cluster_count();
     const int64_t rows = pressure == 0 ? 1 : capacity + 1;
     if (capacity <= 0 || capacity > kMaxRows || rows > kMaxRows)
-        throw std::runtime_error("peer COUNTER public AIV capacity exceeds fixture bounds");
+        throw std::runtime_error("peer COUNTER public Cube capacity exceeds fixture bounds");
+    std::array<TaskId, kMaxRows> waiting;
     for (uint32_t row = 0; row < static_cast<uint32_t>(rows); ++row) {
         TaskViews waiter;
         add_view(waiter, args, 2, kSignalWords, row * kSignalWords);
@@ -82,22 +83,10 @@ void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, i
         add_view(waiter, args, 7, kRegistrationWords);
         waiter.args.add_scalar(epoch);
         waiter.args.add_scalar(tag);
-        const TaskId main_waiter = rt_submit_aiv_task(0, waiter.args).task_id();
-
-        TaskViews consumer;
-        add_view(consumer, args, 1, kDataWords, row * kRowWords);
-        add_view(consumer, args, 2, kSignalWords, row * kSignalWords);
-        add_view(consumer, args, 6, kDataWords, row * kRowWords);
-        add_diagnostic(consumer, args, kMaxRows + row);
-        consumer.args.add_scalar(epoch);
-        consumer.args.add_scalar(tag);
-        consumer.args.add_scalar(static_cast<int64_t>(row));
-        consumer.args.add_scalar(INT64_C(0));
-        consumer.args.set_dependencies(&main_waiter, 1);
-        rt_submit_aiv_task(4, consumer.args);
+        waiting[row] = rt_submit_aic_task(5, waiter.args).task_id();
     }
 
-    // No waiter TaskDone dependency: the separate AIC checks only the test's
+    // No waiter TaskDone dependency: the separate Vector checks only the test's
     // actual local registration counter while the main conditions stay pending.
     TaskViews gate;
     add_view(gate, args, 7, kRegistrationWords);
@@ -106,7 +95,7 @@ void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, i
     gate.args.add_scalar(capacity);
     gate.args.add_scalar(epoch);
     gate.args.add_scalar(tag);
-    const TaskId registration_gate = rt_submit_aic_task(1, gate.args).task_id();
+    const TaskId registration_gate = rt_submit_aiv_task(1, gate.args).task_id();
 
     TaskViews sender;
     add_view(sender, args, 3, kReadyWords);
@@ -118,7 +107,24 @@ void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, i
     sender.args.add_scalar(tag);
     sender.args.add_scalar(static_cast<int64_t>(kMaxRows));
     sender.args.set_dependencies(&registration_gate, 1);
-    rt_submit_aiv_task(2, sender.args);
+    const TaskId ready_sent = rt_submit_aiv_task(2, sender.args).task_id();
+
+    // READY is a protocol prerequisite of every main payload. It releases the
+    // remote publisher; each consumer must still observe its own deferred DONE.
+    for (uint32_t row = 0; row < static_cast<uint32_t>(rows); ++row) {
+        TaskViews consumer;
+        add_view(consumer, args, 1, kDataWords, row * kRowWords);
+        add_view(consumer, args, 2, kSignalWords, row * kSignalWords);
+        add_view(consumer, args, 6, kDataWords, row * kRowWords);
+        add_diagnostic(consumer, args, kMaxRows + row);
+        consumer.args.add_scalar(epoch);
+        consumer.args.add_scalar(tag);
+        consumer.args.add_scalar(static_cast<int64_t>(row));
+        consumer.args.add_scalar(INT64_C(0));
+        const TaskId dependencies[]{waiting[row], ready_sent};
+        consumer.args.set_dependencies(dependencies, 2);
+        rt_submit_aiv_task(4, consumer.args);
+    }
 }
 }  // namespace
 
