@@ -386,7 +386,7 @@ def main():
     parser.add_argument("--destroy-refusal", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--retained-child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    example = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/native_capture.py"
+    example = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_kernel/native_capture.py"
     if args.retained_child:
         roots = []
         try:

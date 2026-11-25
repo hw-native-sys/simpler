@@ -1,6 +1,6 @@
 # Native framework submission
 
-This document covers direct L2 eager native submission ([issue #2774](https://github.com/hw-native-sys/simpler/issues/2774)).
+This document covers GIL-free direct L2 native submission ([issue #2774](https://github.com/hw-native-sys/simpler/issues/2774)).
 
 ## Background and goals
 
@@ -34,7 +34,7 @@ Design inputs:
 
 Delivery includes the native entry, Python handoff helpers, a runnable framework reference adapter, lifetime/error regressions, documentation and current-revision CI. Native execution remains independent of Python and Torch; torch_npu queue integration belongs in the adapter.
 
-The scope is direct L2 eager. Program and Kernel use the common execution API; differences in environment and IO management do not require separate submit families. Capture/replay, model/graph ownership, L3 native submission, reusable prepared calls, automatic preparation caches and full-model/vLLM qualification are excluded. Existing capacity backpressure remains valid.
+Program and Kernel use the common execution API; differences in environment and IO management do not require separate execution engines. Kernel ordinary submission and graph recording share the native token and preparation/launch machinery. The [common execution contract](native-capture-common-contract.md) describes graph recording, replay and model-owned lifetime. L3 native submission, reusable prepared calls, automatic preparation caches and full-model/vLLM qualification are outside this document's scope. Existing capacity backpressure remains valid.
 
 [PyPTO #3209](https://github.com/hw-native-sys/pypto/issues/3209) owns downstream adapter migration and qualification. That separate migration does not excuse an unused interface here, and a passing reference consumer does not prove that PyPTO has migrated.
 

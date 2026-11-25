@@ -1,6 +1,6 @@
-# Framework queue → public Worker eager execution
+# Framework Kernel submission and graph recording
 
-These bounded reference consumers select A3 (`a2a3`) or A5 (`a5`) and put `Worker.submit` in torch_npu's actual
+These bounded reference consumers select A3 (`a2a3`) or A5 (`a5`) and put Simpler submissions in torch_npu's actual
 host emission queue. Torch operations produce two DEVICE inputs; the ordinary
 public Worker launches one add kernel; a Torch tensor addition consumes its
 output on the same framework stream. TMR and HBG use the same consumer.
@@ -8,6 +8,11 @@ Additional consumers exercise caller-stream switching, aliased INOUT views,
 accepted callback failures and per-call values through that same public Worker
 and host queue bridge. A persistent-state consumer reuses that path across
 DEVICE-controlled updates to caller-owned storage.
+
+Ordinary submission and graph recording use the common Kernel execution path.
+The framework graph consumer retains the original run and tensor owners through
+model destruction and checked cleanup. The `eager` and `capture_replay` test
+labels identify framework usage scenarios, not separate Simpler execution modes.
 
 | Consumer | Executable assertions |
 | -------- | --------------------- |
@@ -22,6 +27,7 @@ DEVICE-controlled updates to caller-owned storage.
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
 | `persistent_state.py` | Twelve DEVICE-controlled weighted cache updates, unchanged guards and weights, zero acceptance and revisited rows |
 | `argument_capture.py` | OFF/FULL/HYBRID/OFF ArgsDump payloads; A5 HBG verifies AICore scheduling |
+| `native_capture.py` | Cold graph recording, changed-input replay, retained tensor owners and checked cleanup through the original Torch graph |
 
 One process owns at most one onboard execution Worker per device. Program and
 Kernel use the same admission rule; another device and ordinary Torch operators
@@ -66,7 +72,7 @@ and the ACL model destroy callback.
 consumer arms the original native ticket before exporting it to the host queue.
 The ACL model must support destroy callback registration. A capture that cannot
 register the callback fails before publication. The pytest entry
-`tests/st/worker/framework_eager/test_native_capture.py` runs this consumer in the
+`tests/st/worker/framework_kernel/test_native_capture.py` runs this consumer in the
 existing `torch_npu` test environment and produces its normal JUnit receipt. On A2/A3 it checks three concurrently retained models
 with two initial grants and includes an injected destroy refusal followed by
 a real retry on the same model.
@@ -74,7 +80,7 @@ Build the bridge against the same stock Torch and torch_npu installation that
 will run the case. Select the normal compiled artifact explicitly:
 
 ```sh
-TASK_QUEUE_ENABLE=0 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python tests/st/worker/framework_eager/native_capture.py \
+TASK_QUEUE_ENABLE=0 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python tests/st/worker/framework_kernel/native_capture.py \
   --runtime tensormap_and_ringbuffer --platform a2a3 --device "$TASK_DEVICE" \
   --bridge /path/to/_simpler_framework_queue.so --output /path/to/new-case-output
 ```
@@ -127,14 +133,14 @@ Simpler SDK and PTO-ISA prerequisites. Build the optional host extension without
 initializing a device:
 
 ```sh
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=2 python examples/workers/l2/framework_eager/main.py --compile-only
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=2 python examples/workers/l2/framework_kernel/main.py --compile-only
 ```
 
 Run hardware through the queue, after architecture detection:
 
 ```sh
 .claude/skills/onboard-arch-precheck/check.sh a2a3
-task-submit --timeout 600 --max-time 180 --device auto --device-num 1 --run   'TASK_QUEUE_ENABLE=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=2 python examples/workers/l2/framework_eager/main.py --runtime tensormap_and_ringbuffer --device "$TASK_DEVICE"'
+task-submit --timeout 600 --max-time 180 --device auto --device-num 1 --run   'TASK_QUEUE_ENABLE=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=2 python examples/workers/l2/framework_kernel/main.py --runtime tensormap_and_ringbuffer --device "$TASK_DEVICE"'
 ```
 
 Pass `--platform a5` to select A5 on a matching runner; the default is
@@ -351,7 +357,7 @@ pending until the producer cancels them. With the task queue disabled,
 caller thread outside the framework queue; the reference uses it to show
 duplicate refusal without failing the queue. This numerical consumer
 does not load diagnostic probes. The separate system-test driver
-`tests/st/worker/framework_eager/native_submission_gil.py` releases a native
+`tests/st/worker/framework_kernel/native_submission_gil.py` releases a native
 reference on a background thread while Python holds GIL and exercises
 `stream.query()` and `torch.npu.empty_cache()` with two controlled calls.
 Every successful wait checks `safe_to_release` before owners may retire.
@@ -365,7 +371,7 @@ tensors through the ACL model destroy notice and checked native release.
 Readonly HOST control values are already native snapshots; that value copy does
 not establish ownership of unrelated DEVICE storage.
 
-The system test is `tests/st/worker/framework_eager/test_native_submission.py`.
+The system test is `tests/st/worker/framework_kernel/test_native_submission.py`.
 Run it in the declared `torch_npu` test environment with `--junitxml`, the matching
 `--platform`, and a device reserved through `task-submit`. Both HBG and TMR and
 queue enabled/disabled are covered. Cancellation does not produce an output

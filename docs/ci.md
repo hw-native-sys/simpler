@@ -564,8 +564,9 @@ An explicit `ASCEND_PROCESS_LOG_PATH` takes precedence.
 
 Program is the default product: a test declares
 `runtime_product("kernel"|"auxiliary")` only when it is not Program. Kernel tests
-also declare `execution_mode("eager"|"capture_replay")`; Program and auxiliary
-groups are mode-free because Program only supports eager. Runtime identity comes
+also declare `execution_mode("eager"|"capture_replay")` to identify the tested
+framework usage scenario. This marker does not select a Simpler execution path.
+Program and auxiliary groups are mode-free. Runtime identity comes
 from the existing runtime marker, scene class or parameter instance; conflicting
 sources are errors. `SceneTestCase` defaults to Program through
 `_st_runtime_product`; its `_st_execution_mode` default applies only when the
@@ -666,6 +667,9 @@ kernel cache before acquiring four physical devices. Preparation uses the instal
 wheel's `PYTHONPATH`, and the device task reuses those artifacts with one pytest
 process per device. The framework job timeout is 60 minutes on A5 and 45 minutes
 on A2/A3, including preparation and queue wait.
+The shared consumers and tests live in `examples/workers/l2/framework_kernel/`
+and `tests/st/worker/framework_kernel/`. The two scenario labels remain separate
+coverage groups so passing ordinary submission cannot qualify graph replay.
 
 Comment-trigger workflows are loaded from the default branch, whereas their local
 actions and identity scripts come from the checked-out PR. The canonical

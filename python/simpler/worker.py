@@ -14778,7 +14778,8 @@ class Worker:
         ``caller_stream``: Direct L2 RTS stream handle, required for a borrowed
         environment. Successful submit enqueues the caller exit dependency before
         returning. The caller keeps the stream and external allocations alive through
-        explicit wait or close. Capture is rejected before source references are reserved.
+        explicit wait or close. Graph recording uses ``prepare_submission`` with
+        a framework adapter that retains the original run through its last model use.
 
         Graph construction remains serialized. A local L3 Worker that owns its
         startup and uses an onboard a2a3/a5 host_build_graph or

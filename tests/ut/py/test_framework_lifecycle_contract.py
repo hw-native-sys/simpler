@@ -18,8 +18,8 @@ from types import SimpleNamespace
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
-_CONSUMER = _ROOT / "examples/workers/l2/framework_eager/lifecycle.py"
-_ST = _ROOT / "tests/st/worker/framework_eager/test_lifecycle.py"
+_CONSUMER = _ROOT / "examples/workers/l2/framework_kernel/lifecycle.py"
+_ST = _ROOT / "tests/st/worker/framework_kernel/test_lifecycle.py"
 _TMR = "tensormap_and_ringbuffer"
 _HBG = "host_build_graph"
 

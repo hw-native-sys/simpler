@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
-_CONSUMER = _ROOT / "examples/workers/l2/framework_eager/scope_statistics.py"
+_CONSUMER = _ROOT / "examples/workers/l2/framework_kernel/scope_statistics.py"
 
 
 def _load(path, name):
@@ -345,7 +345,7 @@ def test_unknown_completion_or_export_failure_retains_all_owners(consumer, trans
     "defect", [None, "wrong_value", "wrong_selection", "mixed_epoch", "missing_mutation", "wrong_thread"]
 )
 def test_actual_st_rejects_invalid_summary(tmp_path, monkeypatch, defect):
-    st = _load(_ROOT / "tests/st/worker/framework_eager/test_scope_statistics.py", "scope_st")
+    st = _load(_ROOT / "tests/st/worker/framework_kernel/test_scope_statistics.py", "scope_st")
     summary = dict(
         platform="a2a3",
         runtime="tensormap_and_ringbuffer",

@@ -22,7 +22,7 @@ A completed execution is not authorization to destroy a model's backing.
 | Shared state and scheduler resources | Simpler retains the shared AICPU/AICore backing, each workspace lease, and scheduler notification and counter owners until the last use. Both device roles receive the same shared addresses. |
 | HBG GM heap | Preparation retains a fixed heap lease through its last use, including external model uses. |
 | Internal streams, fences and caller-order events | Actual stream generation and event storage survive their recording/execution/wait references. |
-| Program input staging | Owned by the ordinary eager Program run through observation and cleanup. |
+| Program input staging | Owned by the Program run through observation and cleanup. |
 
 Host orchestration scratch and draft mirrors can be reused after extraction has
 ended their readers. RTS launch snapshots and the Simpler-owned sources of

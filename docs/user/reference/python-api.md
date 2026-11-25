@@ -86,18 +86,22 @@ rejects implicit tensor H2D. Keep external allocations, context and stream alive
 through retirement. Successful submit has already enqueued both kernels and the
 caller exit dependency, so work appended to that caller stream is ordered after
 the operator. Caller synchronization can establish device results; `RunHandle.wait`
-still performs runtime retirement. Capture is rejected before run/source state is
-published. Borrowed close does not reset the caller device or destroy its stream.
+still performs runtime retirement. Graph recording uses the native framework
+queue interface below; ordinary RunHandle retirement does not establish a
+graph's last-use boundary. Borrowed close does not reset the caller device or destroy its stream.
 
 Frameworks with a separate host emission queue must place the submission in
 that queue's callback; passing a stream integer alone does not order a Python
 call against framework work still waiting for host emission. The optional
-[A3 framework eager reference](../../../examples/workers/l2/framework_eager/README.md)
+[framework Kernel reference](../../../examples/workers/l2/framework_kernel/README.md)
 uses the same public Worker for TMR and HBG, preserves frame/storage owners and
 uses the final framework completion boundary before runtime retirement. It
 demonstrates ordering, not overlapping execution: native admission, predecessor
 retirement and capacity backpressure can still wait. It
-requires matching torch/torch_npu/CANN and does not enable capture submission.
+requires matching torch/torch_npu/CANN. Its graph consumer uses the same
+`Worker.prepare_submission` token and native queue bridge, retaining the original
+run until graph destruction and checked cleanup. See the
+[common execution contract](../../design/native-capture-common-contract.md).
 
 ### Memory
 
@@ -272,18 +276,28 @@ Add tensors **in signature order**, before any scalars. Use `INPUT` for an
 input, `OUTPUT_EXISTING` for a caller-allocated output, and `INOUT` for an
 input/output view. `DataType` carries the element types.
 
-### Eager workspace capacity
+### Invocation workspace capacity
 
-Owned and borrowed direct-L2 calls reuse internal arena capacity and grow it
-when a later invocation needs more storage. An empty first HBG call does not
-require a nonempty warmup or a new Worker before submitting a larger graph.
-A failed replacement allocation preserves the existing arena addresses and
-capacities; public submission errors retain their existing cleanup requirements.
+HBG separates its fixed-capacity GM heap from its growable execution arena.
+`runtime_env.ring_heap[0]` selects the heap capacity; zero selects 256 MiB.
+The first successful allocation fixes the heap capacity and address for that
+context. Later calls must request the same capacity, and preparation rejects a
+graph whose heap requirement exceeds it. Configure sufficient capacity before
+the first allocation; increasing it later requires a new context.
 
-Each native run retains its bank through retirement. Concurrent HBG preparation
-uses a different bank, while shared-bank runtimes require compatible storage
-before preparing ahead of an executing run. This does not make capture/replay
-supported: captured graphs require their own address-retention contract.
+The execution arena can grow when a later graph needs more storage. An empty
+first HBG call does not require a nonempty warmup before submitting a larger
+graph within the configured heap capacity. Failed replacement allocation
+preserves committed storage, and retained runs keep the backing they reference.
+Public submission errors retain their existing cleanup requirements.
+
+Ordered HBG runs in one context share heap and writable execution storage while
+retaining their own initial images. Concurrent Host preparation does not grant
+independent device scratch: launches and recorded replays must be ordered before
+reusing shared contents. Other runtimes follow their declared resource contracts.
+A recorded run retains its prepared backing through the graph's last use;
+ordinary retirement alone cannot establish that boundary. See the
+[resource lifetime contract](../../design/native-hbg-prepared-lifetime.md).
 
 ### Borrowed device storage
 
@@ -368,8 +382,11 @@ keepalive=(...))` prepares a direct L2 invocation without launching it or waitin
 for lane capacity. It snapshots arguments/configuration, including readonly HOST/NONE control
 contents, and reserves the callable
 and referenced Simpler buffers. Pass external tensor and stream owners in
-`keepalive`; raw addresses do not retain storage. Capture and L3 Python
-orchestration are outside this interface.
+`keepalive`; raw addresses do not retain storage. The framework adapter uses the
+same token for ordinary submission and graph recording. For a graph it registers
+the model-destruction notice before enqueue, retains the original run through
+all replays, and releases owners only after checked native cleanup. L3 Python
+orchestration is outside this interface.
 
 The returned `PreparedSubmission` supports the usual `RunHandle.wait()` and
 `done` property. On the Python thread, pass `ticket.native_handle` to your native adapter.
@@ -420,7 +437,7 @@ retry after retirement; physical completion alone does not retire the Python use
 Keep the interpreter alive
 until queued callbacks and Worker cleanup finish; tokens cannot cross a fork.
 
-See the [native queue example](../../../examples/workers/l2/framework_eager/native_submission.py)
+See the [native queue example](../../../examples/workers/l2/framework_kernel/native_submission.py)
 for real framework producer/kernel/consumer ordering and cancellation handling.
 
 ## `simpler_setup`

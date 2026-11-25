@@ -30,7 +30,7 @@ prepared = test_native_submission.prepared
 
 @pytest.fixture
 def consumer():
-    path = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/native_capture.py"
+    path = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_kernel/native_capture.py"
     spec = importlib.util.spec_from_file_location("cold_consumer", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -403,7 +403,7 @@ def test_storage_only_rhs_still_produces_correct_replays_without_qualification(s
 
 @pytest.fixture
 def driver():
-    path = Path(__file__).resolve().parents[3] / "st/worker/framework_eager/native_capture.py"
+    path = Path(__file__).resolve().parents[3] / "st/worker/framework_kernel/native_capture.py"
     spec = importlib.util.spec_from_file_location("cold_capture_driver", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

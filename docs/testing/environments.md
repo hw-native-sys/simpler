@@ -64,11 +64,11 @@ For hardware runs, install dependencies and build the framework bridge before
 requesting devices. Populate the managed PTO-ISA checkout by calling
 `simpler_setup.pto_isa.ensure_pto_isa_root()` with the same installed-wheel
 `PYTHONPATH` used by the device job; warming the source checkout alone does not
-populate the installed assets' cache. `framework_eager/main.py --compile-only --build-dir <dir>`
+populate the installed assets' cache. `framework_kernel/main.py --compile-only --build-dir <dir>`
 prepares the bridge; exporting `SIMPLER_FRAMEWORK_BUILD_DIR=<absolute-dir>` makes
 the fixture reuse it. Without that explicit setting the fixture retains its
 existing session-local build. Run
-`python examples/workers/l2/framework_eager/warm_kernels.py --platform <arch> --output <warmup.json>`
+`python examples/workers/l2/framework_kernel/warm_kernels.py --platform <arch> --output <warmup.json>`
 outside the allocation with the same Python, CANN environment and `PYTHONPATH`
 as the device run. It calls the consumers' own compile entries for both runtimes,
 including lifecycle x/y and HOST-control value arguments, and records each
@@ -81,7 +81,7 @@ does not prove that compilation stayed outside the allocation. Audit compiler
 execution separately when validating the prepared run.
 The destroy-refusal case can reuse a precompiled shim through
 `SIMPLER_FRAMEWORK_DESTROY_SHIM=<absolute-so-path>`; build it from
-`tests/st/worker/framework_eager/native_capture_destroy_shim.c` using
+`tests/st/worker/framework_kernel/native_capture_destroy_shim.c` using
 `cc -std=c11 -O2 -fPIC -shared -Wall -Wextra -Werror <source> -o <output> -ldl`
 before allocation. The eager entry point accepts `--bridge <existing-so>` to
 load the prepared bridge without any relinking.
@@ -110,19 +110,27 @@ The CPU checker contracts exercise export validation; actual collector behavior
 requires the framework hardware cases. Diagnostic collection may wait, and this
 consumer does not qualify other DFX collectors or capture/replay.
 
-The framework eager tests live in `tests/st/worker/framework_eager` and run on
+The framework Kernel tests live in `tests/st/worker/framework_kernel` and run on
 `--platform a2a3` or `--platform a5`. Each consumer uses that platform for
 compilation, Worker construction and its result record; compile caches include
 the platform. A shared host bridge does not establish device compatibility.
 Each platform needs its own actual plan, JUnit and environment identity.
 
-The framework eager corpus shares one session-scoped optional bridge fixture.
+The framework Kernel corpus shares one session-scoped optional bridge fixture.
 Its same-stream, cross-stream, alias/INOUT, callback-failure recovery and
 per-call-value and persistent-DEVICE-state modules are discovered by their
 environment declaration; adding
 a module does not require an expected-nodeid list or workflow path edit. Run the
 declared environment under an exclusive device allocation. Use one device with
 `--max-parallel 1` as the serial control; a filtered plan proves only that filtered set.
+
+Ordinary submission and graph recording share this environment and the native
+queue bridge. `execution_mode("eager")` and `execution_mode("capture_replay")`
+label the framework scenarios for coverage; they do not configure separate
+Simpler execution modes. `test_native_capture.py` checks graph recording and
+replay with both runtimes and both Torch task-queue settings. The other consumers
+cover ordinary submission, ordering, values, diagnostics and failure recovery.
+
 The recovery consumer also exercises the public direct-chip close path: accepted
 handles are drained before workspace ownership can be released, without
 individual user waits. Native timeout/context refusals and retryable close debt

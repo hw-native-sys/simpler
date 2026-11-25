@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[4]
-_EXAMPLE = ROOT / "examples/workers/l2/framework_eager/native_submission.py"
+_EXAMPLE = ROOT / "examples/workers/l2/framework_kernel/native_submission.py"
 pytestmark = [
     pytest.mark.runtime_product("kernel"),
     pytest.mark.execution_mode("eager"),

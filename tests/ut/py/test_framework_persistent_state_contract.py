@@ -23,8 +23,8 @@ from simpler.buffer import AccessMode, Buffer, BufferLocation, LocalEndpointBuff
 from simpler.task_interface import DataType, TensorArgType, TensorTransfer
 
 _ROOT = Path(__file__).resolve().parents[3]
-_CONSUMER = _ROOT / "examples/workers/l2/framework_eager/persistent_state.py"
-_ST = _ROOT / "tests/st/worker/framework_eager/test_persistent_state.py"
+_CONSUMER = _ROOT / "examples/workers/l2/framework_kernel/persistent_state.py"
+_ST = _ROOT / "tests/st/worker/framework_kernel/test_persistent_state.py"
 
 
 def _load(path, name):

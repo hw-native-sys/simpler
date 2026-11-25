@@ -20,8 +20,8 @@ from simpler.buffer import create_host_shared_buffer
 from simpler.task_interface import DataType, Tensor, TensorArgType, TensorTransfer
 
 _ROOT = Path(__file__).resolve().parents[3]
-_CONSUMER = _ROOT / "examples/workers/l2/framework_eager/value_arguments.py"
-_ST = _ROOT / "tests/st/worker/framework_eager/test_value_arguments.py"
+_CONSUMER = _ROOT / "examples/workers/l2/framework_kernel/value_arguments.py"
+_ST = _ROOT / "tests/st/worker/framework_kernel/test_value_arguments.py"
 
 
 def _load(path, name):

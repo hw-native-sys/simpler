@@ -93,7 +93,7 @@ def _compile(runtime, platform="a2a3"):
             }
         ],
     }
-    return compile_chip_callable_spec(spec, platform, runtime, f"framework-eager-{platform}-{runtime}")
+    return compile_chip_callable_spec(spec, platform, runtime, f"framework-kernel-{platform}-{runtime}")
 
 
 def _prepare_frames(torch, worker, handle, stream, raw_stream, calls):
@@ -286,7 +286,7 @@ def main():
     parser.add_argument("--platform", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--calls", type=int, default=3)
-    parser.add_argument("--build-dir", type=Path, default=ROOT / "build/framework_eager")
+    parser.add_argument("--build-dir", type=Path, default=ROOT / "build/framework_kernel")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--bridge", type=Path, help="Load an existing compiled bridge without rebuilding it")
     options = parser.parse_args()

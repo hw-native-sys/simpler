@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A queued request failure preserves accepted work and later healthy requests."""
+"""Real framework source/context preflight refusal followed by healthy work."""
 
 import json
 import os
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/failure_recovery.py"
+_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_kernel/preflight_recovery.py"
 pytestmark = [
     pytest.mark.runtime_product("kernel"),
     pytest.mark.execution_mode("eager"),
@@ -28,7 +28,7 @@ pytestmark = [
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_recovers_after_accepted_callback_failure(runtime, task_queue, framework_module, tmp_path, request):
+def test_framework_preflight_recovery(runtime, task_queue, framework_module, tmp_path, request):
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
@@ -60,22 +60,21 @@ def test_framework_recovers_after_accepted_callback_failure(runtime, task_queue,
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
-    print("FRAMEWORK_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print("FRAMEWORK_PREFLIGHT_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    summaries = [
-        json.loads(line.removeprefix("FRAMEWORK_FAILURE_RECOVERY_PASS "))
+    records = [
+        json.loads(line.removeprefix("FRAMEWORK_PREFLIGHT_RECOVERY_PASS "))
         for line in result.stdout.splitlines()
-        if line.startswith("FRAMEWORK_FAILURE_RECOVERY_PASS ")
+        if line.startswith("FRAMEWORK_PREFLIGHT_RECOVERY_PASS ")
     ]
-    assert len(summaries) == 1, result.stdout + result.stderr
-    summary = summaries[0]
+    assert len(records) == 1, result.stdout + result.stderr
+    summary = records[0]
     assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["verified"] and summary["calls"] == 3
-    assert summary["submissions"] == [0, 1, 2] and summary["callback_errors"] == [0]
-    assert summary["observed"] == [8, 12, 16]
-    assert summary["caller_tensors_retained"] and summary["close_without_individual_wait"]
-    assert summary["buffers_closed_after_worker"] and summary["caller_stream_after_close"]
+    assert summary["verified"] and summary["calls"] == 3 and summary["observed"] == [8.0, 12.0, 16.0]
+    assert summary["refusals"] == ["source", "context"] and summary["source_registration_replaced"]
+    assert summary["caller_context_preserved"] and summary["alternate_destroyed"]
+    assert summary["caller_stream_after_close"] and summary["caller_tensors_retained"]
     assert len(summary["callback_threads"]) == 3
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

@@ -29,7 +29,7 @@ _SIZE = 128 * 128
 def _callable_spec(name):
     return {
         "orchestration": {
-            "source": str(_ROOT / "examples/workers/l2/framework_eager/kernels/lifecycle_orchestration.cpp"),
+            "source": str(_ROOT / "examples/workers/l2/framework_kernel/kernels/lifecycle_orchestration.cpp"),
             "function_name": "framework_owner_" + name,
             "signature": [D.IN, D.IN, D.OUT],
         },

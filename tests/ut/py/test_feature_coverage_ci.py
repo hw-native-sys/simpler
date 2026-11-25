@@ -102,8 +102,8 @@ def test_auxiliary_probe():
 @pytest.mark.parametrize(
     "path,environment,platform",
     [
-        ("tests/st/worker/framework_eager/test_native_submission.py", "torch_npu", "a2a3"),
-        ("tests/st/worker/framework_eager/test_native_submission.py", "torch_npu", "a5"),
+        ("tests/st/worker/framework_kernel/test_native_submission.py", "torch_npu", "a2a3"),
+        ("tests/st/worker/framework_kernel/test_native_submission.py", "torch_npu", "a5"),
         ("examples/a5/tensormap_and_ringbuffer/host_comm_domain/test_host_comm_domain.py", "default", "a5"),
     ],
 )

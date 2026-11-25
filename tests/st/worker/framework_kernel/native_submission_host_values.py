@@ -28,7 +28,7 @@ def main():
     from simpler.worker import Worker  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[4]
-    path = root / "examples/workers/l2/framework_eager/value_arguments.py"
+    path = root / "examples/workers/l2/framework_kernel/value_arguments.py"
     spec = importlib.util.spec_from_file_location("host_value_helpers", path)
     assert spec is not None and spec.loader is not None
     helpers = importlib.util.module_from_spec(spec)

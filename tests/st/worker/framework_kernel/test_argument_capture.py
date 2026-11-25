@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Persistent DEVICE controls and caller-owned weighted cache through real callbacks."""
+"""Per-task argument-dump payloads and A5 HBG AICore scheduler selection."""
 
 import json
 import os
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/persistent_state.py"
+_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_kernel/argument_capture.py"
 pytestmark = [
     pytest.mark.runtime_product("kernel"),
     pytest.mark.execution_mode("eager"),
@@ -28,7 +28,7 @@ pytestmark = [
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_persistent_state(runtime, task_queue, framework_module, tmp_path, request):
+def test_framework_argument_dump_contract(runtime, task_queue, framework_module, tmp_path, request):
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
@@ -46,6 +46,8 @@ def test_framework_persistent_state(runtime, task_queue, framework_module, tmp_p
             device,
             "--build-dir",
             str(framework_module),
+            "--output-dir",
+            str(tmp_path / "captures"),
         ],
         capture_output=True,
         text=True,
@@ -60,37 +62,26 @@ def test_framework_persistent_state(runtime, task_queue, framework_module, tmp_p
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
-    print("FRAMEWORK_PERSISTENT_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print("FRAMEWORK_ARGUMENT_CAPTURE_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    records = [
-        line.removeprefix("FRAMEWORK_PERSISTENT_STATE_PASS ")
-        for line in result.stdout.splitlines()
-        if line.startswith("FRAMEWORK_PERSISTENT_STATE_PASS ")
-    ]
-    assert len(records) == 1, result.stdout + result.stderr
-    summary = json.loads(records[0])
+    marker = "FRAMEWORK_ARGUMENT_CAPTURE_PASS "
+    records = [line for line in result.stdout.splitlines() if line.startswith(marker)]
+    assert len(records) == 1
+    summary = json.loads(records[0].removeprefix(marker))
     assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["verified"] and summary["calls"] == 12
-    assert summary["controls"] == [
-        [0, 0],
-        [1, 2],
-        [6, 1],
-        [0, 4],
-        [4, 0],
-        [3, 3],
-        [2, 2],
-        [7, 1],
-        [4, 4],
-        [0, 0],
-        [5, 2],
-        [1, 3],
-    ]
-    assert summary["cache_shape"] == [8, 32] and summary["cache_strides"] == [64, 1]
-    assert summary["cache_byte_offset"] == 256
-    assert summary["checksums"] == [-38, 1018, 2602, 6826, 6826, 490, -3206, -7430, -16934, -16934, -22742, -35414]
-    assert summary["caller_frame_retained"] and summary["guard_verified"] and summary["zero_accept_verified"]
-    assert summary["weights_verified"] and summary["persistent_state_verified"]
-    assert len(summary["callback_threads"]) == 12
+    assert summary["verified"]
+    assert summary["levels"] == [0, 3, 2, 0] and summary["shape"] == [128, 128]
+    assert summary["guards_verified"] and summary["config_snapshot_verified"]
+    assert summary["args_dump_supported"] is True
+    assert summary["calls"] == summary["accepted_calls"] == 4 and summary["refusals"] == []
+    assert summary["payload_counts"] == [0, 6, 3, 0] and summary["records_per_enabled_call"] == 6
+    assert summary["payloads_verified"]
+    epochs = summary["run_epochs"]
+    assert len(epochs) == 4 and epochs[0] is None and epochs[3] is None
+    assert all(type(epoch) is int and epoch > 0 for epoch in epochs[1:3]) and epochs[1] != epochs[2]
+    if platform == "a5" and runtime == "host_build_graph":
+        assert summary["scheduler_modes"] == [None, 1, 1, None]
+    assert len(summary["callback_threads"]) == 4
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

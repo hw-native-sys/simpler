@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
-_EXAMPLES = _ROOT / "examples/workers/l2/framework_eager"
+_EXAMPLES = _ROOT / "examples/workers/l2/framework_kernel"
 _COMPILED = (
     "main",
     "alias_inout",
@@ -39,7 +39,7 @@ def _load(path, name):
 
 def _shared_consumers():
     consumers = set()
-    for path in (_ROOT / "tests/st").glob("**/framework_eager/test_*.py"):
+    for path in (_ROOT / "tests/st").glob("**/framework_kernel/test_*.py"):
         module = _load(path, "platform_scene_metadata")
         marks = getattr(module, "pytestmark", [])
         if not any(mark.name == "platforms" and "a5" in mark.args[0] for mark in marks):

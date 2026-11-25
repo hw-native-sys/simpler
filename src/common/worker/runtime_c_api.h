@@ -1107,7 +1107,7 @@ int simpler_run(
  * Build and bind one run into caller-owned opaque storage without launching it.
  * A successful prepare must be paired with simpler_finalize_run(), even when
  * launch is abandoned or fails. The `args` container itself is consumed during
- * prepare and need not remain alive afterward. Eager tensor backing buffers
+ * prepare and need not remain alive afterward. Tensor backing buffers
  * must remain valid through finalize, including Program output delivery. Caller-owned
  * preparation consumes read-only HOST/NONE controls. The caller keeps borrowed
  * device tensors and the execution environment alive until finalizing the original run.
@@ -1163,7 +1163,7 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
  * Launch a prepared run. Returns only after the platform has published its
  * real kernel-launch marker, or after execution terminates before that marker.
  * The acceptance sink captured by prepare is published at that marker; an
- * execution failure before the marker leaves it unchanged. Eager Kernel runs may use a caller stream via
+ * execution failure before the marker leaves it unchanged. Kernel runs may use a caller stream via
  * simpler_launch_run_on_stream.
  */
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
@@ -1456,14 +1456,15 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * which init entry runs first. simpler_init latches program mode — the
  * exclusive-device path driven through the prepared-run family
  * above. simpler_kernel_mode_init latches kernel mode, which borrows the
- * caller's already-current device. Native eager uses simpler_prepare_run,
- * simpler_launch_run_on_stream, and the shared poll/wait/finalize family.
+ * caller's already-current device. Native calls use the prepared-run family
+ * above. Caller-owned runs use simpler_prepare_caller_run and
+ * simpler_submit_run_on_stream for ordinary submission and graph recording.
  * Its caller edges order the whole operator on the explicitly supplied stream.
  * No borrowed path resets or synchronizes the whole device. Cold-path bring-up
  * and registration synchronize a context-owned stream; partial enqueue cleanup
  * may synchronize the bound caller and private streams to prove references are
- * consumed. Capture/replay and the legacy simpler_kernel_mode_launch entry
- * remain unsupported.
+ * consumed. The caller retains a recorded run through all model uses before
+ * finalization. The legacy simpler_kernel_mode_launch entry is unsupported.
  *
  * Identity is a write-once property of the context, not a state that evolves:
  * ExecutionModeLatch on the platform runner holds it, the first init entry to
@@ -1477,13 +1478,17 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * PTO_RUNTIME_ERR_INVALID_STATE.
  *
  * Each call supplies its own config. TMR init validates config-derived scratch
- * sizes; HBG declares per-run banks whose sizes are determined at bind time.
- * Neither declaration commits those arenas. Native eager calls reuse an arena
- * while its capacity suffices and transactionally replace it when more is
- * needed. Native-run admission protects a shared bank; HBG per-run banks may
- * prepare independently. Failed staging preserves the committed regions.
- * Capture/replay remains unsupported; graph retention of arena addresses is
- * not provided by this eager resource lifecycle.
+ * sizes. HBG uses a fixed GM heap: ring_heap[0] selects its capacity, with zero
+ * selecting 256 MiB. The first successful allocation fixes capacity and address
+ * for the context; later calls must request the same capacity, and preparation
+ * rejects graphs exceeding it. The separate execution arena may grow while
+ * retained runs keep the backing they reference. Failed staging preserves
+ * committed regions. Ordered HBG runs share heap and writable execution storage
+ * but retain their own initial images. Concurrent Host preparation does not
+ * permit overlapping device use of shared scratch; launches and model replays
+ * must preserve the context's execution order.
+ * Caller-owned runs retain the backing named by their prepared resources until
+ * finalization, including while recorded models can still use those addresses.
  *
  * Every host_runtime.so exports all four entries below, so a consumer resolves
  * them unconditionally like the rest of the uniform ABI; supported answers the
@@ -1599,17 +1604,7 @@ int simpler_kernel_mode_prepare_callable(
 
 /**
  * Reserved legacy single-call entry; currently a rejecting stub.
- * Native eager callers use simpler_prepare_run and simpler_launch_run_on_stream.
- *
- * The intended single-call contract is:
- *
- * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
- * caller-owned device addresses; they are passed through without ever being
- * dereferenced on the host. A launch performs no device malloc/free, no
- * tensor staging, no synchronize, no capture-state query, and no
- * stream-to-model attachment — keeping those out of the launch path is the
- * implementation's obligation. A return of 0 means the sequence was enqueued;
- * device execution may still be in flight and may still fail asynchronously.
+ * Native callers use the prepared-run and caller-stream entries above.
  */
 int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
 

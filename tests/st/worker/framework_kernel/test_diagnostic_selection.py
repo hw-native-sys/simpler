@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Per-task argument-dump payloads and A5 HBG AICore scheduler selection."""
+"""Queued per-call DFX selections retain their own exported records."""
 
 import json
 import os
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/argument_capture.py"
+_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_kernel/diagnostic_selection.py"
 pytestmark = [
     pytest.mark.runtime_product("kernel"),
     pytest.mark.execution_mode("eager"),
@@ -28,7 +28,7 @@ pytestmark = [
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_argument_dump_contract(runtime, task_queue, framework_module, tmp_path, request):
+def test_framework_diagnostic_selection(runtime, task_queue, framework_module, tmp_path, request):
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
@@ -47,7 +47,7 @@ def test_framework_argument_dump_contract(runtime, task_queue, framework_module,
             "--build-dir",
             str(framework_module),
             "--output-dir",
-            str(tmp_path / "captures"),
+            str(tmp_path / "diagnostics"),
         ],
         capture_output=True,
         text=True,
@@ -62,26 +62,22 @@ def test_framework_argument_dump_contract(runtime, task_queue, framework_module,
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
-    print("FRAMEWORK_ARGUMENT_CAPTURE_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print("FRAMEWORK_DIAGNOSTICS_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    marker = "FRAMEWORK_ARGUMENT_CAPTURE_PASS "
-    records = [line for line in result.stdout.splitlines() if line.startswith(marker)]
-    assert len(records) == 1
-    summary = json.loads(records[0].removeprefix(marker))
+    records = [
+        json.loads(line.removeprefix("FRAMEWORK_DIAGNOSTIC_SELECTION_PASS "))
+        for line in result.stdout.splitlines()
+        if line.startswith("FRAMEWORK_DIAGNOSTIC_SELECTION_PASS ")
+    ]
+    assert len(records) == 1, result.stdout + result.stderr
+    summary = records[0]
     assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["verified"]
-    assert summary["levels"] == [0, 3, 2, 0] and summary["shape"] == [128, 128]
-    assert summary["guards_verified"] and summary["config_snapshot_verified"]
-    assert summary["args_dump_supported"] is True
-    assert summary["calls"] == summary["accepted_calls"] == 4 and summary["refusals"] == []
-    assert summary["payload_counts"] == [0, 6, 3, 0] and summary["records_per_enabled_call"] == 6
-    assert summary["payloads_verified"]
-    epochs = summary["run_epochs"]
-    assert len(epochs) == 4 and epochs[0] is None and epochs[3] is None
-    assert all(type(epoch) is int and epoch > 0 for epoch in epochs[1:3]) and epochs[1] != epochs[2]
-    if platform == "a5" and runtime == "host_build_graph":
-        assert summary["scheduler_modes"] == [None, 1, 1, None]
+    assert summary["verified"] and summary["observed"] == [8.0, 12.0, 16.0, 20.0]
+    assert summary["calls"] == 4 and summary["selections"] == [[0, 0], [1, 2], [3, 4], [0, 0]]
+    assert summary["caller_configs_mutated"]
+    assert len(summary["run_epochs"]) == len(set(summary["run_epochs"])) == 2
+    assert all(epoch > 0 for epoch in summary["run_epochs"])
     assert len(summary["callback_threads"]) == 4
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

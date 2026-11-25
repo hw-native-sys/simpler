@@ -466,7 +466,7 @@ the [common capture and resource lifetime](../design/native-capture-common-contr
 path. Prepare the caller-owned run before `CaptureBegin` and record its stream
 submission. The original run holds the dump pool and output window for replay
 through finalization after model destruction. Caller
-IO remains caller-owned and stream-ordered. Program remains eager-only.
+IO remains caller-owned and stream-ordered. Program has no eager/capture mode selection.
 
 Diagnostic producers sharing a context's collector pool execute serially in one
 caller-ordered domain. Before finalizing any model run, finish
