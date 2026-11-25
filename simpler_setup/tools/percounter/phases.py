@@ -49,7 +49,6 @@ PHASES_BY_PRODUCER = {
             "scalar_calendar_range_enter",
             "scalar_calendar_range_exit",
             "scalar_calendar_mix_rendezvous",
-            "scalar_calendar_start_rendezvous",
             "scalar_calendar_output_fence",
             "scalar_cntnotify_read",
             "scalar_cntnotify_add_issue",

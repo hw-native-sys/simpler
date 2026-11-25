@@ -186,7 +186,7 @@ Use L3 to attribute active Scalar work inside an interval.
 | L0 | AICore wall from the first kernel start to the last kernel's output fence | Coarse run wall in strace when enabled |
 | L1 | Actual kernel entry to return for every task, block and participating role | Assists streaming the AICore records |
 | L2 | Calendar range entry, Graph watermark observed, row begin, inputs satisfied, READY, kernel return, output fence, DONE issue, and row retirement. Defer records link registration with the polling core, signal observation and DONE issue | Core READY publication, Graph materialization and each published watermark, sink and deferred completion observation, and assistant shutdown wait |
-| L3 | Adds scalar intervals for row decoding, range entry and exit, dependency checks, MIX and START rendezvous, argument binding, output fences and completion work. Reports omitted intervals shorter than 1 µs | L2 records |
+| L3 | Adds scalar intervals for row decoding, range entry and exit, dependency checks, local MIX rendezvous, argument binding, output fences and completion work. Reports omitted intervals shorter than 1 µs | L2 records |
 | L4 | Adds the instrumented GM, SSBUF and CntNotify SRAM operations, and retains sub-µs scalar intervals. CntNotify reads show the address and returned word. CntNotify writes show their address and operand at issue | L2 records and existing Host preparation capture |
 
 **Worker View** uses the physical lanes `Cluster NN · C`, `V0` and `V1`.

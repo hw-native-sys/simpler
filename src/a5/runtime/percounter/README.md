@@ -11,7 +11,7 @@ outer DAG by dependency and uses a separate range for each Graph body.
 | ------- | ----------------------- |
 | GM | Per-lane range indexes, calendar rows, bound kernel entries and arguments, and dependency descriptors. AICPU materializes a Graph's arguments and publishes a prefix watermark after flushing the bindings. |
 | SSBUF | Per-cluster rendezvous tokens for MIX roles and eligible blocks of the same consumer, and the block context read by each kernel. |
-| CntNotify SRAM | Run-wide START and EXIT, arrivals for explicit `sync_start`, logical DONE counts, defer indicators, and range tail arrivals. |
+| CntNotify SRAM | Run-wide START and EXIT, logical DONE counts, defer indicators, and range tail arrivals. |
 | SPR | Each core acknowledges quiescence through its own COND nonce. |
 
 Several invocations can share the placement of a Graph body. Each invocation
@@ -23,8 +23,10 @@ publishes completion only when all those credits have arrived.
 
 Within a range, a lane checks the dependencies attached to its row and calls the
 bound kernel with the block index and block count in its invocation context.
-A MIX block uses a local SSBUF rendezvous across its participating roles. An
-explicit `sync_start` also waits for the entire cohort's CntNotify START count.
+A MIX block uses a local SSBUF rendezvous across its participating roles.
+For `sync_start`, the Host places the entire cohort on distinct compatible lanes.
+Each block can enter after its own lane and dependencies are ready. The kernel
+handles any synchronization between blocks of the cohort.
 The kernel's output barrier precedes completion publication.
 
 ### Graph boundaries
@@ -41,7 +43,7 @@ explicit DAG edges.
 
 ## CntNotify capacity
 
-The Host requires a complete CntNotify lease for START, DONE, range tail and
+The Host requires a complete CntNotify lease for DONE, range tail and
 fan-in counters. Quota exhaustion fails bind before launch. This makes the
 counter demand visible at the point of failure so it can be investigated.
 The `complete CntNotify lease required` error reports `requested`, `received`
@@ -131,7 +133,9 @@ same resource class. The backfill must preserve the selected task's estimated
 start and placements. The planner commits both groups before considering
 overlapping resource classes. The evaluator replays each placement's lane and
 wait events, including the follower's periodic DONE probe, fused producer
-counts, START, completion and lane retirement. The worker caches the calendar
+counts, completion and lane retirement. The evaluator predicts completion
+from the latest ready block in a cooperative cohort and uses the measured
+remaining duration from its latest kernel entry. The worker caches the calendar
 with the smallest estimated end time in memory.
 
 A repeated Graph in the same submission samples its last matching invocation.

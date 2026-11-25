@@ -488,17 +488,17 @@ TEST(PercounterCalendar, FusedFaninsWaitForAllIndependentDeferredProducersInEver
 }
 
 TEST(PercounterCalendar, SeparatesCoreOccupancyFromDeferredTail) {
-    const auto ordinary = calendar_sample_cost({100, 104, 0, 0});
+    const auto ordinary = calendar_sample_cost({100, 104, 0, 0}, 0);
     ASSERT_TRUE(ordinary.has_value());
     EXPECT_EQ(ordinary->occupancy_cycles, 4U);
     EXPECT_EQ(ordinary->defer_tail_cycles, 0U);
 
-    const auto deferred = calendar_sample_cost({100, 104, 108, 119});
+    const auto deferred = calendar_sample_cost({100, 104, 108, 119}, 0);
     ASSERT_TRUE(deferred.has_value());
     EXPECT_EQ(deferred->occupancy_cycles, 8U);
     EXPECT_EQ(deferred->defer_tail_cycles, 11U);
-    EXPECT_FALSE(calendar_sample_cost({100, 104, 108, 0}).has_value());
-    EXPECT_FALSE(calendar_sample_cost({100, 104, 108, 105}).has_value());
+    EXPECT_FALSE(calendar_sample_cost({100, 104, 108, 0}, 0).has_value());
+    EXPECT_FALSE(calendar_sample_cost({100, 104, 108, 105}, 0).has_value());
 }
 
 TEST(PercounterCalendar, SyncMixReservesDistinctClustersAndWaitsForWholePredecessor) {

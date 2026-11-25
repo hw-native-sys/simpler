@@ -209,7 +209,6 @@ inline StateSelection select_percounter_state(
     std::vector<int32_t> edges;
     std::vector<size_t> edge_begin(task_count, 0);
     uint64_t mix_task_count = 0;
-    uint64_t sync_cohort_count = 0;
     // Each GRAPH task places its body's blocks, and holds one of its own that
     // no list carries.
     uint64_t block_total = graph.body_blocks;
@@ -223,7 +222,6 @@ inline StateSelection select_percounter_state(
             const HostGraphTemplate &tmpl =
                 graph.templates[graph.invocations[static_cast<size_t>(input.graph_invocation)].template_index];
             mix_task_count += tmpl.mix_task_count;
-            sync_cohort_count += tmpl.sync_cohort_count;
             ++block_total;
             defer_rows += tmpl.defer_rows;
         } else if (!input.inline_completed) {
@@ -243,7 +241,6 @@ inline StateSelection select_percounter_state(
             input.subtask_count = __builtin_popcount(active_mask);
             if (input.active_mask != 0)
                 defer_rows += uint64_t{static_cast<uint32_t>(input.block_num)} * input.subtask_count;
-            sync_cohort_count += input.sync_start;
             mix_task_count += input.is_mix;
             block_total += static_cast<uint64_t>(input.block_num);
         } else {
@@ -374,7 +371,7 @@ inline StateSelection select_percounter_state(
 
     PercounterLayout layout{};
     if (!plan_layout(
-            task_count, block_total, &layout, mix_task_count, sync_cohort_count, graph.layout, defer_rows,
+            task_count, block_total, &layout, mix_task_count, graph.layout, defer_rows,
             runtime->dev.chip_swimlane_level, calendar.uses_cluster_input_share
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");
@@ -397,7 +394,6 @@ inline StateSelection select_percounter_state(
     const uint64_t device_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_state));
 
     SchedulerDoneNotifications notifications{};
-    if (calendar.sync_slot_count != sync_cohort_count) return StateSelection::FAILED;
     // The last SET slot is a run-wide lifecycle word. Keep it out of the
     // calendar slot table: lanes sample the previous generation before discovery.
     const size_t requested = static_cast<size_t>(calendar_header.notify_slots_count) + 1;
@@ -419,8 +415,6 @@ inline StateSelection select_percounter_state(
     external.graph_storage_count = task_count;
     external.callable_table = runtime->callable_entry_table_addr();
     external.callable_count = static_cast<uint64_t>(runtime->callable_table_len());
-    external.sync_notify = notifications.addresses.data();
-    external.sync_notify_count = sync_cohort_count;
     if (!build_tables(inputs, layout, host_base, external, graph_plan)) {
         LOG_ERROR("A5 calendar: failed to build scheduler metadata");
         return StateSelection::FAILED;

@@ -53,7 +53,6 @@ enum class ProfilePhase : uint8_t {
     RangeEnter,
     RangeExit,
     MixRendezvous,
-    StartRendezvous,
     OutputFence,
     CntNotifyRead,
     CntNotifyAddIssue,
@@ -143,8 +142,6 @@ constexpr const char *profile_phase_name(ProfilePhase kind) {
         return "scalar_calendar_range_exit";
     case ProfilePhase::MixRendezvous:
         return "scalar_calendar_mix_rendezvous";
-    case ProfilePhase::StartRendezvous:
-        return "scalar_calendar_start_rendezvous";
     case ProfilePhase::OutputFence:
         return "scalar_calendar_output_fence";
     case ProfilePhase::CntNotifyRead:

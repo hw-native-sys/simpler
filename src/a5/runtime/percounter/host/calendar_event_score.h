@@ -25,8 +25,6 @@ struct CalendarEventCosts {
     uint64_t mix_arrival_cycles{0};
     uint64_t mix_release_cycles{0};
     uint64_t mix_follower_observe_cycles{0};
-    // Cohort START completes after the last participating block has its inputs.
-    uint64_t start_cycles{0};
     uint64_t entry_cycles{0};
     // Logical output readiness to publishing DONE, including on a deferred path.
     uint64_t done_publish_cycles{0};
@@ -370,7 +368,7 @@ inline bool evaluate_calendar_events(
             }
             size_t start_permission = inputs_ready;
             if (task.sync_start) {
-                graph.link(inputs_ready, events.cohort_start, costs.start_cycles);
+                graph.link(inputs_ready, events.cohort_start);
                 start_permission = events.cohort_start;
             }
             if (is_mix) {

@@ -209,7 +209,9 @@ When the device reports 24 clusters and a task requests one logical block,
 that task does not execute once on every physical cluster. Multiple logical
 blocks can be dispatched in batches as compatible cores become available.
 `require_sync_start` requests admission of one task's fitting cohort; it does
-not reserve resources for another task or a remote producer. See the
+not reserve resources for another task or a remote producer. Cohort blocks
+can enter at different times. A kernel that requires a rendezvous between
+blocks must perform that synchronization itself. See the
 [TMR task dependency and progress constraints](aicore-kernel-programming/task-progress.md)
 before adding waits between logical blocks or tasks.
 

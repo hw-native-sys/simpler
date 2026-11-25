@@ -251,7 +251,7 @@ def _row_spans(rows):
         timestamps["fence_end"] = kernel["finish_us"]
     stages = (
         ("row_begin", "inputs_ready", "Read row and wait for inputs"),
-        ("inputs_ready", "ready", "Wait for start permission"),
+        ("inputs_ready", "ready", "Finalize row readiness"),
         ("row_begin", "mix_release_observed", "Read row and wait for local MIX release"),
         ("ready", "kernel_start", "Prepare kernel entry"),
         ("kernel_end", "fence_end", "Output fence"),

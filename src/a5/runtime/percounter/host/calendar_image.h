@@ -82,9 +82,7 @@ struct RangeCalendarImage {
     std::vector<uint32_t> graph_shells;
     std::vector<FusedFanin> fused_fanins;
     CalendarCompletionPlan completion;
-    std::vector<uint32_t> sync_indices;
     std::array<uint64_t, 3> sync_widths{};
-    uint32_t sync_slot_count{0};
     uint32_t phase_slot_count{0};
     uint32_t fanin_slot_count{0};
     bool uses_cluster_input_share{false};
@@ -305,7 +303,6 @@ inline bool build_range_calendar(
         total_tasks += static_cast<uint32_t>(tasks);
     }
     image.completion.tasks.resize(total_tasks);
-    image.sync_indices.assign(total_tasks, PERCOUNTER_NO_SYNC);
     CompletionChains chains(image.completion);
     const uint32_t patch_offset = graphs.invocation_count == 0 ? 0 : image.allocate<CalendarDispatchPatch>(total_tasks);
     if (graphs.invocation_count != 0 && patch_offset == 0) return false;
@@ -368,7 +365,6 @@ inline bool build_range_calendar(
             const uint32_t global = physical_task(task, phase, body_base);
             const auto &task_input = phase.tasks[task];
             if (task_input.sync_start) {
-                image.sync_indices[global] = image.sync_slot_count++;
                 const uint32_t domain = task_input.is_mix ? 2 : task_input.core_type_index;
                 image.sync_widths[domain] =
                     std::max(image.sync_widths[domain], static_cast<uint64_t>(task_input.block_num));
@@ -400,9 +396,7 @@ inline bool build_range_calendar(
             }
             const uint32_t extra_offset = image.allocate<CalendarExecutionExtra>(1);
             if (extra_offset == 0) return false;
-            image.store(
-                extra_offset, CalendarExecutionExtra{global, phase.task_ids[task], shell, PERCOUNTER_NO_SYNC, 0, 0}
-            );
+            image.store(extra_offset, CalendarExecutionExtra{global, phase.task_ids[task], shell, 0, 0});
             image.extras.push_back({extra_offset, global, shell});
             CalendarDispatchPatch patch{};
             if (task_input.has_predicate) patch.predicate_extra_offset = extra_offset;
@@ -501,8 +495,7 @@ inline bool build_range_calendar(
     const uint32_t worker_offset = image.allocate<uint32_t>(workers + 1);
     const uint32_t ranges_offset = image.allocate<CalendarRange>(std::max(1U, total_ranges));
     const uint32_t sample_indexes = image.allocate<uint32_t>(sampled ? total_ranges : 0);
-    const uint64_t slots =
-        uint64_t{image.sync_slot_count} + image.completion.slot_count + image.phase_slot_count + image.fanin_slot_count;
+    const uint64_t slots = uint64_t{image.completion.slot_count} + image.phase_slot_count + image.fanin_slot_count;
     if (slots > UINT32_MAX) return false;
     const uint32_t notify_slots = image.allocate<uint64_t>(slots);
     if (worker_offset == 0 || ranges_offset == 0 || (sampled && sample_indexes == 0) ||
@@ -561,7 +554,7 @@ inline bool bind_range_calendar(
         if (mapped.slot == UINT32_MAX) continue;
         if (mapped.slot >= image.completion.slot_count) return false;
         auto &counter = counters[task_id];
-        counter.completion_notify_address = notifications[image.sync_slot_count + mapped.slot];
+        counter.completion_notify_address = notifications[mapped.slot];
         counter.completion_notify_target = mapped.target;
         counter.calendar_defer_bit = mapped.defer_bit;
     }
@@ -585,7 +578,7 @@ inline bool bind_range_calendar(
             );
         }
     }
-    const size_t first_phase_slot = image.sync_slot_count + image.completion.slot_count;
+    const size_t first_phase_slot = image.completion.slot_count;
     const size_t first_fanin_slot = first_phase_slot + image.phase_slot_count;
     for (const auto &group : image.fused_fanins) {
         const size_t slot = first_fanin_slot + group.slot;
@@ -663,7 +656,6 @@ inline bool bind_range_calendar(
     }
     for (const auto &patch : image.extras) {
         auto extra = image.load<CalendarExecutionExtra>(patch.offset);
-        extra.sync_index = image.sync_indices[patch.global_task];
         if (patch.shell >= 0) extra.shell_add_cmd = range_add_command(counters[patch.shell]);
         else extra.predicate_address = counters[patch.global_task].predicate_address;
         image.store(patch.offset, extra);
