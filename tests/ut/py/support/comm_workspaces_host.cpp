@@ -299,6 +299,14 @@ extern "C" HcclResult HcclCommDestroy(HcclComm comm) {
     return HCCL_SUCCESS;
 }
 
+static void assert_urma_sender_storage(const CommContext &ctx) {
+    const auto &workspace = comm_workspace<CommWorkspaceKind::URMA>(ctx);
+    assert(workspace.size == 8192);  // The size advertised by the fixture's ISA manager.
+    assert(workspace.addr != ctx.windowsIn[ctx.rankId]);
+    const auto capacity = mappings.at(reinterpret_cast<void *>(workspace.addr));
+    assert(capacity == simpler::urma::sender_view_offset(workspace.size, workspace_fixture::device_aiv_count));
+}
+
 static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
     using namespace workspace_fixture;
     const int old_nranks = h->nranks;
@@ -721,6 +729,7 @@ static void test_host_domain(const std::string &scenario) {
     const auto *context = reinterpret_cast<const CommContext *>(ctx);
     assert(context->windowsIn[0] == base && context->windowsOut[0] == base);
     if (mask != 0) {
+        assert_urma_sender_storage(*context);
         for (size_t peer = 1; peer < COMM_MAX_RANK_NUM; ++peer)
             assert(context->windowsIn[peer] == 0);
         assert(registered_hosts.size() == 1);
@@ -1166,8 +1175,10 @@ int main(int argc, char **argv) {
     assert(allocate(2, first, first_ctx, &multi) == 0);
     assert(sized_jetties == 2 && initialized_jetties == 2 && initialized_sq_depth == 512);
     assert(sized_aivs == 2 && initialized_aivs == 2);
+    const auto &multi_context = *reinterpret_cast<const CommContext *>(first_ctx);
+    assert_urma_sender_storage(multi_context);
     auto *multi_info = reinterpret_cast<const pto::comm::urma::UrmaInfo *>(
-        comm_workspace<CommWorkspaceKind::URMA>(*reinterpret_cast<CommContext *>(first_ctx)).addr
+        comm_workspace<CommWorkspaceKind::URMA>(multi_context).addr
     );
     assert(multi_info->rowsPerPeer == 4 && multi_info->jettyCount == 8);
     release(first);

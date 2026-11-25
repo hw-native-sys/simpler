@@ -136,3 +136,34 @@ inline __aicore__ bool send_request_entry(AsyncCtx &ctx, UrmaRequestDescriptor<D
     runtime.publish();
     return submitted;
 }
+
+#if defined(PTO_URMA_SUPPORTED)
+template <typename DstTensor, typename SrcTensor>
+inline __aicore__ bool send_request_entry(
+    AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTensor> desc, simpler::urma::UrmaSession &session
+) {
+    simpler::urma::TmrRequestAdapter runtime(ctx);
+    const bool submitted = simpler::urma::submit_chunked_urma_request(runtime, desc, &session);
+    runtime.publish();
+    return submitted;
+}
+
+template <typename Remote, typename Local>
+inline __aicore__ bool
+send_request_entry(AsyncCtx &ctx, UrmaSegmentedRequest<Remote, Local> desc, simpler::urma::UrmaSession &session) {
+    simpler::urma::TmrRequestAdapter runtime(ctx);
+    const bool submitted = simpler::urma::submit_segmented_request(runtime, desc, session);
+    runtime.publish();
+    return submitted;
+}
+
+template <typename Request>
+inline __aicore__ bool send_request_entry(AsyncCtx &ctx, Request desc, const __gm__ CommWorkspace &workspace) {
+    simpler::urma::UrmaSession session;
+    if (simpler::urma::build_urma_session(ctx, workspace, session)) return send_request_entry(ctx, desc, session);
+    simpler::urma::TmrRequestAdapter runtime(ctx);
+    runtime.set_error(simpler::urma::RequestError::INVALID);
+    runtime.publish();
+    return false;
+}
+#endif

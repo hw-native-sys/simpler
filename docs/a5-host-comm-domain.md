@@ -166,16 +166,73 @@ Use the offset to locate the source in the peer MR.
 
 ```cpp
 const uint64_t offset = reinterpret_cast<uint64_t>(local_table) - ctx->windowsIn[ctx->rankId];
-auto *workspace = reinterpret_cast<__gm__ uint8_t *>(
-    comm_workspace<CommWorkspaceKind::URMA>(*ctx).addr);
+const auto &urma = comm_workspace<CommWorkspaceKind::URMA>(*ctx);
+auto *workspace = reinterpret_cast<__gm__ uint8_t *>(urma.addr);
 auto *peer_source = pto2::urma_backend::peer_mr_ptr<float>(workspace, peer, offset);
-send_request_entry(async, UrmaTget(local_destination, peer_source_tensor, workspace, peer));
+send_request_entry(async, UrmaTget(local_destination, peer_source_tensor, urma, peer));
 ```
 
 The destination and source in `UrmaTget` are PTO GlobalTensors. The runnable
 example constructs them for each requested row on a non-self peer. Kernel return alone does not prove URMA completion: the
 runtime's deferred-completion path holds the producer's output dependencies
 until the transfer completes.
+
+A5 TMR also accepts single-segment URMA Gather PUT and Scatter GET requests.
+The local segment length must be **1 byte through 256 MiB, inclusive**, for both
+directions. Split a larger transfer into separate requests before submission.
+
+Use the URMA descriptor published by the domain to let the request create a
+session for the executing AIV. Tensor requests take the domain and peer in
+their constructor. A Gather or Scatter descriptor carries its own peer, so
+pass the domain when submitting the request. For example, with initialized
+descriptors in GM:
+
+```cpp
+const auto &urma = comm_workspace<CommWorkspaceKind::URMA>(*ctx);
+if (!send_request_entry(async, UrmaTput(remote_destination, 1, local_source, 1), urma)) return;
+```
+
+To reuse a session, bind it once and pass it to each submission. A single
+session can issue tensor and descriptor calls, including native ISA operations.
+The optional last argument sets the default peer for native tensor operations
+that omit it. Its default is zero. Each explicit tensor peer,
+`GatherDestination.peer` or `ScatterSource.peer` selects the peer for that
+request.
+
+```cpp
+simpler::urma::UrmaSession session;
+if (!simpler::urma::build_urma_session(async, urma, session)) {
+    pto2::detail::set_urma_error(async, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    pto2::detail::defer_flush(async);
+    return;
+}
+if (!send_request_entry(async, UrmaTput(dst_tensor, src_tensor, urma, peer), session)) return;
+if (!send_request_entry(async, UrmaTget(local_destination, 1, remote_source, 1), session)) return;
+```
+
+Host reserves one cache-line-padded `UrmaInfo` slot per physical AIV after
+the ISA workspace. `CommWorkspace.size` gives the ISA byte count. When the
+native block index selects the sender's staging area directly, the session
+uses the original header. Otherwise the builder uses that sender's slot and
+adjusts its `gatherRuntimeBase`. Sessions on the same sender and domain share
+that header. All headers point to the domain's original queues, registered
+memory and staging storage. The communication window remains available for
+tensor data at the offsets assigned during allocation.
+
+Use the domain's `CommWorkspace` for sender-aware binding. The legacy tensor
+overload that accepts only a raw ISA workspace address retains its original
+block-indexed staging behavior when it builds its own session.
+
+Each call submits one immediate operation. Both local and peer payload ranges
+must belong to their respective registered memory regions. Keep payloads live
+through completion and declare the corresponding task dependencies before
+consuming the result. The AIV reserves one completion entry before submission.
+A native descriptor operation issued on the same session after a combined call
+uses the same sender staging area. Check the return value of any native
+`event.Wait(session)`. A native wait consumes CQ entries, so its queue must
+have a single consumer during that wait. After FIN, the AICPU uses the original domain workspace
+to check the registered queue progress and propagate observable CQ errors.
+Multi-segment descriptors and deferred batches require separate support.
 
 The selected MTE mappings or URMA workspace belong to this communication domain. They do not replace the
 workspaces of Device-source domains, and they do not use a separate global

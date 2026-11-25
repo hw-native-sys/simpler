@@ -25,6 +25,7 @@
 #include "platform_comm/comm.h"
 #include "platform_comm/comm_context.h"
 #include "platform_comm/comm_domain_onboard.h"
+#include "platform_comm/urma_workspace_layout.h"
 #include "platform_comm/ccu/ccu_domain_owner.h"
 #include "ccu_domain_backend_hcomm.h"
 #include "task_interface/ccu_module_package.h"
@@ -973,7 +974,9 @@ static int init_urma_workspace(
         LOG_ERROR("[comm rank %d] URMA GetWorkspaceSize rejected configuration", h->rank);
         return COMM_DOMAIN_URMA_INIT_FAILED;
     }
-    if (aclrtMalloc(&alloc.urma_workspace_addr, workspace_size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+    const uint64_t allocation_size = simpler::urma::sender_view_offset(workspace_size, alloc.urma_aiv_count);
+    if (allocation_size == UINT64_MAX ||
+        aclrtMalloc(&alloc.urma_workspace_addr, allocation_size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
         return COMM_DOMAIN_URMA_INIT_FAILED;
     }
     pto::comm::Workspace workspace{};
@@ -992,9 +995,14 @@ static int init_urma_workspace(
         return COMM_DOMAIN_URMA_INIT_FAILED;
     }
     alloc.urma_workspace = workspace;
-    if (alloc.urma_workspace.addr == nullptr || alloc.urma_workspace.bytes == 0) {
+    if (workspace.addr != alloc.urma_workspace_addr || workspace.bytes == 0 || workspace.bytes > workspace_size) {
         LOG_ERROR("[comm rank %d] URMA manager returned an invalid workspace descriptor", h->rank);
         return COMM_DOMAIN_URMA_WORKSPACE_INVALID;
+    }
+    const uint64_t views_offset = simpler::urma::sender_view_offset(workspace.bytes, 0);
+    const uint64_t views_size = allocation_size - views_offset;
+    if (aclrtMemset(static_cast<uint8_t *>(workspace.addr) + views_offset, views_size, 0, views_size) != ACL_SUCCESS) {
+        return COMM_DOMAIN_URMA_INIT_FAILED;
     }
     return 0;
 } catch (const std::exception &e) {
