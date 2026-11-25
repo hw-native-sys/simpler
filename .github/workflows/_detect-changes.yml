@@ -133,7 +133,7 @@ jobs:
           if [ -z "$BASE" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
             echo "No usable base commit: cannot attribute changes"
             FILES=""
-          elif ! FILES=$(git diff --name-only "${BASE}...${HEAD_REV}"); then
+          elif ! FILES=$(git diff --no-renames --name-only "${BASE}...${HEAD_REV}"); then
             echo "git diff failed (unresolved base/head SHA?); treating as unattributable"
             FILES=""
           fi
@@ -180,11 +180,16 @@ jobs:
           # in the sibling partition or non-code.
           WSE_ONLY='^(src/wse/|examples/wse/|tests/(st|ut/cpp)/wse/)'
           A5_ONLY='^(src/a5/|examples/a5/|tests/(st|ut/cpp)/a5/)'
+          # The A2/A3 CANN device-query smoke also consumes these A5 topology inputs.
+          A2A3_SHARED_INPUTS='^src/a5/platform/onboard/host/(aicpu_topology_probe\.(cpp|h)|aicpu_affinity_select\.cpp|aicpu_cpu_topo_fallback\.json)$'
+          A2A3_SHARED_INPUTS+='|^src/a5/platform/include/common/platform_config\.h$'
+          A2A3_SHARED=$(echo "$AUTO_TEST_FILES" | grep -E "$A2A3_SHARED_INPUTS" | grep -vE "$NON_CODE" || true)
           A2A3_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$A5_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
-          if [ -n "$A2A3_REMAINING" ]; then
+          if [ -n "$A2A3_REMAINING" ] || [ -n "$A2A3_SHARED" ]; then
             echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
             echo "Files affecting a2a3:"
             echo "$A2A3_REMAINING"
+            if [ -n "$A2A3_SHARED" ]; then echo "$A2A3_SHARED"; fi
           else
             echo "a2a3_changed=false" >> "$GITHUB_OUTPUT"
             echo "All changes are confined to other architectures or non-code; skipping a2a3"
@@ -212,7 +217,6 @@ jobs:
           fi
 
           # Test-category axis. Repo-local tools are not used by scene tests.
-          ST_ONLY='^(tests/st/|examples/)'
           UT_ONLY='^(tests/ut/|tools/)'
 
           ST_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$UT_ONLY" | grep -vE "$NON_CODE" || true)
@@ -223,12 +227,13 @@ jobs:
             echo "All changes are unit-test/tooling-only or non-code; skipping scene tests"
           fi
 
-          UT_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$ST_ONLY" | grep -vE "$NON_CODE" || true)
+          # UTs can import, inspect or compile code from examples and scene tests.
+          UT_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$NON_CODE" || true)
           if [ -n "$UT_REMAINING" ]; then
             echo "ut_affected=true" >> "$GITHUB_OUTPUT"
           else
             echo "ut_affected=false" >> "$GITHUB_OUTPUT"
-            echo "All changes are scene-test/example-only or non-code; skipping unit tests"
+            echo "All changes are manual-only or non-code; skipping unit tests"
           fi
 
           # Corpus axis: product-build jobs read neither examples/ nor tests/
