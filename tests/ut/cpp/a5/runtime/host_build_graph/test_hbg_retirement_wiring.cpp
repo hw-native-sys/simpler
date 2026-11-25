@@ -41,6 +41,7 @@
 // per-core gate on normal shutdown and failed startup.
 namespace {
 struct RetireCall {
+    bool uses_dispatch_register{false};
     std::vector<uint64_t> addrs;
     std::vector<AicoreTeardownControl *> gates;
 };
@@ -69,6 +70,7 @@ uint64_t platform_aicore_exit_deadline() { return std::numeric_limits<uint64_t>:
 int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t count, uint64_t, bool *released) {
     RetireCall call;
     for (size_t i = 0; i < count; ++i) {
+        call.uses_dispatch_register |= targets[i].uses_dispatch_register;
         call.addrs.push_back(targets[i].reg_addr);
         call.gates.push_back(targets[i].teardown);
         if (observed_retirement_runtime != nullptr) {
@@ -494,6 +496,59 @@ TEST_F(HbgRetirementWiring, ResidentClearsStaleRequestAndReleaseBeforeHandshake)
         EXPECT_EQ(runtime->get_teardown_gates()[i].post_close_release, 0u);
         EXPECT_EQ(runtime->get_teardown_gates()[i].exit_request, 0u);
     }
+}
+
+TEST_F(HbgRetirementWiring, ReusedLifecycleWordSeparatesStartExitAndRejectedLaunchAcrossWrap) {
+    auto runtime = std::make_unique<Runtime>();
+    runtime->set_worker_count(3);
+    alignas(32) uint32_t notification = UINT32_MAX;
+    runtime->dev.scheduler_bootstrap.lifecycle_notify_address = reinterpret_cast<uint64_t>(&notification);
+    AicoreLifecycle lifecycle;
+    for (bool start : {true, false, true}) {
+        const uint32_t previous = notification;
+        ASSERT_EQ(lifecycle.pre_handshake_init(runtime.get(), 1, 0), 0);
+        AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
+        ASSERT_EQ(notification, previous);
+        if (start) {
+            lifecycle.publish_lifecycle_start();
+            const uint32_t running = notification;
+            EXPECT_NE(running, previous);
+            EXPECT_EQ(running & AICORE_LIFECYCLE_EXIT_BIT, 0u);
+            EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, true), 0);
+            lifecycle.signal_shutdown_partition(0);
+            EXPECT_EQ(notification, running | AICORE_LIFECYCLE_EXIT_BIT);
+            EXPECT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
+        } else {
+            EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), 0);
+        }
+        EXPECT_NE(notification, previous);
+        EXPECT_NE(notification & AICORE_LIFECYCLE_EXIT_BIT, 0u);
+        EXPECT_TRUE(lifecycle.cores_retired());
+        EXPECT_TRUE(exit_signals.empty());
+        ASSERT_FALSE(retire_calls.empty());
+        EXPECT_FALSE(retire_calls.back().uses_dispatch_register);
+        lifecycle.deinit();
+    }
+}
+
+TEST_F(HbgRetirementWiring, RejectedDiscoveryOnlyMarksWorkersWithoutRetirementTargets) {
+    auto runtime = std::make_unique<Runtime>();
+    runtime->set_worker_count(3);
+    alignas(32) uint32_t notification = UINT32_MAX;
+    alignas(64) std::array<uint32_t, 3> requests{};
+    runtime->dev.scheduler_bootstrap.lifecycle_notify_address = reinterpret_cast<uint64_t>(&notification);
+    runtime->dev.scheduler_bootstrap.rejected_exit_address = reinterpret_cast<uint64_t>(requests.data());
+    AicoreLifecycle lifecycle;
+    ASSERT_EQ(lifecycle.pre_handshake_init(runtime.get(), 1, 0), 0);
+    AicoreLifecycleTestPeer::seed(lifecycle, {kAddrs[0], 0, kAddrs[0]});
+    ASSERT_NE(lifecycle.validate_discovery(), 0);
+    EXPECT_EQ(notification, UINT32_MAX);
+    EXPECT_EQ(requests, (std::array<uint32_t, 3>{0, 1, 1}));
+    EXPECT_NE(lifecycle.release_partition(runtime.get(), 0, false), 0);
+    EXPECT_EQ(notification, requests[1]);
+    ASSERT_EQ(retire_calls.size(), 1u);
+    EXPECT_EQ(retire_calls[0].addrs, std::vector<uint64_t>{kAddrs[0]});
+    EXPECT_FALSE(lifecycle.cores_retired());
 }
 
 TEST_F(HbgRetirementWiring, FailedResidentStartupStillRetiresThroughPerCoreGates) {

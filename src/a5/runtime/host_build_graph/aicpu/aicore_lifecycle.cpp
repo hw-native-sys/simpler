@@ -55,6 +55,15 @@ constexpr int32_t kDiagnosticDumpLane = 0;
 CoreType subtask_core_type(uint8_t subtask) { return subtask == 0 ? CoreType::AIC : CoreType::AIV; }
 #endif
 
+void publish_lifecycle_word(volatile uint32_t *word, uint32_t value) {
+    wmb();
+    __atomic_store_n(word, value, __ATOMIC_RELEASE);
+    // Drain the posted SET on the same register before a different partition
+    // can issue EXIT, or the completed run can release its lease for reuse.
+    (void)__atomic_load_n(word, __ATOMIC_RELAXED);
+    rmb();
+}
+
 void record_lifecycle_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     SchedulerRunControl *run_control = aicore_scheduler_run_control(context);
@@ -74,6 +83,8 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
     core_count_ = 0;
     aicpu_thread_num_ = aicpu_thread_num;
     regs_base_ = regs_base;
+    lifecycle_notify_ = nullptr;
+    rejected_exit_ = nullptr;
     lifecycle_traces_ = nullptr;
     pmu_initialized_ = false;
     handshake_failed_.store(false, std::memory_order_release);
@@ -89,6 +100,13 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
     for (auto &window : thread_work_windows_)
         window = {};
     core_count_ = runtime->dev.worker_count;
+    lifecycle_notify_ =
+        reinterpret_cast<volatile uint32_t *>(runtime->dev.scheduler_bootstrap.lifecycle_notify_address);
+    rejected_exit_ = reinterpret_cast<uint32_t *>(runtime->dev.scheduler_bootstrap.rejected_exit_address);
+    if (lifecycle_notify_ != nullptr) {
+        const uint32_t prior = __atomic_load_n(lifecycle_notify_, __ATOMIC_RELAXED);
+        lifecycle_start_ = (prior + 2U) & ~AICORE_LIFECYCLE_EXIT_BIT;
+    }
     // The descriptor's gate tail is device-owned and is not copied from the host.
     // Clear prior-run releases before any partition can open a register window.
     std::memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * core_count_);
@@ -181,7 +199,21 @@ int32_t AicoreLifecycle::validate_discovery() {
             break;
         }
     }
-    if (!valid) handshake_failed_.store(true, std::memory_order_release);
+    if (!valid) {
+        // Discovery has joined. These workers have no register window and will
+        // never receive a COND nonce. Publish their request before broadcast EXIT.
+        if (rejected_exit_ != nullptr) {
+            for (int32_t i = 0; i < core_count_; ++i) {
+                if (!core_reported(i))
+                    __atomic_store_n(
+                        &rejected_exit_[i], lifecycle_start_ | AICORE_LIFECYCLE_EXIT_BIT, __ATOMIC_RELEASE
+                    );
+            }
+            cache_flush_range(rejected_exit_, core_count_ * sizeof(*rejected_exit_));
+            wmb();
+        }
+        handshake_failed_.store(true, std::memory_order_release);
+    }
     return valid ? 0 : -SIMPLER_ERROR_INVALID_ARGS;
 }
 
@@ -476,9 +508,17 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
     return 0;
 }
 
+// The calendar leader publishes this after validating all reports and making
+// the topology and reset dependency counters visible. Only this leader writes START.
+void AicoreLifecycle::publish_lifecycle_start() const { publish_lifecycle_word(lifecycle_notify_, lifecycle_start_); }
+
 int32_t AicoreLifecycle::release_partition(Runtime *runtime, int32_t thread_idx, bool start_execution) {
     if (core_count_ <= 0 || aicpu_thread_num_ <= 0) return -SIMPLER_ERROR_INVALID_ARGS;
-    if (!start_execution) return finish_shutdown_partition(thread_idx, runtime);
+    if (!start_execution) {
+        if (lifecycle_notify_ != nullptr) signal_shutdown_partition(thread_idx);
+        return finish_shutdown_partition(thread_idx, runtime);
+    }
+    if (lifecycle_notify_ != nullptr) return 0;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
     AicpuThreadLifecycleTrace *trace = thread_lifecycle_trace(thread_idx);
@@ -496,9 +536,13 @@ void AicoreLifecycle::signal_shutdown_partition(int32_t thread_idx) {
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
     AicpuThreadLifecycleTrace *trace = thread_lifecycle_trace(thread_idx);
     if (trace != nullptr && lifecycle_timing_enabled()) trace->exit_signal_start_cycles = get_sys_cnt_aicpu();
-    for (int32_t i = lo; i < hi; ++i) {
-        if (cores_[i].reg_addr == 0) continue;
-        platform_signal_aicore_exit(cores_[i].reg_addr);
+    if (lifecycle_notify_ != nullptr) {
+        // Any retiring partition can stop the lanes, even when a peer times out.
+        publish_lifecycle_word(lifecycle_notify_, lifecycle_start_ | AICORE_LIFECYCLE_EXIT_BIT);
+    } else {
+        for (int32_t i = lo; i < hi; ++i) {
+            if (cores_[i].reg_addr != 0) platform_signal_aicore_exit(cores_[i].reg_addr);
+        }
     }
     wmb();
     if (trace != nullptr && lifecycle_timing_enabled()) trace->exit_signal_end_cycles = get_sys_cnt_aicpu();
@@ -515,7 +559,7 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
     size_t count = 0;
     for (int32_t i = lo; i < hi; ++i) {
         if (cores_[i].reg_addr == 0) continue;
-        targets[count] = {cores_[i].reg_addr, &runtime->get_teardown_gates()[i]};
+        targets[count] = {cores_[i].reg_addr, &runtime->get_teardown_gates()[i], lifecycle_notify_ == nullptr};
         core_ids[count] = i;
         ++count;
     }
@@ -822,6 +866,8 @@ void AicoreLifecycle::deinit() {
     core_count_ = 0;
     aicpu_thread_num_ = 0;
     regs_base_ = 0;
+    lifecycle_notify_ = nullptr;
+    rejected_exit_ = nullptr;
 }
 
 AicpuThreadLifecycleTrace *AicoreLifecycle::thread_lifecycle_trace(int32_t thread_idx) {

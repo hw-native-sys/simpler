@@ -95,6 +95,48 @@ TEST(AicoreRetirement, ReturnGatesReleaseOnlyAcknowledgedCoresAfterClose) {
     EXPECT_FALSE(released[1]);
 }
 
+TEST(AicoreRetirement, CntNotifyExitPreservesDispatchRegisterAndRequiresFreshCond) {
+    CoreRegs core;
+    constexpr uint32_t sentinel = 0x12345678;
+    write_reg(core.addr(), RegId::DATA_MAIN_BASE, sentinel);
+    write_reg(core.addr(), RegId::COND, AICORE_EXIT_NONCE_0);
+    AicoreTeardownControl gate{};
+    AicoreExitTarget target{core.addr(), &gate, false};
+    bool released = false;
+    std::thread worker([&] {
+        if (wait_until(
+                [&] {
+                    return __atomic_load_n(&gate.exit_request, __ATOMIC_ACQUIRE) == AICORE_EXIT_NONCE_1;
+                },
+                std::chrono::seconds(1)
+            ))
+            write_reg(core.addr(), RegId::COND, AICORE_EXIT_NONCE_1);
+    });
+    EXPECT_EQ(platform_retire_aicore_group(&target, 1, short_deadline(), &released), 0);
+    worker.join();
+    EXPECT_TRUE(released);
+    EXPECT_EQ(gate.post_close_release, AICORE_POST_CLOSE_RELEASE);
+    EXPECT_EQ(core.dispatch(), sentinel);
+}
+
+TEST(AicoreRetirement, CntNotifyExitRejectsRetainedCondWithoutAResponder) {
+    for (uint32_t retained : {AICORE_EXIT_NONCE_0, AICORE_EXIT_NONCE_1}) {
+        CoreRegs core;
+        constexpr uint32_t sentinel = 0x12345678;
+        write_reg(core.addr(), RegId::DATA_MAIN_BASE, sentinel);
+        write_reg(core.addr(), RegId::COND, retained);
+        AicoreTeardownControl gate{};
+        AicoreExitTarget target{core.addr(), &gate, false};
+        bool released = false;
+        EXPECT_EQ(platform_retire_aicore_group(&target, 1, 0, &released), -1);
+        EXPECT_FALSE(released);
+        EXPECT_EQ(gate.post_close_release, 0u);
+        EXPECT_EQ(gate.exit_request, retained == AICORE_EXIT_NONCE_0 ? AICORE_EXIT_NONCE_1 : AICORE_EXIT_NONCE_0);
+        EXPECT_EQ(read_reg(core.addr(), RegId::COND), retained);
+        EXPECT_EQ(core.dispatch(), sentinel);
+    }
+}
+
 TEST(AicoreRetirement, ReturnGateStaysClosedWhilePeerAckIsPending) {
     std::array<CoreRegs, 2> cores;
     std::array<AicoreTeardownControl, 2> gates{};

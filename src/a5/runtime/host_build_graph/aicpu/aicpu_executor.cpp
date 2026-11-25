@@ -505,15 +505,15 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         );
     }
 
-    // Publish the configured context through GM. AICore performs descriptor
-    // observation, Ready bootstrap, and initial slot fill while the DMB gate
-    // remains closed. This is a one-way publication, not a second launch gate.
+    // The resident path publishes contexts before its bootstrap acknowledgement.
+    // The calendar leader can release the lanes here: all reports are accepted
+    // and its topology and dependency counters are already visible.
     if (!init_failed_.load(std::memory_order_acquire)) {
         publish_partition(runtime, tidx, nthreads);
     }
 
     // Only the leader polls GM bootstrap state; peers acquire its local
-    // completion flag. The following release is the AICore-wide DMB gate.
+    // completion flag before any partition can enter failure cleanup.
     aicore_lifecycle_.begin_bootstrap_wait(tidx);
     if (is_leader) {
         if (!init_failed_.load(std::memory_order_acquire) && awaits_bootstrap() &&
@@ -532,8 +532,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     }
     aicore_lifecycle_.end_bootstrap_wait(tidx);
 
-    // The DMB register is the only execution gate. On failure the same
-    // partitioned path sends EXIT and waits for every ACK.
+    // Release the resident dispatch registers, or retire the failed launch
+    // through the transport its host prepared.
     const bool started = !init_failed_.load(std::memory_order_acquire);
     int32_t shutdown_rc = aicore_lifecycle_.release_partition(runtime, tidx, started);
     if (shutdown_rc != 0) {

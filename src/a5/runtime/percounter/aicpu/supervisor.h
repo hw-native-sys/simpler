@@ -44,6 +44,7 @@ namespace simpler::percounter {
 
 inline bool percounter_mode_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
+           runtime->dev.scheduler_bootstrap.lifecycle_notify_address != 0 &&
            runtime->dev.scheduler_bootstrap.runtime_mode == SCHEDULER_RUNTIME_MODE_PERCOUNTER;
 }
 
@@ -122,30 +123,6 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     wmb();
     LOG_INFO("A5 percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);
     return 0;
-}
-
-/**
- * Tell this thread's slice of cores READY.
- *
- * Only a core whose report this run accepted is answered; on a stamped run a
- * silent core is exactly what the epoch check withheld. Unlike resident there
- * is no per-worker context to hand over: the control block address is already
- * in the bootstrap word the host published before launch.
- */
-inline void percounter_publish_partition(
-    Runtime *runtime, const AicoreLifecycle &lifecycle, int32_t thread_idx, int32_t thread_count
-) {
-    if (percounter_control(runtime) == nullptr || thread_count <= 0) return;
-    const int32_t core_count = lifecycle.core_count();
-    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count) / thread_count);
-    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count) / thread_count);
-    Handshake *handshakes = runtime->get_workers();
-    for (int32_t i = lo; i < hi; ++i) {
-        if (!lifecycle.core_reported(i)) continue;
-        handshakes[i].aicpu_ready = SCHEDULER_RUNTIME_MODE_PERCOUNTER;
-    }
-    if (hi > lo) cache_flush_range(&handshakes[lo], static_cast<size_t>(hi - lo) * sizeof(Handshake));
-    wmb();
 }
 
 /** What an AICPU thread other than the supervisor does while the lanes run. */
