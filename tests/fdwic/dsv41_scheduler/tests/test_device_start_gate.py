@@ -124,6 +124,7 @@ def test_prepare_passes_valid_snapshot_to_capture(tmp_path, gate, monkeypatch, s
     monkeypatch.setattr(sys, "argv", ["prepare.py", str(runtime), str(output), *selection])
     monkeypatch.setattr(prepare.subprocess, "run", lambda command, **kwargs: calls.append(command))
     monkeypatch.setattr(prepare, "export", lambda *args: [])
+    monkeypatch.setattr(prepare, "build_bundle", lambda *args: None)
     prepare.main()
     assert len(calls) == 1 and calls[0][3] == str(runtime)
     assert Path(calls[0][2]).name == "pypto_lib_latest"

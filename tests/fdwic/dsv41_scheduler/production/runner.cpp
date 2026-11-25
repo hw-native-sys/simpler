@@ -243,7 +243,11 @@ int run(int argc, char **argv) {
     const bool all_levels = std::string(argv[7]) == "all";
     const int level = all_levels ? 0 : std::stoi(argv[7]), warmup = std::stoi(argv[8]), rounds = std::stoi(argv[9]);
     const bool sliced = fs::exists(bundle / "slice.txt");
-    const bool snapshot = fs::exists(bundle / "snapshot.txt");
+    std::ifstream snapshot_marker(bundle / "snapshot.txt");
+    const bool snapshot = snapshot_marker.is_open();
+    std::string reference_kind;
+    snapshot_marker >> reference_kind;
+    const bool analytical_snapshot = reference_kind == "analytical";
     if (runtime_name == "tensormap_and_ringbuffer" && !fs::exists(bundle / "tmr.json"))
         throw std::runtime_error("Prepare a TMR bundle before selecting AICPU scheduling");
     if ((snapshot && (!sliced || materialize)) || (materialize && !sliced))
@@ -511,15 +515,17 @@ int run(int argc, char **argv) {
     }
     worker.finalize();
     HostLogger::get_instance().flush();
+    const char *execution =
+        native_moe ? "native_moe_host_control" : (analytical_snapshot ? "analytical_snapshot" : "replay");
     std::ofstream result(output / "result.json");
     result << "{\"passed\":true,\"device\":" << device << ",\"rank\":" << rank << ",\"runtime\":\"" << runtime_name
            << "\""
            << ",\"original_kernels\":" << registered->child_count()
            << ",\"isolated_case\":" << (sliced ? "true" : "false")
-           << ",\"validated_against_fused_prefix\":" << (sliced ? "true" : "false") << ",\"warmup\":" << warmup
-           << ",\"rounds\":" << rounds << ",\"snapshot_inputs\":" << (snapshot ? "true" : "false")
-           << ",\"ranks\":" << ranks << ",\"execution\":\"" << (native_moe ? "native_moe_host_control" : "replay")
-           << "\""
+           << ",\"validated_against_fused_prefix\":" << (sliced && !analytical_snapshot ? "true" : "false")
+           << ",\"warmup\":" << warmup << ",\"rounds\":" << rounds
+           << ",\"snapshot_inputs\":" << (snapshot ? "true" : "false") << ",\"ranks\":" << ranks << ",\"execution\":\""
+           << execution << "\""
            << ",\"numerical_validation\":" << (native_moe ? "false" : "true") << "}\n";
     return 0;
 }

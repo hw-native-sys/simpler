@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
-for directory in (ROOT, ROOT / "python"):
+for directory in (ROOT, ROOT / "python", Path(__file__).resolve().parents[1]):
     sys.path.insert(0, str(directory))
 
 

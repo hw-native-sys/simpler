@@ -28,7 +28,7 @@ runtime=$(realpath "$2")
 if [[ "$runtime_name" == tensormap_and_ringbuffer && ( "$4" == 0 || "$4" == all ) ]]; then
     "${DSV41_PYTHON:-python3}" "$root/production/tmr_runtime.py" validate "$runtime"
 fi
-ranks=$("${DSV41_PYTHON:-python3}" "$root/production/topology.py" "$bundle" "$preparation")
+ranks=$("${DSV41_PYTHON:-python3}" "$root/production/topology.py" "$bundle" ${preparation:+"$preparation"} "--runtime=$runtime_name")
 if [[ "$ranks" == 2 ]]; then
     "${DSV41_PYTHON:-python3}" "$root/production/device_start_gate.py" validate "$runtime" "$runtime_name"
 fi
