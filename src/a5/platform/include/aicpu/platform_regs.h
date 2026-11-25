@@ -148,12 +148,14 @@ void platform_close_aicore_window(uint64_t reg_addr);
 struct AicoreExitTarget {
     uint64_t reg_addr;
     AicoreTeardownControl *teardown;
+    bool uses_dispatch_register{true};  // False when EXIT was broadcast by CntNotify.
 };
 
 // Enable exit signalling without releasing a core into normal initialization.
 void platform_open_aicore_exit_window(uint64_t reg_addr);
 
-// Retires one exclusively claimed set of cores. Each target's request and
+// Retires one exclusively claimed set of cores. CntNotify users have already
+// signalled EXIT and leave the dispatch register alone through return. Each target's request and
 // release gate must be reset before READY or any EXIT; Native and unstamped
 // launches use the same reserved COND nonce protocol. Each core echoes its
 // current request once after quiescence and makes no subsequent SPR writes.

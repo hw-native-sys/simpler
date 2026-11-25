@@ -242,6 +242,8 @@ struct alignas(128) PercounterControl {
     alignas(128) uint64_t async_registered;
     uint64_t async_settled;
     uint64_t aicpu_profile_offset;
+    // The host upload clears these before either processor starts, including on replay.
+    alignas(64) uint32_t rejected_exit[PLATFORM_MAX_CORES];
 };
 static_assert(
     offsetof(PercounterControl, async_registered) % 128 == 0,

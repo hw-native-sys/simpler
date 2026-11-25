@@ -47,6 +47,7 @@ struct CalendarDeferTest : testing::Test {
     static constexpr uint32_t defer_bit = 1U << 24;
     alignas(32) uint32_t done{0};
     alignas(32) uint32_t shell_done{0};
+    alignas(32) uint32_t lifecycle{0};
     uint32_t signal{0};
     CalendarTiming sample{100, 110, 0, 0};
     PercounterControl control{};
@@ -64,6 +65,7 @@ struct CalendarDeferTest : testing::Test {
         counter.calendar_defer_bit = defer_bit;
         extra.shell_add_cmd = percounter_notify_add_address(reinterpret_cast<uint64_t>(&shell_done));
         wait = {set | CALENDAR_WAIT_DEFER, (uint64_t{24} << 24) | 1};
+        producer.lifecycle_notify = &lifecycle;
         producer.control = &control;
         producer.counters = &counter;
         producer.task_count = 1;
@@ -84,6 +86,39 @@ struct CalendarDeferTest : testing::Test {
         ASSERT_TRUE(deferred);
     }
 };
+
+TEST(CalendarLifecycle, EarlyAndLateWorkersAcknowledgeOnlyTheirOwnRejectedExitAcrossWrap) {
+    PercounterControl control{};
+    alignas(32) uint32_t signal = 1;
+    for (uint32_t first_sample : {UINT32_MAX, signal}) {
+        control.rejected_exit[1] = signal;
+        EXPECT_EQ(percounter_wait_for_admission(&control, 1, signal, first_sample), PercounterAdmission::Rejected);
+        EXPECT_EQ(control.rejected_exit[1], 0u);
+    }
+    // An accepted peer seeing the identical broadcast proceeds to COND retirement.
+    EXPECT_EQ(percounter_wait_for_admission(&control, 0, signal, UINT32_MAX), PercounterAdmission::Retire);
+    // With only a retained EXIT the worker waits for this launch's START.
+    const uint32_t retained = signal;
+    signal = 2;
+    EXPECT_EQ(percounter_wait_for_admission(&control, 1, signal, retained), PercounterAdmission::Start);
+    EXPECT_EQ(control.lane_error, 0u);
+}
+
+TEST(CalendarLifecycle, WatchdogStillWaitsForThisLaunchToRejectTheWorker) {
+    PercounterControl control{};
+    control.scheduler_timeout_cycles = 1;
+    alignas(32) uint32_t signal = 3;
+    std::thread supervisor([&] {
+        while (percounter_gm_read(control.lane_error) == 0)
+            std::this_thread::yield();
+        percounter_gm_store(control.rejected_exit[0], uint32_t{5});
+        __atomic_store_n(&signal, 5u, __ATOMIC_RELEASE);
+    });
+    EXPECT_EQ(percounter_wait_for_admission(&control, 0, signal, 3), PercounterAdmission::Rejected);
+    supervisor.join();
+    EXPECT_EQ(control.lane_error, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+    EXPECT_EQ(control.rejected_exit[0], 0u);
+}
 
 TEST_F(CalendarDeferTest, DirectWaitOnlyBacksOffWhenItHasNoRegisteredDeferToService) {
     const auto many_credits = (uint64_t{24} << 24) | 24;
@@ -396,7 +431,9 @@ TEST(PercounterCalendar, FusedFaninsWaitForAllIndependentDeferredProducersInEver
             registration.expected_value = 1;
             registration.engine = COMPLETION_ENGINE_SDMA;
             registration.completion_type = COMPLETION_TYPE_COUNTER;
+            alignas(32) uint32_t lifecycle = 0;
             LaneConfig lane{};
+            lane.lifecycle_notify = &lifecycle;
             lane.control = &control;
             lane.counters = counters.data();
             lane.task_count = producers;

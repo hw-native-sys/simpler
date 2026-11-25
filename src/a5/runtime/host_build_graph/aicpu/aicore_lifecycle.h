@@ -29,6 +29,7 @@ public:
     int32_t validate_discovery();
     int32_t post_handshake_init(Runtime *runtime);
     void publish_context_partition(Runtime *runtime, int32_t thread_idx);
+    void publish_lifecycle_start() const;
     void begin_bootstrap_wait(int32_t thread_idx);
     void end_bootstrap_wait(int32_t thread_idx);
     int32_t wait_bootstrap_complete(Runtime *runtime);
@@ -108,4 +109,7 @@ private:
     int32_t core_count_{0};
     int32_t aicpu_thread_num_{0};
     uint64_t regs_base_{0};
+    volatile uint32_t *lifecycle_notify_{nullptr};
+    uint32_t lifecycle_start_{0};
+    uint32_t *rejected_exit_{nullptr};
 };

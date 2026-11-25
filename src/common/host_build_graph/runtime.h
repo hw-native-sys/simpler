@@ -244,6 +244,8 @@ struct alignas(64) SchedulerBootstrapInputs {
     volatile uint32_t reserved_;            // keeps worker_context_base 8-byte aligned
     volatile uint64_t worker_context_base;  // device address of worker 0's SchedulerWorkerContext, 0 when unused
     uint64_t context_ready_address;         // Optional A5 READY generation, sampled before reporting this launch.
+    uint64_t lifecycle_notify_address;      // A5 calendar START/EXIT broadcast, owned by this run.
+    uint64_t rejected_exit_address;         // Launch-cleared per-worker slots for A5 calendar discovery failures.
 };
 
 static_assert(sizeof(SchedulerBootstrapInputs) == 64);
@@ -560,10 +562,15 @@ public:
     // through here: a resident base surviving a legacy selection would name an
     // allocation that selection has already released, and a resident mode
     // without its base would send each AICore to a null context.
-    void publish_scheduler_bootstrap(uint32_t mode, uint64_t worker_context_base, uint64_t context_ready_address = 0) {
+    void publish_scheduler_bootstrap(
+        uint32_t mode, uint64_t worker_context_base, uint64_t context_ready_address = 0,
+        uint64_t lifecycle_notify_address = 0, uint64_t rejected_exit_address = 0
+    ) {
         dev.scheduler_bootstrap.runtime_mode = mode;
         dev.scheduler_bootstrap.worker_context_base = worker_context_base;
         dev.scheduler_bootstrap.context_ready_address = context_ready_address;
+        dev.scheduler_bootstrap.lifecycle_notify_address = lifecycle_notify_address;
+        dev.scheduler_bootstrap.rejected_exit_address = rejected_exit_address;
     }
     AicoreTeardownControl *get_teardown_gates() {
         return reinterpret_cast<RuntimeSharedState *>(dev.shared_state_addr)->teardown_gates;

@@ -40,8 +40,10 @@ namespace {
 
 typedef void (*PercounterKernelFunc)(__gm__ int64_t *);
 
-/** How often a spinning lane looks at the exit register and the error word. */
+/** How often a spinning lane looks at the lifecycle notification and the error word. */
 inline constexpr uint32_t PERCOUNTER_SPIN_CHECK_INTERVAL = 64;
+// The lifecycle word is shared by all lanes, including ones idle for the entire graph.
+inline constexpr uint64_t PERCOUNTER_EXIT_POLL_CYCLES = 16 * (PLATFORM_PROF_SYS_CNT_FREQ / 1000000);  // 16 us
 
 struct LaneConfig {
     __gm__ ChipSwimlaneActiveHead *profile_head{nullptr};
@@ -59,6 +61,8 @@ struct LaneConfig {
     mutable bool pending_task_valid{false};
     mutable AicoreWorkWindow work_window{};
     mutable __gm__ ChipSwimlaneAicoreTaskRecord *pending_stream_record{nullptr};
+    __gm__ volatile uint32_t *lifecycle_notify;
+    mutable uint64_t last_exit_poll{0};
     __gm__ PercounterControl *control;
     __gm__ PercounterCounter *counters;
     __gm__ uint64_t *sync_notify;
@@ -152,9 +156,13 @@ percounter_fail(const LaneConfig &cfg, SchedulerGraphResult result, int64_t task
 }
 
 /** True when the lane should stop: EXIT is signalled or some lane has failed. */
-inline __aicore__ bool percounter_should_stop(const LaneConfig &cfg) {
-    return static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL ||
-           percounter_gm_read(cfg.control->lane_error) != 0;
+inline __aicore__ bool percounter_should_stop(const LaneConfig &cfg, bool check_exit = true) {
+    if (percounter_gm_read(cfg.control->lane_error) != 0) return true;
+    if (!check_exit) return false;
+    const uint64_t now = get_sys_cnt_aicore();
+    if (now - cfg.last_exit_poll < PERCOUNTER_EXIT_POLL_CYCLES) return false;
+    cfg.last_exit_poll = now;
+    return (percounter_notify_query(*cfg.lifecycle_notify) & AICORE_LIFECYCLE_EXIT_BIT) != 0;
 }
 
 inline __aicore__ __gm__ pto2::resident::AsyncGroupData *percounter_init_async_record(
@@ -282,8 +290,9 @@ inline __aicore__ bool percounter_clear_mix_signal(const LaneConfig &cfg, uint64
 
 #include "calendar_loop.h"
 
-inline __aicore__
-    AicoreWorkWindow run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType core_type) {
+inline __aicore__ AicoreWorkWindow run_percounter_lane(
+    __gm__ PercounterControl *control, int block_idx, CoreType core_type, __gm__ volatile uint32_t *lifecycle_notify
+) {
     // The caller invalidates the data cache after observing AICPU READY.
     // Configuration is immutable after that publication; use cached loads here.
     // Progress, dependency and exit words retain their bypass/atomic accesses.
@@ -302,6 +311,8 @@ inline __aicore__
     }
 
     LaneConfig cfg{};
+    cfg.lifecycle_notify = lifecycle_notify;
+    cfg.last_exit_poll = get_sys_cnt_aicore();
     PercounterScalarTrace scalar{};
     PercounterScalarBinding scalar_binding;
     uint32_t task_count = 0;
@@ -410,11 +421,57 @@ inline __aicore__
     return cfg.work_window;
 }
 
+// Only a worker rejected by this launch may leave without a register handshake.
+// The request is an odd EXIT generation. Clearing it acknowledges the request;
+// retirement still fails because this worker has no verified physical window.
+inline __aicore__ bool percounter_ack_rejected_exit(__gm__ uint32_t &request, uint32_t signal) {
+    if ((signal & AICORE_LIFECYCLE_EXIT_BIT) == 0) return false;
+    percounter_memory_barrier();  // Order the CntNotify observation before reading the published GM request.
+    if (percounter_gm_read(request) != signal) return false;
+    percounter_gm_store(request, uint32_t{0});
+    percounter_memory_barrier();
+    return true;
+}
+
+enum class PercounterAdmission { Start, Retire, Rejected };
+
+inline __aicore__ PercounterAdmission percounter_wait_for_admission(
+    __gm__ PercounterControl *control, int block_idx, __gm__ volatile uint32_t &lifecycle, uint32_t previous
+) {
+    auto &request = control->rejected_exit[block_idx];
+    // A worker that first samples the already-published EXIT has no later
+    // transition to wait for. The launch-cleared slot disambiguates a retained EXIT.
+    if (percounter_ack_rejected_exit(request, previous)) return PercounterAdmission::Rejected;
+    percounter_observe_data_cache(reinterpret_cast<__gm__ void *>(control));
+    const uint64_t timeout_cycles = percounter_gm_read(control->scheduler_timeout_cycles);
+    const uint64_t ready_wait_start = get_sys_cnt_aicore();
+    const uint64_t poll_cycles = 512U + 16U * static_cast<uint32_t>(block_idx);
+    bool timed_out = false;
+    for (;;) {
+        const uint32_t signal = percounter_notify_query(lifecycle);
+        if (signal != previous) {
+            if (signal & AICORE_LIFECYCLE_EXIT_BIT)
+                return percounter_ack_rejected_exit(request, signal) ? PercounterAdmission::Rejected :
+                                                                       PercounterAdmission::Retire;
+            if (!timed_out) return PercounterAdmission::Start;
+        }
+        if (!timed_out && scheduler_watchdog_expired(ready_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
+            percounter_gm_compare_exchange(
+                control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
+            );
+            timed_out = true;
+        }
+        const uint64_t poll_start = get_sys_cnt_aicore();
+        while (get_sys_cnt_aicore() - poll_start < poll_cycles)
+            SPIN_WAIT_HINT();
+    }
+}
+
 /**
  * A percounter AICore, from its report to the COND nonce acknowledgement.
  *
- * The lane reports its core, waits for READY and register release, executes its
- * ranges, and acknowledges the AICPU's EXIT.
+ * The lane samples the lifecycle generation before reporting, waits for START,
+ * executes its ranges and acknowledges the AICPU's EXIT.
  */
 inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
     __gm__ Handshake *handshake =
@@ -423,6 +480,14 @@ inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int bl
     __gm__ PercounterControl *control =
         reinterpret_cast<__gm__ PercounterControl *>(runtime->dev.scheduler_bootstrap.worker_context_base);
     percounter_observe_cache_line(handshake);
+
+    auto *lifecycle =
+        reinterpret_cast<__gm__ volatile uint32_t *>(runtime->dev.scheduler_bootstrap.lifecycle_notify_address);
+    // The Host rejects an incomplete lease before launch. A malformed
+    // bootstrap cannot publish a report for a gate this lane cannot observe.
+    if (lifecycle == nullptr) return;
+    const uint32_t previous = percounter_notify_query(*lifecycle);
+    percounter_memory_barrier();  // Complete the sample before discovery can authorize START or EXIT.
 
     const uint64_t report_epoch = get_aicore_report_epoch();
     handshake->work_start_cycle = 0;
@@ -442,56 +507,24 @@ inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int bl
     dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
 
-    // The host prefills the timeout, so it bounds this wait before the AICPU
-    // has written anything.
-    percounter_observe_data_cache(reinterpret_cast<__gm__ void *>(control));
-    const uint64_t timeout_cycles = percounter_gm_read(control->scheduler_timeout_cycles);
-    bool released = false;
-    uint32_t signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
-    const uint64_t ready_wait_start = get_sys_cnt_aicore();
-    while (handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_PERCOUNTER && signal != AICORE_EXIT_SIGNAL) {
-        percounter_observe_cache_line(handshake);
-        if (scheduler_watchdog_expired(ready_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
-            percounter_gm_compare_exchange(
-                control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
-            );
-            signal = AICORE_EXIT_SIGNAL;
-            break;
-        }
-        signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
-        SPIN_WAIT_HINT();
-    }
-    if (signal != AICORE_EXIT_SIGNAL) {
-        // The AICPU published the topology before READY; re-observe the block.
+    const auto admission = percounter_wait_for_admission(control, block_idx, *lifecycle, previous);
+    if (admission == PercounterAdmission::Rejected) return;
+    if (admission == PercounterAdmission::Start) {
         percounter_observe_data_cache(reinterpret_cast<__gm__ void *>(control));
-        const uint64_t release_wait_start = get_sys_cnt_aicore();
-        while (signal != AICPU_IDLE_TASK_ID && signal != AICORE_EXIT_SIGNAL) {
-            if (scheduler_watchdog_expired(release_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
-                percounter_gm_compare_exchange(
-                    control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
-                );
-                break;
-            }
-            signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
-            SPIN_WAIT_HINT();
-        }
-        released = signal == AICPU_IDLE_TASK_ID;
-    }
-    if (released) {
         write_reg(RegId::COND, AICORE_IDLE_VALUE);
-        const auto work_window = run_percounter_lane(control, block_idx, core_type);
+        const auto work_window = run_percounter_lane(control, block_idx, core_type, lifecycle);
         handshake->work_start_cycle = work_window.start_cycle;
         handshake->work_end_cycle = work_window.end_cycle;
         dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
         dsb((mem_dsb_t)0);
+        // A finished lane can be idle for most of the run. Space its SRAM reads
+        // so retired lanes do not consume the active workers' notification bandwidth.
+        while ((percounter_notify_query(*lifecycle) & AICORE_LIFECYCLE_EXIT_BIT) == 0) {
+            const uint64_t poll_start = get_sys_cnt_aicore();
+            while (get_sys_cnt_aicore() - poll_start < PERCOUNTER_EXIT_POLL_CYCLES)
+                SPIN_WAIT_HINT();
+        }
     }
-    // A lane arrives here when its share of the run is done, which can be long
-    // before the run ends, or after a local watchdog ended a wait above. The
-    // AICPU sends EXIT on every outcome once its supervisor returns, and the
-    // supervisor has its own progress watchdog, so this wait needs none. EXIT
-    // is published only after the return gate is reset, so wait for it before
-    // acknowledging, and complete the preceding GM writes first.
-    wait_for_aicpu_exit_signal();
     OUT_OF_ORDER_STORE_BARRIER();
     acknowledge_aicore_cond_nonce_and_wait(
         &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime->dev.shared_state_addr)->teardown_gates[block_idx]

@@ -11,8 +11,8 @@ outer DAG by dependency and uses a separate range for each Graph body.
 | ------- | ----------------------- |
 | GM | Per-lane range indexes, calendar rows, bound kernel entries and arguments, and dependency descriptors. AICPU materializes a Graph's arguments and publishes a prefix watermark after flushing the bindings. |
 | SSBUF | Per-cluster rendezvous tokens for MIX roles and eligible blocks of the same consumer, and the block context read by each kernel. |
-| CntNotify SRAM | START arrivals for explicit `sync_start`, logical DONE counts, defer indicators, and range tail arrivals. |
-| SPR | Core bring-up, exit and error handling through the shared platform lifecycle. |
+| CntNotify SRAM | Run-wide START and EXIT, arrivals for explicit `sync_start`, logical DONE counts, defer indicators, and range tail arrivals. |
+| SPR | Each core acknowledges quiescence through its own COND nonce. |
 
 Several invocations can share the placement of a Graph body. Each invocation
 has its own argument bindings and completion targets. A lane waits for the
@@ -47,8 +47,20 @@ counter demand visible at the point of failure so it can be investigated.
 The `complete CntNotify lease required` error reports `requested`, `received`
 and `status`. Check the requested slot count and the SDK allocation error in
 the preceding `scheduler notification acquire failed` message when diagnosing
-quota exhaustion. The AICPU clears a successful lease before it releases the
-lanes.
+quota exhaustion. The AICPU clears the calendar counters before it releases the lanes.
+
+One additional CntNotify SET slot carries START and EXIT for all workers in the
+run. Each lane samples its previous value before publishing its startup report.
+After discovery and calendar initialization, the AICPU leader publishes the next
+even generation with a direct store to SET. The AICPU publishes EXIT to the
+same address with the low bit set. If discovery fails, it first records that
+EXIT generation for each worker without a validated register window. The Host
+upload clears these per-worker slots before launch. A late worker that first
+samples the current EXIT can acknowledge its matching slot and return. The
+run still reports incomplete retirement for those missing windows.
+The lease outlives every worker using it. Retirement still requires each
+discovered core to echo its fresh COND nonce before the AICPU releases that core.
+The calendar leaves DATA_MAIN_BASE available during startup, execution and teardown.
 
 ## Completion and defer
 

@@ -58,10 +58,11 @@ int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
     return simpler::percounter::percounter_post_handshake_init(runtime, aicore_lifecycle_, scheduler_timeout_cycles());
 }
 
-void AicpuExecutor::publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
+void AicpuExecutor::publish_partition(Runtime *runtime, int32_t tidx, int32_t) {
+    if (tidx != 0) return;
     auto *timing = simpler::percounter::percounter_aicpu_timing(simpler::percounter::percounter_control(runtime), tidx);
     if (timing != nullptr) timing->ready_publish_start_cycles = get_sys_cnt_aicpu();
-    simpler::percounter::percounter_publish_partition(runtime, aicore_lifecycle_, tidx, nthreads);
+    aicore_lifecycle_.publish_lifecycle_start();
     if (timing != nullptr) {
         timing->ready_publish_end_cycles = get_sys_cnt_aicpu();
         cache_flush_range(timing, sizeof(*timing));

@@ -398,19 +398,21 @@ inline StateSelection select_percounter_state(
 
     SchedulerDoneNotifications notifications{};
     if (calendar.sync_slot_count != sync_cohort_count) return StateSelection::FAILED;
-    if (calendar_header.notify_slots_count != 0) {
-        const auto requested = calendar_header.notify_slots_count;
-        const int rc = api->acquire_scheduler_notifications(
-            SchedulerNotificationPurpose::CALENDAR_COUNTER, requested, &notifications
+    // The last SET slot is a run-wide lifecycle word. Keep it out of the
+    // calendar slot table: lanes sample the previous generation before discovery.
+    const size_t requested = static_cast<size_t>(calendar_header.notify_slots_count) + 1;
+    const int lease_rc =
+        api->acquire_scheduler_notifications(SchedulerNotificationPurpose::CALENDAR_COUNTER, requested, &notifications);
+    if (lease_rc != 0 || notifications.addresses.size() != requested || notifications.owner == nullptr ||
+        a5_cnt_notify_increment_address(notifications.addresses.back()) == 0) {
+        LOG_ERROR(
+            "A5 calendar: complete CntNotify lease required (requested=%zu, received=%zu, status=%d)", requested,
+            notifications.addresses.size(), lease_rc
         );
-        if (rc != 0 || notifications.addresses.size() != requested || notifications.owner == nullptr) {
-            LOG_ERROR(
-                "A5 calendar: complete CntNotify lease required (requested=%u, received=%zu, status=%d)", requested,
-                notifications.addresses.size(), rc
-            );
-            return StateSelection::FAILED;
-        }
+        return StateSelection::FAILED;
     }
+    const uint64_t lifecycle_notify = notifications.addresses.back();
+    notifications.addresses.pop_back();
 
     ExternalAddresses external{};
     external.graph_storage = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr()) + device_segments.storage;
@@ -531,7 +533,10 @@ inline StateSelection select_percounter_state(
         }
     }
     retain_profile_state(runtime, api, device_state, layout, folded, inline_completed_task_ids);
-    runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);
+    runtime->publish_scheduler_bootstrap(
+        SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset, 0, lifecycle_notify,
+        device_base + layout.control_offset + offsetof(PercounterControl, rejected_exit)
+    );
     if (api != nullptr) api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_PERCOUNTER);
     runtime->add_pending_metadata(
         device_state, host_base, static_cast<size_t>(layout.upload_size), HostPhaseKind::Count, {}

@@ -24,7 +24,9 @@ template <typename Ready>
 inline __aicore__ bool percounter_calendar_wait(const LaneConfig &cfg, Ready ready, const uint32_t &retry_cycles = 0) {
     uint32_t pending = 0;
     for (; !ready(); ++pending) {
-        if (pending % PERCOUNTER_SPIN_CHECK_INTERVAL == 0 && percounter_should_stop(cfg)) {
+        // Check errors on the first miss. Sample the shared EXIT word only
+        // on a sustained wait; the row loop also checks it during ready work.
+        if (pending % PERCOUNTER_SPIN_CHECK_INTERVAL == 0 && percounter_should_stop(cfg, pending != 0)) {
             if constexpr (profile_compiled) {
                 if (cfg.scalar != nullptr) cfg.scalar->poll_loops += static_cast<uint64_t>(pending) + 1;
             }
