@@ -106,17 +106,7 @@ def summarize(per_rank, devices, warmup, rounds):
     }
 
 
-def replay_rank_samples(directory, result):
-    native = result.get("execution") == "native_moe_host_control"
-    require(result["passed"], "Execution failed")
-    if native:
-        require(result.get("numerical_validation") is False, "Native MoE is a performance-only run")
-    else:
-        require(result["validated_against_fused_prefix"], "Replay numerical validation failed")
-    text = "\n".join(path.read_text() for path in sorted((directory / "host").glob("host.*.log")))
-    kernels, _ = paired_spans(text)
-    device = result["device"]
-    require(set(kernels) == {device}, "Raw replay device differs from result")
+def replay_launches(directory, result):
     runs = [
         tuple(map(int, values))
         for values in re.findall(
@@ -125,17 +115,42 @@ def replay_rank_samples(directory, result):
         )
     ]
     warmup, rounds = result["warmup"], result["rounds"]
+    count = warmup + rounds
     mode = {"host_build_graph": 1, "percounter": 5, "tensormap_and_ringbuffer": 0}[result["runtime"]]
-    require(len(runs) in (warmup + rounds, warmup + rounds + 2), "Incomplete replay run sequence")
+    require(warmup >= 0 and rounds >= 1 and len(runs) in (count, count + 2), "Incomplete replay run sequence")
+    level = runs[0][2]
+    require(0 <= level <= 4, "Invalid replay profiling level")
     require(
-        runs[: warmup + rounds] == [(index, mode, 0, int(index < warmup)) for index in range(warmup + rounds)],
-        "Performance samples must be L0 in the selected scheduler mode",
+        all(row == (i, mode, level, int(i < warmup)) for i, row in enumerate(runs[:count])),
+        "Invalid replay launch sequence",
     )
-    if len(runs) > warmup + rounds:
+    if len(runs) > count:
         require(
-            runs[-2:] == [(warmup + rounds, mode, 1, 0), (warmup + rounds + 1, mode, 3, 0)],
+            level == 0 and runs[count:] == [(count, mode, 1, 0), (count + 1, mode, 3, 0)],
             "Unexpected profiled runs after L0 samples",
         )
+    return runs
+
+
+def replay_rank_samples(directory, result, *, analytical_golden=False):
+    native = result.get("execution") == "native_moe_host_control"
+    require(result["passed"], "Execution failed")
+    if analytical_golden or result.get("execution") == "analytical_snapshot":
+        require(
+            result.get("numerical_validation") is True and result["snapshot_inputs"] and result["isolated_case"],
+            "Full-wave numerical validation against analytical outputs failed",
+        )
+    elif native:
+        require(result.get("numerical_validation") is False, "Native MoE is a performance-only run")
+    else:
+        require(result["validated_against_fused_prefix"], "Replay numerical validation failed")
+    text = "\n".join(path.read_text() for path in sorted((directory / "host").glob("host.*.log")))
+    kernels, _ = paired_spans(text)
+    device = result["device"]
+    require(set(kernels) == {device}, "Raw replay device differs from result")
+    runs = replay_launches(directory, result)
+    require(runs[0][2] == 0, "Performance samples must be L0 in the selected scheduler mode")
+    warmup, rounds = result["warmup"], result["rounds"]
     spans = kernels[device]
     snapshot = result["snapshot_inputs"] or native
     require(len(spans) == (len(runs) if snapshot else 1 + 2 * len(runs)), "Missing replay kernel endpoints")
@@ -144,7 +159,7 @@ def replay_rank_samples(directory, result):
     ]
 
 
-def summarize_replay(directory):
+def summarize_replay(directory, *, analytical_golden=False):
     reports = [json.loads(path.read_text()) for path in directory.glob("rank*/result.json")]
     reports.sort(key=lambda result: result["rank"])
     require(
@@ -158,7 +173,10 @@ def summarize_replay(directory):
             "Ranks disagree on the replay contract",
         )
     return summarize(
-        [replay_rank_samples(directory / f"rank{result['rank']}", result) for result in reports],
+        [
+            replay_rank_samples(directory / f"rank{result['rank']}", result, analytical_golden=analytical_golden)
+            for result in reports
+        ],
         [result["device"] for result in reports],
         first["warmup"],
         first["rounds"],

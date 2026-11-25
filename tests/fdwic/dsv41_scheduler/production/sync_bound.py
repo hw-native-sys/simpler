@@ -273,26 +273,27 @@ def analyze_case(bundle, capture, output, seconds=3):
     spec.loader.exec_module(helper)
     checked = helper.read_case(bundle, capture)  # coverage, DAG, metadata, validation and topology audit
     meta = json.loads((bundle / "case.json").read_text())
-    flags = plan_sync(bundle)
-    table = root / "workloads" / meta["flavor"] / meta["case"] / "tasks.tsv"
-    original_ids = {
-        int(line.split()[0]) for line in table.read_text().splitlines() if line and not line.startswith("#")
-    }
+    direct = meta.get("execution") == "full_wave_mix_chain"
+    flags = (
+        {stage["task_id"]: stage["sync_start"] for stage in meta["source"]["stages"]} if direct else plan_sync(bundle)
+    )
+    original_ids = helper.source_task_ids(meta)
     output.mkdir(parents=True, exist_ok=True)
     results = []
     signature = None
     for iteration in range(checked["warmup"], checked["warmup"] + checked["rounds"]):
         folder = capture / f"run{iteration}"
         records = json.loads((folder / "chip_swimlane_records.json").read_text())
-        deps = helper.complete_flat_dag(
-            json.loads((folder / "deps.json").read_text()), folder / "source-task-map.txt", original_ids, 1
-        )
-        mapping = {
-            target: source
-            for source, target in (
-                map(int, line.split()) for line in (folder / "source-task-map.txt").read_text().splitlines()
-            )
-        }
+        deps = helper.case_dag(meta, folder, original_ids)
+        if direct:
+            mapping = {tid: tid for tid in original_ids}
+        else:
+            mapping = {
+                target: source
+                for source, target in (
+                    map(int, line.split()) for line in (folder / "source-task-map.txt").read_text().splitlines()
+                )
+            }
         kinds = records["metadata"]["core_types"]
         hz = records["metadata"]["clock_freq_hz"]
         identities = [
