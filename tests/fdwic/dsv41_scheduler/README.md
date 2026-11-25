@@ -13,17 +13,15 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The active matrix contains seven model cases from `workloads/pypto_lib_latest/source.json`
-and the single-device `synthetic/full_wave_mix_chain`. Use `production/list_cases.py`
-for the eight paths in measurement order.
-Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
-Refresh both HBG and percounter for every case.
+The default benchmark runs seven single-device cases: five native model slices
+(SWA, both C1A cases, C2A full and Engram), the six-stage MIX chain, and the balanced
+four-task MPMD diamond. `production/list_cases.py` prints the seven runnable bundle
+paths. MoE and layers 19–21 remain available as separate communication workloads.
+The original two-device forward is used once to prepare model inputs.
 
-Retain scheduler optimizations only when the sum of all eight case means improves,
-using AICore L0 wall with one warmup and ten measured rounds per case. Include
-both communicating cases; each two-device round starts after a Device
-rendezvous and contributes the maximum of the ranks' local durations. L1/L3
-are diagnostic and do not replace this acceptance metric.
+Report each case separately using the PGO L0 AICore wall, the zero-gap theoretical
+bound, the fixed-calendar 1 µs model and the percentage gap from that model.
+[RESULTS.md](RESULTS.md) records the values and measurement boundaries.
 
 ## Manual-only execution
 
@@ -56,10 +54,9 @@ correctness or update its performance results; run and record those explicitly.
 | c2a_full | 1 | Layer 2 full C2A attention |
 | c1a_reindex | 1 | Layer 24 C1A index refresh |
 | c1a_reuse | 1 | Layer 21 C1A index reuse |
-| moe | 2 | Standalone native MoE with Host token-count control |
 | engram | 1 | Layer 1 Engram quantization, projection and gating |
-| layers_19_21 | 2 | Layers 19 through 21, including the encoder-to-decoder transition |
 | full_wave_mix_chain | 1 | Six dependent synthetic stages alternating pure and mixed engine use |
+| mpmd_diamond | 1 | Four single-block tasks with two independent AIV branches and an AIC join |
 
 Layer indices are zero-based. The six slices use the original full-forward
 prefix to produce their boundary inputs.
@@ -79,7 +76,7 @@ completion, MIX admission, and `defer_wait` use the unchanged production code.
 
 ## Latest native PyPTO-lib group
 
-The seven latest cases use the DeepSeek V4.1 Flash model at
+The seven source model cases use the DeepSeek V4.1 Flash model at
 [PyPTO-lib `4cb7442261`](https://github.com/hw-native-sys/pypto-lib/tree/4cb74422616359b3f95c598b1f9cdd31cf4e4173/models/deepseek_v4_1_flash).
 Six are slices of the same 40-layer HBG capture. The seventh runs the upstream
 `l3_moe` entry. All use the model's original task boundaries and synchronization.
@@ -103,7 +100,7 @@ The IR was lowered with the upstream compiler's pinned PTOAS 0.72.
 
 The native sources and compact input initializers are checked in under
 `kernels/pypto_lib_latest/` and `workloads/pypto_lib_latest/`. Build and prepare
-with `--flavor pypto_lib_latest` to regenerate the seven selected cases. To refresh
+with `--flavor pypto_lib_latest` to prepare the five single-device model cases. To refresh
 topology tables from a full 40-layer capture, place its `deps.json` and matching
 `name_map.json` together and run `export_workloads.py CAPTURE --flavor pypto_lib_latest`.
 The exporter recognizes the fused attention output and the following MoE boundary and
@@ -143,14 +140,14 @@ Host controls execute during graph construction, outside Device wall time.
 The other replay cases preserve device execution for their captured controls;
 they do not test dynamic Host `get_tensor_data` reads.
 
-All eight prepared cases run with the C++ `native-runner`, standard Python and
+All seven default cases run with the C++ `native-runner`, standard Python and
 Simpler/CANN libraries. No PyPTO, PyPTO-lib checkout, Torch or Simpler Python
 bindings are needed during execution. Only initial native MoE input preparation
 requires CPU Torch; the numerical helpers and generated Host/kernel sources
 are included here. Existing prepared bundles avoid that preparation step.
 
 `build.sh --flavor pypto_lib_latest` also builds the native MoE callable under
-`build/portable/native-moe`. `prepare.py`/`export_cases.py` prepare its input
+`build/portable/native-moe`. The standalone `export_cases.py` can prepare its input
 bundle; `--native-moe-bundle` reuses an existing standalone bundle.
 `production/moe.py BUNDLE OUTPUT --compile-only --build-dir PATH` prepares
 only this case; `--reuse-bundle PATH` copies a compatible standalone bundle.
@@ -243,13 +240,11 @@ Historical Device-wall measurements in existing reports retain their original
 labels and cannot be reused as AICore-wall reference values. A refreshed table
 must identify the runtime revision and measurement boundary for each column.
 
-Use one row per native case. Report average milliseconds with six decimal
-places using the six columns in [RESULTS.md](RESULTS.md). Identify the runtime
-revisions for each measurement batch and which rows were refreshed.
-Compute the percentage as `(min(HBG, percounter) / limit - 1) * 100`
-before rounding to two decimal places. In the final row, sum the unrounded case
-means for each runtime and the case limits. Apply the same formula to these totals. Use an em dash for unavailable values.
-Mark unclosed solver bounds and their percentages with a dagger.
+Use one row per default case and the four data columns in [RESULTS.md](RESULTS.md).
+Calculate the PGO gap as `100 × (PGO L0 / fixed-calendar 1 µs time − 1)` before
+rounding. Record the runtime revision and capture level. The 1 µs model adds
+a delay to each same-worker handoff and dependency-to-launch edge, taking the
+latest required arrival at a join. Report the seven rows individually.
 
 ## Included sources and data
 
@@ -371,8 +366,8 @@ launcher never compiles while holding devices. Native MoE `--compile-only`
 remains available with an unwrapped runtime. Single-device Attention replay
 needs no gate.
 
-The default preparation creates all eight bundles. To prepare only the synthetic
-case for an existing runtime and native runner, use the same `--runtime` for
+The default preparation creates all seven default bundles. To prepare just the two synthetic
+cases for an existing runtime and native runner, use the same `--runtime` for
 preparation and execution:
 
 ```bash
@@ -382,7 +377,10 @@ bash "$DSV41/run.sh" "$DSV41/build/chain-prepared/cases/synthetic/full_wave_mix_
   "$DSV41_RUNTIME" "$DSV41/outputs/chain" 0 1 10 --runtime=host_build_graph
 ```
 
-To run all eight active cases from the default prepared directory:
+The balanced diamond is runnable at `cases/synthetic/mpmd_diamond`. Its B-last
+and C-last diagnostic inputs live under `diagnostics/mpmd_diamond/`.
+
+To run all seven active cases from the default prepared directory:
 
 ```bash
 while IFS= read -r selected; do

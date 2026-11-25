@@ -273,7 +273,7 @@ def analyze_case(bundle, capture, output, seconds=3):
     spec.loader.exec_module(helper)
     checked = helper.read_case(bundle, capture)  # coverage, DAG, metadata, validation and topology audit
     meta = json.loads((bundle / "case.json").read_text())
-    direct = meta.get("execution") == "full_wave_mix_chain"
+    direct = meta.get("execution") in ("full_wave_mix_chain", "mpmd_diamond")
     flags = (
         {stage["task_id"]: stage["sync_start"] for stage in meta["source"]["stages"]} if direct else plan_sync(bundle)
     )

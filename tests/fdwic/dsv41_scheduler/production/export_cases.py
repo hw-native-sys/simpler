@@ -40,11 +40,13 @@ def _export_native(destination, root, tools, native_moe_bundle):
     subprocess.run(command, check=True)
 
 
-def export(bundle, capture, flavor, output, tools, native_moe_bundle=None):
+def export(bundle, capture, flavor, output, tools, native_moe_bundle=None, case_names=None):
     if flavor != "pypto_lib_latest":
         raise ValueError(f"Unknown workload: {flavor}")
     root = Path(__file__).resolve().parents[1]
     cases = json.loads((root / "workloads" / flavor / "source.json").read_text())["cases"]
+    if case_names is not None:
+        cases = {name: cases[name] for name in case_names}
     for name, case in cases.items():
         destination = output / flavor / name
         if case.get("execution") == "native_moe_host_control":

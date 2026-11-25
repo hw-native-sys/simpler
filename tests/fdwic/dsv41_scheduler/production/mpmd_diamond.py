@@ -60,7 +60,7 @@ def write_snapshot(dest, seed, steps):
     (dest / "snapshot.txt").write_text("analytical\n")
 
 
-def build(output, runner, runtime, pto_isa, slow_steps, legacy):
+def build(output, runner, runtime, pto_isa, slow_steps=4096, legacy=False):
     from simpler_setup import KernelCompiler, extract_text_section  # noqa: PLC0415
 
     output = output.resolve()
@@ -115,6 +115,21 @@ def build(output, runner, runtime, pto_isa, slow_steps, legacy):
                     "variant": variant,
                     "seed": seed,
                     "branch_steps": steps,
+                    "source": {
+                        "tasks": 4,
+                        "executions": 4,
+                        "edges": [[0, 1], [0, 2], [1, 3], [2, 3]],
+                        "stages": [
+                            {
+                                "task_id": i,
+                                "kernel_ids": [i, -1, -1] if core == "aic" else [-1, i, -1],
+                                "block_num": 1,
+                                "sync_start": False,
+                            }
+                            for i, (_, core, _, _) in enumerate(STAGES)
+                        ],
+                    },
+                    "validation": "Compare four output buffers, including padding, against analytical references.",
                 },
                 indent=2,
             )

@@ -10,7 +10,6 @@
 
 import importlib.util
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -38,34 +37,26 @@ def test_manifests_and_tables_contain_only_selected_cases():
     assert {p.parent.name for p in folder.glob("*/tasks.tsv")} == CASES - {"moe"}
 
 
-def test_performance_table_matches_selected_variants():
-    lines = iter((SUITE / "RESULTS.md").read_text().splitlines())
-    first = next(line for line in lines if line.startswith("|"))
-    table = [[cell.strip() for cell in first.split("|")[1:-1]]]
-    for line in lines:
-        if not line.startswith("|"):
-            break
-        table.append([cell.strip() for cell in line.split("|")[1:-1]])
-    assert table[0][0] == "Case" and table[0][2:4] == ["main HBG", "main percounter"]
-    rows, native_total, total = table[2:-2], table[-2], table[-1]
-    assert native_total[:2] == ["\u4e03\u9879\u5408\u8ba1", "7 \u7ec4"]
-    assert len(rows) == 8 and total[1].split()[0] == "8"
-    assert {row[0] for row in rows} == CASES | {"full_wave_mix_chain"}
-    for row in [*rows, native_total, total]:
-        assert len(row) == 6
-        assert all(re.fullmatch(r"[0-9]+\.[0-9]{6}", value) and float(value) > 0 for value in row[2:4])
-        assert re.fullmatch(r"[0-9]+\.[0-9]{6}†?", row[4])
-        assert re.fullmatch(r"-?[0-9]+\.[0-9]{2}%†?", row[5])
-    for column in (2, 3):
-        # Individual means and totals are independently rounded to six decimal places.
-        native_values = [float(row[column]) for row in rows if row[0] in CASES]
-        assert float(native_total[column]) == pytest.approx(sum(native_values), abs=(len(native_values) + 1) * 0.5e-6)
-        assert float(total[column]) == pytest.approx(
-            sum(float(row[column]) for row in rows), abs=(len(rows) + 1) * 0.5e-6
-        )
-    assert all("PyPTO-lib" in row[1] for row in rows if row[0] in CASES)
-    synthetic = next(row for row in rows if row[0] == "full_wave_mix_chain")
-    assert "\u5408\u6210" in synthetic[1] or "synthetic" in synthetic[1].lower()
+def test_performance_table_matches_default_list():
+    table = [
+        [cell.strip() for cell in line.split("|")[1:-1]]
+        for line in (SUITE / "RESULTS.md").read_text().splitlines()
+        if line.startswith("|")
+    ]
+    rows = table[2:]
+    assert [row[0] for row in rows] == [
+        "swa",
+        "c2a_full",
+        "c1a_reindex",
+        "c1a_reuse",
+        "engram",
+        "full_wave_mix_chain",
+        "mpmd_diamond",
+    ]
+    for _, pgo, bound, scheduled, gap in rows:
+        assert 0 < float(bound) <= float(scheduled) and gap.endswith("%")
+        # Displayed times are independently rounded to six decimal places.
+        assert float(gap[:-1]) == pytest.approx(100 * (float(pgo) / float(scheduled) - 1), abs=0.035)
 
 
 def test_topology_refresh_cannot_restore_removed_cases(tmp_path):
@@ -106,6 +97,9 @@ def test_run_list_excludes_removed_cached_bundles(args):
     listed = subprocess.check_output(
         [sys.executable, str(SUITE / "production/list_cases.py"), *args], text=True
     ).splitlines()
-    expected = {f"{FLAVOR}/{case}" for case in CASES}
-    assert listed[-1] == "synthetic/full_wave_mix_chain"
-    assert len(listed) == len(CASES) + 1 and set(listed[:-1]) == expected
+    model = ["swa", "c2a_full", "c1a_reindex", "c1a_reuse", "engram"]
+    assert listed == [
+        *(f"{FLAVOR}/{case}" for case in model),
+        "synthetic/full_wave_mix_chain",
+        "synthetic/mpmd_diamond",
+    ]

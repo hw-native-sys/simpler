@@ -126,17 +126,18 @@ def check_observed_completion(deps, intervals):
             finished[task] = ready
 
 
-def validate_full_wave_dag(deps, stages):
+def validate_synthetic_dag(deps, stages, expected_edges=None):
     expected = {stage["task_id"]: (stage["block_num"], stage["kernel_ids"]) for stage in stages}
     actual = {int(task["task_id"]): (task["block_num"], task["kernel_ids"]) for task in deps["tasks"]}
     order = [stage["task_id"] for stage in stages]
     edges = {(int(edge["pred"]), int(edge["succ"])) for edge in deps["edges"]}
-    if actual != expected or len(deps["tasks"]) != len(stages) or edges != set(zip(order, order[1:])):
-        raise ValueError("Unexpected full-wave MIX chain geometry or dependencies")
+    expected_edges = set(zip(order, order[1:])) if expected_edges is None else set(map(tuple, expected_edges))
+    if actual != expected or len(deps["tasks"]) != len(stages) or edges != expected_edges:
+        raise ValueError("Unexpected synthetic geometry or dependencies")
 
 
 def source_task_ids(metadata):
-    if metadata.get("execution") == "full_wave_mix_chain":
+    if metadata.get("execution") in ("full_wave_mix_chain", "mpmd_diamond"):
         return {stage["task_id"] for stage in metadata["source"]["stages"]}
     suite = Path(__file__).resolve().parents[1]
     workload = suite / "workloads" / metadata["flavor"] / metadata["case"] / "tasks.tsv"
@@ -148,8 +149,8 @@ def source_task_ids(metadata):
 
 def case_dag(metadata, folder, source_ids):
     deps = json.loads((folder / "deps.json").read_text())
-    if metadata.get("execution") == "full_wave_mix_chain":
-        validate_full_wave_dag(deps, metadata["source"]["stages"])
+    if metadata.get("execution") in ("full_wave_mix_chain", "mpmd_diamond"):
+        validate_synthetic_dag(deps, metadata["source"]["stages"], metadata["source"].get("edges"))
         return deps
     return complete_flat_dag(deps, folder / "source-task-map.txt", source_ids, 1)
 
@@ -232,7 +233,7 @@ def read_case(bundle, capture):
         "rounds": rounds,
         "callable_sha256": hashlib.sha256((bundle / "callable.bin").read_bytes()).hexdigest(),
         "plan_sha256": None
-        if metadata.get("execution") == "full_wave_mix_chain"
+        if metadata.get("execution") in ("full_wave_mix_chain", "mpmd_diamond")
         else hashlib.sha256((bundle / "plan-rank0.bin").read_bytes()).hexdigest(),
         "mean_lower_bound_ms": statistics.mean(s["lower_bound_ms"] for s in samples),
         "samples": samples,
