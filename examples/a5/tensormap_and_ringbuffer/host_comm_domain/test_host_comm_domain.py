@@ -9,43 +9,43 @@
 # -----------------------------------------------------------------------------------------------------------
 """Hardware coverage of retained Host-source A5 domains and Device-domain coexistence."""
 
-import importlib.util
-import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-pytestmark = [
-    pytest.mark.coverage_skip(
-        platforms=["a5"],
-        reason="A5 PCIe CI Host-source URMA ACK timeout; DT validation passes (issue #2922)",
-    ),
-]
+from examples.a5.tensormap_and_ringbuffer.host_comm_domain.host_comm_callable import GATHER, RUNTIME
+from simpler_setup import SceneTestCase, scene_test
+
+# UB and HCCS both run the transfer checks. Only UB has been verified on hardware.
+_PCIE_SKIP = "Cross-rank URMA reads of Host memory hit an ACK timeout with a PCIe Host-Device link"
+pytestmark = pytest.mark.coverage_skip(platforms=["a5"], reason=_PCIE_SKIP)
 
 
-def _driver():
-    name = "_a5_host_comm_domain_driver"
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("run.py"))
-        if spec is None or spec.loader is None:
-            raise RuntimeError("cannot load the Host communication-domain example")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules[name]
+@scene_test(level=3, runtime=RUNTIME)
+class TestHostCommDomain(SceneTestCase):
+    CALLABLE = {"callables": [GATHER]}
+    CASES = [{"name": "host_comm_domain", "platforms": ["a5"], "config": {"device_count": 2}}]
 
+    @pytest.mark.device_count(2)
+    @pytest.mark.parametrize("staged", [False, True], ids=["serial", "staged"])
+    @pytest.mark.parametrize("aiv_blocks", [1, 4], ids=["single_aiv", "multi_aiv"])
+    def test_run(self, st_platform, st_device_ids, staged, aiv_blocks, request):
+        if not self._matching_cases(st_platform, request):
+            pytest.skip("Host communication domain case was not selected")
+        devices = tuple(map(int, st_device_ids))
+        assert len(devices) == len(set(devices)) == 2, f"expected two distinct devices, got {devices}"
+        # The L3 worker forks its children, so the pytest parent must stay free of ACL state.
+        probe = subprocess.run(
+            [sys.executable, Path(__file__).with_name("probe_host_link.py"), *map(str, devices)],
+            timeout=30,
+            check=False,
+        )
+        if probe.returncode == 77:
+            pytest.skip(_PCIE_SKIP)
+        probe.check_returncode()
+        from .run import run  # noqa: PLC0415 -- only the transfer path needs the worker
 
-@pytest.mark.platforms(["a5"])
-@pytest.mark.manual(["a5"])
-@pytest.mark.skipif(
-    os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="A5 PCIe CI Host-source URMA ACK timeout; DT validation passes (issue #2922)",
-)
-@pytest.mark.runtime("tensormap_and_ringbuffer")
-@pytest.mark.device_count(2)
-@pytest.mark.parametrize("staged", [False, True], ids=["serial", "staged"])
-@pytest.mark.parametrize("aiv_blocks", [1, 4], ids=["single_aiv", "multi_aiv"])
-def test_host_comm_domain(st_platform, st_device_ids, staged, aiv_blocks):
-    assert st_platform == "a5"
-    _driver().run(tuple(int(device) for device in st_device_ids[:2]), staged=staged, aiv_blocks=aiv_blocks)
+        compiled = self._compile_l3_callables(st_platform)["gather"]
+        run(devices, compiled=compiled, staged=staged, aiv_blocks=aiv_blocks)

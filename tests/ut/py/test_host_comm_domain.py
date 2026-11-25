@@ -7,14 +7,20 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import ctypes
 import gc
+import importlib
+import os
+import runpy
 import subprocess
 import sys
 import threading
 import weakref
 from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -22,6 +28,59 @@ from simpler.buffer import AddressSpace, wrap_vmm_window
 from simpler.comm_domain import DomainConfig, HostBufferMapping
 from simpler.task_interface import CommDomainHandle
 from simpler.worker import Worker
+
+
+def test_standalone_prepare_uses_scene_cache_without_pytest(monkeypatch):
+    from examples.a5.tensormap_and_ringbuffer.host_comm_domain.test_host_comm_domain import (  # noqa: PLC0415
+        TestHostCommDomain,
+    )
+
+    driver = Path(__file__).resolve().parents[3] / "examples/a5/tensormap_and_ringbuffer/host_comm_domain/run.py"
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    with patch.object(scene_test_module, "compile_chip_callable_spec") as compile_chip:
+        TestHostCommDomain._compile_l3_callables("a5")
+        compile_chip.assert_called_once()
+        args = compile_chip.call_args.args
+        compile_chip.reset_mock()
+
+        monkeypatch.syspath_prepend(str(driver.parent))
+        monkeypatch.setattr(sys, "argv", [str(driver), "--prepare"])
+        with patch.dict(sys.modules, {"pytest": None, TestHostCommDomain.__module__: None}):
+            runpy.run_path(str(driver), run_name="__main__")
+
+        compile_chip.assert_called_once_with(*args)
+
+
+def test_standalone_driver_prefers_checkout_over_installed_setup(tmp_path, monkeypatch):
+    driver = Path(__file__).resolve().parents[3] / "examples/a5/tensormap_and_ringbuffer/host_comm_domain/run.py"
+    installed_setup = tmp_path / "simpler_setup"
+    installed_setup.mkdir()
+    (installed_setup / "__init__.py").write_text("raise AssertionError('driver selected the installed cache root')")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
+    subprocess.run([sys.executable, str(driver), "--help"], cwd=tmp_path, check=True)
+
+
+@pytest.mark.parametrize(("rc", "link"), [(107001, -1), (0, 9)], ids=["query_failure", "unknown_link"])
+def test_pcie_first_device_does_not_mask_second_device_error(monkeypatch, rc, link):
+    probe = (
+        Path(__file__).resolve().parents[3] / "examples/a5/tensormap_and_ringbuffer/host_comm_domain/probe_host_link.py"
+    )
+    acl = Mock()
+    acl.aclInit.return_value = acl.aclFinalize.return_value = 0
+
+    def query(device, attr, result):
+        assert attr == 408
+        ctypes.cast(result, ctypes.POINTER(ctypes.c_int64))[0] = {2: 0, 7: link}[device]
+        return 0 if device == 2 else rc
+
+    acl.aclrtGetDeviceInfo.side_effect = query
+    monkeypatch.setattr(ctypes, "CDLL", lambda _: acl)
+    monkeypatch.setattr(sys, "argv", [str(probe), "2", "7"])
+
+    with pytest.raises(RuntimeError, match=rf"device=7, rc={rc}, value={link}"):
+        runpy.run_path(str(probe), run_name="__main__")
+    assert [call.args[0] for call in acl.aclrtGetDeviceInfo.call_args_list] == [2, 7]
+    acl.aclFinalize.assert_called_once_with()
 
 
 def test_memory_source_is_part_of_reuse_identity():

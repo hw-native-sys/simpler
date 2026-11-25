@@ -14,47 +14,25 @@ import sys
 from functools import partial
 from pathlib import Path
 
+if __name__ == "__main__" and not __package__:
+    # The scene precompiler imports simpler_setup from this checkout and caches kernels under its build directory.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
 import numpy as np
 from simpler.task_interface import AddressSpace, CommBufferSpec, DataType, TaskArgs, TensorArgType
-from simpler.task_interface import ArgDirection as D
 from simpler.worker import Worker
 
-from simpler_setup.scene_test import compile_chip_callable_spec
+if __package__:
+    from .host_comm_callable import RUNTIME, build_callable
+else:
+    from host_comm_callable import RUNTIME, build_callable
 
-ROOT = Path(__file__).resolve().parent
-RUNTIME = "tensormap_and_ringbuffer"
 ROWS = 64
 WIDTH = 128
 INDICES = (0, 63, 7, 7, 1, 62, 31, 32)
 TABLE_BYTES = ROWS * WIDTH * 4
 OUTPUT_BYTES = len(INDICES) * WIDTH * 4
 PREFIX_BYTES = 256
-
-
-def build_callable():
-    spec = {
-        "orchestration": {
-            "source": str(ROOT / "kernels/orchestration/gather.cpp"),
-            "function_name": "host_comm_domain",
-            "config_name": "host_comm_domain_config",
-            "signature": [D.IN, D.OUT, D.OUT, D.IN, D.IN],
-        },
-        "incores": [
-            {
-                "func_id": 0,
-                "source": str(ROOT / "kernels/aiv/gather.cpp"),
-                "core_type": "aiv",
-                "signature": [D.IN, D.OUT, D.IN],
-            },
-            {
-                "func_id": 1,
-                "source": str(ROOT / "kernels/aiv/consume.cpp"),
-                "core_type": "aiv",
-                "signature": [D.IN, D.OUT],
-            },
-        ],
-    }
-    return compile_chip_callable_spec(spec, "a5", RUNTIME, ("host_comm_domain", "a5", RUNTIME))
 
 
 def _table(rank, generation, *, device=False):
@@ -100,13 +78,14 @@ def _read_device(worker, buffer, scratch, *, slot=0):
         return np.frombuffer(memory, dtype=np.float32).reshape(len(INDICES), WIDTH).copy()
 
 
-def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
+def run(devices=(0, 1), *, staged=False, aiv_blocks=1, compiled=None):
     if len(devices) != 2 or len(set(devices)) != 2:
         raise ValueError("this example requires two distinct A5 devices")
     if aiv_blocks not in (1, 4):
         raise ValueError("aiv_blocks must be 1 or 4")
     depth = 2 if staged else 1
-    compiled = build_callable()
+    if compiled is None:
+        compiled = build_callable()
     worker = Worker(
         level=3,
         platform="a5",
