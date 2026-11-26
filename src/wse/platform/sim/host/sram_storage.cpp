@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "sram_storage.h"
-#include "wse_hardware_defaults.h"
+#include "hardware_defaults.h"
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>

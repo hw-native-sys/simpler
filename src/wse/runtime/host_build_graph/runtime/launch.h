@@ -32,13 +32,28 @@ struct WseNodePlan {
     uint32_t has_predicate;
     uint32_t block_plan_count;
     uint64_t block_plans_offset;
+    // Descriptor-relative array of producer node IDs. A producer completes after all its Blocks.
+    uint32_t wait_count;
+    uint64_t waits_offset;
 };
+
+namespace wse {
+// One row dispatches every Thread of a logical Block on its assigned Core.
+struct CalendarRow {
+    uint32_t task, block;
+    // Unit-cost earliest start. This is an ordering witness, independent of wall time.
+    uint32_t tick;
+};
+}  // namespace wse
 
 struct WseGraphDescriptor {
     SchedulerGraphView graph;
     uint64_t nodes_address;
     uint64_t expected_tasks;
     uint64_t descriptor_bytes;
+    uint32_t calendar_core_count, calendar_row_count;
+    // Descriptor-relative offsets to Core row boundaries and packed rows.
+    uint64_t calendar_indices_offset, calendar_rows_offset;
 };
 
 enum class WseEventKind : uint32_t {

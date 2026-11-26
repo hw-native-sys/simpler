@@ -66,8 +66,8 @@ list(APPEND HOST_RUNTIME_SOURCES
 )
 # WSE owns its runner and C API; the Host scratch allocator is shared unchanged.
 list(APPEND HOST_RUNTIME_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/wse_host_runner.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/wse_runtime_api.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/host_runner.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/host/memory_allocator.cpp"
 )
 

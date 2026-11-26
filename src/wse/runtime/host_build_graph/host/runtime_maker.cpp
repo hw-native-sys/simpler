@@ -41,12 +41,13 @@
 #include <vector>
 
 #include "assert_compat.h"
-#include "wse_launch.h"
-#include "wse_dso.h"
+#include "launch.h"
+#include "dso.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
 #include "native_graph_plan.h"
+#include "calendar_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 #include "host_build_graph/host/host_tensor_access.h"
@@ -55,8 +56,7 @@
 #include "host_build_graph/host/host_phase_trace.h"
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/host/orch_ops.h"
-#include "wse_submission.h"
-#include "host_build_graph/host/ready_queue_sizing.h"
+#include "submission.h"
 #include "host_build_graph/host/graph_recorder_pool.h"
 #include "host_build_graph/runtime_core.h"
 #include "host_build_graph/shared_memory.h"
@@ -445,7 +445,7 @@ struct DefinitionUploads {
 // headers and fallback objects are copied before the used prefix is published.
 bool bind_graph_definitions(
     Runtime *runtime, const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
-    ReadyQueuePopulations *ready_queue_populations, NativeGraphHostPlan *native_plan, int32_t total_tasks
+    NativeGraphHostPlan *native_plan, int32_t total_tasks
 ) {
     *uploads = DefinitionUploads{};
     *native_plan = NativeGraphHostPlan{};
@@ -462,8 +462,6 @@ bool bind_graph_definitions(
         size_t object_offset;   // of the object's header, from the block base
         size_t image_bytes;     // the Definition image alone
         const std::byte *copy;  // the image to copy in, or nullptr when built in place
-        ReadyQueuePopulations ready_queue_populations;
-        bool populations_ready{false};
     };
     std::unordered_map<uint64_t, PackedDefinition> packed;
     // Objects the recorders built already occupy the arena's used prefix at the
@@ -473,12 +471,12 @@ bool bind_graph_definitions(
     for (const GraphHostImage &entry : definitions) {
         if (entry.bytes < sizeof(Graph)) continue;
         if (entry.spill == nullptr) {
-            packed.emplace(entry.graph_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr, {}, false});
+            packed.emplace(entry.graph_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr});
             continue;
         }
         const size_t object_offset = block_bytes;
         block_bytes += align_up(sizeof(GraphImageHeader) + entry.bytes);
-        packed.emplace(entry.graph_key, PackedDefinition{object_offset, entry.bytes, entry.spill, {}, false});
+        packed.emplace(entry.graph_key, PackedDefinition{object_offset, entry.bytes, entry.spill});
         uploads->spilled++;
     }
 
@@ -587,32 +585,7 @@ bool bind_graph_definitions(
             LOG_ERROR("host-orch: Graph runtime storage address is misaligned");
             return false;
         }
-        PackedDefinition &packed_definition = object_it->second;
-        if (!packed_definition.populations_ready) {
-            const SubTaskDefinition *tasks = graph_definition_array<SubTaskDefinition>(
-                *definition, definition->off_sub_tasks, definition->task_count
-            );
-            if (tasks == nullptr) {
-                LOG_ERROR("host-orch: invalid Graph Definition sub-task array");
-                return false;
-            }
-            for (int32_t i = 0; i < definition->task_count; ++i) {
-                // Sizing takes the kind materialize will give this task. add_task
-                // singles out GRAPH and routes everything else by shape, and a Graph
-                // body member is never the shell, so the shape decides. Derived here
-                // the same way the device derives it, so the two cannot drift.
-                const LaneMask mask(tasks[i].active_mask);
-                packed_definition.ready_queue_populations.add_task(
-                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_empty() ? TaskKind::DUMMY : TaskKind::KERNEL
-                );
-            }
-            packed_definition.populations_ready = true;
-        }
-        ready_queue_populations->add(packed_definition.ready_queue_populations);
-        // The Definition is named by its position in this run's section, not by an
-        // address: the bytes reach the device as the tail of each AICPU thread's
-        // own launch arguments, so no address in them is shared. graph_context
-        // stays null until the device installs this task's execution.
+        // The shell names its immutable Definition by offset in this run's image.
         upload->outer_slot->to_descriptor().graph_definition_offset =
             static_cast<uint32_t>(object_it->second.object_offset + sizeof(GraphImageHeader));
         upload->outer_slot->graph_context = nullptr;
@@ -669,7 +642,7 @@ bool create_scheduler_state(
             return false;
         }
     }
-    const size_t graph_bytes = (image.bytes.size() + 63) & ~size_t{63};
+    const size_t graph_bytes = image.size;
     const size_t descriptor_offset = graph_bytes;
     const size_t nodes_offset = descriptor_offset + sizeof(WseGraphDescriptor);
     if (count > (SIZE_MAX - nodes_offset) / sizeof(WseNodePlan)) return false;
@@ -720,14 +693,8 @@ bool create_scheduler_state(
             block_plans[ref].push_back(plan);
         }
     }
-    void *device = nullptr;
-    void *host = nullptr;
-    if (api->acquire_scheduler_state_storage(bytes, SCHEDULER_STATE_ALIGNMENT, &device, &host) != 0 || !device || !host)
-        return false;
-    std::memset(host, 0, bytes);
     if (native) {
-        std::memcpy(host, image.bytes.data(), image.bytes.size());
-        auto *header = reinterpret_cast<SchedulerNativeGraphHeader *>(static_cast<char *>(host) + image.header_offset);
+        auto *header = reinterpret_cast<SchedulerNativeGraphHeader *>(image.bytes.get() + image.header_offset);
         header->image_bytes = graph_bytes;
         header->run_epoch = api->run_epoch();
         header->control_inboxes_offset = graph_bytes;
@@ -738,9 +705,13 @@ bool create_scheduler_state(
     );
     view.task_count = count;
     view.native_header_offset = image.header_offset;
-    view.scheduler_state_address = reinterpret_cast<uint64_t>(host);
+    view.scheduler_state_address = reinterpret_cast<uint64_t>(image.bytes.get());
     view.scheduler_state_bytes = graph_bytes;
-    auto *plans = reinterpret_cast<WseNodePlan *>(static_cast<char *>(host) + nodes_offset);
+    const int worker_count = runtime->get_worker_count();
+    if (worker_count <= 0 || worker_count % WSE_PE_PER_CORE != 0) return false;
+    const uint32_t core_count = worker_count / WSE_PE_PER_CORE;
+    std::vector<WseNodePlan> plans(count);
+    std::vector<wse::CalendarTask> tasks(count);
     const SchedulerGraphAccess access(view);
     uint64_t expected = 0;
     for (uint64_t ref = 0; ref < count; ++ref) {
@@ -766,7 +737,91 @@ bool create_scheduler_state(
             const auto &blocks = launches[ref]->blocks;
             plan.block_plan_count = blocks.size();
             plan.block_plans_offset = block_offsets[ref];
-            auto *descriptor_bytes = static_cast<std::byte *>(host) + descriptor_offset;
+        }
+        plan.blocks = 1;
+        if (!plan.host_done && !control) {
+            SchedulerTaskShape shape{};
+            if (scheduler_classify_task_shape(access, ref, &shape) != SchedulerGraphResult::OK ||
+                shape.active_mask.count() != 1) {
+                LOG_ERROR("WSE requires one SS kernel entry per logical Block");
+                return false;
+            }
+            int kernel = -1;
+            for (int entry : shape.kernel_ids)
+                if (entry >= 0) kernel = entry;
+            if (kernel < 0 || static_cast<uint64_t>(kernel) >= runtime->callable_table_len() ||
+                runtime->callable_entry_table_addr() == 0)
+                return false;
+            plan.entry = reinterpret_cast<const uint64_t *>(runtime->callable_entry_table_addr())[kernel];
+            plan.blocks = child ? child->logical_block_num :
+                                  host_sm_handle.header->tasks.get_slot_state_by_task_id(original).logical_block_num;
+            const bool sync =
+                child ?
+                    scheduler_task_requires_sync_start(child->flags) :
+                    host_sm_handle.header->tasks.get_slot_state_by_task_id(original).task_attrs.requires_sync_start();
+            plan.has_predicate =
+                child ? scheduler_task_has_predicate(child->flags) :
+                        host_sm_handle.header->tasks.get_slot_state_by_task_id(original).task_attrs.has_predicate();
+            if (plan.has_predicate && plan.blocks != 1) return false;
+            if (!plan.entry || !plan.blocks || plan.blocks > INT16_MAX || sync) {
+                LOG_ERROR("WSE requires a registered entry, 1 to INT16_MAX Blocks and no cluster sync-start");
+                return false;
+            }
+        }
+        auto &task = tasks[ref];
+        if (plan.entry) {
+            if (launches[ref] && plan.block_plan_count != plan.blocks) return false;
+            task.block_cores.reserve(plan.blocks);
+            for (uint32_t b = 0; b < plan.blocks; ++b)
+                task.block_cores.push_back(launches[ref] ? block_plans[ref][b].core_id : b % core_count);
+        }
+        uint32_t fanins = 0;
+        if (scheduler_node_fanin_count(access, ref, &fanins) != SchedulerGraphResult::OK) return false;
+        for (uint32_t i = 0; i < fanins; ++i) {
+            int64_t producer = -1;
+            const auto status = scheduler_node_fanin_ref(access, ref, i, &producer);
+            if (status != SchedulerGraphResult::OK || producer < 0 || static_cast<uint64_t>(producer) >= ref) {
+                std::fprintf(
+                    stderr, "WSE host dependency error: ref=%llu index=%u count=%u producer=%lld status=%llu\n",
+                    (unsigned long long)ref, i, fanins, (long long)producer, (unsigned long long)status
+                );
+                return false;
+            }
+            if (!plan.host_done && !plans[producer].host_done) task.waits.push_back(producer);
+        }
+        plan.wait_count = task.waits.size();
+        plan.waits_offset = task.waits.empty() ? 0 : reserve(task.waits.size() * sizeof(uint32_t), alignof(uint32_t));
+        expected += !plan.host_done;
+    }
+    wse::CoreCalendar calendar;
+    if (!wse::build_core_calendar(tasks, core_count, calendar)) {
+        LOG_ERROR("WSE failed to plan the Core calendars");
+        return false;
+    }
+    const uint64_t indices_offset = reserve(calendar.indices.size() * sizeof(uint32_t), alignof(uint32_t));
+    const uint64_t rows_offset =
+        calendar.rows.empty() ? 0 : reserve(calendar.rows.size() * sizeof(wse::CalendarRow), alignof(wse::CalendarRow));
+    void *device = nullptr;
+    void *host = nullptr;
+    if (api->acquire_scheduler_state_storage(bytes, SCHEDULER_STATE_ALIGNMENT, &device, &host) != 0 || !device || !host)
+        return false;
+    std::memset(host, 0, bytes);
+    if (native) std::memcpy(host, image.bytes.get(), image.size);
+    auto *descriptor_bytes = static_cast<std::byte *>(host) + descriptor_offset;
+    if (count) std::memcpy(static_cast<std::byte *>(host) + nodes_offset, plans.data(), count * sizeof(WseNodePlan));
+    std::memcpy(descriptor_bytes + indices_offset, calendar.indices.data(), calendar.indices.size() * sizeof(uint32_t));
+    if (!calendar.rows.empty())
+        std::memcpy(
+            descriptor_bytes + rows_offset, calendar.rows.data(), calendar.rows.size() * sizeof(wse::CalendarRow)
+        );
+    for (uint64_t ref = 0; ref < count; ++ref) {
+        const auto &plan = plans[ref];
+        if (plan.wait_count)
+            std::memcpy(
+                descriptor_bytes + plan.waits_offset, tasks[ref].waits.data(), plan.wait_count * sizeof(uint32_t)
+            );
+        if (launches[ref]) {
+            const auto &blocks = launches[ref]->blocks;
             std::memcpy(
                 descriptor_bytes + plan.block_plans_offset, block_plans[ref].data(),
                 blocks.size() * sizeof(WseBlockPlan)
@@ -791,50 +846,6 @@ bool create_scheduler_state(
                 }
             }
         }
-        plan.blocks = 1;
-        if (!plan.host_done && !control) {
-            SchedulerTaskShape shape{};
-            if (scheduler_classify_task_shape(access, ref, &shape) != SchedulerGraphResult::OK ||
-                shape.active_mask.count() != 1) {
-                LOG_ERROR("WSE requires one Kernel entry per task; Mix/lane dispatch is unsupported");
-                return false;
-            }
-            int kernel = -1;
-            for (int entry : shape.kernel_ids)
-                if (entry >= 0) kernel = entry;
-            if (kernel < 0 || static_cast<uint64_t>(kernel) >= runtime->callable_table_len() ||
-                runtime->callable_entry_table_addr() == 0)
-                return false;
-            plan.entry = reinterpret_cast<const uint64_t *>(runtime->callable_entry_table_addr())[kernel];
-            plan.blocks = child ? child->logical_block_num :
-                                  host_sm_handle.header->tasks.get_slot_state_by_task_id(original).logical_block_num;
-            const bool sync =
-                child ?
-                    scheduler_task_requires_sync_start(child->flags) :
-                    host_sm_handle.header->tasks.get_slot_state_by_task_id(original).task_attrs.requires_sync_start();
-            plan.has_predicate =
-                child ? scheduler_task_has_predicate(child->flags) :
-                        host_sm_handle.header->tasks.get_slot_state_by_task_id(original).task_attrs.has_predicate();
-            if (plan.has_predicate && plan.blocks != 1) return false;
-            if (!plan.entry || !plan.blocks || sync) {
-                LOG_ERROR("WSE requires a registered entry, positive block count and no cluster sync-start");
-                return false;
-            }
-        }
-        uint32_t fanins = 0;
-        if (scheduler_node_fanin_count(access, ref, &fanins) != SchedulerGraphResult::OK) return false;
-        for (uint32_t i = 0; i < fanins; ++i) {
-            int64_t producer = -1;
-            const auto status = scheduler_node_fanin_ref(access, ref, i, &producer);
-            if (status != SchedulerGraphResult::OK || producer < 0 || static_cast<uint64_t>(producer) >= ref) {
-                std::fprintf(
-                    stderr, "WSE host dependency error: ref=%llu index=%u count=%u producer=%lld status=%llu\n",
-                    (unsigned long long)ref, i, fanins, (long long)producer, (unsigned long long)status
-                );
-                return false;
-            }
-        }
-        expected += !plan.host_done;
     }
     auto *descriptor = reinterpret_cast<WseGraphDescriptor *>(static_cast<char *>(host) + descriptor_offset);
     descriptor->graph = view;
@@ -843,6 +854,10 @@ bool create_scheduler_state(
     descriptor->nodes_address = reinterpret_cast<uint64_t>(device) + nodes_offset;
     descriptor->expected_tasks = expected;
     descriptor->descriptor_bytes = bytes - descriptor_offset;
+    descriptor->calendar_core_count = core_count;
+    descriptor->calendar_row_count = calendar.rows.size();
+    descriptor->calendar_indices_offset = indices_offset;
+    descriptor->calendar_rows_offset = rows_offset;
     runtime->publish_scheduler_bootstrap(
         SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(device) + descriptor_offset
     );
@@ -1027,7 +1042,7 @@ int32_t run_host_orchestration(
     }
     auto &storage = *static_cast<OrchestrationScratch *>(scratch.get());
     OrchestratorState orchestrator{};
-    WseLaunchState wse_state;
+    WseLaunchState launch_state;
     storage.swap_storage(orchestrator);
     OrchContext orch_ctx{};
     orch_ctx.orchestrator = &orchestrator;
@@ -1082,8 +1097,8 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     orch_bind_ops(&orch_ctx);
-    WseOrchOps wse_ops{};
-    wse_bind_ops(&orch_ctx, wse_ops, wse_state);
+    WseOrchOps orch_ops{};
+    wse::bind_ops(&orch_ctx, orch_ops, launch_state);
     orchestrator.total_cluster_count = block_dim * PLATFORM_AIC_CORES_PER_BLOCKDIM;
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
@@ -1172,33 +1187,13 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    // Submission already classified each slot while its fields were hot.
-    ReadyQueuePopulations ready_queue_populations = orchestrator.ready_queue_populations;
-
     // Bind Graph tasks to retained Definition addresses. The slot holds the
     // prepared source until synchronous publication consumes it.
     DefinitionUploads definition_uploads{};
-    if (!bind_graph_definitions(
-            runtime, api, *graph_state, &definition_uploads, &ready_queue_populations, &plan.native_graph, total_tasks
-        )) {
+    if (!bind_graph_definitions(runtime, api, *graph_state, &definition_uploads, &plan.native_graph, total_tasks)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    ReadyQueueCapacities ready_queue_capacities{};
-    const int32_t ready_queue_status = derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities);
-    if (ready_queue_status != 0) {
-        LOG_ERROR(
-            "host-orch: ready queue reachable population exceeds %" PRIu64 " (ready=%" PRIu64 "/%" PRIu64 "/%" PRIu64
-            ", sync=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", dummy=%" PRIu64 ", graph_prepare=%" PRIu64 ")",
-            READY_QUEUE_CAPACITY_LIMIT, ready_queue_populations.ready[0], ready_queue_populations.ready[1],
-            ready_queue_populations.ready[2], ready_queue_populations.ready_sync[0],
-            ready_queue_populations.ready_sync[1], ready_queue_populations.ready_sync[2], ready_queue_populations.dummy,
-            ready_queue_populations.graph_prepare
-        );
-        LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, SIMPLER_ERROR_READY_QUEUE_OVERFLOW, ready_queue_status);
-        return ready_queue_status;
-    }
-    rt->prebuilt_layout.sched.capacities = ready_queue_capacities;
     host_phase_trace_note_submitted(static_cast<uint64_t>(total_tasks));
 
     // The count travels inside the header the restack copies wholesale, which is
@@ -1237,7 +1232,7 @@ int32_t run_host_orchestration(
     plan.image_bytes = image_bytes;
     plan.total_tasks = total_tasks;
     plan.bind_usage = bind_usage;
-    plan.launches = std::move(wse_state.launches);
+    plan.launches = std::move(launch_state.launches);
     return total_tasks;
 }
 
@@ -1591,7 +1586,8 @@ extern "C" int bind_callable_to_runtime_impl(
     api->get_retained_temp_buffer(&plan->staging_backing, &staging_capacity);
     DeviceArena &host_arena = plan->host_arena;
     RuntimeArenaLayout &layout = plan->layout;
-    layout = runtime_reserve_layout(host_arena, task_capacity);
+    // Calendar rows live in Core SRAM; shared Host arena headers require no ready-queue slots.
+    layout = runtime_reserve_layout(host_arena, task_capacity, ReadyQueueCapacities{});
     if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return PTO_RUNTIME_ERR_INTERNAL;

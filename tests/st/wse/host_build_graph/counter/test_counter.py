@@ -34,7 +34,7 @@ def build_counter(platform):
         HERE / "kernels",
         "orchestration.cpp",
         [D.INOUT] * 3 + [D.IN] * 6,
-        [(f"{name}.cpp", [D.INOUT] * 3 + [D.IN] * 5) for name in ("mixed", "producer", "consumer")],
+        [(f"{name}.cpp", [D.INOUT] * 3 + [D.IN] * 5) for name in ("producer_consumer", "producer", "consumer")],
     )
 
 

@@ -18,7 +18,7 @@
  */
 
 #include "host_build_graph/host/orchestrator.h"
-#include "wse_graph_builder.h"
+#include "graph_builder.h"
 
 #include <assert.h>
 #include <inttypes.h>
@@ -365,7 +365,6 @@ static bool prepare_task(
     out->slot_state->active_mask = active_mask;
     out->slot_state->task_attrs = task_attrs;
     out->slot_state->task_kind = active_mask.is_empty() ? TaskKind::DUMMY : TaskKind::KERNEL;
-    orch->ready_queue_populations.add_task(active_mask, task_attrs, out->slot_state->task_kind);
     // payload.fanin_count is left untouched here: submit_task_common zeroes it before
     // its fanin appends, which accumulate into it in place.
 
@@ -714,10 +713,10 @@ static TaskOutputTensors submit_task_common(
 }
 
 TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
-    return wse_submit_task_with_dependencies(this, mixed_kernels, args, nullptr);
+    return wse::submit_task_with_dependencies(this, mixed_kernels, args, nullptr);
 }
 
-TaskOutputTensors wse_submit_task_with_dependencies(
+TaskOutputTensors wse::submit_task_with_dependencies(
     OrchestratorState *orch, const MixedKernels &mixed_kernels, const CoreTaskArgs &args, const DepInputs *dependencies
 ) {
     if (!require_device_arguments(orch, args)) return {};
@@ -743,20 +742,14 @@ TaskOutputTensors wse_submit_task_with_dependencies(
     // === Validate submit inputs ===
     LaneMask active_mask = mixed_kernels.to_lanes();
     if (active_mask.is_empty()) {
-        orch->report_fatal(
-            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "MixedKernels names no active slot; set at least one of aic/aiv0/aiv1 kernel_id"
-        );
+        orch->report_fatal(SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "WSE submission requires an SS kernel entry");
         return TaskOutputTensors{};
     }
 
     int16_t block_num = args.launch_spec.block_num();
 
-    // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
-    // it to the aiv0 slot.  This guarantees the dispatch path can always use
-    // SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
-    // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
-    // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
+    // The shared Graph format uses AIV0 for a lone vector entry. WSE bind
+    // resolves the occupied slot to the SS entry for the Block.
     MixedKernels normalized = mixed_kernels;
     bool has_aic = active_mask.has_aic();
     bool has_aiv0 = active_mask.has_aiv0();
@@ -773,9 +766,7 @@ TaskOutputTensors wse_submit_task_with_dependencies(
 
     // sync_start is only meaningful for tasks with block_num > 1.
     if (block_num > 1 && args.launch_spec.require_sync_start()) {
-        // Deadlock check: block_num >= total available slots of the required type.
-        // For MIX/AIC: limit is total_cluster_count (one AIC per cluster).
-        // For AIV:     limit is total_aiv_count.
+        // Validate the shared launch description before WSE bind.
         ResourceShape shape = active_mask.to_shape();
         int32_t limit = (shape == ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
         if (limit > 0 && block_num > limit) {
@@ -798,7 +789,7 @@ TaskOutputTensors wse_submit_task_with_dependencies(
     }
 
     if (active_graph_recording(orch) != nullptr) {
-        return wse_graph_record_submit_with_dependencies(
+        return wse::graph_record_submit_with_dependencies(
             orch, args, active_mask, task_attrs, normalized.aic_kernel_id, normalized.aiv0_kernel_id,
             normalized.aiv1_kernel_id, dependencies
         );

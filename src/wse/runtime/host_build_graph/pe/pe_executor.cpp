@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "wse_launch.h"
+#include "launch.h"
 #include "sram_layout.h"
 #include "wse/block_lifecycle.h"
 #include <algorithm>
@@ -75,6 +75,27 @@ private:
     std::vector<wse::SramRegion> regions_;
     std::vector<uint64_t> cursor_;
 };
+
+const std::byte *descriptor_region(
+    const WseGraphDescriptor &descriptor, uint64_t offset, uint64_t count, uint64_t stride, uint64_t alignment
+) {
+    if (count == 0 && offset == 0) return nullptr;
+    if (offset < sizeof(WseGraphDescriptor) || offset > descriptor.descriptor_bytes || offset % alignment ||
+        count > (descriptor.descriptor_bytes - offset) / stride)
+        throw std::invalid_argument("invalid WSE descriptor table");
+    return reinterpret_cast<const std::byte *>(&descriptor) + offset;
+}
+
+template <class T>
+const T *descriptor_table(const WseGraphDescriptor &descriptor, uint64_t offset, uint64_t count) {
+    return reinterpret_cast<const T *>(descriptor_region(descriptor, offset, count, sizeof(T), alignof(T)));
+}
+
+struct TaskCalendar {
+    std::vector<uint32_t> row_by_block;
+    uint64_t first_tick = UINT64_MAX;
+    uint64_t finish_tick = 0;
+};
 }  // namespace
 
 struct WseRun {
@@ -105,7 +126,7 @@ struct WseRun {
         return reinterpret_cast<wse::Work *>(regions()[core].base + q.work_offset)[q.head];
     }
     bool dependencies_ready(const wse::TaskRecord &task) const {
-        const auto *predecessors = at<uint64_t>(task.predecessors_offset);
+        const auto *predecessors = at<uint32_t>(task.predecessors_offset);
         for (uint32_t i = 0; i < task.predecessor_count; ++i)
             if (!plans()[predecessors[i]].completed) return false;
         return true;
@@ -163,8 +184,20 @@ struct WseRun {
             block_storage.push_back(std::make_unique<wse::BlockOperationStorage>());
         const SchedulerGraphAccess graph(d->graph);
         if (!scheduler_graph_view_valid(graph)) throw std::invalid_argument("invalid WSE graph");
-        const auto *source_plans = reinterpret_cast<const WseNodePlan *>(d->nodes_address);
         const auto count = graph.task_count;
+        const auto *source_plans =
+            descriptor_table<WseNodePlan>(*d, d->nodes_address - reinterpret_cast<uintptr_t>(d), count);
+        if (d->calendar_core_count != cores) throw std::invalid_argument("WSE calendar Core count mismatch");
+        const auto *indices = descriptor_table<uint32_t>(*d, d->calendar_indices_offset, cores + 1);
+        const auto *rows = descriptor_table<wse::CalendarRow>(*d, d->calendar_rows_offset, d->calendar_row_count);
+        if (indices[0] != 0 || indices[cores] != d->calendar_row_count)
+            throw std::invalid_argument("invalid WSE calendar boundaries");
+        uint64_t expected_rows = 0;
+        for (uint32_t ref = 0; ref < count; ++ref) {
+            const auto &plan = source_plans[ref];
+            if (plan.entry && !plan.host_done) expected_rows += plan.blocks;
+        }
+        if (expected_rows != d->calendar_row_count) throw std::invalid_argument("WSE calendar Block count mismatch");
         ImageBuilder image(storage, region_count);
         control = image.at<wse::RunControl>(0, image.allocate<wse::RunControl>(0, 1, 1));
         control->epoch = epoch;
@@ -176,7 +209,32 @@ struct WseRun {
         control->access.region_count = region_count;
         control->access.regions_offset = image.allocate<wse::SramRegion>(0, region_count, 4);
         std::copy(storage, storage + region_count, at<wse::SramRegion>(control->access.regions_offset));
-        std::vector<std::vector<wse::Work>> queues(cores);
+        std::vector<TaskCalendar> calendar(count);
+        for (uint32_t core = 0; core < cores; ++core) {
+            const uint32_t begin = indices[core], end = indices[core + 1];
+            if (begin > end || end > d->calendar_row_count)
+                throw std::invalid_argument("invalid WSE Core calendar range");
+            const auto offset = image.allocate<wse::CoreControl>(core, 1, 8);
+            at<uint64_t>(control->core_offsets_offset)[core] = offset;
+            auto &q = local(core).queue;
+            q.capacity = q.tail = end - begin;
+            q.work_offset = image.allocate<wse::Work>(core, q.capacity, 9);
+            for (uint32_t i = begin; i < end; ++i) {
+                const auto &row = rows[i];
+                if (row.task >= count || (i > begin && row.tick <= rows[i - 1].tick))
+                    throw std::invalid_argument("invalid WSE calendar task or Core order");
+                const auto &plan = source_plans[row.task];
+                if (!plan.entry || plan.host_done || plan.blocks > INT16_MAX || row.block >= plan.blocks)
+                    throw std::invalid_argument("invalid WSE calendar Block");
+                auto &task = calendar[row.task];
+                if (task.row_by_block.empty()) task.row_by_block.resize(plan.blocks, UINT32_MAX);
+                if (task.row_by_block[row.block] != UINT32_MAX)
+                    throw std::invalid_argument("duplicate WSE calendar Block");
+                task.row_by_block[row.block] = i;
+                task.first_tick = std::min(task.first_tick, uint64_t{row.tick});
+                task.finish_tick = std::max(task.finish_tick, uint64_t{row.tick} + 1);
+            }
+        }
         std::vector<wse::SramAllocation> used_allocations;
         auto validate_storage = [&](uint64_t address, uint64_t bytes) {
             if (bytes > UINT64_MAX - address) throw std::invalid_argument("WSE tensor address overflow");
@@ -207,7 +265,10 @@ struct WseRun {
             task.host_done = source.host_done;
             task.has_predicate = source.has_predicate;
             task.completed = source.host_done;
-            if (source.host_done) continue;
+            if (source.host_done) {
+                if (source.wait_count) throw std::invalid_argument("host-completed WSE task has waits");
+                continue;
+            }
             ++expected;
             if (!source.blocks || source.blocks > INT16_MAX)
                 throw std::invalid_argument("invalid WSE task block count");
@@ -227,36 +288,31 @@ struct WseRun {
                     validate_storage(predicate->addr, predicate->elem_size);
                 }
             }
-            uint32_t fanins = 0;
-            if (scheduler_node_fanin_count(graph, ref, &fanins) != SchedulerGraphResult::OK)
-                throw std::invalid_argument("invalid WSE dependencies");
-            std::vector<uint64_t> predecessors;
-            for (uint32_t i = 0; i < fanins; ++i) {
-                int64_t producer = -1;
-                if (scheduler_node_fanin_ref(graph, ref, i, &producer) != SchedulerGraphResult::OK || producer < 0 ||
-                    static_cast<uint64_t>(producer) >= ref)
-                    throw std::invalid_argument("invalid WSE dependency order");
-                if (!source_plans[producer].host_done) {
-                    predecessors.push_back(producer);
-                }
+            const auto *waits = descriptor_table<uint32_t>(*d, source.waits_offset, source.wait_count);
+            task.predecessor_count = source.wait_count;
+            task.predecessors_offset = image.allocate<uint32_t>(0, source.wait_count, 7);
+            uint64_t ready_tick = 0;
+            for (uint32_t i = 0; i < source.wait_count; ++i) {
+                const uint32_t producer = waits[i];
+                if (producer >= ref || source_plans[producer].host_done)
+                    throw std::invalid_argument("invalid WSE calendar wait");
+                at<uint32_t>(task.predecessors_offset)[i] = producer;
+                ready_tick = std::max(ready_tick, calendar[producer].finish_tick);
             }
-            task.predecessor_count = predecessors.size();
-            task.predecessors_offset = image.allocate<uint64_t>(0, predecessors.size(), 7);
-            std::copy(predecessors.begin(), predecessors.end(), at<uint64_t>(task.predecessors_offset));
-            if (!source.entry) continue;
-            auto source_region = [&](uint64_t offset, uint64_t elements, uint64_t stride, uint64_t alignment) {
-                if (offset < sizeof(WseGraphDescriptor) || offset > d->descriptor_bytes || offset % alignment ||
-                    elements > (d->descriptor_bytes - offset) / stride)
-                    throw std::invalid_argument("invalid WSE Block argument image");
-                return reinterpret_cast<const std::byte *>(d) + offset;
-            };
+            // Controls advance at their predecessors' join. Kernel rows must be
+            // reachable in both the Core order and the whole-task wait order.
+            auto &task_calendar = calendar[ref];
+            if (!source.entry) {
+                task_calendar.finish_tick = ready_tick;
+                continue;
+            }
+            if (task_calendar.row_by_block.size() != source.blocks || task_calendar.first_tick < ready_tick)
+                throw std::invalid_argument("missing or premature WSE calendar task");
             const WseBlockPlan *block_plans = nullptr;
             if (source.block_plan_count) {
                 if (source.block_plan_count != source.blocks)
                     throw std::invalid_argument("invalid WSE Block plan count");
-                block_plans = reinterpret_cast<const WseBlockPlan *>(source_region(
-                    source.block_plans_offset, source.block_plan_count, sizeof(WseBlockPlan), alignof(WseBlockPlan)
-                ));
+                block_plans = descriptor_table<WseBlockPlan>(*d, source.block_plans_offset, source.block_plan_count);
             } else if (source.block_plans_offset) throw std::invalid_argument("unexpected WSE Block plans offset");
             SchedulerNativeNode native_node{};
             const bool child = graph.native_header_offset && scheduler_native_node_checked(graph, ref, &native_node) &&
@@ -279,7 +335,10 @@ struct WseRun {
                         throw std::invalid_argument("WSE Block Threads must map to distinct local PEs");
                     mask |= 1u << pe;
                 }
-                wse::Work work{};
+                const uint32_t row = task_calendar.row_by_block[b];
+                if (row < indices[core] || row >= indices[core + 1])
+                    throw std::invalid_argument("WSE calendar Block missing or assigned to the wrong Core");
+                auto &work = image.at<wse::Work>(core, local(core).queue.work_offset)[row - indices[core]];
                 work.task = ref;
                 work.block = b;
                 work.thread_num = placement.thread_num;
@@ -289,9 +348,10 @@ struct WseRun {
                 work.tensors_offset = image.allocate<Tensor>(core, work.tensor_count, 5);
                 work.scalars_offset = image.allocate<uint64_t>(core, work.scalar_count, 6);
                 const auto *tensor_bytes =
-                    block_plans ?
-                        source_region(placement.tensors_offset, work.tensor_count, sizeof(Tensor), alignof(Tensor)) :
-                        reinterpret_cast<const std::byte *>(args.tensors);
+                    block_plans ? descriptor_region(
+                                      *d, placement.tensors_offset, work.tensor_count, sizeof(Tensor), alignof(Tensor)
+                                  ) :
+                                  reinterpret_cast<const std::byte *>(args.tensors);
                 for (uint32_t i = 0; i < work.tensor_count; ++i) {
                     auto &tensor = image.at<Tensor>(core, work.tensors_offset)[i];
                     std::memcpy(&tensor, tensor_bytes + i * sizeof(Tensor), sizeof(Tensor));
@@ -309,8 +369,8 @@ struct WseRun {
                         throw std::invalid_argument("invalid WSE Tensor span");
                     validate_storage(tensor.buffer.addr, tensor.buffer.size);
                 }
-                const auto *values = block_plans ? reinterpret_cast<const uint64_t *>(source_region(
-                                                       placement.scalars_offset, work.scalar_count,
+                const auto *values = block_plans ? reinterpret_cast<const uint64_t *>(descriptor_region(
+                                                       *d, placement.scalars_offset, work.scalar_count,
                                                        sizeof(uint64_t) + sizeof(int32_t), alignof(uint64_t)
                                                    )) :
                                                    args.scalars;
@@ -328,18 +388,9 @@ struct WseRun {
                     }
                     image.at<uint64_t>(core, work.scalars_offset)[i] = value;
                 }
-                queues[core].push_back(work);
             }
         }
         if (expected != d->expected_tasks) throw std::invalid_argument("WSE task count mismatch");
-        for (uint32_t core = 0; core < cores; ++core) {
-            const auto offset = image.allocate<wse::CoreControl>(core, 1, 8);
-            at<uint64_t>(control->core_offsets_offset)[core] = offset;
-            auto &q = local(core).queue;
-            q.capacity = q.tail = queues[core].size();
-            q.work_offset = image.allocate<wse::Work>(core, q.capacity, 9);
-            std::copy(queues[core].begin(), queues[core].end(), image.at<wse::Work>(core, q.work_offset));
-        }
         control->access.allocation_count = used_allocations.size();
         control->access.allocations_offset = image.allocate<wse::SramAllocation>(0, used_allocations.size(), 10);
         std::copy(

@@ -11,7 +11,7 @@
 
 #include "common/module_thread_value.h"
 #include "host_build_graph/host/graph_submit.h"
-#include "wse_graph_builder.h"
+#include "graph_builder.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -324,7 +324,6 @@ bool graph_submit_outer(
     // would make early-dispatch readiness bypass Graph activation.
     slot.logical_block_num = 1;
     slot.task_kind = TaskKind::GRAPH;
-    orch->ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
 
     task.task_id = task_id;
     std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
@@ -493,12 +492,12 @@ TaskOutputTensors graph_record_submit_sub_task(
     OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
-    return wse_graph_record_submit_with_dependencies(
+    return wse::graph_record_submit_with_dependencies(
         orch, args, active_mask, task_attrs, aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id, nullptr
     );
 }
 
-TaskOutputTensors wse_graph_record_submit_with_dependencies(
+TaskOutputTensors wse::graph_record_submit_with_dependencies(
     OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id, const DepInputs *dependencies
 ) {

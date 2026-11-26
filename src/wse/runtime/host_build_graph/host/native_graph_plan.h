@@ -13,6 +13,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -54,7 +56,9 @@ bool native_graph_plan_nodes(
 // Validate device-wide barriers even when the whole run needs the legacy path.
 
 struct NativeGraphReadonlyImage {
-    std::vector<std::byte> bytes;
+    // Host and PE graph access use the same alignment checks on the immutable image.
+    std::unique_ptr<std::byte, decltype(&std::free)> bytes{nullptr, &std::free};
+    size_t size{0};
     uint64_t header_offset{0};
 };
 

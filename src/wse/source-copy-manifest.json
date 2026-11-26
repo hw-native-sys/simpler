@@ -40,22 +40,22 @@
     {
       "source": "src/a5/platform/sim/host/CMakeLists.txt",
       "destination": "src/wse/platform/sim/host/CMakeLists.txt",
-      "sha256": "61bdbc742386c9301a668988162821f8e37a575709e7a230652134a9642d70fc"
+      "sha256": "e81d02e439a8e56259f54fca11a329015a0eea36bfcda0d6f742c73246969d5d"
     },
     {
       "source": "src/a5/platform/sim/host/device_runner.cpp",
       "destination": "src/wse/platform/sim/host/device_runner.cpp",
-      "sha256": "4f43901633ceee71fed1310520fdc713aba447f48b39097d0ad99f7f255a226b"
+      "sha256": "899d61d457c29d76a7b9f49315989394523058ac154efdb9b40041626e41a656"
     },
     {
       "source": "src/a5/platform/sim/host/device_runner.h",
       "destination": "src/wse/platform/sim/host/device_runner.h",
-      "sha256": "21c5f0dfbcfdfface247f515b38ba20c954d6927fc791cbd544552ccc8265a7c"
+      "sha256": "cfa6676b9b03820390f24da334dc59cdf27ccf92efed452c544d460d1f309a94"
     },
     {
       "source": "src/a5/platform/sim/host/runtime_c_api.cpp",
       "destination": "src/wse/platform/sim/host/runtime_c_api.cpp",
-      "sha256": "f9568d33d073957980727f2a438c54456d53cedc25104390edf775d178518771"
+      "sha256": "47dd456e711679baa0f9aee4aaa8f5148a0cf2ed6395ac8bdf02e7690c8034bd"
     },
     {
       "source": "src/a5/runtime/host_build_graph/build_config.py",
@@ -68,19 +68,25 @@
       "sha256": "547bd7a6a1b1e41208365bb287e3212f6290715d2b58253ac1213ebacda58057"
     },
     {
+      "source": "src/a5/runtime/host_build_graph/host/calendar_plan.h",
+      "source_revision": "31fcd9d834a51aa143781923362a6fa20c3a75f0",
+      "destination": "src/wse/runtime/host_build_graph/host/calendar_plan.h",
+      "sha256": "2b00d1edca68b13fd755a2a5725bd619a31850eafa3bda15db606a76ed690145"
+    },
+    {
       "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.cpp",
-      "sha256": "b76d4bc195fab7471846694fccbae0e0e83eec1f4f910a41205fbd413dd3c649"
+      "sha256": "9772a4c98a63e7f032887a58ea8cf5fe791a9e2f437a7fe13f2573fb0030cd1b"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.h",
       "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.h",
-      "sha256": "b9dcd5af87b05d6808c5200bac4ab2fd2528915d6437766eeda9e4c7a06e639c"
+      "sha256": "76a1864a736d0f7e17994d116d2614b54e1c8a4f0edc8832a3ce5b4cf4bced47"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/runtime_maker.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/runtime_maker.cpp",
-      "sha256": "de6a2cdf66323d9c01fb41f6a28a52227aff71ced5874a1cd2db759cc9c68614"
+      "sha256": "272e1612d6eeef1b3ea0a52c719060487c3cd4d533886f653e031762be933afa"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",

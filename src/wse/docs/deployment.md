@@ -23,11 +23,11 @@ for each Block. A placement names one Core and distinct PEs on that Core. Invali
 Core IDs, duplicate PEs, mismatched table lengths and unsupported synchronization
 requirements reject before launch.
 
-If `B < C`, some Cores have no task Blocks. If `B > C`, each Core drains its
-queue in order. Device initialization and run completion still include all Cores
-and PEs. One Core runs at most one active Block; all participating Threads must
-finish before that Core advances. The task reports completion exactly once,
-after all its Blocks finish.
+If `B < C`, some Cores have no task Blocks. If `B > C`, each Core executes
+its assigned Blocks in Host calendar order. Device initialization and run
+completion include all Cores and PEs. One Core runs at most one active Block.
+All participating Threads must finish before that Core advances. The task
+reports completion exactly once, after all its Blocks finish.
 
 ## Fixed data ownership
 
@@ -61,9 +61,17 @@ The WSE scene tests cover:
 - explicit Core/PE placement and one to four Threads;
 - independent per-Block Tensor arguments, cross-Core access and fixed data owners;
 - Graph recording, rebinding, predicates and reverse-order waits;
+- an `SS → SPMD(4) → SS` Graph in which the final SS consumes all four results,
+  with per-Core calendar rows checked against dispatch on each replay;
 - counter and SharedTile collaboration, FFN numerics and capacity refusal before GO;
 - startup failure rollback, timed waits and owner shutdown.
 
 Run the same fixed-SRAM FFN tests after rebuilding the configuration with 1 MiB
 per Core to qualify that device model. Passing with the default 100 MiB model is
 not evidence for the smaller capacity.
+
+Run the two Graph tests to verify calendar scheduling with the ordinary Worker.
+
+```sh
+python -m pytest tests/st/wse/host_build_graph/calendar --platform wsesim --require-pto-isa
+```

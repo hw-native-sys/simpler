@@ -12,9 +12,9 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
-#include "../common/wse_submission.h"
+#include "../common/launch_spec.h"
 #include "host_build_graph/host/orchestrator.h"
-#include "wse_launch.h"
+#include "launch.h"
 
 struct WseBlockArguments {
     WseBlockPlan plan{};
@@ -34,4 +34,7 @@ struct WseLaunchState {
     std::mutex launches_mutex;
     WseLaunchRecords launches;
 };
-void wse_bind_ops(OrchContext *, WseOrchOps &, WseLaunchState &);
+
+namespace wse {
+void bind_ops(OrchContext *, WseOrchOps &, WseLaunchState &);
+}  // namespace wse

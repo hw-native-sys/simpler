@@ -12,7 +12,7 @@
 // The concrete DeviceRunner supplies SRAM policy and PE execution.
 
 #pragma once
-#include "wse_dso.h"
+#include "dso.h"
 #include "host/aligned_image_storage.h"
 
 #include <dlfcn.h>
@@ -34,7 +34,7 @@
 #include <vector>
 
 #include "runtime_c_api.h"
-#include "wse_launch_transaction.h"
+#include "launch_transaction.h"
 #include "run_resource_arena.h"
 
 #include "callable.h"

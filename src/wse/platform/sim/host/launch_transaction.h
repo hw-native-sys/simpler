@@ -121,8 +121,10 @@ struct WseSingleLaunchTransaction {
     }
 };
 
+namespace wse {
 template <typename Submit>
 WseLaunchTransactionResult
-wse_launch_transaction(const NativeRunIdentity &identity, WseLaunchPermit permit, Submit &&submit) {
+launch_transaction(const NativeRunIdentity &identity, WseLaunchPermit permit, Submit &&submit) {
     return WseSingleLaunchTransaction<Submit>::run(identity, std::move(permit), std::forward<Submit>(submit));
 }
+}  // namespace wse

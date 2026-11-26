@@ -74,7 +74,7 @@ def test_sram_native_contracts(tmp_path):
     cores = 40
     capacities = ",".join(str(v) for v in [1024, 2048] + [1024] * 38)
     reserves = ",".join(str(v) for v in [256, 512] + [256] * 38)
-    (tmp_path / "wse_hardware_defaults.h").write_text(
+    (tmp_path / "hardware_defaults.h").write_text(
         "#pragma once\n#include <cstdint>\nnamespace wse {\n"
         f"constexpr unsigned DEFAULT_CORES = {cores};\n"
         "constexpr unsigned DEFAULT_PES = 4;\n"
@@ -179,7 +179,7 @@ def test_sram_default_config_generation(tmp_path):
     path.write_text(json.dumps(config))
     command = ["cmake", "-S", str(source), "-B", str(tmp_path / "build")]
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
-    header = (tmp_path / "build/generated/wse_hardware_defaults.h").read_text()
+    header = (tmp_path / "build/generated/hardware_defaults.h").read_text()
     assert "4096ULL,8192ULL," in header and "1024ULL,1024ULL," in header
     config["hardware"]["unknown"] = 1
     path.write_text(json.dumps(config))

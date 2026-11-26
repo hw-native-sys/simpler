@@ -367,11 +367,16 @@ bool native_graph_plan_readonly_image(
     if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &header.readonly_end_offset) ||
         header.readonly_end_offset > std::numeric_limits<size_t>::max())
         return fail(error, "native readonly alignment overflow");
-    next.bytes.resize(static_cast<size_t>(header.readonly_end_offset));
+    next.size = static_cast<size_t>(header.readonly_end_offset);
+    void *storage = nullptr;
+    if (posix_memalign(&storage, SCHEDULER_STATE_ALIGNMENT, next.size) != 0)
+        return fail(error, "unable to allocate native Graph image");
+    next.bytes.reset(static_cast<std::byte *>(storage));
+    std::memset(next.bytes.get(), 0, next.size);
     const auto copy = [&](uint64_t offset, const auto &values) {
-        if (!values.empty()) std::memcpy(next.bytes.data() + offset, values.data(), values.size() * sizeof(values[0]));
+        if (!values.empty()) std::memcpy(next.bytes.get() + offset, values.data(), values.size() * sizeof(values[0]));
     };
-    std::memcpy(next.bytes.data() + next.header_offset, &header, sizeof(header));
+    std::memcpy(next.bytes.get() + next.header_offset, &header, sizeof(header));
     copy(header.bindings_offset, plan.bindings);
     copy(header.completion_refs_offset, plan.completion_refs);
     copy(header.templates_offset, templates);
