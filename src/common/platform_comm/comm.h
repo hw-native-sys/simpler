@@ -50,6 +50,8 @@ typedef struct CommWorkspaceConfig {
 static_assert(std::is_trivially_copyable_v<CommWorkspaceConfig> && std::is_standard_layout_v<CommWorkspaceConfig>);
 static_assert(sizeof(CommWorkspaceConfig) == 12);
 #endif
+// Abort (also for run sets): 0 confirms stop; 1 awaits completion after successful abort;
+// COMM_RECLAMATION_UNCONFIRMED retains owners after an SDK error.
 // Internal callable execution controls: activate=1, stop/poll=3, abort=4, discard preparation=7.
 int comm_control_ccu_run(CommHandle h, uint64_t registration_id, uint32_t operation, uint64_t generation);
 

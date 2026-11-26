@@ -40,8 +40,12 @@ public:
         *ready = true;
         return 0;
     }
-    int query_stream(uint64_t, StreamState *) override { return 0; }
+    int query_stream(uint64_t, StreamState *state) override {
+        *state = stream_state;
+        return 0;
+    }
     int abort_stream(uint64_t) override { return 0; }
+    StreamState stream_state{StreamState::RUNNING};
 };
 
 MissionRunResources mission(uint64_t) {
@@ -84,6 +88,8 @@ TEST(CcuDomainOwner, RetainsResourcesWhenBackendCloseCannotBeConfirmed) {
     EXPECT_FALSE(owner.close());
     EXPECT_FALSE(owner.closed());
     EXPECT_EQ(owner.registered_kernels().size(), 1U);
+    FakeRunSdk sdk;
+    EXPECT_THROW(owner.begin_run(12, {mission(12)}, sdk), std::runtime_error);
     observed->close_succeeds = true;
     EXPECT_TRUE(owner.close());
     EXPECT_TRUE(owner.registered_kernels().empty());
@@ -105,6 +111,27 @@ TEST(CcuDomainOwner, UnconfirmedRunPermanentlyBlocksDomainReclamation) {
     EXPECT_TRUE(owner.lifecycle().resources_retained());
     EXPECT_FALSE(owner.close());
     EXPECT_EQ(*close_calls, 0);
+}
+
+TEST(CcuDomainOwner, ConfirmedAbortClosesOwnerOnceDespitePermanentAdmissionClosure) {
+    auto backend = std::make_unique<FakeBackend>();
+    const auto close_calls = backend->close_calls;
+    DomainCcuOwner owner(std::move(backend));
+    owner.set_registered_kernels({{1, 7, 101}});
+    FakeRunSdk sdk;
+    auto run = owner.begin_run(10, {mission(10)}, sdk);
+    run->launch_all();
+    sdk.stream_state = StreamState::COMPLETE;
+    run->abort();
+
+    EXPECT_FALSE(owner.lifecycle().admission_open());
+    EXPECT_THROW(owner.begin_run(11, {mission(11)}, sdk), std::runtime_error);
+    EXPECT_TRUE(owner.drained());
+    EXPECT_TRUE(owner.close());
+    EXPECT_TRUE(owner.close());
+    EXPECT_EQ(*close_calls, 1);
+    EXPECT_TRUE(owner.closed());
+    EXPECT_TRUE(owner.registered_kernels().empty());
 }
 
 }  // namespace

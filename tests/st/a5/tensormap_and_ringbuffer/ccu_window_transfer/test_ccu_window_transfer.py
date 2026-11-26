@@ -76,6 +76,7 @@ def _exercise_window_transfer(
     try:
         chip = worker.register(target)
         worker.init()
+        child_pids = set(worker._chip_pids)
         outputs = [[worker.create_buffer(64), worker.create_buffer(64), worker.create_buffer(32768)] for _ in members]
         for generation in range(1, rounds + 1):
             selection = (generation - 1) % len(member_sets)
@@ -163,3 +164,4 @@ def _exercise_window_transfer(
         print("CCU W retained reuse, release and reallocation passed; domain-owned native registrations", flush=True)
     finally:
         worker.close()
+    return child_pids

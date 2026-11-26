@@ -56,11 +56,12 @@ DomainRun::DomainRun(
     generation_(generation),
     missions_(std::move(missions)),
     sdk_(sdk),
-    ready_events_consumed_(missions_.size(), false) {}
+    ready_events_consumed_(missions_.size(), false),
+    abort_streams_confirmed_(missions_.size(), false) {}
 
 DomainRun::~DomainRun() {
     if (released_) return;
-    if (launched_missions_ == 0) {
+    if (attempted_missions_ == 0) {
         owner_.active_ = false;
         released_ = true;
         return;
@@ -77,6 +78,7 @@ void DomainRun::finish_confirmed() {
     terminal_ = true;
     released_ = true;
     owner_.active_ = false;
+    owner_.resources_retained_ = false;
 }
 
 void DomainRun::retain_unconfirmed() {
@@ -86,22 +88,24 @@ void DomainRun::retain_unconfirmed() {
 }
 
 void DomainRun::launch_all() {
-    if (launched_) throw std::runtime_error("CCU run already launched");
+    if (launched_ || attempted_missions_ != 0 || abort_attempted_ || !owner_.admission_open_)
+        throw std::runtime_error("CCU run cannot be launched again");
     for (const auto &mission : missions_) {
         const auto *words = reinterpret_cast<const uint64_t *>(&mission.launch_arguments);
+        ++attempted_missions_;
         const int rc =
             sdk_.launch(mission.program_handle, words, SIMPLER_CCU_TASK_ARGUMENT_COUNT, mission.stream_handle);
         if (rc != 0) {
             record_failure("HcommCcuKernelLaunch", rc);
-            abort();
+            retain_unconfirmed();
             throw std::runtime_error("CCU mission launch failed");
         }
-        ++launched_missions_;
     }
     launched_ = true;
 }
 
 bool DomainRun::poll_ready() {
+    if (abort_attempted_) return false;
     if (!launched_) throw std::runtime_error("CCU run has not launched");
     if (ready_) return true;
     if (failed()) return false;
@@ -113,7 +117,7 @@ bool DomainRun::poll_ready() {
         const int rc = sdk_.poll_ready_event(event.address, event.mask, &observed);
         if (rc != 0) {
             record_failure("observe/clear CCU ready Event", rc);
-            abort();
+            retain_unconfirmed();
             return false;
         }
         ready_events_consumed_[i] = observed;
@@ -124,8 +128,9 @@ bool DomainRun::poll_ready() {
 }
 
 bool DomainRun::poll_terminal() {
-    if (!launched_) throw std::runtime_error("CCU run has not launched");
     if (confirmed_stopped_) return true;
+    if (abort_attempted_) return false;
+    if (!launched_) throw std::runtime_error("CCU run has not launched");
     if (failed()) return false;
     bool complete = true;
     for (const auto &mission : missions_) {
@@ -133,7 +138,7 @@ bool DomainRun::poll_terminal() {
         const int rc = sdk_.query_stream(mission.stream_handle, &state);
         if (rc != 0 || state == StreamState::ERROR) {
             record_failure("query CCU stream", rc != 0 ? rc : kProtocolError);
-            abort();
+            retain_unconfirmed();
             return false;
         }
         complete = complete && state == StreamState::COMPLETE;
@@ -148,41 +153,63 @@ bool DomainRun::stop() {
 }
 
 bool DomainRun::finish_completed_requests() {
-    if (!launched_) throw std::runtime_error("CCU run has not launched");
     if (confirmed_stopped_) return true;
+    if (!launched_) throw std::runtime_error("CCU run has not launched");
     if (failed() || abort_attempted_) return false;
-    bool stopped = true;
     for (const auto &mission : missions_) {
         StreamState state = StreamState::UNKNOWN;
         int rc = sdk_.query_stream(mission.stream_handle, &state);
         if (rc == 0 && state == StreamState::COMPLETE) continue;
         if (rc != 0 || state == StreamState::ERROR || state == StreamState::UNKNOWN) {
             record_failure("query completed CCU stream", rc != 0 ? rc : kProtocolError);
-            stopped = false;
-            continue;
+            retain_unconfirmed();
+            return false;
         }
         rc = sdk_.stop_completed_stream(mission.stream_handle);
         if (rc != 0) {
             record_failure("stop and confirm completed CCU stream", rc);
-            stopped = false;
+            retain_unconfirmed();
+            return false;
         }
     }
-    if (stopped) finish_confirmed();
-    else abort();
-    return stopped;
+    finish_confirmed();
+    return true;
 }
 
-void DomainRun::abort() {
-    if (abort_attempted_) return;
-    abort_attempted_ = true;
-    if (launched_missions_ != 0) {
-        for (size_t i = 0; i < launched_missions_; ++i) {
-            const auto &mission = missions_[i];
-            const int rc = sdk_.abort_stream(mission.stream_handle);
-            if (rc != 0) record_failure("abort CCU stream", rc);
+bool DomainRun::abort() try {
+    owner_.admission_open_ = false;
+    if (confirmed_stopped_) return true;
+    if (abort_failed_) return false;
+    if (!abort_attempted_) {
+        abort_attempted_ = true;
+        for (size_t i = 0; i < attempted_missions_; ++i) {
+            const int rc = sdk_.abort_stream(missions_[i].stream_handle);
+            if (rc != 0) {
+                record_failure("abort CCU stream", rc);
+                abort_failed_ = true;
+            }
         }
     }
+    bool stopped = true;
+    for (size_t i = 0; i < attempted_missions_; ++i) {
+        if (abort_streams_confirmed_[i]) continue;
+        StreamState state = StreamState::UNKNOWN;
+        const int rc = sdk_.query_stream(missions_[i].stream_handle, &state);
+        if (rc != 0 || (state != StreamState::COMPLETE && state != StreamState::RUNNING)) {
+            record_failure("confirm aborted CCU stream", rc != 0 ? rc : kProtocolError);
+            abort_failed_ = true;
+        }
+        abort_streams_confirmed_[i] = rc == 0 && state == StreamState::COMPLETE;
+        stopped = abort_streams_confirmed_[i] && stopped;
+    }
+    stopped = stopped && !abort_failed_;
+    if (stopped) finish_confirmed();
+    else retain_unconfirmed();
+    return stopped;
+} catch (...) {
+    abort_failed_ = true;
     retain_unconfirmed();
+    throw;
 }
 
 bool all_runs_ready(const std::vector<DomainRun *> &runs) {

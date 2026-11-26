@@ -128,6 +128,23 @@ def test_registration_cache_is_owned_by_domain_worker_and_definition():
     assert initial.registration_id == 12
 
 
+def test_run_set_partial_launch_retains_owner_until_terminal_stop():
+    operations = []
+
+    def control(_comm, _run_set, operation):
+        operations.append(operation)
+        raise RuntimeError("partial launch")
+
+    native = SimpleNamespace(prepare_ccu_run_set=lambda *a: 8, control_ccu_run_set=control)
+    run = ChipCcuRunSet(native, 1, [10, 20], 3, 3)
+    with pytest.raises(RuntimeError, match="partial launch"):
+        run.begin()
+    with pytest.raises(RuntimeError, match="admission is closed"):
+        run.begin()
+    assert operations == [1]
+    assert run.started
+
+
 def test_run_set_does_not_discard_when_stop_is_unconfirmed():
     calls = []
 

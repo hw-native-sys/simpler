@@ -1243,8 +1243,8 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run");
     if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
         return PTO_RUNTIME_ERR_INTERNAL;
-    if (!state->runner_claimed || !state->runner->native_run_owned_by(state)) return PTO_RUNTIME_ERR_INTERNAL;
     state->launch_not_started_proven = true;
+    if (!state->runner_claimed || !state->runner->native_run_owned_by(state)) return PTO_RUNTIME_ERR_INTERNAL;
 
     state->runner_trace_start_ns = STRACE_NOW_NS();
     int rc = PTO_RUNTIME_ERR_INTERNAL;
@@ -1323,13 +1323,28 @@ static void collect_completion_feedback(SimNativeRunContext *state) {
     }
 }
 
+int simpler_query_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    try {
+        SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_query_run_completion");
+        if (state == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        const NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
+        if (state->physical_complete || (state->active_execution == nullptr && state->launch_not_started_proven))
+            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        if (phase == NativeRunPhase::Prepared || state->active_execution == nullptr)
+            return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        return state->runner->poll_execution(*state->active_execution);
+    } catch (...) {
+        return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    }
+}
+
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     try {
         SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
         if (state == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
         NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
         if (phase == NativeRunPhase::Prepared) return SIMPLER_NATIVE_RUN_POLL_ERROR;
-        if (state->execution_retired || (phase == NativeRunPhase::Complete && state->active_execution == nullptr)) {
+        if (state->execution_retired || (phase == NativeRunPhase::Complete && state->launch_not_started_proven)) {
             return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
         }
         if (state->active_execution == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;

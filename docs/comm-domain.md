@@ -750,6 +750,19 @@ Confirmed cleanup preserves successful execution and returns streams to the pool
 failed confirmation retains resources and reports failure. L2 finalization
 releases the pool after HCOMM registration resources.
 
+A failed CCU run permanently closes admission, even when stopping its missions
+succeeds. Terminal Worker cleanup first checks that every participating chip's
+native execution has ended, then confirms SDK stops across the participants
+before discarding run storage and releasing domains and buffers. An execution
+error remains the run's result; it does not by itself prevent successful close.
+Missing acknowledgements and visible SDK stop/query/destroy errors retain the
+affected owners and report unconfirmed cleanup.
+
+Simpler uses public SDK results for this boundary. It releases its own memory
+and public handles in ownership order; assigned CCU instances are destroyed by
+their owning communicator. Physical CCU resource reclamation remains the SDK's
+responsibility, with no additional driver-internal release performed by simpler.
+
 See [the native CCU contract](design/ccu-native-abi.md) for ABI versioning,
 registration ownership and stream-stop confirmation.
 
