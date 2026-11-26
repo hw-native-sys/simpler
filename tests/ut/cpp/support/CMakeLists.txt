@@ -47,3 +47,5 @@ foreach(arch a2a3 a5)
     simpler_ut_common_includes(${arch} aicpu _support_includes)
     target_include_directories(${arch}_ut_support PUBLIC ${_support_includes})
 endforeach()
+
+target_sources(a5_ut_support PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/l0_profiling_stub.cpp)

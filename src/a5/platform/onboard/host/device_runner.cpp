@@ -34,6 +34,7 @@
 #include <future>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "aicpu_topology_probe.h"
@@ -415,6 +416,10 @@ int DeviceRunner::prepare_execution(
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (config.enable_l0_swimlane && std::string_view(SIMPLER_RUNTIME_NAME) != "tensormap_and_ringbuffer") {
+        LOG_ERROR("L0 swimlane capture is supported only by the A5 tensormap_and_ringbuffer runtime");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
     execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
     execution->resources_owned = true;
@@ -670,6 +675,9 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                     if (!core_types.empty()) {
                         chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
                     }
+                    if (prepared.dfx.l0_swimlane_enabled()) {
+                        if (int l0_rc = start_l0_capture(prepared); l0_rc != 0) return l0_rc;
+                    }
                 }
 
                 // Launch the AICore worker BEFORE the AICPU Run task. This is a first-launch
@@ -706,7 +714,10 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                 const int join_rc = queue_cross_run_wait(prepared, streams.aicpu, sink);
                 if (join_rc != 0) return join_rc;
             }
-            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
+            const int entry_rc = queue_run_entry(prepared, sink, [&]() {
+                return launch_l0_config(prepared, sink);
+            });
+            if (entry_rc != 0) return entry_rc;
 
             // After any cross-run wait and before the kernel: the instant this stream was
             // released to begin this run's AICore work. A record is not a wait and no stream
@@ -808,9 +819,97 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     return rc;
 }
 
+int DeviceRunner::start_l0_capture(PreparedExecution &prepared) {
+    if (l0_capture_collector_ != nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    l0_capture_active_.store(true, std::memory_order_release);
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        l0_capture_collector_ = std::make_unique<L0CaptureCollector>();
+        rc = l0_capture_collector_->initialize(
+            prepared.identity, device_id_, PLATFORM_MAX_CORES, prepared.kernel_args.args.regs,
+            [this](size_t bytes) {
+                return mem_alloc_.alloc(bytes);
+            },
+            [this](void *ptr) {
+                return mem_alloc_.free(ptr);
+            }
+        );
+        if (rc == 0) rc = l0_capture_collector_->start_run(prepared.identity, prepared.dfx.output_prefix);
+    } catch (const std::exception &error) {
+        LOG_WARN("L0 setup failed: %s", error.what());
+        rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (rc != 0 && rc != PTO_RUNTIME_ERR_INVALID_STATE && l0_capture_collector_ != nullptr) {
+        l0_capture_collector_->finalize_capture(false);
+    }
+    if (l0_capture_collector_ != nullptr && l0_capture_collector_->device_io_failed()) {
+        if (rc == 0) rc = PTO_RUNTIME_ERR_INVALID_STATE;
+        mark_device_unusable(rc);
+        stop_shared_collectors_for_device_failure();
+        dep_gen_collector_.stop_for_device_failure();
+        return rc;
+    }
+    if (rc == PTO_RUNTIME_ERR_INVALID_STATE) return rc;
+    if (rc != 0) {
+        LOG_WARN("L0 setup failed (%d); continuing without L0 capture", rc);
+        l0_capture_collector_.reset();
+        l0_capture_active_.store(false, std::memory_order_release);
+        prepared.dfx.enable_l0_swimlane = false;
+        prepared.kernel_args.args.enable_profiling_flag &= ~SIMPLER_DFX_FLAG_L0_SWIMLANE;
+    }
+    return 0;
+}
+
+int DeviceRunner::launch_l0_config(PreparedExecution &prepared, LaunchProgressSink &sink) {
+    if (!prepared.dfx.l0_swimlane_enabled()) return 0;
+    return l0_capture_collector_->configure_run(prepared.identity, [&](L0ConfigArgs &config) {
+        InitArgs args{};
+        args.l0_capture = config;
+        const int rc =
+            launch_aicpu_payload(prepared.streams.aicpu, &args, sizeof(args), host::KernelNames::InitName, 1);
+        if (rc == 0) sink.mark_submitted();
+        return rc;
+    });
+}
+
+void DeviceRunner::cleanup_l0_capture(PreparedExecution &prepared, bool device_execution_complete) noexcept {
+    if (!prepared.dfx.l0_swimlane_enabled() || l0_capture_collector_ == nullptr || prepared.retirement_device_rc != 0)
+        return;
+    if (!can_accept_run()) l0_capture_collector_->finalize_capture(true);
+    const int rc = l0_capture_collector_->close_run(prepared.identity, device_execution_complete, [&prepared] {
+        if (prepared.streams.aicore != nullptr) {
+            const int rc = aclrtSynchronizeStream(static_cast<aclrtStream>(prepared.streams.aicore));
+            if (rc != 0) return rc;
+        }
+        return prepared.streams.aicpu != nullptr ?
+                   aclrtSynchronizeStream(static_cast<aclrtStream>(prepared.streams.aicpu)) :
+                   0;
+    });
+    if (rc != 0 || l0_capture_collector_->device_io_failed() || !can_accept_run()) {
+        prepared.retirement_device_rc = rc != 0 ? rc : PTO_RUNTIME_ERR_INVALID_STATE;
+        mark_device_unusable(prepared.retirement_device_rc);
+        stop_shared_collectors_for_device_failure();
+        dep_gen_collector_.stop_for_device_failure();
+    } else if (!l0_capture_collector_->capture_active()) {
+        l0_capture_collector_.reset();
+        l0_capture_active_.store(false, std::memory_order_release);
+    }
+}
+
+int DeviceRunner::teardown_collectors_after_run(PreparedExecution &prepared, bool device_execution_complete) {
+    if (prepared.dfx.l0_swimlane_enabled()) {
+        cleanup_l0_capture(prepared, device_execution_complete);
+        if (prepared.retirement_device_rc != 0) return prepared.retirement_device_rc;
+    }
+    return teardown_shared_collectors_after_run(
+        prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, device_execution_complete
+    );
+}
+
 int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
     if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     PreparedExecution &prepared = *active.prepared;
+    if (prepared.retirement_device_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     if (!prepared.resources_owned)
         return prepared.physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
     const int poll_rc = poll_execution(active);
@@ -823,8 +922,11 @@ int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
         !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
     }
-    prepared.retirement_diagnostics_rc =
-        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    prepared.retirement_diagnostics_rc = teardown_collectors_after_run(prepared, true);
+    if (prepared.retirement_device_rc != 0) {
+        cleanup_execution(prepared, true);
+        return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    }
     emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
     print_handshake_results(prepared.kernel_args, prepared.num_aicore);
     cleanup_execution(prepared, true);
@@ -835,6 +937,8 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     if (active.prepared == nullptr) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     PreparedExecution &prepared = *active.prepared;
     const uint32_t pipeline_slot = prepared.pipeline_slot;
+    if (prepared.retirement_device_rc != 0)
+        return DrainOutcome::device_error(prepared.retirement_device_rc, prepared.physical_complete);
     if (!prepared.resources_owned && prepared.physical_complete) {
         const int rc = wait_run_fence(prepared);
         if (rc != 0) {
@@ -872,9 +976,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         }
         // The device error that brought this path here stays authoritative, so
         // a diagnostics ownership failure only logs on it.
-        const int teardown_rc = teardown_shared_collectors_after_run(
-            prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, false
-        );
+        const int teardown_rc = teardown_collectors_after_run(prepared, false);
         if (teardown_rc != 0) {
             LOG_ERROR("Diagnostics teardown reported %d on the error path; run error %d is kept", teardown_rc, rc);
         }
@@ -901,9 +1003,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         // this run the discharge has already stopped admission and kept the
         // reference, and a code reported with the references retired is a failure to
         // surface rather than a reason to take the card down.
-        const int teardown_rc = teardown_shared_collectors_after_run(
-            prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, false
-        );
+        const int teardown_rc = teardown_collectors_after_run(prepared, false);
         if (teardown_rc != 0) {
             LOG_ERROR(
                 "Diagnostics teardown reported %d on the discharge-error path; run error %d is kept", teardown_rc,
@@ -925,8 +1025,8 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // collected content fails the run: the claim is released here, and a caller
     // told the run succeeded would read files whose completeness nothing
     // established.
-    const int teardown_rc =
-        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    const int teardown_rc = teardown_collectors_after_run(prepared, true);
+    if (prepared.retirement_device_rc != 0) return DrainOutcome::device_error(prepared.retirement_device_rc, true);
     emit_device_dep_gen_graph(
         prepared.dfx, prepared.identity.run_epoch, /*device_execution_complete=*/true,
         /*device_producers_stopped=*/false
@@ -992,6 +1092,7 @@ void DeviceRunner::emit_device_dep_gen_graph(
 
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched) noexcept {
     if (!prepared.resources_owned) return;
+    if (prepared.dfx.l0_swimlane_enabled()) cleanup_l0_capture(prepared);
 
     // Before anything is released, and before the poison is read: a queued
     // stream wait naming one of this run's boundaries must not outlive the
@@ -1105,6 +1206,7 @@ int DeviceRunner::quiesce_host_uses() {
     begin_fatal_close();
     stop_shared_collectors_for_device_failure();
     dep_gen_collector_.stop_for_device_failure();
+    if (l0_capture_collector_ != nullptr) l0_capture_collector_->finalize_capture(true);
     // Admission and native host operations are fenced by ChipWorker. A zero
     // result proves last use, not device health or registration retirement.
     // Keep ACL and all backing alive until explicit Host unregistration.
@@ -1315,6 +1417,7 @@ int DeviceRunner::finalize_impl() {
         begin_fatal_close();
         stop_shared_collectors_for_device_failure();
         dep_gen_collector_.stop_for_device_failure();
+        if (l0_capture_collector_ != nullptr) l0_capture_collector_->finalize_capture(true);
 
         // force_reset_device() drains before it resets and returns 0 only when
         // its post-reset probe confirms the card, so a second pass runs against
@@ -1360,6 +1463,8 @@ int DeviceRunner::finalize_impl() {
         }
         abandon_shared_collectors_after_device_reset();
         dep_gen_collector_.abandon_after_device_reset();
+        l0_capture_collector_.reset();
+        l0_capture_active_.store(false, std::memory_order_release);
         int abandon_rc = abandon_common_after_device_failure();
         owned_context_ = nullptr;
         rts_device_ref_ = acl_device_ref_ = false;
@@ -1603,6 +1708,7 @@ int DeviceRunner::prepare_collector_storage(const Runtime &runtime, PreparedExec
     uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
     if (dfx.dump_args_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     if (dfx.chip_swimlane_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    if (dfx.l0_swimlane_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L0_SWIMLANE);
     if (dfx.pmu_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
     // The device flag drives the AICPU writer only; a host-orch runtime has no
     // device-side dep_gen to switch on.

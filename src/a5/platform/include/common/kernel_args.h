@@ -42,6 +42,7 @@
 
 #include "common/dma_workspace.h"
 #include "common/launch_entry_args.h"
+#include "l0_profiling.h"
 
 inline constexpr bool PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE = false;
 
@@ -281,6 +282,7 @@ inline void fill_arch_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_ar
  * register_callable/exec launch. Republished when first-use provisioning adds
  * an async-DMA workspace. The values do not ride on per-run KernelArgs; the
  * resident AICPU SO keeps the latest configuration across task launches.
+ * An L0 capture request uses l0_capture and leaves these device settings untouched.
  *
  * `regs` is intentionally NOT here. The host owns the per-core register table
  * per device context, but on a5 the table is also read by the AICore
@@ -294,6 +296,8 @@ struct InitArgs {
     // Per-engine async-DMA workspace dev addrs -> set_dma_workspace_addr(kind, .);
     // indexed by DmaWorkspaceKind; 0 = that engine unavailable.
     uint64_t dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT]{};
+    // A nonzero core_count selects sampler configuration and leaves device init state unchanged.
+    L0ConfigArgs l0_capture{};
 };
 
 struct AicpuTopologyQueryResult {

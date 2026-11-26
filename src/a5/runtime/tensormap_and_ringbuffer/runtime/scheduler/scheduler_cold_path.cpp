@@ -25,6 +25,7 @@
 #include "aicpu/args_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/chip_swimlane_profiling.h"
+#include "common/l0_profiling.h"
 #include "common/platform_config.h"
 #include "runtime_core.h"
 #include "shared_memory.h"
@@ -749,7 +750,8 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     }
 #endif
 
-    return retire_cores(core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num());
+    const int32_t rc = retire_cores(core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num());
+    return rc != 0 || !is_l0_swimlane_enabled() ? rc : retirement_error_.load(std::memory_order_acquire);
 }
 
 void SchedulerContext::publish_retirement_group(int32_t owner_thread) {
@@ -824,6 +826,16 @@ int32_t SchedulerContext::retire_claimed_cores(const int32_t *core_ids, int32_t 
     bool released[PLATFORM_MAX_CORES];
     const uint64_t deadline = platform_aicore_exit_deadline();
     const int32_t rc = platform_retire_aicore_group(targets, count, deadline, released);
+    if (is_l0_swimlane_enabled()) {
+        int32_t proved = 0;
+        for (size_t i = 0; i < count; ++i)
+            if (released[i]) ++proved;
+        retired_core_count_.fetch_add(proved, std::memory_order_acq_rel);
+        if (rc != 0) {
+            int32_t expected = 0;
+            retirement_error_.compare_exchange_strong(expected, rc, std::memory_order_acq_rel);
+        }
+    }
     if (rc != 0) {
         // Naming the cores is the only signal an unretired core leaves: the host
         // sees just a stream timeout.
@@ -939,6 +951,8 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
             }
             __builtin_prefetch(&core_exec_states_[i], 1, 3);
             ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+            if (is_l0_swimlane_enabled())
+                l0_live_capture_note_core_type(physical_core_id, hank->core_type == CoreType::AIC);
             core_serviced[i] = true;
             remaining--;
         }
@@ -1047,6 +1061,8 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
             }
             __builtin_prefetch(&core_exec_states_[i], 1, 3);
             ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+            if (is_l0_swimlane_enabled())
+                l0_live_capture_note_core_type(physical_core_id, hank->core_type == CoreType::AIC);
             core_serviced[i] = true;
             remaining--;
         }
@@ -1284,6 +1300,10 @@ int32_t SchedulerContext::pre_handshake_init(
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
     // Reset before hs_setup_done_ releases any initializer or emergency caller.
     memset(retirement_state_, 0, sizeof(retirement_state_));
+    if (is_l0_swimlane_enabled()) {
+        retired_core_count_.store(0, std::memory_order_release);
+        retirement_error_.store(0, std::memory_order_release);
+    }
     retirement_blocked_layout_ = aicpu_thread_num > 1 && !runtime->dev.serial_orch_sched;
     retirement_unassigned_ = false;
 

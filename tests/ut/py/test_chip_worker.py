@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import textwrap
@@ -3273,7 +3274,8 @@ class TestChipWorkerPython:
 
 
 class TestMailboxConfigRoundtrip:
-    def test_config_roundtrip(self):
+    @pytest.mark.parametrize("enable_l0", [False, True])
+    def test_config_roundtrip(self, enable_l0):
         # Guards the worker mailbox ABI: pack a CallConfig with _CFG_FMT, then
         # decode it with _read_config_from_mailbox and assert every field
         # survives. Catches field-order / offset drift in the packed layout
@@ -3288,6 +3290,7 @@ class TestMailboxConfigRoundtrip:
         cfg = CallConfig()
         cfg.aicpu_thread_num = 2
         cfg.enable_chip_swimlane = 3
+        cfg.enable_l0_swimlane = enable_l0
         cfg.enable_dump_args = 2
         cfg.enable_pmu = 5
         cfg.enable_dep_gen = True
@@ -3303,6 +3306,7 @@ class TestMailboxConfigRoundtrip:
             _OFF_CONFIG,
             cfg.aicpu_thread_num,
             cfg.enable_chip_swimlane,
+            int(cfg.enable_l0_swimlane),
             int(cfg.enable_dump_args),
             cfg.enable_pmu,
             int(cfg.enable_dep_gen),
@@ -3313,9 +3317,13 @@ class TestMailboxConfigRoundtrip:
             cfg.output_prefix.encode(),
         )
 
+        assert _CFG_FMT.size == 1152
+        assert buf[_OFF_CONFIG + 28 : _OFF_CONFIG + 32] == b"\0" * 4
+        assert struct.unpack_from("=4Q", buf, _OFF_CONFIG + 32) == (16, 32, 128, 256)
         decoded = _read_config_from_mailbox(memoryview(buf))
         assert decoded.aicpu_thread_num == 2
         assert decoded.enable_chip_swimlane == 3
+        assert decoded.enable_l0_swimlane is enable_l0
         assert decoded.enable_dump_args == 2
         assert decoded.enable_pmu == 5
         assert decoded.enable_dep_gen is True
@@ -3368,6 +3376,7 @@ class TestMailboxConfigRoundtrip:
                 _OFF_CONFIG,
                 cfg.aicpu_thread_num,
                 cfg.enable_chip_swimlane,
+                int(cfg.enable_l0_swimlane),
                 int(cfg.enable_dump_args),
                 cfg.enable_pmu,
                 int(cfg.enable_dep_gen),

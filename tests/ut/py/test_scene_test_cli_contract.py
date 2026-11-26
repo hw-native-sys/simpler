@@ -17,6 +17,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -297,6 +298,7 @@ def test_multi_rounds_disable_every_diagnostic() -> None:
     options = effective_diagnostic_options(
         2,
         chip_swimlane=4,
+        l0_swimlane=True,
         dump_args=3,
         pmu=5,
         dep_gen=True,
@@ -304,7 +306,7 @@ def test_multi_rounds_disable_every_diagnostic() -> None:
         swimlane_overhead=True,
     )
 
-    assert options == (0, 0, 0, False, False, False)
+    assert options == (0, False, 0, 0, False, False, False)
 
 
 def test_swimlane_overhead_requires_chip_swimlane() -> None:
@@ -312,6 +314,7 @@ def test_swimlane_overhead_requires_chip_swimlane() -> None:
         effective_diagnostic_options(
             1,
             chip_swimlane=0,
+            l0_swimlane=False,
             dump_args=0,
             pmu=0,
             dep_gen=False,
@@ -353,6 +356,7 @@ def test_thin_pytest_wrapper_forwards_the_shared_cli_contract() -> None:
         "rounds": 7,
         "skip_golden": True,
         "enable_chip_swimlane": 3,
+        "enable_l0_swimlane": False,
         "dump_args": 2,
         "enable_pmu": 4,
         "enable_dep_gen": True,
@@ -389,6 +393,7 @@ def test_swimlane_overhead_allocates_a_diagnostic_output_prefix(monkeypatch) -> 
         rounds=1,
         skip_golden=False,
         enable_chip_swimlane=0,
+        enable_l0_swimlane=False,
         enable_dump_args=0,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -397,6 +402,23 @@ def test_swimlane_overhead_allocates_a_diagnostic_output_prefix(monkeypatch) -> 
     )
 
     assert captured["output_prefix"] == str(output_prefix)
+
+
+def test_a5_prepared_callable_passes_l0_to_each_run(tmp_path, monkeypatch) -> None:
+    prepared = importlib.import_module("tests.st.a5.tensormap_and_ringbuffer.prepared_callable.test_prepared_callable")
+    scene = prepared.TestPreparedCallable()
+    chip = Mock()
+    monkeypatch.setattr(prepared, "_compare_outputs", lambda *_: None)
+    scene._run_and_validate(
+        SimpleNamespace(_chip_worker=chip),
+        object(),
+        scene.CASES[0],
+        enable_l0_swimlane=True,
+        output_prefix=str(tmp_path),
+    )
+
+    configs = [call.kwargs["config"] for call in chip.run.call_args_list]
+    assert [(cfg.enable_l0_swimlane, cfg.output_prefix) for cfg in configs] == [(True, str(tmp_path))] * 3
 
 
 def test_run_class_cases_reports_the_failing_case_name() -> None:
@@ -496,6 +518,7 @@ def test_standalone_dispatch_forwards_every_diagnostic_flag(monkeypatch) -> None
         rounds=1,
         skip_golden=False,
         enable_chip_swimlane=4,
+        enable_l0_swimlane=True,
         dump_args=3,
         enable_pmu=5,
         enable_dep_gen=True,
@@ -518,6 +541,7 @@ def test_standalone_dispatch_forwards_every_diagnostic_flag(monkeypatch) -> None
     assert len(commands) == 1
     command = commands[0]
     assert command[command.index("--enable-chip-swimlane") + 1] == "4"
+    assert "--enable-l0-swimlane" in command
     assert command[command.index("--dump-args") + 1] == "3"
     assert command[command.index("--enable-pmu") + 1] == "5"
     assert "--enable-dep-gen" in command

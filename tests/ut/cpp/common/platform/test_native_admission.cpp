@@ -5490,8 +5490,8 @@ public:
 TEST_F(NativeAdmissionTest, MixedCaptureDiagnosticsRefuseBeforeAnySharedPoolMutation) {
     const bool args_dump_supported = args_dump_capture_supported_impl() != 0;
     unsigned checked = 0;
-    for (unsigned selection = 1; selection < 16; ++selection) {
-        if ((selection & (selection - 1)) == 0) continue;
+    for (unsigned selection = 1; selection < 32; ++selection) {
+        if ((selection & (selection - 1)) == 0 && (selection & 16) == 0) continue;
         if (!args_dump_supported && (selection & 4) != 0) continue;
         ++checked;
         SCOPED_TRACE(selection);
@@ -5503,6 +5503,7 @@ TEST_F(NativeAdmissionTest, MixedCaptureDiagnosticsRefuseBeforeAnySharedPoolMuta
         attempt.config.enable_pmu = (selection & 2) != 0 ? 2 : 0;
         attempt.config.enable_dump_args = (selection & 4) != 0 ? static_cast<int>(DumpArgsLevel::FULL) : 0;
         attempt.config.enable_chip_swimlane = (selection & 8) != 0 ? 4 : 0;
+        attempt.config.enable_l0_swimlane = (selection & 16) != 0;
         std::strcpy(attempt.config.output_prefix, "unused-mixed-diagnostic-refusal");
         const auto pmu_starts = control().pmu_start_calls;
         EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_UNSUPPORTED);
@@ -5511,7 +5512,7 @@ TEST_F(NativeAdmissionTest, MixedCaptureDiagnosticsRefuseBeforeAnySharedPoolMuta
         EXPECT_EQ(control().pmu_start_calls, pmu_starts);
     }
     RecordProperty("mixed_selections_checked", checked);
-    EXPECT_EQ(checked, args_dump_supported ? 11u : 4u);
+    EXPECT_EQ(checked, args_dump_supported ? 27u : 12u);
 }
 }  // namespace native_admission_test
 

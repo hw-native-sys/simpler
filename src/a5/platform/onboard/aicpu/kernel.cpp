@@ -17,6 +17,7 @@
 
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
+#include "common/l0_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_entry_args.h"
 #include "aicpu/runtime_launch_view.h"
@@ -91,6 +92,9 @@ static void bind_platform_task(KernelArgs *k_args) {
     set_platform_chip_swimlane_run_terminal_bank(k_args->chip_swimlane_run_terminal_bank);
     set_platform_chip_swimlane_aicore_rotation_table(k_args->chip_swimlane_aicore_rotation_table);
     set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
+    set_l0_swimlane_enabled(
+        SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_L0_SWIMLANE), k_args->run_result_epoch
+    );
     set_platform_pmu_base(k_args->pmu_data_base);
     set_platform_pmu_run_terminal(k_args->pmu_run_terminal_bank);
     set_pmu_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU));
@@ -191,18 +195,20 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
 }
 
 /**
- * AICPU per-device init entry point.
+ * AICPU device initialization and sampler configuration entry point.
  *
- * Launched at worker init (before any register_callable / exec), this latches
- * the per-device invariants into the resident AICPU SO globals. It is launched
- * again only when first-use provisioning adds an async-DMA workspace. Because
- * the inner SO stays dlopen'd across launches, the latest values survive every
- * subsequent per-task launch.
+ * Device initialization latches configuration into the resident AICPU SO at
+ * worker init and when async-DMA workspaces are provisioned. A request with
+ * a nonzero l0_capture.core_count configures only the sampler before a run.
  *
  * @param arg Pointer to an InitArgs payload
  * @return 0 on success, non-zero on error
  */
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *arg) {
+    if (arg != nullptr) {
+        auto *args = static_cast<InitArgs *>(arg);
+        if (args->l0_capture.core_count != 0) return configure_l0_capture(args->l0_capture);
+    }
     init_log_switch();
     if (arg == nullptr) {
         LOG_ERROR("%s", "Invalid init kernel arguments: null pointer");

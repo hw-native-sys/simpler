@@ -10,6 +10,8 @@
  */
 
 #include <cstdint>
+#include <cstddef>
+#include <array>
 #include <stdexcept>
 
 #include <gtest/gtest.h>
@@ -19,7 +21,19 @@
 // Wire contract: parent and forked child move CallConfig with one memcpy.
 TEST(CallConfig, WireLayoutMatchesConstant) {
     EXPECT_EQ(sizeof(RuntimeEnv), RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t));
-    EXPECT_EQ(sizeof(CallConfig), 6 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024);
+    EXPECT_EQ(sizeof(CallConfig), 8 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024);
+}
+
+TEST(CallConfig, RuntimeEnvArraysStayAlignedInEveryArrayElement) {
+    EXPECT_GE(alignof(RuntimeEnv), alignof(uint64_t));
+    EXPECT_GE(alignof(CallConfig), alignof(uint64_t));
+    EXPECT_EQ(offsetof(CallConfig, runtime_env) % alignof(uint64_t), 0u);
+    std::array<CallConfig, 2> configs{};
+    for (auto &config : configs) {
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(config.runtime_env.ring_task_window) % alignof(uint64_t), 0u);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(config.runtime_env.ring_heap) % alignof(uint64_t), 0u);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(config.runtime_env.ring_dep_pool) % alignof(uint64_t), 0u);
+    }
 }
 
 TEST(CallConfig, RuntimeEnvDefaultsAreUnset) {
