@@ -373,17 +373,36 @@ class TestJournalRetryOnClose:
             worker._domain_free_results[7] = None
             worker.close()
 
-    def test_child_journal_driven_after_shutdown_phase(self, monkeypatch):
+    @pytest.mark.parametrize("retained_startup_group", [False, True])
+    def test_child_journal_driven_after_shutdown_phase(self, monkeypatch, retained_startup_group):
         """A retained child cannot fence the SHUTDOWN that lets it converge."""
         w = Worker(level=3, num_sub_workers=1)
         w.register(lambda args: None)
         events = []
-        w._cleanup_journal.add("child", "test", lambda: events.append("journal"))
+        group_alive = retained_startup_group
+
+        def reap_child():
+            nonlocal group_alive
+            events.append("journal")
+            group_alive = False
+
+        if retained_startup_group:
+            w._last_rollback = {}
+            w._startup_group_leader_pids.add(12345)
+
+            def check_process_group(pgid, number):
+                assert (pgid, number) == (12345, 0)
+                if not group_alive:
+                    raise ProcessLookupError
+
+            monkeypatch.setattr(os, "killpg", check_process_group)
+        w._cleanup_journal.add("child", "test", reap_child)
         monkeypatch.setattr(w, "_broadcast_child_shutdown", lambda _shms: events.append("shutdown"))
         w.close()
         assert events[-1] == "journal"
         assert "shutdown" in events[:-1]
         assert w._cleanup_journal.empty
+        assert not w._startup_group_leader_pids
 
     def test_comm_marker_cleanup_retries_after_child_exit(self, monkeypatch, tmp_path):
         w = Worker(level=3, num_sub_workers=1)

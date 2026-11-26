@@ -422,7 +422,8 @@ public:
             EXPECT_EQ(frame_type, remote_l3::FrameType::CONTROL_REPLY);
             auto control = remote_l3::decode_control(submitted.payload.data(), submitted.payload.size());
             last_control_name = control.control_name;
-            if (control.control_name == remote_l3::ControlName::PREPARE_REGISTER_CALLABLE) {
+            if (control.control_name == remote_l3::ControlName::PREPARE_REGISTER_CALLABLE ||
+                control.control_name == remote_l3::ControlName::PREPARE_CALLABLE) {
                 if (control.command_bytes.size() < 8u) {
                     ADD_FAILURE() << "PREPARE_REGISTER_CALLABLE command is truncated";
                     return {};
@@ -603,14 +604,25 @@ TEST(RemoteEndpoint, RemoteTaskErrorMapsToTaskFailure) {
 }
 
 TEST(RemoteEndpoint, ControlPrepareUsesTypedPrepareCallableFrame) {
-    auto *transport = new FakeRemoteTransport();
-    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
-    std::array<uint8_t, CALLABLE_HASH_DIGEST_SIZE> digest{};
-    digest.fill(0x7B);
+    for (const auto kind : {WorkerEndpointKind::REMOTE_L3, WorkerEndpointKind::REMOTE_L2}) {
+        auto *transport = new FakeRemoteTransport();
+        RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport), kind);
+        std::array<uint8_t, CALLABLE_HASH_DIGEST_SIZE> digest{};
+        digest.fill(0x7B);
 
-    endpoint.control_prepare(digest.data());
+        endpoint.control_prepare(digest.data());
 
-    EXPECT_EQ(transport->last_control_name, remote_l3::ControlName::PREPARE_CALLABLE);
+        EXPECT_EQ(transport->last_control_name, remote_l3::ControlName::PREPARE_CALLABLE);
+        EXPECT_EQ(
+            transport->last_target_registry, kind == WorkerEndpointKind::REMOTE_L2 ?
+                                                 remote_l3::RemoteRegistryTarget::REMOTE_CHIP_WORKER :
+                                                 remote_l3::RemoteRegistryTarget::REMOTE_TASK_DISPATCHER
+        );
+        EXPECT_EQ(
+            transport->last_callable_kind,
+            kind == WorkerEndpointKind::REMOTE_L2 ? CallableKind::CHIP_CALLABLE : CallableKind::PYTHON_IMPORT
+        );
+    }
 }
 
 TEST(RemoteEndpoint, RemoteRegisterPrepareCarriesRequestedRegistryTarget) {

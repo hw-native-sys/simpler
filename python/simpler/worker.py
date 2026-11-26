@@ -1148,6 +1148,23 @@ class RemoteWorkerSpec:
 
 
 @dataclass(frozen=True)
+class RemoteChipSpec(RemoteWorkerSpec):
+    """One remote device, runtime, command lane and independent health lane."""
+
+    device_ids: tuple[int, ...] = field(init=False, default=())
+    num_sub_workers: int = field(init=False, default=0)
+    device_id: int = 0
+
+    def __post_init__(self) -> None:
+        device_id = int(self.device_id)
+        if device_id < 0 or device_id >= (1 << 31):
+            raise ValueError("RemoteChipSpec.device_id must be a non-negative int32")
+        object.__setattr__(self, "device_id", device_id)
+        object.__setattr__(self, "device_ids", (device_id,))
+        super().__post_init__()
+
+
+@dataclass(frozen=True)
 class MpiL3GroupSpec:
     """Describes L3 workers launched by one parent-owned ``mpirun``.
 
@@ -3448,19 +3465,30 @@ def _read_teardown_report(shm: SharedMemory, child_pid: int) -> TeardownReport:
         return TeardownReport()
 
 
-def _finalize_chip_worker_and_publish(buf: memoryview, cw: _ChipWorker) -> None:
-    """Finalize this child and publish its retained teardown observation.
+def _wait_in_resource_quarantine(reason: str) -> None:
+    """Retain process-owned resources until an operator establishes global safety."""
+    # Cooperative cancellation must not unwind the resource-owning stack.
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(number, signal.SIG_IGN)
+    with contextlib.suppress(BaseException):
+        sys.stderr.write(f"[resource quarantine pid={os.getpid()}] {reason}; manual recovery required\n")
+        sys.stderr.flush()
+    threading.Event().wait()
 
-    Both startup failure and the main loop's exit go through here. Terminal
-    Host recovery can already have finalized the native owner; native finalize
-    is idempotent and preserves that owner's captured report. Publication runs
-    even when teardown raises and never replaces its outcome.
-    """
+
+def _finalize_chip_worker_and_publish(buf: memoryview, cw: _ChipWorker, *, retain_on_failure: bool = False) -> None:
+    """Publish teardown and retain an onboard owner whose cleanup is unconfirmed."""
+    error: BaseException | None = None
     try:
         cw.finalize()
-    finally:
-        _flush_host_log_or_warn("chip_process finalize")
-        _publish_teardown_report(buf, cw)
+    except BaseException as exc:  # noqa: BLE001 -- the device owner survives interrupted teardown
+        error = exc
+    _flush_host_log_or_warn("chip_process finalize")
+    _publish_teardown_report(buf, cw)
+    if error is not None:
+        if retain_on_failure:
+            _wait_in_resource_quarantine(f"chip cleanup is unconfirmed: {error}")
+        raise error
 
 
 def _publish_teardown_report(buf: memoryview, cw: _ChipWorker) -> None:
@@ -4761,116 +4789,120 @@ def _chip_process_loop(  # noqa: PLR0913 -- chip-child entry receives binaries, 
     """
     import traceback as _tb  # noqa: PLC0415
 
-    reports_admissible_sets = False
+    retain_on_startup_failure = not str(platform).endswith("sim")
+    cw = None
     try:
-        cw = _ChipWorker()
-        # Before init: the backend's own capability is only known once init binds the runtime, and
-        # `ChipWorker.launch_depth` is where the request and that capability meet.
-        if launch_depth > 1:
-            cw.configure_launch_depth(launch_depth)
-        _initialize_chip_runtime(
-            cw,
-            device_id,
-            bins,
-            log_level=log_level,
-            prewarm_config=prewarm_config,
-            enable_sdma=enable_sdma,
-            collect_across_runs=collect_across_runs,
-            # Before prewarm, which commits one set's storage per slot: the granted count has to
-            # be decided while nothing has been built against the old one. The parent reads back
-            # what was granted after INIT_READY and cannot change it.
-            requested_pipeline_depth=pipeline_depth_request,
-        )
-        if automatic_admission:
-            # After init, which is what binds the runtime and installs the
-            # workspace owner this measures against, and before any run. A
-            # backend that cannot size itself — a module without the entry —
-            # answers False, and the endpoint then admits exactly what it was
-            # granted, which is what it did before. The answer decides whether
-            # this child reports a figure at all: an endpoint that does not
-            # measure itself has nothing to publish.
-            reports_admissible_sets = bool(cw._enable_automatic_admission())  # noqa: SLF001 -- no public equivalent
-    except Exception as e:
-        _tb.print_exc()
-        # Publish the cause into the mailbox and flag INIT_FAILED so the
-        # parent's readiness barrier returns a bounded error instead of
-        # spinning forever on a child that will never reach INIT_READY.
-        _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} init", e))
-        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-        return
-
-    # Prepare every ChipCallable in the startup snapshot before publishing
-    # INIT_READY, so the H2D upload + device-orch load is charged inside the
-    # readiness barrier and the first task dispatch pays no upload. The set of
-    # prepared cids carries into the main loop, which requires a cid be prepared
-    # before it dispatches. The parent therefore issues no post-READY
-    # control_prepare for the initial snapshot.
-    prepared: set[int] = set()
-    analysis_deadline = _startup_input_cache_analysis_deadline(startup_deadline)
-    try:
-        for cid, target in registry.items():
-            if isinstance(target, ChipCallable):
-                _ensure_prepared(
-                    cw,
-                    registry,
-                    prepared,
-                    int(cid),
-                    device_id=device_id,
-                    platform=platform,
-                    runtime=runtime,
-                    analysis_deadline=analysis_deadline,
-                )
-    except Exception as e:
-        _tb.print_exc()
-        _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
-        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-        # This branch already owns a real device teardown, and the child exits
-        # normally from it, so its observation is publishable — the same
-        # finalize-then-publish shape the main loop's exit uses.
-        _finalize_chip_worker_and_publish(buf, cw)
-        return
-
-    mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-    state_addr = mailbox_addr + _OFF_STATE
-    environment = RegionEnvironmentKind.SIM if str(platform).endswith("sim") else RegionEnvironmentKind.ONBOARD
-    try:
-        _ = aicore_owner_instance_id
-        allocator = LocalEndpointBufferIdentityAllocator(aicpu_owner_instance_id)
-        provider_region_store = ProviderRegionStore(
-            RegionAllocationContext(
-                environment_kind=environment,
-                target=DeviceAllocationTarget(int(device_id)),
-            ),
-            identity_allocator=allocator,
-        )
-    except Exception as e:
-        _tb.print_exc()
-        _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} provider store", e))
-        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+        reports_admissible_sets = False
         try:
-            cw.finalize()
-        finally:
-            _flush_host_log_or_warn("chip_process finalize")
-        return
-    if expected_parent_pid is not None and os.getppid() != expected_parent_pid:
-        _write_error(buf, 1, f"chip_process dev={device_id}: parent exited during init")
-        _mailbox_store_i32(state_addr, _INIT_FAILED)
-        _finalize_chip_worker_and_publish(buf, cw)
-        return
-    # Signal init success. The parent's readiness barrier waits for every chip
-    # child to reach _INIT_READY before dispatching the first task, so the
-    # per-rank host-side stream sync budget only covers actual op execution
-    # rather than absorbing peer-rank init skew.
-    #
-    # The child publishes the resolved runtime depth and the grant that sizes
-    # its run-state entries. Request frames have a fixed, independent count.
-    granted_sets = _local_run_resource_set_count(int(cw.pipeline_depth))
-    _PIPELINE_LEASE_FMT.pack_into(buf, _OFF_PIPELINE_LEASE, int(cw.pipeline_depth), granted_sets, 0)
-    _mailbox_store_i32(state_addr, _INIT_READY)
-    sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
-    sys.stderr.flush()
+            cw = _ChipWorker()
+            # Before init: the backend's own capability is only known once init binds the runtime, and
+            # `ChipWorker.launch_depth` is where the request and that capability meet.
+            if launch_depth > 1:
+                cw.configure_launch_depth(launch_depth)
+            _initialize_chip_runtime(
+                cw,
+                device_id,
+                bins,
+                log_level=log_level,
+                prewarm_config=prewarm_config,
+                enable_sdma=enable_sdma,
+                collect_across_runs=collect_across_runs,
+                # Before prewarm, which commits one set's storage per slot: the granted count has to
+                # be decided while nothing has been built against the old one. The parent reads back
+                # what was granted after INIT_READY and cannot change it.
+                requested_pipeline_depth=pipeline_depth_request,
+            )
+            if automatic_admission:
+                # After init, which is what binds the runtime and installs the
+                # workspace owner this measures against, and before any run. A
+                # backend that cannot size itself — a module without the entry —
+                # answers False, and the endpoint then admits exactly what it was
+                # granted, which is what it did before. The answer decides whether
+                # this child reports a figure at all: an endpoint that does not
+                # measure itself has nothing to publish.
+                reports_admissible_sets = bool(cw._enable_automatic_admission())  # noqa: SLF001 -- no public equivalent
+        except Exception as e:
+            _tb.print_exc()
+            # Publish the cause into the mailbox and flag INIT_FAILED so the
+            # parent's readiness barrier returns a bounded error instead of
+            # spinning forever on a child that will never reach INIT_READY.
+            _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} init", e))
+            _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+            return
 
-    try:
+        if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_SHUTDOWN)) == _SHUTDOWN_REQUESTED:
+            return
+
+        # Prepare every ChipCallable in the startup snapshot before publishing
+        # INIT_READY, so the H2D upload + device-orch load is charged inside the
+        # readiness barrier and the first task dispatch pays no upload. The set of
+        # prepared cids carries into the main loop, which requires a cid be prepared
+        # before it dispatches. The parent therefore issues no post-READY
+        # control_prepare for the initial snapshot.
+        prepared: set[int] = set()
+        analysis_deadline = _startup_input_cache_analysis_deadline(startup_deadline)
+        try:
+            for cid, target in registry.items():
+                if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_SHUTDOWN)) == _SHUTDOWN_REQUESTED:
+                    break
+                if isinstance(target, ChipCallable):
+                    _ensure_prepared(
+                        cw,
+                        registry,
+                        prepared,
+                        int(cid),
+                        device_id=device_id,
+                        platform=platform,
+                        runtime=runtime,
+                        analysis_deadline=analysis_deadline,
+                    )
+        except Exception as e:
+            _tb.print_exc()
+            _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
+            _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+            return
+
+        if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_SHUTDOWN)) == _SHUTDOWN_REQUESTED:
+            return
+
+        mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+        state_addr = mailbox_addr + _OFF_STATE
+        environment = RegionEnvironmentKind.SIM if str(platform).endswith("sim") else RegionEnvironmentKind.ONBOARD
+        try:
+            _ = aicore_owner_instance_id
+            allocator = LocalEndpointBufferIdentityAllocator(aicpu_owner_instance_id)
+            provider_region_store = ProviderRegionStore(
+                RegionAllocationContext(
+                    environment_kind=environment,
+                    target=DeviceAllocationTarget(int(device_id)),
+                ),
+                identity_allocator=allocator,
+            )
+        except Exception as e:
+            _tb.print_exc()
+            _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} provider store", e))
+            _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+            return
+        if expected_parent_pid is not None and os.getppid() != expected_parent_pid:
+            _write_error(buf, 1, f"chip_process dev={device_id}: parent exited during init")
+            _mailbox_store_i32(state_addr, _INIT_FAILED)
+            return
+        # Signal init success. The parent's readiness barrier waits for every chip
+        # child to reach _INIT_READY before dispatching the first task, so the
+        # per-rank host-side stream sync budget only covers actual op execution
+        # rather than absorbing peer-rank init skew.
+        #
+        # The child publishes the resolved runtime depth and the grant that sizes
+        # its run-state entries. Request frames have a fixed, independent count.
+        granted_sets = _local_run_resource_set_count(int(cw.pipeline_depth))
+        _PIPELINE_LEASE_FMT.pack_into(buf, _OFF_PIPELINE_LEASE, int(cw.pipeline_depth), granted_sets, 0)
+        # Once ready, report teardown errors and let the parent reap the child.
+        # The parent's waitpid path retains the mailbox while the child is live.
+        retain_on_startup_failure = False
+        _mailbox_store_i32(state_addr, _INIT_READY)
+        sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
+        sys.stderr.flush()
+
         _run_chip_main_loop(
             cw,
             buf,
@@ -4894,10 +4926,8 @@ def _chip_process_loop(  # noqa: PLR0913 -- chip-child entry receives binaries, 
             shared_heap_files=shared_heap_files,
         )
     finally:
-        # After the teardown, whether or not it raised: the C++ side captured
-        # its observation before throwing, and the parent's shared mailbox
-        # outlives this process.
-        _finalize_chip_worker_and_publish(buf, cw)
+        if cw is not None:
+            _finalize_chip_worker_and_publish(buf, cw, retain_on_failure=retain_on_startup_failure)
 
 
 def _level_capture_prefix(prefix: str, worker: Worker) -> str:
@@ -5407,6 +5437,10 @@ class _CloseAttempt:
             if effective_error is None:
                 effective_error = exc
             return self.publish(effective_error, True)
+
+
+class _ChildReclaimPending(RuntimeError):
+    """Namespace reclamation is deferred until the child journal is driven."""
 
 
 class _StartupCancelled(BaseException):
@@ -6692,7 +6726,7 @@ class Worker:
                 raise RuntimeError("Worker.add_remote_worker after init")
             if self.level < 4:
                 raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
-            if not isinstance(spec, RemoteWorkerSpec):
+            if not isinstance(spec, RemoteWorkerSpec) or isinstance(spec, RemoteChipSpec):
                 raise TypeError("Worker.add_remote_worker expects a RemoteWorkerSpec")
             # Validate the endpoint here, before any startup resource exists, so a
             # non-numeric host fails at registration rather than mid-activation
@@ -6703,6 +6737,28 @@ class Worker:
             self._remote_worker_specs.append(spec)
             self._remote_worker_ids.append(worker_id)
             return worker_id
+
+    def add_remote_chip(self, spec: RemoteChipSpec) -> int:
+        """Attach one daemon-hosted L2 to this L3 before topology initialization."""
+        with self._hierarchical_start_cv:
+            if self._lifecycle is not _Lifecycle.NEW:
+                raise RuntimeError("Worker.add_remote_chip after init")
+            if self.level != 3:
+                raise TypeError("Worker.add_remote_chip requires a level-3 parent")
+            if not isinstance(spec, RemoteChipSpec):
+                raise TypeError("Worker.add_remote_chip expects a RemoteChipSpec")
+            host, _port = self._parse_remote_endpoint(spec.endpoint)
+            self._validate_numeric_endpoint_host(host)
+            self._next_level_worker_id_count = max(
+                self._next_level_worker_id_count, len(self._config.get("device_ids", ()))
+            )
+            worker_id = self._allocate_next_level_worker_id()
+            self._remote_worker_specs.append(spec)
+            self._remote_worker_ids.append(worker_id)
+            return worker_id
+
+    def _is_remote_chip(self, worker_id: int) -> bool:
+        return self.level == 3 and int(worker_id) in self._remote_worker_ids
 
     def add_mpirun_worker_group(self, spec: MpiL3GroupSpec) -> tuple[int, ...]:
         """Register L3 workers that will be launched by one parent-owned ``mpirun``.
@@ -6921,7 +6977,7 @@ class Worker:
         return entries
 
     def _inner_registry_entries_for_spec(
-        self, spec: RemoteWorkerSpec | _MpiL3RankSpec | MpiDirectExecutorSpec
+        self, spec: RemoteWorkerSpec | _MpiL3RankSpec | MpiDirectExecutorSpec, *, digest: bytes | None = None
     ) -> list[dict[str, Any]]:
         from .remote_l3_protocol import (  # noqa: PLC0415
             ChipCallableBlobLocation,
@@ -6931,7 +6987,7 @@ class Worker:
 
         entries: list[dict[str, Any]] = []
         with self._registry_lock:
-            states = list(self._identity_registry.values())
+            states = list(self._identity_registry.values()) if digest is None else [self._identity_registry[digest]]
         for state in states:
             if state.target_namespace != "LOCAL_CHIP":
                 continue
@@ -6955,15 +7011,16 @@ class Worker:
                     staged_blob_token=b"",
                 )
             )
-            entries.append(
-                {
-                    "hashid": state.digest.hex(),
-                    "kind": "CHIP_CALLABLE",
-                    "target_registry": "INNER_L3_WORKER",
-                    "payload_version": 1,
-                    "payload_hex": payload.hex(),
-                }
-            )
+            entry = {
+                "hashid": state.digest.hex(),
+                "kind": "CHIP_CALLABLE",
+                "target_registry": "INNER_L3_WORKER",
+                "payload_version": 1,
+                "payload_hex": payload.hex(),
+            }
+            if isinstance(spec, RemoteChipSpec) and digest is None:
+                entry["ref_count"] = state.ref_count
+            entries.append(entry)
         return entries
 
     @staticmethod
@@ -7105,7 +7162,7 @@ class Worker:
         return {
             "session_id": int(session_id),
             "parent_worker_level": int(self.level),
-            "remote_worker_level": 3,
+            "remote_worker_level": 2 if isinstance(spec, RemoteChipSpec) else 3,
             "worker_id": int(worker_id),
             "platform": spec.platform,
             "runtime": spec.runtime,
@@ -7125,8 +7182,16 @@ class Worker:
             "startup_remaining_s": float(startup_remaining_s),
             "listen_host": listen_host,
             "connect_host": daemon_host,
-            "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(worker_id),
-            "inner_l3_worker": self._inner_registry_entries_for_spec(spec),
+            "remote_task_dispatcher": []
+            if isinstance(spec, RemoteChipSpec)
+            else self._remote_dispatcher_entries_for_worker(worker_id),
+            "inner_l3_worker": [] if isinstance(spec, RemoteChipSpec) else self._inner_registry_entries_for_spec(spec),
+            "chip_worker": [
+                {**entry, "target_registry": "REMOTE_CHIP_WORKER"}
+                for entry in self._inner_registry_entries_for_spec(spec)
+            ]
+            if isinstance(spec, RemoteChipSpec)
+            else [],
             "feature_flags": [],
         }
 
@@ -7500,8 +7565,8 @@ class Worker:
         public lifecycle), so an operation legitimately admitted before a
         concurrent ``close()`` published CLOSED still completes during the drain
         instead of spuriously failing."""
-        if self.level < 4:
-            raise TypeError("remote memory APIs require a level >= 4 parent Worker")
+        if self.level < 4 and not self._is_remote_chip(worker_id):
+            raise TypeError("remote memory APIs require a remote child of a hierarchical Worker")
         if int(worker_id) not in self._remote_like_worker_ids():
             raise ValueError(
                 "remote memory APIs require a remote worker id returned by add_remote_worker or add_mpirun_worker_group"
@@ -8520,8 +8585,13 @@ class Worker:
             child_path = _format_worker_path(int(child.level), parent_path=path, index=int(child_index))
             self._append_endpoint_topology(entries, child, child_path, node_identity, include_self=True)
         for child_index, spec in zip(worker._remote_worker_ids, worker._remote_worker_specs):
-            remote_path = _format_worker_path(3, parent_path=path, index=int(child_index))
             remote_node_identity = self._node_identity_from_remote_endpoint(spec.endpoint)
+            if isinstance(spec, RemoteChipSpec):
+                remote_path = _format_worker_path(2, parent_path=path, index=int(child_index))
+                entries.append(_EndpointTopologyEntry(remote_path, DEVICE_AICORE, remote_node_identity))
+                entries.append(_EndpointTopologyEntry(remote_path, DEVICE_AICPU, remote_node_identity))
+                continue
+            remote_path = _format_worker_path(3, parent_path=path, index=int(child_index))
             entries.append(_EndpointTopologyEntry(remote_path, HOST_CPU, remote_node_identity))
             self._append_device_endpoint_topology(entries, remote_path, spec.device_ids, remote_node_identity)
         mpi_groups = {group.group_id: group for group in worker._mpi_l3_groups}
@@ -9013,7 +9083,9 @@ class Worker:
                     self._uncertain_hashids.add(reg.digest)
             raise
 
-    def _remote_abort_prepared(self, worker_ids: list[int], reg: _CallableRegistration) -> list[str]:
+    def _remote_abort_prepared(
+        self, worker_ids: list[int], reg: _CallableRegistration, *, registry: str = "REMOTE_TASK_DISPATCHER"
+    ) -> list[str]:
         if self._worker is None:
             return []
         errors: list[str] = []
@@ -9021,7 +9093,7 @@ class Worker:
             try:
                 result = self._worker.remote_abort_register(
                     worker_id,
-                    "REMOTE_TASK_DISPATCHER",
+                    registry,
                     reg.kind,
                     reg.digest,
                 )
@@ -9032,7 +9104,9 @@ class Worker:
                 errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
         return errors
 
-    def _remote_unregister_committed(self, worker_ids: list[int], reg: _CallableRegistration) -> list[str]:
+    def _remote_unregister_committed(
+        self, worker_ids: list[int], reg: _CallableRegistration, *, registry: str = "REMOTE_TASK_DISPATCHER"
+    ) -> list[str]:
         if self._worker is None:
             return []
         errors: list[str] = []
@@ -9040,7 +9114,7 @@ class Worker:
             try:
                 result = self._worker.remote_unregister(
                     worker_id,
-                    "REMOTE_TASK_DISPATCHER",
+                    registry,
                     reg.kind,
                     reg.digest,
                 )
@@ -9277,6 +9351,9 @@ class Worker:
         if not getattr(self, "_hierarchical_started", False):
             return
         assert self._worker is not None
+        if self.level == 3 and self._remote_worker_specs:
+            self._post_init_register_mixed_chip(target, digest)
+            return
         try:
             results = self._worker.broadcast_register_all(int(target.buffer_ptr()), int(target.buffer_size()), digest)
         except Exception:
@@ -9292,6 +9369,49 @@ class Worker:
                 with self._registry_lock:
                     self._uncertain_hashids.add(digest)
             raise RuntimeError(self._format_register_partial_failure(digest, errors, cleanup_errors))
+
+    def _post_init_register_mixed_chip(self, target: ChipCallable, digest: bytes) -> None:
+        """Publish a chip identity across mailbox and remote endpoints as one transaction."""
+        assert self._worker is not None
+        reg = _build_callable_registration(self, target)
+        prepared: list[int] = []
+        committed: list[int] = []
+        local_results: list[Any] = []
+        try:
+            for worker_id, spec in zip(self._remote_worker_ids, self._remote_worker_specs):
+                entry = self._inner_registry_entries_for_spec(spec, digest=digest)[0]
+                result = self._worker.remote_prepare_register(
+                    worker_id, "REMOTE_CHIP_WORKER", "CHIP_CALLABLE", bytes.fromhex(entry["payload_hex"]), digest
+                )
+                if not result.ok:
+                    raise RuntimeError(result.error_message)
+                prepared.append(worker_id)
+            local_results = [
+                result
+                for result in self._worker.broadcast_register_all(
+                    int(target.buffer_ptr()), int(target.buffer_size()), digest
+                )
+                if not self._is_remote_chip(int(result.worker_id))
+            ]
+            errors = self._control_errors(local_results)
+            if errors:
+                raise RuntimeError(errors[0])
+            for worker_id in prepared:
+                result = self._worker.remote_commit_register(worker_id, "REMOTE_CHIP_WORKER", "CHIP_CALLABLE", digest)
+                if not result.ok:
+                    raise RuntimeError(result.error_message)
+                committed.append(worker_id)
+        except BaseException:
+            cleanup = self._remote_abort_prepared(
+                [worker_id for worker_id in prepared if worker_id not in committed], reg, registry="REMOTE_CHIP_WORKER"
+            )
+            cleanup.extend(self._remote_unregister_committed(committed, reg, registry="REMOTE_CHIP_WORKER"))
+            cleanup.extend(self._cleanup_control_successes(local_results, _CTRL_UNREGISTER, digest))
+            with self._registry_lock:
+                self._uncertain_hashids.add(digest)
+            if cleanup:
+                _simpler_log.get_logger().error("Chip registration cleanup incomplete: %s", cleanup[0])
+            raise
 
     @staticmethod
     def _format_register_partial_failure(digest: bytes, errors: list[str], cleanup_errors: list[str]) -> str:
@@ -9603,6 +9723,17 @@ class Worker:
         """
         assert self._worker is not None
         errors = self._worker.broadcast_unregister_all(digest)
+        if self.level == 3:
+            for worker_id in self._remote_worker_ids:
+                try:
+                    result = self._worker.remote_unregister(worker_id, "REMOTE_CHIP_WORKER", "CHIP_CALLABLE", digest)
+                    if not result.ok:
+                        errors.append(result.error_message)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(self._format_remote_control_exception(worker_id, exc))
+            if errors:
+                with self._registry_lock:
+                    self._uncertain_hashids.add(digest)
         if errors:
             sys.stderr.write(
                 f"Worker.unregister(hash={_format_digest(digest)}): {len(errors)} chips reported errors "
@@ -10222,7 +10353,7 @@ class Worker:
             # remaining startup budget; runtime_timeout is the full runtime command
             # budget, never clamped by leftover startup time.
             try:
-                self._worker.add_remote_l3_socket(
+                attach_args = (
                     session.worker_id,
                     session.session_id,
                     spec.comm_profile,
@@ -10233,6 +10364,10 @@ class Worker:
                     remaining,
                     session_timeout,
                 )
+                if isinstance(spec, RemoteChipSpec):
+                    self._worker.add_remote_l3_socket(*attach_args, remote_worker_level=2)
+                else:
+                    self._worker.add_remote_l3_socket(*attach_args)
             except TimeoutError as exc:
                 raise TimeoutError(f"remote L3 endpoint attach failed for worker {worker_id}: {exc}") from exc
             except Exception as exc:
@@ -10243,6 +10378,9 @@ class Worker:
         # deadline check keeps a just-over-budget attach from committing READY.
         if _monotonic() >= deadline:
             raise RuntimeError("remote L3 activation: startup deadline exceeded after attach")
+
+    def _has_remote_chip_children(self) -> bool:
+        return any(isinstance(spec, RemoteChipSpec) for spec in self._remote_worker_specs)
 
     def _record_chip_pid(self, pid: int) -> None:
         if pid not in self._chip_pids:
@@ -10667,33 +10805,19 @@ class Worker:
     # Hierarchical abort
     # ------------------------------------------------------------------
 
+    def _has_onboard_chip_children(self) -> bool:
+        """Whether this subtree can own physical-device resources after fork."""
+        if self._config.get("device_ids") and not str(self._config.get("platform", "")).endswith("sim"):
+            return True
+        return any(child._has_onboard_chip_children() for child in self._next_level_workers)
+
     def _abort_hierarchical(self, deadline: float | None = None) -> None:  # noqa: PLR0912 -- graceful/cooperative-cancel-then-killpg rollback across sub/chip/next-level, bounded-wait, reap, free shms
-        """Tear down the whole forked subtree + shms after a bootstrap failure.
+        """Cancel startup with one bounded cleanup budget.
 
-        Called from the init() failure path — the single rollback entry
-        (_cleanup_partial_init) — so `dw.init()` may or may not have run.
-
-        ``deadline`` is one absolute ``time.monotonic()`` budget shared by both
-        phases (cooperative wait and the final reap), so the whole rollback is
-        bounded end-to-end; a survivor still alive at the deadline is left to the
-        OS/init rather than blocking this thread on a D-state child. Defaults to
-        one ``_ROLLBACK_GRACEFUL_TIMEOUT_S`` window.
-
-        Teardown proceeds in two bounded phases within one cleanup budget:
-
-        1. Cooperative. A child that reached its serve loop (READY) is asked to
-           close gracefully via SHUTDOWN so it finalizes its device / unlinks its
-           own nested shms. A next-level child still inside ``inner.init()``
-           (mid-init, and possibly already the parent of grandchildren) is sent
-           SIGTERM, which unwinds its ``inner.init()`` and recursively reclaims
-           its grandchildren and their nested shms.
-        2. Hard backstop. Any child still alive past the cleanup deadline is
-           reaped. As the startup root, ``killpg`` takes the whole subtree — the
-           child and every descendant that inherited its process group — so a
-           mid-init grandchild is reaped here rather than left to the
-           multiprocessing resource_tracker; a nested (non-root) worker SIGKILLs
-           the direct pid and relies on the root's killpg. PIDs the barrier
-           already reaped are excluded so a reused PID is never signalled.
+        READY children and every chip receive a sticky shutdown request. Physical
+        device subtrees finish initialization and teardown cooperatively; surviving
+        owners and their mailbox/group identities remain available for recovery.
+        CPU-only subtrees retain a bounded signal/kill backstop.
         """
         if deadline is None:
             deadline = _monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
@@ -10701,39 +10825,50 @@ class Worker:
         graceful: list[int] = []
         cancelled: list[int] = []
         killed: list[int] = []
+        protected: set[int] = set()
+        if not str(self._config.get("platform", "")).endswith("sim"):
+            protected.update(self._chip_pids)
+        protected.update(
+            pid
+            for pid, child in zip(self._next_level_pids, self._next_level_workers)
+            if child._has_onboard_chip_children()
+        )
 
-        # A next-level child may have published INIT_READY in the window between
-        # the barrier last polling it and aborting on a failing sibling — its
-        # mailbox still reads INIT_READY (only the barrier resets it to IDLE).
-        # Promote it to READY so it is torn down gracefully (SHUTDOWN unlinks its
-        # own nested shms) rather than cooperatively cancelled after it has
-        # already restored the default SIGTERM disposition.
-        for idx, pid in enumerate(self._next_level_pids):
-            if pid in reaped or pid in self._startup_ready_pids:
-                continue
-            buf = self._next_level_shms[idx].buf if idx < len(self._next_level_shms) else None
-            if buf is not None and _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _INIT_READY:
-                self._startup_ready_pids.add(pid)
-
-        # Phase 1a: READY children (sub / chip / next-level) close gracefully.
+        # READY publication can race a sibling's failure before the barrier observes it.
         for pids_list, shms_list in (
             (self._next_level_pids, self._next_level_shms),
             (self._chip_pids, self._chip_shms),
             (self._sub_pids, self._sub_shms),
         ):
             for idx, pid in enumerate(pids_list):
-                if pid in reaped or pid not in self._startup_ready_pids:
+                if pid in reaped or pid in self._startup_ready_pids:
+                    continue
+                buf = shms_list[idx].buf if idx < len(shms_list) else None
+                if buf is not None and _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _INIT_READY:
+                    self._startup_ready_pids.add(pid)
+
+        # Sticky shutdown survives an initializing chip's later READY publication.
+        for pids_list, shms_list in (
+            (self._next_level_pids, self._next_level_shms),
+            (self._chip_pids, self._chip_shms),
+            (self._sub_pids, self._sub_shms),
+        ):
+            for idx, pid in enumerate(pids_list):
+                if pid in reaped:
+                    continue
+                if pid not in self._startup_ready_pids and pids_list is not self._chip_pids and pid not in protected:
                     continue
                 buf = shms_list[idx].buf if idx < len(shms_list) else None
                 if buf is None:
                     continue
                 _request_child_shutdown(buf)
-                graceful.append(pid)
+                if pid in self._startup_ready_pids or pid in protected:
+                    graceful.append(pid)
 
         # Phase 1b: mid-init next-level children get a cooperative cancel so they
         # unwind inner.init() and recursively reclaim their own subtree.
         for pid in self._next_level_pids:
-            if pid in reaped or pid in self._startup_ready_pids:
+            if pid in reaped or pid in self._startup_ready_pids or pid in protected:
                 continue
             with contextlib.suppress(ProcessLookupError, OSError):
                 os.kill(pid, signal.SIGTERM)
@@ -10755,12 +10890,10 @@ class Worker:
                 if waiting:
                     _sleep(_STARTUP_POLL_INTERVAL_S)
 
-        # Phase 2: hard backstop for any survivor. A not-yet-reaped pid still
-        # holds its slot (no reuse), so killpg on the root reaps the survivor's
-        # whole group (it + inherited-group descendants) safely.
+        # CPU-only survivors have a kill backstop; device owners retain their groups.
         pids = list(self._chip_pids) + list(self._sub_pids) + list(self._next_level_pids)
         for pid in pids:
-            if pid in reaped:
+            if pid in reaped or pid in protected:
                 continue
             if self._is_startup_root:
                 with contextlib.suppress(ProcessLookupError, OSError):
@@ -10803,12 +10936,16 @@ class Worker:
         # window here is negligible).
         if self._is_startup_root:
             for leader_pid in self._startup_group_leader_pids:
+                if leader_pid in protected:
+                    continue
                 with contextlib.suppress(ProcessLookupError, OSError):
                     os.killpg(leader_pid, signal.SIGKILL)
 
+        self._startup_group_leader_pids.intersection_update(protected)
         self._last_rollback = {
             "graceful": [p for p in graceful if p not in killed],
             "killed": list(killed),
+            "retained": sorted(protected - reaped),
         }
 
         # Release the pre-fork _Worker so a retry / close() won't double-free
@@ -10825,7 +10962,6 @@ class Worker:
                 f"[worker pid={os.getpid()}] WARN: startup child reclaim failed (continuing best-effort): {exc}\n"
             )
             sys.stderr.flush()
-        self._startup_group_leader_pids.clear()
 
     def _cleanup_partial_init(self) -> None:
         """Best-effort cleanup for init() failures before the Worker is public-live.
@@ -13876,7 +14012,7 @@ class Worker:
         C++ target check only rejects unregistered ids, so a registered remote
         worker slips through — this guards that hole.
         """
-        if worker_id in self._remote_like_worker_ids():
+        if worker_id in self._remote_like_worker_ids() and not self._is_remote_chip(worker_id):
             raise ValueError(
                 f"orch.{api}: worker {worker_id} is a remote NEXT_LEVEL worker; a local callable "
                 f"must target a local child (remote workers only run RemoteCallable dispatches)"
@@ -16701,8 +16837,26 @@ class Worker:
             return True
         raise RuntimeError(f"Host domain process group {pgid} is still alive")
 
+    def _check_startup_process_groups_exited(self) -> None:
+        if self._last_rollback is None:
+            return
+        for pgid in tuple(self._startup_group_leader_pids):
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                self._startup_group_leader_pids.discard(pgid)
+            else:
+                message = f"startup device process group {pgid} is still alive"
+                if self._cleanup_journal.has_kind("child"):
+                    # Retry the namespace after the same close has driven the child entries.
+                    raise _ChildReclaimPending(message)
+                raise RuntimeError(message)
+
     def _unlink_shm_namespace(self, protected_names: set[str]) -> None:
         """Unlink orphan shared memory belonging to this exact startup tree."""
+        if self._cleanup_journal.has_kind("child") and self._has_remote_chip_children():
+            raise _ChildReclaimPending("startup namespace has unconfirmed L2 child exit")
+        self._check_startup_process_groups_exited()
         shm_dir = "/dev/shm"
         if not self._shm_tree_tokens or not os.path.isdir(shm_dir):
             return
@@ -17076,7 +17230,12 @@ class Worker:
             # eat it. Reap transfers a surviving pid/shm pair into the journal;
             # a later close() can retry without freeing a live mailbox.
             reap_deadline = _monotonic() + _CLOSE_CHILD_REAP_TIMEOUT_S
-            _step(lambda: self._reclaim_child_groups(reap_deadline))
+            try:
+                self._reclaim_child_groups(reap_deadline)
+            except _ChildReclaimPending:
+                pass
+            except BaseException as exc:  # noqa: BLE001 -- every cleanup phase is attempted
+                errors.append(exc)
             # A prior attempt may already have transferred a surviving child
             # and its mailbox into the journal. Retry those entries only after
             # this attempt has delivered SHUTDOWN and reaped the live groups;

@@ -27,7 +27,7 @@ from simpler.task_interface import (
 )
 from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
 
-from examples.workers.l3.multi_chip_dispatch.main import N_COLS, N_ROWS, build_chip_callable
+from examples.workers.l3.multi_chip_dispatch.main import N_COLS, N_ROWS, build_chip_callable, run_remote
 from examples.workers.l4.global_tload_mixed_l3.main import COUNT, _build_tload_callable
 
 _NUMEL = N_ROWS * N_COLS
@@ -292,6 +292,13 @@ def test_domain_tensor_reaches_remote_chip(tcp_daemon, st_platform, st_device_id
         )
     )
     exercise_domain_tensors(worker, [(node, 0)], st_platform)
+
+
+@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+def test_l3_dispatches_directly_to_local_and_remote_l2(tcp_daemon, st_platform, st_device_ids):
+    assert run_remote(st_platform, [int(st_device_ids[0])], tcp_daemon, [int(st_device_ids[1])]) == 0
 
 
 @pytest.mark.platforms(["a2a3sim", "a5sim"])

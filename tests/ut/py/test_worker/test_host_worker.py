@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import weakref
+from contextlib import nullcontext
 from multiprocessing.shared_memory import SharedMemory
 from types import SimpleNamespace
 from typing import Any, Optional, cast
@@ -223,7 +224,8 @@ def _chip_payload_shm(callable_obj: ChipCallable) -> SharedMemory:
     return shm
 
 
-def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
+@pytest.mark.parametrize("finalize_fails", [False, True])
+def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch, finalize_fails):
     events: list[tuple] = []
     published_depths: list[int] = []
     published_frame_counts: list[int] = []
@@ -239,6 +241,11 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
 
         def finalize(self) -> None:
             events.append(("finalize",))
+            if finalize_fails:
+                raise RuntimeError("synthetic finalize failure")
+
+        def teardown_report_bytes(self) -> None:
+            events.append(("report",))
 
     def fake_run_chip_main_loop(
         cw, *_args, chip_platform, chip_runtime, prepared=None, granted_sets=1, chip_rank=None, **_kwargs
@@ -254,24 +261,29 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
 
     monkeypatch.setattr(worker_mod, "_ChipWorker", FakeChipWorker)
     monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
+    monkeypatch.setattr(
+        worker_mod, "_wait_in_resource_quarantine", lambda _: pytest.fail("READY child must report failure and exit")
+    )
 
     bins = SimpleNamespace(host_path="host.so", aicpu_path="aicpu.so", aicore_path="aicore.bin")
     shm = SharedMemory(create=True, size=worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST))
     try:
         assert shm.buf is not None
-        worker_mod._chip_process_loop(
-            shm.buf,
-            bins,
-            7,
-            {},
-            {},
-            {},
-            worker_mod.mint_owner_instance_id(),
-            worker_mod.mint_owner_instance_id(),
-            worker_mod.mint_owner_instance_id(),
-            platform="a2a3",
-            runtime="tensormap_and_ringbuffer",
-        )
+        expected = pytest.raises(RuntimeError, match="synthetic finalize failure") if finalize_fails else nullcontext()
+        with expected:
+            worker_mod._chip_process_loop(
+                shm.buf,
+                bins,
+                7,
+                {},
+                {},
+                {},
+                worker_mod.mint_owner_instance_id(),
+                worker_mod.mint_owner_instance_id(),
+                worker_mod.mint_owner_instance_id(),
+                platform="a2a3",
+                runtime="tensormap_and_ringbuffer",
+            )
     finally:
         shm.close()
         shm.unlink()
@@ -281,7 +293,7 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
     assert events[0] == ("init", "host.so", "aicpu.so", "aicore.bin", "", 7, None, False, "", "", False, 0, False, 0)
     assert events[1][0] == "main_loop"
     assert events[1][2:] == ("a2a3", "tensormap_and_ringbuffer")
-    assert events[2] == ("finalize",)
+    assert events[2:] == [("finalize",), ("report",)]
     assert published_depths == [2]
     assert published_frame_counts == [2]
 

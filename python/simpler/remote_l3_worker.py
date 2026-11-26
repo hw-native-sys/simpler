@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Remote L3 control daemon."""
+"""Control daemon for remote L2 and L3 workers."""
 
 from __future__ import annotations
 
@@ -52,6 +52,22 @@ def _send_json(sock: socket.socket, payload: dict[str, Any]) -> None:
     sock.sendall(struct.pack("<I", len(data)) + data)
 
 
+def _validate_worker_role(manifest: dict[str, Any]) -> None:
+    remote_level = int(manifest["remote_worker_level"])
+    parent_level = int(manifest["parent_worker_level"])
+    if remote_level not in (2, 3):
+        raise ValueError("manifest remote_worker_level must be 2 or 3")
+    if (remote_level == 2 and parent_level != 3) or (remote_level == 3 and parent_level < 4):
+        raise ValueError("manifest parent_worker_level does not match remote_worker_level")
+    if remote_level == 2:
+        if len(manifest.get("device_ids", [])) != 1 or int(manifest.get("num_sub_workers", 0)) != 0:
+            raise ValueError("remote L2 requires exactly one device and no sub-workers")
+        if manifest.get("remote_task_dispatcher") or manifest.get("inner_l3_worker"):
+            raise ValueError("remote L2 accepts only its chip_worker registry")
+    elif manifest.get("chip_worker"):
+        raise ValueError("remote L3 cannot install a chip_worker registry")
+
+
 def _validate_manifest(manifest: dict[str, Any]) -> None:
     required = ["session_id", "worker_id", "parent_worker_level", "remote_worker_level", "platform", "transport"]
     for key in required:
@@ -61,8 +77,7 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
         raise ValueError("manifest session_id must be non-zero")
     if int(manifest["worker_id"]) < 0:
         raise ValueError("manifest worker_id must be non-negative")
-    if int(manifest["remote_worker_level"]) != 3:
-        raise ValueError("manifest remote_worker_level must be 3")
+    _validate_worker_role(manifest)
     if not str(manifest["platform"]):
         raise ValueError("manifest platform must be non-empty")
     if str(manifest["transport"]) != HOST_TCP_TRANSPORT_PROFILE:
@@ -79,6 +94,8 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
     if node_count <= 0 or node_rank < 0 or node_rank >= node_count:
         raise ValueError("manifest node identity is invalid")
     device_ids = [int(device_id) for device_id in manifest.get("device_ids", [])]
+    if any(device_id < 0 for device_id in device_ids) or len(set(device_ids)) != len(device_ids):
+        raise ValueError("manifest device_ids must be unique and non-negative")
     global_device_ranks = [int(rank) for rank in manifest.get("global_device_ranks", range(len(device_ids)))]
     if len(global_device_ranks) != len(device_ids):
         raise ValueError("manifest global_device_ranks must match device_ids length")
@@ -210,8 +227,7 @@ def _start_session(manifest: dict[str, Any]) -> tuple[dict[str, Any], subprocess
             ],
             pass_fds=(ready_w,),
             close_fds=True,
-            # Own session/group so the daemon can killpg the whole runner
-            # subtree (runner + eagerly-forked inner L3->L2 children).
+            # The runner's process group contains its complete inner subtree.
             start_new_session=True,
         )
         os.close(ready_w)
