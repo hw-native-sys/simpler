@@ -136,7 +136,7 @@ drain or reset; the caller owns device recovery. The native entry
 `simpler_launch_run_on_stream` binds a borrowed caller stream to an already
 prepared run. Public `Worker.init(borrowed_context_generation=...)` and
 `Worker.submit(..., caller_stream=...)` use this same native path. Caller-owned
-Kernel submissions use `simpler_prepare_caller_run` and
+Kernel submissions use `simpler_prepare_caller_run_v2` and
 `simpler_submit_run_on_stream` over the common preparation and launch machinery,
 retaining the original run through all model uses when recorded.
 Program has no eager/capture mode selection. The [capture execution contract](native-capture-common-contract.md)

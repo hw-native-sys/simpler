@@ -40,6 +40,7 @@ _RANGE_LABELS = {
     "range_enter_begin": "Wait for range",
     "graph_ready_observed": "Graph watermark observed",
     "range_entered": "Range entered",
+    "ready_row_scan": "Select a ready row",
 }
 
 _DEFER_EVENTS = {
@@ -100,6 +101,10 @@ def parse_capture(section):
             type(row.get("graph_shell_id")) is not int or type(row.get("watermark")) is not int
         ):
             raise ValueError("invalid calendar Graph watermark event")
+        if row["kind"] == "ready_row_scan" and (
+            type(row.get("scan_start_cycles")) is not int or not 0 < row["scan_start_cycles"] <= row["cycles"]
+        ):
+            raise ValueError("invalid calendar ready-row scan interval")
     return section
 
 
@@ -193,7 +198,14 @@ def _validate_task_event(row):
 def decode_capture(section, to_us):
     return {
         **section,
-        "range_records": [{**row, "time_us": to_us(row["cycles"])} for row in section["range_records"]],
+        "range_records": [
+            {
+                **row,
+                "time_us": to_us(row["cycles"]),
+                **({"scan_start_us": to_us(row["scan_start_cycles"])} if row["kind"] == "ready_row_scan" else {}),
+            }
+            for row in section["range_records"]
+        ],
         "records": [
             {
                 **row,
@@ -502,9 +514,20 @@ def _range_events(rows, lanes):
     ranges = defaultdict(dict)
     for row in rows:
         worker, index, kind = row["worker_id"], row["range_index"], row["kind"]
-        ranges[row["run_epoch"], worker, index][kind] = row
         graph = row.get("graph_shell_id")
         label = f"Graph {graph} · " if graph is not None else ""
+        if kind == "ready_row_scan":
+            yield {
+                **lanes[worker],
+                "cat": "calendar_range",
+                "ph": "X",
+                "ts": row["scan_start_us"],
+                "dur": row["time_us"] - row["scan_start_us"],
+                "name": label + _RANGE_LABELS[kind],
+                "args": row,
+            }
+            continue
+        ranges[row["run_epoch"], worker, index][kind] = row
         yield {
             **lanes[worker],
             "cat": "calendar_range",

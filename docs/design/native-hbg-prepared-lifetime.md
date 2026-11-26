@@ -55,7 +55,7 @@ notification can serve multiple nodes in one model.
 
 ## Native caller-owned runs
 
-Prepare each Kernel node with `simpler_prepare_caller_run` and submit it with
+Prepare each Kernel node with `simpler_prepare_caller_run_v2` and submit it with
 `simpler_submit_run_on_stream`. Keep the original run storage, borrowed
 context, stream and tensors valid until checked finalization. A successful
 submission returns execution capacity while preserving the backing named by

@@ -10,6 +10,7 @@
  */
 
 #include <cstdint>
+#include "../urma_queue_command.h"
 
 extern "C" __global__[aicore] void
 simpler_ccu_event_trigger(uint64_t gate_address, uint64_t value, uint64_t result_address) {
@@ -29,4 +30,27 @@ simpler_ccu_event_trigger(uint64_t gate_address, uint64_t value, uint64_t result
     }
     dsb(DSB_DDR);
     pipe_barrier(PIPE_ALL);
+}
+
+namespace {
+struct AivQueueMemory {
+    static inline[aicore] bool read(uint64_t address, uint32_t &word) {
+        word = static_cast<uint32_t>(__builtin_cce_ld_dev(reinterpret_cast<__gm__ uint32_t *>(address), 0));
+        return true;
+    }
+    static inline[aicore] bool write(uint64_t address, uint32_t word) {
+        __builtin_cce_st_dev(word, reinterpret_cast<__gm__ uint32_t *>(address), 0);
+        dsb(DSB_DDR);
+        return true;
+    }
+};
+}  // namespace
+
+// HCCL's AIV channel exports its CQE and doorbell in the device's address space.
+extern "C" __global__[aicore] void simpler_urma_queue_control(
+    uint64_t action, uint64_t address, uint64_t depth, uint64_t completed, uint64_t target, uint64_t result_address
+) {
+    using namespace simpler::urma;
+    const QueueCommand command{static_cast<QueueAction>(action), address, depth, completed, target, result_address};
+    AivQueueMemory::write(result_address, static_cast<uint32_t>(execute_queue_command(AivQueueMemory{}, command)));
 }

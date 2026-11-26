@@ -31,7 +31,7 @@ import numpy as np
 import pytest
 import simpler.worker as worker_mod
 from simpler.buffer import AccessMode, AddressSpace, buffer_reference, wrap_vmm_window
-from simpler.comm_domain import HostBufferMapping
+from simpler.comm_domain import HostBufferMapping, UrmaConfig
 from simpler.orchestrator import _callback_run
 from simpler.task_interface import CommBufferSpec, CommDomainHandle, DataType, GlobalCommDomainHandle, TaskArgs
 from simpler.worker import Worker
@@ -1322,6 +1322,20 @@ def test_registered_views_resolve_and_revalidate_after_revocation(domain_worker)
             worker._reexport(logical.to_descriptor())
     finally:
         registry.close()
+
+
+@pytest.mark.parametrize(
+    "devices,members,jetties",
+    [([2, 3], [0, 1], 1), ([2, 3], [1, 0], 1), ([2, 3], [0, 1], 2), ([2, 3, 4], [2, 0, 1], 2)],
+)
+def test_hbg_device_urma_capability(devices, members, jetties):
+    owner: Any = SimpleNamespace(
+        level=3, _config={"device_ids": devices, "platform": "a5", "runtime": "host_build_graph"}
+    )
+    config = {"urma": UrmaConfig(jetties_per_aiv=jetties)}
+    domain = Worker._domain_config(owner, members, 4096, [], True, config, AddressSpace.DEVICE)
+    assert domain.members == tuple(members)
+    assert domain.urma_config().jetties_per_aiv == jetties
 
 
 @pytest.mark.parametrize("engines", [(), ("sdma",), ("rdma",)])

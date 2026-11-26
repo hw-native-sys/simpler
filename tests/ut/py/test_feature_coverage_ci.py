@@ -134,6 +134,55 @@ def test_native_consumers_have_collectable_feature_declarations(tmp_path, path, 
     assert {case["feature"]["product"] for case in content["cases"]} == {expected_product}
 
 
+def test_a5_hbg_urma_collection_only_allows_pcie_host_gather_skips(tmp_path):
+    scene_dir = ROOT / "tests/st/a5/host_build_graph"
+    inventory = tmp_path / "inventory.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            *sorted(scene_dir.glob("urma_*")),
+            "--collect-only",
+            "--platform=a5",
+            "--runtime=host_build_graph",
+            "--level=3",
+            "--manual=include",
+            "--environment-receipts",
+            "--verify-feature-coverage",
+            "-p",
+            "simpler_setup.tools.collection_inventory",
+            "--collection-inventory",
+            str(inventory),
+        ],
+        cwd=ROOT,
+        env={
+            **{key: value for key, value in os.environ.items() if not key.startswith("PYTEST_XDIST_")},
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "python"))),
+        },
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    content = json.loads(inventory.read_text())
+    assert not content["classification_errors"] and not content["collection_errors"] and not content["duplicates"]
+    cases = {case["nodeid"]: case["feature"]["allowed_skip"] for case in content["cases"]}
+    host_gather = "tests/st/a5/host_build_graph/urma_host/test_urma_host.py::TestHbgHostGather::test_run"
+    pcie_reason = "Cross-rank URMA reads of Host memory hit an ACK timeout with a PCIe Host-Device link"
+    pcie_exceptions = {
+        f"{host_gather}[{blocks}-{mode}]": pcie_reason
+        for blocks in ("single_aiv", "multi_aiv")
+        for mode in ("serial", "staged")
+    }
+    assert {nodeid: reason for nodeid, reason in cases.items() if reason is not None} == pcie_exceptions
+    assert content["policy"]["required_groups"] == ["program/host_build_graph"]
+    assert set(content["policy"]["required_nodeids"]) == cases.keys() - pcie_exceptions.keys()
+
+
 @pytest.mark.parametrize("phase", ["setup", "call", "teardown", "call_and_teardown"])
 def test_failed_framework_cases_have_feature_counts(tmp_path, phase):
     fixture = """

@@ -100,6 +100,8 @@ const char *task_event_name(PercounterTaskEventKind kind) {
         return "peer_dmb_observed";
     case PercounterTaskEventKind::RangeEntered:
         return "range_entered";
+    case PercounterTaskEventKind::ReadyRowScan:
+        return "ready_row_scan";
     }
     throw std::runtime_error("invalid percounter task event kind");
 }
@@ -229,7 +231,8 @@ bool export_profile(const ProfileOwner &owner) {
         for (const auto &event : read_records<PercounterTaskEvent>(owner, event_offset, header.event_committed)) {
             if (event.kind == PercounterTaskEventKind::RangeEnterBegin ||
                 event.kind == PercounterTaskEventKind::GraphReadyObserved ||
-                event.kind == PercounterTaskEventKind::RangeEntered) {
+                event.kind == PercounterTaskEventKind::RangeEntered ||
+                event.kind == PercounterTaskEventKind::ReadyRowScan) {
                 if (!first_range) range_events << ',';
                 first_range = false;
                 range_events << "{\"kind\":\"" << task_event_name(event.kind) << "\",\"cycles\":" << event.cycles
@@ -241,6 +244,8 @@ bool export_profile(const ProfileOwner &owner) {
                 if (shell != UINT32_MAX) range_events << ",\"graph_shell_id\":" << shell;
                 if (event.kind == PercounterTaskEventKind::GraphReadyObserved)
                     range_events << ",\"watermark\":" << event.detail;
+                if (event.kind == PercounterTaskEventKind::ReadyRowScan)
+                    range_events << ",\"scan_start_cycles\":" << event.detail;
                 range_events << '}';
                 continue;
             }

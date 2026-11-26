@@ -11,7 +11,7 @@
 /**
  * simpler host-runtime C API — a2a3 arch-specific entries
  *
- * The shared c_api glue (simpler_init / simpler_register_callable / simpler_run /
+ * The shared c_api glue (simpler_init / simpler_register_callable / simpler_run_v2 /
  * device_*_ctx / etc.) lives in
  * `src/common/platform/onboard/host/c_api_shared.cpp` and is linked into
  * this same `libhost_runtime.so`. This file keeps only the entries that

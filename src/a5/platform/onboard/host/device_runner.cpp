@@ -98,7 +98,10 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip
 // DeviceRunner Implementation
 // =============================================================================
 
-DeviceRunner::~DeviceRunner() { finalize(); }
+DeviceRunner::~DeviceRunner() {
+    stop_urma_scans();
+    finalize();
+}
 
 // `setup_static_arena`, `attach_current_thread`, `configure_aicore_op_timeout`,
 // `ensure_device_initialized`, `ensure_aicpu_runtime_registered`, `query_max_block_dim`,
@@ -1091,7 +1094,9 @@ int DeviceRunner::queue_cross_run_wait(
 }
 
 void DeviceRunner::mark_device_unusable(int runtime_rc) {
-    device_unusable_.store(true, std::memory_order_release);
+    revoke_urma_launches_and_mark([&] {
+        device_unusable_.store(true, std::memory_order_release);
+    });
     if (execution_mode_latch_.is_kernel()) kernel_exec_state_.poison(runtime_rc);
 }
 

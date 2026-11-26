@@ -125,6 +125,7 @@ struct Template {
     std::vector<CalendarLocalJoin> joins;
     std::vector<std::array<uint32_t, 3>> binding_indexes;
     std::vector<bool> polls_task_fanins;
+    std::vector<uint32_t> progress_ends;  // Exclusive row index at each reorderable range's start.
     uint32_t binding_count{0};
     uint32_t rows_offset{0};
     uint32_t joins_offset{0};
@@ -132,7 +133,7 @@ struct Template {
 
 inline bool decode_template(
     RangeCalendarImage &image, const CalendarPhase &phase, const CalendarPlan &plan, const HostGraphTemplate *graph,
-    uint32_t clusters, Template &result
+    uint32_t clusters, Template &result, bool has_urma
 ) {
     if (plan.bytes.size() < sizeof(result.header)) return false;
     std::memcpy(&result.header, plan.bytes.data(), sizeof(result.header));
@@ -146,7 +147,7 @@ inline bool decode_template(
     result.rows_offset = image.allocate<CalendarExecutionRow>(header.row_count);
     result.joins_offset = image.allocate<CalendarLocalJoin>(result.joins.size());
     if (result.rows_offset == 0 || (!result.joins.empty() && result.joins_offset == 0) || result.indexes.front() != 0 ||
-        result.indexes.back() != header.row_count)
+        result.indexes.back() != header.row_count || !std::is_sorted(result.indexes.begin(), result.indexes.end()))
         return false;
     if (!result.joins.empty())
         std::memcpy(
@@ -158,6 +159,31 @@ inline bool decode_template(
     if (waits.row_waits.size() != header.row_count || waits.row_input_owners.size() != header.row_count ||
         waits.task_fanins.size() != phase.tasks.size())
         return false;
+    // Ordinary rows can make progress until their lane reaches its next collective rendezvous.
+    if (has_urma && phase.tasks.size() >= 3) {
+        for (uint32_t worker = 0; worker < header.worker_count; ++worker) {
+            const uint32_t begin = result.indexes[worker];
+            const uint32_t end = result.indexes[worker + 1];
+            uint32_t span_begin = begin;
+            bool saw_wait = false;
+            for (uint32_t i = begin; i < end; ++i) {
+                const auto task = static_cast<size_t>(percounter_order_task_id(result.rows[i].entry));
+                if (task >= phase.tasks.size()) return false;
+                const auto &input = phase.tasks[task];
+                if (input.is_mix || input.sync_start) {
+                    span_begin = i + 1;
+                    saw_wait = false;
+                    continue;
+                }
+                if (saw_wait) {
+                    if (result.progress_ends.empty()) result.progress_ends.resize(header.row_count);
+                    result.progress_ends[span_begin] = i + 1;
+                }
+                saw_wait |= input.fanin_count != 0;
+            }
+        }
+    }
+    const bool allow_out_of_order = !result.progress_ends.empty();
     result.binding_indexes.resize(phase.tasks.size());
     result.polls_task_fanins.resize(phase.tasks.size());
     for (size_t task = 0; task < phase.tasks.size(); ++task) {
@@ -185,10 +211,11 @@ inline bool decode_template(
             const auto &input = phase.tasks[task];
             const uint32_t role = calendar_logical_role(input.active_mask, lane);
             const uint32_t binding = result.binding_indexes[task][role];
-            if (binding == UINT32_MAX || waits.task_fanins[task].size() > UINT16_MAX) return false;
+            const auto &inputs = allow_out_of_order ? phase.fanins[task] : waits.task_fanins[task];
+            if (binding == UINT32_MAX || inputs.size() > UINT16_MAX) return false;
             const uint32_t offset = result.rows_offset + i * sizeof(CalendarExecutionRow);
             uint32_t mix_delta = 0;
-            uint16_t wait_count = waits.row_waits[i] ? static_cast<uint16_t>(waits.task_fanins[task].size()) : 0;
+            uint16_t wait_count = (allow_out_of_order || waits.row_waits[i]) ? static_cast<uint16_t>(inputs.size()) : 0;
             if (row.local_join != CALENDAR_NO_JOIN) {
                 if (row.local_join >= result.joins.size()) return false;
                 mix_delta = result.joins_offset + row.local_join * sizeof(CalendarLocalJoin) - offset;
@@ -202,13 +229,13 @@ inline bool decode_template(
             if (input.sync_start) flags |= CALENDAR_EXEC_SYNC_START;
             if (input.has_predicate) flags |= CALENDAR_EXEC_PREDICATE;
             if (input.active_mask == 0) flags |= CALENDAR_EXEC_CONTROL;
-            if (wait_count != 0 && waits.summarized_fanins[task]) {
+            if (!allow_out_of_order && wait_count != 0 && waits.summarized_fanins[task]) {
                 flags |= CALENDAR_EXEC_FANIN;
                 const auto &assignment = waits.row_assignments[i];
                 mix_delta = assignment.begin;
                 wait_count = assignment.count;
             }
-            const uint32_t owner = waits.row_input_owners[i];
+            const uint32_t owner = allow_out_of_order ? CALENDAR_NO_INPUT_OWNER : waits.row_input_owners[i];
             if (owner != CALENDAR_NO_INPUT_OWNER) {
                 const bool summary = (flags & CALENDAR_EXEC_FANIN) != 0;
                 if (lane == 0 || input.is_mix || input.sync_start || input.has_predicate || input.active_mask == 0 ||
@@ -523,7 +550,7 @@ emit_execution_extra(RangeCalendarImage &image, const CalendarExecutionExtra &ex
 inline bool build_range_calendar(
     const std::vector<RangeCalendarInput> &inputs, const GraphPlanInput &graphs, uint32_t outer_count,
     uint32_t clusters, RangeCalendarImage *out, const SchedulerTaskMetadata *pmu_outer_tasks = nullptr,
-    bool enable_peer_hints = true
+    bool enable_peer_hints = true, bool has_urma = false
 ) {
     using namespace range_calendar_detail;
     if (clusters == 0 || clusters > PLATFORM_MAX_BLOCKDIM || out == nullptr) return false;
@@ -558,12 +585,14 @@ inline bool build_range_calendar(
         const uint32_t base = graph == nullptr ? 0 : body_base[phase.invocation];
         auto [entry, inserted] = templates.try_emplace(input.plan.get());
         auto &tmpl = entry->second;
-        if (inserted && !decode_template(image, phase, *input.plan, graph, clusters, tmpl)) return false;
+        if (inserted && !decode_template(image, phase, *input.plan, graph, clusters, tmpl, has_urma)) return false;
+        // Passing a blocked row requires every real input, including waits elided by the fixed lane order.
+        const bool allow_out_of_order = !tmpl.progress_ends.empty();
 
         std::vector<uint32_t> fused_consumers;
         std::vector<bool> fused_producers;
         std::vector<PeerTask> peer_tasks;
-        if (inputs.size() == 1 && graphs.invocation_count == 0) {
+        if (!allow_out_of_order && inputs.size() == 1 && graphs.invocation_count == 0) {
             materialize_fused_fanins(phase, input.plan->waits, image, fused_consumers, fused_producers);
             peer_tasks = plan_peer_notifications(phase, input.plan->waits, tmpl, image, enable_peer_hints);
             if (!prepare_peer_fanouts(image, peer_tasks)) return false;
@@ -580,7 +609,8 @@ inline bool build_range_calendar(
         std::vector<bool> polled(phase.tasks.size(), false);
         for (size_t task = 0; task < phase.tasks.size(); ++task) {
             if (!tmpl.polls_task_fanins[task]) continue;
-            for (int32_t predecessor : input.plan->waits.task_fanins[task]) {
+            const auto &producers = allow_out_of_order ? phase.fanins[task] : input.plan->waits.task_fanins[task];
+            for (int32_t predecessor : producers) {
                 if (predecessor < 0 || static_cast<size_t>(predecessor) >= polled.size()) return false;
                 polled[predecessor] = true;
             }
@@ -612,8 +642,8 @@ inline bool build_range_calendar(
                 image.sync_widths[domain] =
                     std::max(image.sync_widths[domain], static_cast<uint64_t>(task_input.block_num));
             }
-            const auto &producers = input.plan->waits.task_fanins[task];
-            const bool fanin = input.plan->waits.summarized_fanins[task];
+            const auto &producers = allow_out_of_order ? phase.fanins[task] : input.plan->waits.task_fanins[task];
+            const bool fanin = !allow_out_of_order && input.plan->waits.summarized_fanins[task];
             const uint32_t group = fused_consumers.empty() ? UINT32_MAX : fused_consumers[task];
             const uint32_t wait_offset = image.allocate<CalendarWait>(producers.size() + fanin);
             if (!producers.empty() && wait_offset == 0) return false;
@@ -703,6 +733,8 @@ inline bool build_range_calendar(
             longest = std::max(longest, last - first);
             uint32_t need = 0;
             const auto required = [&](uint32_t row) {
+                // A later notifier may live in a different Graph materialization slice.
+                if (allow_out_of_order) return static_cast<uint32_t>(phase.tasks.size());
                 const uint32_t task = static_cast<uint32_t>(percounter_order_task_id(tmpl.rows[row].entry));
                 return std::min(
                     static_cast<uint32_t>(phase.tasks.size()),
@@ -711,8 +743,11 @@ inline bool build_range_calendar(
             };
             for (uint32_t begin = first; begin < last;) {
                 need = invocation == nullptr ? 0 : std::max(need, required(begin));
+                const uint32_t progress_end = allow_out_of_order ? tmpl.progress_ends[begin] : 0;
                 uint32_t limit = begin + 1;
-                while (limit < last && (invocation == nullptr || required(limit) <= need))
+                while (limit < (progress_end != 0 ? progress_end : last) &&
+                       (!allow_out_of_order || tmpl.progress_ends[limit] == 0) &&
+                       (invocation == nullptr || required(limit) <= need))
                     ++limit;
                 const bool previous_phase = begin == first && p != 0;
                 const uint32_t num_waits = previous_phase + (invocation != nullptr);
@@ -728,12 +763,20 @@ inline bool build_range_calendar(
                 const bool tail = limit == last && end.slot != UINT32_MAX;
                 const bool settle = limit == last && worker == exit_worker && !exit_tasks.empty();
                 if (tail) ++end.contributors;
+                uint32_t progress_offset = 0;
+                if (progress_end != 0) {
+                    // Runtime-private state: adjacent lanes must not write back each other's cache lines.
+                    image.bytes.resize((image.bytes.size() + 63U) & ~size_t{63U});
+                    progress_offset = image.allocate<CalendarRowProgress>(limit - begin);
+                    if (progress_offset == 0) return false;
+                    image.bytes.resize((image.bytes.size() + 63U) & ~size_t{63U});
+                }
                 ranges[worker].push_back(
                     {{static_cast<uint32_t>(tmpl.rows_offset + begin * sizeof(CalendarExecutionRow)), limit - begin,
                       bindings, wait_offset, num_waits, sequence_base, 0, settle ? exit_offset : 0,
                       settle ? static_cast<uint32_t>(exit_tasks.size()) : 0,
                       shell < 0 ? UINT32_MAX : static_cast<uint32_t>(shell), begin - first,
-                      pmu == 0 ? 0 : static_cast<uint32_t>(pmu + begin * sizeof(CalendarPmuCell))},
+                      pmu == 0 ? 0 : static_cast<uint32_t>(pmu + begin * sizeof(CalendarPmuCell)), progress_offset},
                      samples == 0 ? 0 : static_cast<uint32_t>(samples + begin * sizeof(CalendarTiming)),
                      tail ? static_cast<int32_t>(p) : -1}
                 );

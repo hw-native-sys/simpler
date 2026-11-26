@@ -143,13 +143,16 @@ inline __aicore__ AsyncReservation reserve_conditions(const AsyncWriter &writer,
     return reservation;
 }
 
-inline __aicore__ bool
-commit_condition(const AsyncWriter &writer, const AsyncReservation &reservation, const CompletionToken &token) {
+namespace detail {
+
+inline __aicore__ bool commit_validated_condition(
+    const AsyncWriter &writer, const AsyncReservation &reservation, const CompletionToken &token, bool token_is_valid
+) {
     if (!detail::valid(writer) || !detail::reservation_valid(writer, reservation)) return false;
     auto *data = detail::group(writer);
     if (data->reservation_written == data->reservation_limit)
         return detail::fail(writer, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
-    if (!detail::token_valid(token)) return detail::fail(writer, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    if (!token_is_valid) return detail::fail(writer, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     const uint32_t index = data->count;
     auto *entries = reinterpret_cast<__gm__ volatile DeferredCompletionEntry *>(writer.image + data->entries_offset);
     entries[index].addr = token.addr;
@@ -161,6 +164,13 @@ commit_condition(const AsyncWriter &writer, const AsyncReservation &reservation,
     data->reservation_written = data->reservation_written + 1;
     data->count = index + 1;
     return true;
+}
+
+}  // namespace detail
+
+inline __aicore__ bool
+commit_condition(const AsyncWriter &writer, const AsyncReservation &reservation, const CompletionToken &token) {
+    return detail::commit_validated_condition(writer, reservation, token, detail::token_valid(token));
 }
 
 inline __aicore__ bool

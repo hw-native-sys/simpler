@@ -48,7 +48,8 @@ inline constexpr uint32_t PERCOUNTER_CONTEXT_SSBUF_STRIDE = 64;
 struct PercounterInvocationContext {
     LocalContext local;
     GlobalContext global;
-    uint32_t async_touched;  // Accessed by the kernel and scheduler on the same lane.
+    uint32_t async_touched;   // Accessed by the kernel and scheduler on the same lane.
+    uint32_t urma_sender_id;  // Physical AIV ordinal for the life of this lane, UINT32_MAX without a sender.
 };
 static_assert(sizeof(PercounterInvocationContext) == PERCOUNTER_CONTEXT_SSBUF_STRIDE);
 static_assert(

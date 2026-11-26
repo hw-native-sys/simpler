@@ -382,7 +382,7 @@ void bind_program_lane(ChipWorker &worker, FencedCompletionRunner &runner) {
     worker.pipeline_generations_.resize(2);
     for (int slot = 0; slot != 2; ++slot)
         worker.runtime_bufs_.emplace_back(get_runtime_size(), get_runtime_alignment(), nullptr);
-    worker.prepare_run_fn_ = simpler_prepare_run;
+    worker.prepare_run_fn_ = simpler_prepare_run_v2;
     worker.launch_run_fn_ = simpler_launch_run;
     worker.poll_run_fn_ = simpler_poll_run;
     worker.wait_run_fn_ = program_lane_wait;
@@ -1922,6 +1922,77 @@ TEST_F(NativeAdmissionTest, BorrowedDeviceDoesNotConfigureTheGlobalOperatorTimeo
     EXPECT_EQ(runner.timeouts().actual_op_execute_timeout_us, 0u);
 }
 
+static void assert_fatal_reset_joins_urma_scan(bool immediate_close_error) {
+    using namespace std::chrono_literals;
+    class ResetRunner : public Runner {
+    public:
+        using DeviceRunnerBase::recover_failed_close;
+        std::atomic<bool> reset_entered{false};
+        void mark_device_unusable(int rc) override {
+            revoke_urma_launches_and_mark([&] {
+                Runner::mark_device_unusable(rc);
+            });
+        }
+        int finalize_impl() override {
+            begin_fatal_close();
+            reset_entered = true;
+            return retire_device_generation_after_confirmed_reset();
+        }
+    } runner;
+    ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_PROGRAM), 0);
+    int owner = 0;
+    ASSERT_TRUE(runner.try_reserve_native_run(&owner, 1, arena_bank(1), true));
+    const auto generation = runner.device_health().generation();
+    auto scan = std::make_shared<UrmaScanThread>();
+    auto permission = runner.acquire_urma_launch_permission(generation, scan);
+    ASSERT_FALSE(permission.expired());
+
+    // Simulate one SDK read that is still inside the old context after poll returns.
+    std::promise<void> entered, release;
+    auto may_finish = release.get_future();
+    scan->worker = std::thread([&] {
+        entered.set_value();
+        may_finish.wait();
+    });
+    entered.get_future().wait();
+    constexpr int device_error = 507018;
+    if (!immediate_close_error) {
+        runner.mark_device_unusable(device_error);
+        EXPECT_FALSE(permission.lock()->open());
+    }
+    auto closing = std::async(std::launch::async, [&] {
+        return immediate_close_error ? runner.recover_failed_close(device_error) : finalize_device(&runner);
+    });
+    {
+        std::unique_lock lock(scan->mutex);
+        EXPECT_TRUE(scan->changed.wait_for(lock, 2s, [&] {
+            return scan->stopping;
+        }));
+    }
+    EXPECT_FALSE(runner.reset_entered);
+    EXPECT_EQ(closing.wait_for(10ms), std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(closing.get(), immediate_close_error ? device_error : 0);
+    // Join in the test, too, so a regression which skipped the fence can report its failures.
+    EXPECT_FALSE(scan->worker.joinable());
+    scan->stop_and_join();
+    EXPECT_TRUE(runner.reset_entered);
+    if (immediate_close_error) runner.abandon_native_run_owners_after_reset();
+    EXPECT_FALSE(runner.native_runs_outstanding());
+    EXPECT_TRUE(permission.expired());
+    runner.admission_poisoned = false;
+    EXPECT_TRUE(runner.acquire_urma_launch_permission(generation, scan).expired());
+    EXPECT_FALSE(runner.acquire_urma_launch_permission(runner.device_health().generation(), {}).expired());
+}
+
+TEST_F(NativeAdmissionTest, FatalProgramResetJoinsTheUrmaScanBeforeAbandoningTheRun) {
+    assert_fatal_reset_joins_urma_scan(false);
+}
+
+TEST_F(NativeAdmissionTest, ImmediateCloseRecoveryJoinsTheUrmaScanBeforeReset) {
+    assert_fatal_reset_joins_urma_scan(true);
+}
+
 TEST_F(NativeAdmissionTest, RegistrationRefusesWhileANativeRunIsOutstanding) {
     Runner runner;
     ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL), 0);
@@ -1990,7 +2061,7 @@ TEST_F(NativeAdmissionTest, AutomaticRegistrationDoesNotRetryFailedProgramInitia
 }
 
 TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunComposition) {
-    EXPECT_EQ(simpler_prepare_run(nullptr, nullptr, 0, nullptr, nullptr, nullptr), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(simpler_prepare_run_v2(nullptr, nullptr, 0, nullptr, nullptr, nullptr), PTO_RUNTIME_ERR_INTERNAL);
     Runner runner;
     Attempt failed(runner, 0, 10);
     failed.config.aicpu_thread_num = 1;
@@ -1998,7 +2069,7 @@ TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunCompositi
     EXPECT_TRUE(failed.consume_release());
     EXPECT_TRUE(failed.empty());
     Attempt next(runner, 0, 20);
-    EXPECT_EQ(simpler_run(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
+    EXPECT_EQ(simpler_run_v2(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
     EXPECT_TRUE(next.empty());
     EXPECT_EQ(runner.reservations(), 0u);
     EXPECT_FALSE(runner.holds_epoch(20));
@@ -2369,7 +2440,7 @@ TEST_F(NativeAdmissionTest, UnstartedLaunchCleanupPublishesOnlyItsOwnReleaseProo
     EXPECT_FALSE(runner.holds_epoch(10));
     runner.launch_refusal_rc = 0;
     Attempt next(runner, 0, 20);
-    EXPECT_EQ(simpler_run(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
+    EXPECT_EQ(simpler_run_v2(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
     EXPECT_TRUE(next.empty());
 }
 
@@ -2602,7 +2673,9 @@ TEST_F(NativeAdmissionTest, DeviceHealthSuspicionDoesNotBlockProvedCallableRelea
     Runner runner;
     runner.allocate_callable();
     Attempt completed(runner, 0, 10);
-    ASSERT_EQ(simpler_run(&runner, completed.storage, 1, &completed.args, &completed.config, &completed.descriptor), 0);
+    ASSERT_EQ(
+        simpler_run_v2(&runner, completed.storage, 1, &completed.args, &completed.config, &completed.descriptor), 0
+    );
     runner.note_device_suspicion();
     ASSERT_FALSE(runner.accepts_new_run());
     ASSERT_TRUE(runner.can_accept_run());
@@ -3046,7 +3119,9 @@ void check_finalize_prefix_allocation_failure(bool launched, bool delivery_entry
     EXPECT_EQ(runner.drain_calls, drains + (launched ? 1 : 0));
     EXPECT_EQ(run.bytes, payload);
     Attempt successor(runner, 0, 8101);
-    EXPECT_EQ(simpler_run(&runner, successor.storage, 1, &successor.args, &successor.config, &successor.descriptor), 0);
+    EXPECT_EQ(
+        simpler_run_v2(&runner, successor.storage, 1, &successor.args, &successor.config, &successor.descriptor), 0
+    );
     EXPECT_TRUE(successor.empty());
     EXPECT_EQ(runner.reservations(), 0u);
 }
@@ -3656,6 +3731,37 @@ TEST_F(NativeAdmissionTest, EagerScopeCollectionPreservesItsOrdinaryRetentionPol
         EXPECT_EQ(text.find("\"recorded_window\": true"), std::string::npos) << text;
         EXPECT_EQ(runner.ordinary_retention(), retain);
     }
+}
+
+TEST_F(NativeAdmissionTest, CallerFinalizeRetriesUrmaWithoutSynchronizingSubsequentWork) {
+    Runner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 9599);
+    use_caller_preparation(attempt);
+    ASSERT_EQ(attempt.prepare(), 0);
+    int caller;
+    ASSERT_EQ(simpler_submit_run_on_stream(&runner, attempt.storage, &caller), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    auto queue = std::make_shared<UrmaQueueState>(UrmaQueueState::PENDING);
+    state->host_api.urma.domains.push_back(
+        {{}, queue, queue, [](void *value, UrmaQueueReceipt &, UrmaWait, const UrmaLaunchPermission &) {
+             return *static_cast<UrmaQueueState *>(value);
+         }}
+    );
+    control().observed_streams.clear();
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE);
+    EXPECT_FALSE(attempt.empty());
+    EXPECT_EQ(std::count(control().observed_streams.begin(), control().observed_streams.end(), &caller), 1);
+    // Any second synchronization would now observe a different call's failure.
+    control().stream_sync_hook = [&caller] {
+        control().stream_sync_rc = control().observed_streams.back() == &caller ? -996 : 0;
+    };
+    *queue = UrmaQueueState::READY;
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    control().stream_sync_hook = {};
+    control().stream_sync_rc = 0;
+    EXPECT_TRUE(attempt.empty());
+    EXPECT_EQ(std::count(control().observed_streams.begin(), control().observed_streams.end(), &caller), 1);
 }
 
 TEST_F(NativeAdmissionTest, CallerScopeWindowSurvivesFailedFinalizeWithoutEnablingOrdinaryRetention) {

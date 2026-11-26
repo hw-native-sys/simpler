@@ -165,7 +165,7 @@ public:
         descriptor.accepted_state = &accepted;
         descriptor.accepted_value = 1;
         accepted = 0;
-        const int rc = simpler_prepare_caller_run(context, model.run, 0, &args, &current, &descriptor);
+        const int rc = simpler_prepare_caller_run_v2(context, model.run, 0, &args, &current, &descriptor);
         if (rc != 0) model.run = nullptr;
         return rc;
     }

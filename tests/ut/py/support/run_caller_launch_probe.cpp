@@ -1205,7 +1205,7 @@ static void check_clock_export(uint32_t mode, const std::filesystem::path &direc
     ChipStorageTaskArgs args;
     args.add_tensor(tensor);
     NativeRunDescriptor descriptor{0, 0, 1, 1, 1, 1};
-    assert(simpler_prepare_run(&runner, original, 1, &args, &config, &descriptor) == 0);
+    assert(simpler_prepare_run_v2(&runner, original, 1, &args, &config, &descriptor) == 0);
     const auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(original);
     const uint64_t invocation = state->trace_inv;
     const auto runner_records = [&] {
@@ -1232,7 +1232,7 @@ static void check_clock_export(uint32_t mode, const std::filesystem::path &direc
     assert(!std::filesystem::exists(target));
 
     descriptor.run_epoch = descriptor.run_id = descriptor.dispatch_id = 2;
-    assert(simpler_prepare_run(&runner, successor, 1, &args, &config, &descriptor) == 0);
+    assert(simpler_prepare_run_v2(&runner, successor, 1, &args, &config, &descriptor) == 0);
     assert(!runner.host_clock_alignment_log_required(0));
     const uint64_t successor_invocation = static_cast<NativeRunContext<DeviceRunnerBase> *>(successor)->trace_inv;
     assert(simpler_finalize_run(&runner, original) == 0);
@@ -1306,7 +1306,7 @@ static void check_observation(const std::string &scenario, uint32_t mode) {
         config.runtime_env.ring_dep_pool[ring] = 4;
     }
     const NativeRunDescriptor descriptor{0, 0, 1, 1, 1, 1};
-    const int prepare_rc = simpler_prepare_run(runner, storage, 1, &args, &config, &descriptor);
+    const int prepare_rc = simpler_prepare_run_v2(runner, storage, 1, &args, &config, &descriptor);
     std::fprintf(stderr, "observer scenario=%s mode=%u prepare_rc=%d\n", scenario.c_str(), mode, prepare_rc);
     assert(prepare_rc == 0);
     // Cold private-worker initialization may synchronize before preparation
@@ -1508,7 +1508,7 @@ static void check_owned_unknown_close(const std::string &scenario) {
         config.runtime_env.ring_dep_pool[ring] = 4;
     }
     const NativeRunDescriptor descriptor{0, 0, 1, 1, 1, 1};
-    const int prepare_rc = simpler_prepare_run(runner, storage, 1, &args, &config, &descriptor);
+    const int prepare_rc = simpler_prepare_run_v2(runner, storage, 1, &args, &config, &descriptor);
     std::fprintf(stderr, "owned-close scenario=%s prepare_rc=%d\n", scenario.c_str(), prepare_rc);
     assert(prepare_rc == 0);
     assert(
@@ -2209,7 +2209,8 @@ static void check_capture_host_effect_refusal() {
         runner.install_host_effect(direction);
         const auto before = std::make_tuple(submits, syncs, copies, allocation_attempts);
         assert(
-            simpler_prepare_caller_run(&runner, storage, 1, &args, &config, &descriptor) == PTO_RUNTIME_ERR_UNSUPPORTED
+            simpler_prepare_caller_run_v2(&runner, storage, 1, &args, &config, &descriptor) ==
+            PTO_RUNTIME_ERR_UNSUPPORTED
         );
         assert(value == 41 && host_effect_calls == 0);
         assert(before == std::make_tuple(submits, syncs, copies, allocation_attempts));
@@ -2218,7 +2219,7 @@ static void check_capture_host_effect_refusal() {
         std::memcpy(&magic, storage, sizeof(magic));
         assert(magic == 0);
     }
-    assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
+    assert(simpler_prepare_run_v2(&runner, storage, 1, &args, &config, &descriptor) == 0);
     assert(value == 42 && host_effect_calls == 1);
     auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(storage);
     const auto original_caller = state->prepared_execution->caller_stream;
@@ -2279,7 +2280,7 @@ static void check_standalone_collector_close(const std::string &scenario) {
         config.runtime_env.ring_dep_pool[ring] = 4;
     }
     const NativeRunDescriptor descriptor{0, 0, 1, 1, 1, 1};
-    assert(simpler_prepare_run(runner, storage, 1, &args, &config, &descriptor) == 0);
+    assert(simpler_prepare_run_v2(runner, storage, 1, &args, &config, &descriptor) == 0);
     // Inject the close failure after private worker initialization completes.
     sync_error = -739;
     std::weak_ptr<const PreparedRunResources> prepared_lifetime =
@@ -2586,12 +2587,13 @@ static int check_capture_submission(bool borrowed, int fault) {
     if (!borrowed) {
         const auto before = std::make_tuple(submits, syncs, copies, allocation_attempts);
         assert(
-            simpler_prepare_caller_run(&runner, storage, 1, &args, &config, &descriptor) == PTO_RUNTIME_ERR_UNSUPPORTED
+            simpler_prepare_caller_run_v2(&runner, storage, 1, &args, &config, &descriptor) ==
+            PTO_RUNTIME_ERR_UNSUPPORTED
         );
         assert(before == std::make_tuple(submits, syncs, copies, allocation_attempts));
     }
     const auto prior_exchanges = capture_mode_exchanges;
-    const auto prepare = borrowed ? simpler_prepare_caller_run : simpler_prepare_run;
+    const auto prepare = borrowed ? simpler_prepare_caller_run_v2 : simpler_prepare_run_v2;
     assert(prepare(&runner, storage, 1, &args, &config, &descriptor) == 0);
     assert(capture_mode_exchanges == prior_exchanges);
     assert(capture_mode == ACL_MODEL_RI_CAPTURE_MODE_GLOBAL);
@@ -2657,7 +2659,7 @@ static int check_capture_submission(bool borrowed, int fault) {
         assert(next != nullptr);
         std::memset(next, 0, get_runtime_size());
         descriptor.run_epoch = descriptor.dispatch_id = 2;
-        assert(simpler_prepare_run(&runner, next, 1, &args, &config, &descriptor) == 0);
+        assert(simpler_prepare_run_v2(&runner, next, 1, &args, &config, &descriptor) == 0);
         assert(copyback_calls == copyback_count);
         assert(simpler_finalize_run(&runner, next) == 0);
         copyback_count = copyback_calls;

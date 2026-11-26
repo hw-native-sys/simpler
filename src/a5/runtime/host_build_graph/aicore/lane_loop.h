@@ -83,6 +83,7 @@ struct LaneConfig {
     int32_t cluster_lane;
     uint32_t cluster_count;
     uint32_t aiv_per_cluster;
+    uint32_t urma_sender_plus_one;
     PERCOUNTER_SSBUF PercounterSsbufRegion *ssbuf;
 };
 
@@ -418,6 +419,9 @@ inline __aicore__ AicoreWorkWindow run_percounter_lane(
     cfg.cluster_lane = coordinate.cluster_lane;
     cfg.cluster_count = static_cast<uint32_t>(cluster_count);
     cfg.aiv_per_cluster = static_cast<uint32_t>(aiv_per_cluster);
+    // The physical AIV owns the same queue rows across blocks, MIX roles and Graph invocations.
+    cfg.urma_sender_plus_one =
+        control->urma.count != 0 && !is_aic ? cfg.cluster_index * cfg.aiv_per_cluster + cfg.cluster_lane : 0;
 
     const uint64_t timeout_cycles = control->scheduler_timeout_cycles;
     // Lane setup precedes the first calendar range.
@@ -432,6 +436,7 @@ inline __aicore__ AicoreWorkWindow run_percounter_lane(
     context->global.async_group_offset = async_group_offset;
     context->global.async_group_index = static_cast<uint32_t>(block_idx);
     context->global.async_output_capture_refused = 0;
+    context->urma_sender_id = cfg.urma_sender_plus_one - 1u;
     percounter_ssbuf_store_field(&context->async_touched, uint32_t{0});
 #if defined(__CPU_SIM)
     if (!percounter_bind_sim_context(context)) {

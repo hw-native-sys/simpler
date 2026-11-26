@@ -76,7 +76,7 @@ public:
     int invoke_device_register(const RegisterCallableArgs & /*reg_args*/) override { return 0; }
 };
 
-/** Runtime storage with the alignment and zeroing `simpler_prepare_run` requires. */
+/** Runtime storage with the alignment and zeroing `simpler_prepare_run_v2` requires. */
 struct RuntimeStorage {
     std::vector<unsigned char> bytes;
 
@@ -116,7 +116,7 @@ TEST(SimRegionBanks, PrepareRoutesEachRegionFromTheContract) {
         descriptor.pipeline_slot = 1;
         descriptor.arena_bank = pipeline_resource_banks_for_slot(contract, 1).heap;
         descriptor.run_epoch = shape + 1;
-        ASSERT_EQ(simpler_prepare_run(&runner, storage.handle(), kCallableId, nullptr, &config, &descriptor), 0);
+        ASSERT_EQ(simpler_prepare_run_v2(&runner, storage.handle(), kCallableId, nullptr, &config, &descriptor), 0);
         const auto *state = static_cast<const NativeRunContext<SimDeviceRunnerBase> *>(storage.handle());
         const RegionBanks expected[] = {{0, 0, 1}, {0, 1, 1}, {1, 0, 0}};
         const auto banks = expected[shape];

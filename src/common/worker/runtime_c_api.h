@@ -24,11 +24,11 @@
  *   - device-mem:   device_malloc_ctx, device_free_ctx,
  *                   committed_device_memory_ctx, device_memory_info_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
- *   - prepared run: simpler_register_callable, simpler_prepare_run,
+ *   - prepared run: simpler_register_callable, simpler_prepare_run_v2,
  *                   simpler_launch_run, simpler_launch_run_joined,
  *                   simpler_poll_run, simpler_wait_run,
  *                   simpler_finalize_run_with_delivery, simpler_finalize_run,
- *                   simpler_run, simpler_launch_run_on_stream,
+ *                   simpler_run_v2, simpler_launch_run_on_stream,
  *                   simpler_validate_caller_stream, simpler_validate_execution_context,
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
@@ -70,10 +70,10 @@
 
 #include "device_memory_info.h"
 
-// simpler_run takes a pointer to the C++ CallConfig POD (task_interface/
+// simpler_run_v2 takes a pointer to the C++ CallConfig POD (task_interface/
 // call_config.h). Forward-declared so this C-linkage header needn't pull the
 // full C++ definition; both the ChipWorker consumer and the platform producers
-// include call_config.h in their .cpp before calling / defining simpler_run.
+// include call_config.h in their .cpp before calling / defining simpler_run_v2.
 #ifdef __cplusplus
 struct CallConfig;
 #endif
@@ -131,9 +131,9 @@ enum {
        remains whose retirement could supply them: either none ever held any, or
        this plan has already waited for every one that did. Terminal. */
     SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE = PTO_RUNTIME_ERR_BASE - 7,
-    /* Reserved for simpler_wait_run: this wait did not observe the result.
-       The run remains live and may be waited/finalized again. Never store this
-       operation result as the execution's terminal error. */
+    /* A bounded physical wait, stream observation, or finalization still has
+       outstanding work. Keep the run live for another wait or finalize.
+       This status belongs to the operation and must not be cached as a run error. */
     SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE = PTO_RUNTIME_ERR_BASE - 8,
     /* Host register/unregister succeeded, but restoring the caller context failed. */
     SIMPLER_HOST_DDR_CONTEXT_RESTORE_FAILED = PTO_RUNTIME_ERR_BASE - 9,
@@ -307,6 +307,8 @@ typedef struct NativeRunArtifactIdentity {
 
 /**
  * Immutable resource and trace identity copied into one prepared run.
+ * All C entry points that accept this layout carry the `_v2` suffix.
+ * Their exported names identify the descriptor layout before it is read.
  * `pipeline_slot` and `arena_bank` must be smaller than the run-resource grant
  * this context was given (`simpler_set_run_resource_grant_ctx`); they remain
  * explicit because some runtimes map a leased slot to a different arena bank.
@@ -340,6 +342,8 @@ typedef struct NativeRunDescriptor {
     NativeRunProvenance provenance;
     /** This execution's immutable CCU controls for AICPU READY admission. Zero without CCU. */
     uint64_t ccu_workspace_addr;
+    /** Worker-owned base communicator for resolving a Device domain passed to this Run. */
+    uint64_t base_comm_handle;
 } NativeRunDescriptor;
 
 /**
@@ -919,7 +923,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *
  *   3. Take ownership of the AICPU + AICore executor binaries (copied into
  *      DeviceRunner-owned vectors). All subsequent simpler_register_callable /
- *      simpler_run invocations reuse this resident pair — no binary bytes
+ *      simpler_run_v2 invocations reuse this resident pair — no binary bytes
  *      cross the C ABI on per-run paths.
  *
  *   4. Provision this device's async-DMA workspaces and latch their device
@@ -953,7 +957,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *   5. When `prewarm_config` is non-null, build + upload + cache the prebuilt
  *      runtime-arena for its `runtime_env` ring sizing (tensormap_and_ringbuffer;
  *      a no-op for runtimes without a prebuilt arena). The device is up by this
- *      point, so the first simpler_run with matching sizing skips the (~800ms)
+ *      point, so the first simpler_run_v2 with matching sizing skips the (~800ms)
  *      cold build. The sizing is fork-constant, so it rides init rather than a
  *      separate call. Only `prewarm_config->runtime_env` is read.
  *
@@ -986,7 +990,7 @@ int finalize_device(DeviceContextHandle ctx);
  * Per-callable_id preparation
  *
  * These entries decouple the one-shot prep work (kernel upload + orch SO
- * H2D + caching keyed by `callable_id`) from each `simpler_run` invocation,
+ * H2D + caching keyed by `callable_id`) from each `simpler_run_v2` invocation,
  * so the per-run cost shrinks to "rebuild Runtime args + launch". Callers
  * keep a stable small-int `callable_id` per ChipCallable; the platform side
  * caches the prepared state in a fixed-size table (cap 64, see
@@ -1020,7 +1024,7 @@ int finalize_device(DeviceContextHandle ctx);
  * ELF Build-ID hash (so two callable_ids with identical SO share one buffer),
  * and prewarms device-orchestration callables by loading their AICPU-side SO
  * table entry before the first real task. Subsequent
- * `simpler_run(callable_id, ...)` calls reuse this state.
+ * `simpler_run_v2(callable_id, ...)` calls reuse this state.
  *
  * `device_id` and the executor binaries are not threaded through this entry
  * — they were captured by context initialization and live on the DeviceRunner.
@@ -1106,7 +1110,7 @@ int simpler_register_callable_v2(
  *
  * @return 0 on success, negative on error (no prep state, NULL ctx/config, etc.).
  */
-int simpler_run(
+int simpler_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 );
@@ -1140,7 +1144,7 @@ int simpler_run(
  * release marker before constructing its next carrier.
  *
  * Onboard prepare is non-reentrant on one thread within a loaded runtime
- * module, including calls for a different context or through simpler_run().
+ * module, including calls for a different context or through simpler_run_v2().
  * A nested call returns PTO_RUNTIME_ERR_INVALID_STATE before validating its
  * arguments or modifying runtime storage, reservations, plans, or acceptance
  * sinks. The outer prepare remains owned until it returns or unwinds; a later
@@ -1148,7 +1152,7 @@ int simpler_run(
  * threads, which remain subject to the context's native reservation rules.
  *
  */
-int simpler_prepare_run(
+int simpler_prepare_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 );
@@ -1156,7 +1160,7 @@ int simpler_prepare_run(
 /** Prepare a Kernel run for caller-owned submission. Reject writable HOST controls
  * before orchestration. The caller keeps the original handle, stream and device
  * tensors through the final execution and retries finalization on cleanup failure. */
-int simpler_prepare_caller_run(
+int simpler_prepare_caller_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 );
@@ -1205,7 +1209,7 @@ int simpler_launch_run_on_stream(
     DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle predecessor
 );
 
-/** Submit a run prepared by simpler_prepare_caller_run. Its caller keeps the original handle and
+/** Submit a run prepared by simpler_prepare_caller_run_v2. Its caller keeps the original handle and
  * device inputs through its last use. Success releases its submission slot.
  * Finalize after all uses end, including work on other streams. A failed
  * submission still requires finalization. Writable host outputs are unsupported. */
@@ -1282,14 +1286,17 @@ int simpler_bind_peer_cancel(DeviceContextHandle ctx, RuntimeHandle runtime, con
  * Internal blocking physical progress under the runtime's existing timeout.
  * Zero proves own boundaries and queued-wait consumption, and retires execution
  * resources. Never synchronizes whole streams or reads the private result.
- * An error retains unresolved debt and does not prove device stop.
+ * If the budget expires with a completion still pending, WAIT_INCOMPLETE
+ * keeps the run and its operands available for a later wait. Other errors
+ * retain unresolved debt and do not prove device stop.
  */
 int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /**
  * Observe the actual run streams once; may include later queued work.
  * For a valid launched run, SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE means the
- * operation failed before observation; retain the run for retry. Every other
+ * stream observation or outstanding engine completion is still pending; retain
+ * the run for retry. Retrying preserves an already observed stream result. Every other
  * return records the observer result, not proof of physical completion; use
  * poll or wait_run_completion to establish that separate fact.
  * The reserved incomplete code is never a terminal run result. Host consumers
@@ -1306,6 +1313,9 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  * ActiveExecution alone does not. The original launch error remains observable.
  * Onboard binding-cleanup failure keeps the carrier live for a finalize retry;
  * returned copyback is not repeated and the carrier cannot be launched again.
+ * Caller-owned finalization can return WAIT_INCOMPLETE after its stream has
+ * stopped while a transfer is pending. A retry checks outstanding transfers
+ * without synchronizing subsequent work on the caller's stream.
  */
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
@@ -1396,7 +1406,7 @@ int simpler_probe_run_retention(
  * Number of distinct callable_ids the AICPU has been asked to dlopen for on
  * the device bound to `ctx`. Returns 0 on runtime variants without per-cid
  * registration support. Used by tests to assert that `simpler_register_callable` +
- * repeated `simpler_run` calls do not trigger redundant AICPU dlopens.
+ * repeated `simpler_run_v2` calls do not trigger redundant AICPU dlopens.
  */
 size_t get_aicpu_dlopen_count(DeviceContextHandle ctx);
 
@@ -1472,7 +1482,7 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * exclusive-device path driven through the prepared-run family
  * above. simpler_kernel_mode_init latches kernel mode, which borrows the
  * caller's already-current device. Native calls use the prepared-run family
- * above. Caller-owned runs use simpler_prepare_caller_run and
+ * above. Caller-owned runs use simpler_prepare_caller_run_v2 and
  * simpler_submit_run_on_stream for ordinary submission and graph recording.
  * Its caller edges order the whole operator on the explicitly supplied stream.
  * No borrowed path resets or synchronizes the whole device. Cold-path bring-up
@@ -1561,7 +1571,7 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * launch. Cold-path bring-up may synchronize a context-owned stream — the AICPU
  * init handshake does — but never a caller stream and never the device; the
  * launch path synchronizes nothing at all. `config` is read here for the
- * runtime's admission check only. Each simpler_prepare_run() copies its own
+ * runtime's admission check only. Each simpler_prepare_run_v2() copies its own
  * config and resolves that invocation's shape, binding and diagnostics.
  * `context_generation` is a nonzero host-process-unique identity minted by the
  * caller for sequential contexts; generation zero is invalid.

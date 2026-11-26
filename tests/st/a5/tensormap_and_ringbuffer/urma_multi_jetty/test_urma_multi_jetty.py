@@ -56,7 +56,7 @@ def multi_jetty_orch(orch, callables, task_args, config):
         for name in ("out", "result", "records", "observations"):
             args.add_tensor(_rehosted_ref_for(task_args, getattr(task_args, name)), TensorArgType.OUTPUT_EXISTING)
         args.add_scalar(domain.device_context(0, workspace_engines=("urma",)))
-        for name in ("elems", "slots", "waves", "repeats", "put"):
+        for name in ("elems", "slots", "waves", "repeats", "put", "fixed_senders"):
             args.add_scalar(getattr(task_args, name))
         orch.submit_next_level(callables.multi_jetty, args, config, worker=0)
 
@@ -92,14 +92,14 @@ class _UrmaMultiJetty(SceneTestCase):
                 "orchestration": {
                     "source": "kernels/orchestration/multi_jetty_orch.cpp",
                     "function_name": "aicpu_orchestration_entry",
-                    "signature": [D.IN, D.IN, D.OUT, D.OUT, D.OUT, D.OUT] + [D.IN] * 6,
+                    "signature": [D.IN, D.IN, D.OUT, D.OUT, D.OUT, D.OUT] + [D.IN] * 7,
                 },
                 "incores": [
                     {
                         "func_id": 0,
                         "source": "kernels/aiv/kernel_transfer.cpp",
                         "core_type": "aiv",
-                        "signature": [D.IN, D.IN, D.OUT, D.OUT] + [D.IN] * 5,
+                        "signature": [D.IN, D.IN, D.OUT, D.OUT] + [D.IN] * 6,
                     },
                     {
                         "func_id": 1,
@@ -136,6 +136,7 @@ class _UrmaMultiJetty(SceneTestCase):
             TensorArg("observations", torch.zeros(phases * slots * OBSERVATION_WORDS, dtype=torch.int64)),
             *(Scalar(key, params[key]) for key in ("elems", "slots", "waves", "repeats", "put", "jetties")),
             Scalar("sq_depth", params.get("sq_depth", 0)),
+            Scalar("fixed_senders", int(params.get("fixed_senders", False))),
         )
 
     def compute_golden(self, args, params):
@@ -157,6 +158,8 @@ class _UrmaMultiJetty(SceneTestCase):
         assert torch.all(records[:, :, 2] == jetties), "workspace ignored the requested jetty count"
         assert torch.all(records[:, :, 15] == 0), "completion registration reported an error"
         assert torch.all(records[:, :, 12] == chunks)
+        if params.get("fixed_senders"):
+            assert torch.equal(records[:, :, 1], torch.arange(slots).expand(phases, slots))
         assert torch.all(observations[:, :, 0] >= records[:, :, 7]), "observer started before posting returned"
         queue_history = {}
         reused = 0

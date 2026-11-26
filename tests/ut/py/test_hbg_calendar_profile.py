@@ -135,6 +135,19 @@ def test_calendar_scheduler_tracks_preserve_role_and_defer_actor(tmp_path, level
             ]
         ],
     }
+    raw["calendar_task_events"]["range_records"].extend(
+        {
+            "kind": "ready_row_scan",
+            "scan_start_cycles": start,
+            "cycles": end,
+            "run_epoch": 0,
+            "worker_id": 2,
+            "cluster_index": 0,
+            "cluster_lane": 1,
+            "range_index": 3,
+        }
+        for start, end in [(4, 18), (68, 76)]
+    )
     raw["aicpu_lifecycle_records"] = [
         {
             "aicpu_thread_id": 1,
@@ -172,6 +185,14 @@ def test_calendar_scheduler_tracks_preserve_role_and_defer_actor(tmp_path, level
     assert all("Kernel execution" not in e["name"] for e in scheduler)
     ready = [e for e in scheduler if e["ph"] == "i" and e["args"]["kind"] == "ready"]
     assert len({e["tid"] for e in ready}) == 2
+    scans = [e for e in scheduler if e["ph"] == "X" and e["args"].get("kind") == "ready_row_scan"]
+    assert [e["dur"] for e in scans] == pytest.approx([d * 1e6 / raw["metadata"]["clock_freq_hz"] for d in (14, 8)])
+    notifier = next(
+        e for e in scheduler if e["ph"] == "i" and e["args"]["kind"] == "kernel_end" and e["args"]["worker_id"] == 2
+    )
+    assert all(e["tid"] == notifier["tid"] and "task_id" not in e["args"] for e in scans)
+    assert 0 <= scans[0]["ts"] and scans[0]["ts"] + scans[0]["dur"] <= notifier["args"]["kernel_start_us"]
+    assert notifier["ts"] <= scans[1]["ts"]
     register = next(e for e in scheduler if e["ph"] == "i" and e["args"]["kind"] == "defer_registered")
     done = next(e for e in scheduler if e["ph"] == "i" and e["args"]["kind"] == "deferred_completion_issue")
     assert register["tid"] != done["tid"]

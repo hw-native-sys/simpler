@@ -83,6 +83,13 @@ inline __aicore__ void set_urma_error(AsyncCtx &ctx, int32_t error_code) {
 
 namespace simpler::urma {
 
+#if defined(PTO_URMA_SUPPORTED)
+inline __aicore__ bool
+build_urma_session(const AsyncCtx &ctx, const __gm__ CommWorkspace &urma, UrmaSession &session, uint32_t peer = 0) {
+    return detail::bind_urma_session(ctx.urma_sender_id, urma.addr, urma.size, session, peer);
+}
+#endif
+
 class TmrRequestAdapter {
 public:
     explicit __aicore__ TmrRequestAdapter(AsyncCtx &ctx) :

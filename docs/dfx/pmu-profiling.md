@@ -950,7 +950,7 @@ caller-owned run path. Program has no eager/capture mode selection. A5,
 framework graph capture and combinations with other diagnostic families are
 not supported by this contract.
 
-Before RTS CaptureBegin, call `simpler_prepare_caller_run` with
+Before RTS CaptureBegin, call `simpler_prepare_caller_run_v2` with
 `CallConfig.enable_pmu > 0` and an `output_prefix`. Prepare snapshots the resolved event group, including a valid
 `SIMPLER_PMU_EVENT_TYPE` override, and the output path. Later configuration or
 environment changes cannot alter the captured descriptor or its CSV columns.

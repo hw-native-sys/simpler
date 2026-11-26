@@ -36,12 +36,16 @@ def _payload(value):
 @pytest.mark.device_count(_DEVICE_COUNT)
 @pytest.mark.parametrize("bc_members", [(1, 2), (2, 1)], ids=["subset", "reordered"])
 def test_retained_urma_domain_release_preserves_other_domain(st_platform, st_device_ids, bc_members):
-    compiled = _UrmaRegression._compile_l3_callables(st_platform)
+    exercise_retained_domains(st_platform, st_device_ids, bc_members, _UrmaRegression)
+
+
+def exercise_retained_domains(platform, device_ids, bc_members, scene):
+    compiled = scene._compile_l3_callables(platform)
     worker = Worker(
         level=3,
-        platform=st_platform,
-        runtime=_RUNTIME,
-        device_ids=[int(device) for device in st_device_ids[:_DEVICE_COUNT]],
+        platform=platform,
+        runtime=scene._st_runtime,
+        device_ids=[int(device) for device in device_ids[:_DEVICE_COUNT]],
         num_sub_workers=0,
     )
     chip = worker.register(compiled["urma_deferred_completion"])

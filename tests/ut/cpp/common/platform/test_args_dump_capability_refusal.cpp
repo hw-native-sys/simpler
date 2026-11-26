@@ -15,7 +15,7 @@
  *
  * The decision has two inputs — the request's `enable_dump_args`, and the
  * runtime's own `args_dump_capture_supported_impl` — and one place it is taken:
- * `simpler_prepare_run`, after carrier validation and ownership. These cases
+ * `simpler_prepare_run_v2`, after carrier validation and ownership. These cases
  * pin: the request is refused as `PTO_RUNTIME_ERR_UNSUPPORTED` with no live carrier
  * left in the caller's storage and an exact-epoch release receipt, the four other owners are not terms in it, and
  * the same request on a runtime that answers yes prepares. A refusal that
@@ -136,7 +136,7 @@ public:
     int prepare_calls{0};
 };
 
-/** Runtime storage with the alignment and zeroing `simpler_prepare_run` requires. */
+/** Runtime storage with the alignment and zeroing `simpler_prepare_run_v2` requires. */
 struct RuntimeStorage {
     std::vector<unsigned char> bytes;
 
@@ -164,7 +164,7 @@ protected:
         g_release_rc = 0;
     }
 
-    /** Drive the real sim `simpler_prepare_run` with this diagnostic request. */
+    /** Drive the real sim `simpler_prepare_run_v2` with this diagnostic request. */
     int prepare(const CallConfig &config, uint64_t epoch = 7701) {
         NativeRunDescriptor descriptor{};
         descriptor.pipeline_slot = 0;
@@ -173,7 +173,7 @@ protected:
         descriptor.generation = 1;
         descriptor.dispatch_id = 3;
         descriptor.run_epoch = epoch;
-        return simpler_prepare_run(
+        return simpler_prepare_run_v2(
             static_cast<DeviceContextHandle>(&runner), storage.handle(), kCallableId, nullptr, &config, &descriptor
         );
     }
@@ -251,7 +251,7 @@ TEST_F(ArgsDumpCapabilityRefusalTest, LeavesTheNoDiagnosticsPathAlone) {
     descriptor.dispatch_id = 4;
     descriptor.run_epoch = 7801;
     ASSERT_EQ(
-        simpler_prepare_run(
+        simpler_prepare_run_v2(
             static_cast<DeviceContextHandle>(&runner), storage.handle(), kCallableId, nullptr, &quiet, &descriptor
         ),
         0
@@ -287,7 +287,7 @@ TEST_F(ArgsDumpCapabilityRefusalTest, UnsupportedRequestPreservesLiveCarrierWith
     descriptor.run_epoch = 7702;
     const auto unsupported = config_with(1, false);
     EXPECT_EQ(
-        simpler_prepare_run(&runner, other.handle(), kCallableId, nullptr, &unsupported, &descriptor),
+        simpler_prepare_run_v2(&runner, other.handle(), kCallableId, nullptr, &unsupported, &descriptor),
         PTO_RUNTIME_ERR_INTERNAL
     );
     EXPECT_FALSE(consume_released_preparation(other.handle(), get_runtime_size(), 7702));
@@ -301,18 +301,18 @@ TEST_F(ArgsDumpCapabilityRefusalTest, UnsupportedRequestDoesNotCertifyInvalidSto
     descriptor.run_epoch = 7701;
     const auto untouched = storage.bytes;
     EXPECT_EQ(
-        simpler_prepare_run(nullptr, storage.handle(), kCallableId, nullptr, &config, &descriptor),
+        simpler_prepare_run_v2(nullptr, storage.handle(), kCallableId, nullptr, &config, &descriptor),
         PTO_RUNTIME_ERR_INTERNAL
     );
     EXPECT_EQ(
-        simpler_prepare_run(
+        simpler_prepare_run_v2(
             &runner, static_cast<unsigned char *>(storage.handle()) + 1, kCallableId, nullptr, &config, &descriptor
         ),
         PTO_RUNTIME_ERR_INTERNAL
     );
     descriptor.pipeline_slot = 1;  // outside this runner's one-set grant
     EXPECT_EQ(
-        simpler_prepare_run(&runner, storage.handle(), kCallableId, nullptr, &config, &descriptor),
+        simpler_prepare_run_v2(&runner, storage.handle(), kCallableId, nullptr, &config, &descriptor),
         PTO_RUNTIME_ERR_INTERNAL
     );
     EXPECT_EQ(storage.bytes, untouched);

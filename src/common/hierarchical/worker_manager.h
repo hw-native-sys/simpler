@@ -357,7 +357,7 @@ static constexpr uint64_t CTRL_FREE = 1;
 static constexpr uint64_t CTRL_COPY_TO = 2;
 static constexpr uint64_t CTRL_COPY_FROM = 3;
 // Pre-warm a chip child by callable digest; issued at end of init() so the
-// first simpler_run does not pay the H2D cost.
+// first simpler_run_v2 does not pay the H2D cost.
 static constexpr uint64_t CTRL_PREPARE = 4;
 // Dynamic post-init register/unregister of a callable identity. CTRL_REGISTER
 // carries (shm_name, blob_size, digest) with bytes staged in POSIX shm by

@@ -29,10 +29,10 @@ The common API shape does not establish capture support for every backend.
 
 ## Preparation and eligibility
 
-Onboard Kernel callers use `simpler_prepare_caller_run` when they own the
+Onboard Kernel callers use `simpler_prepare_caller_run_v2` when they own the
 original run through its last stream or model use. The same entry accepts
 eager streams and recording streams. Ordinary lane-managed runs continue to
-use `simpler_prepare_run`. Both entries take the current `NativeRunDescriptor`.
+use `simpler_prepare_run_v2`. Both entries take the current `NativeRunDescriptor`.
 Rebuild native callers against that layout. Simulation returns `UNSUPPORTED`
 for caller-owned stream submissions.
 
@@ -53,7 +53,7 @@ is separate from starting user tasks.
 The framework queue registers a model-destroy callback before enqueueing its
 first native node. Further nodes in the same model can use that registration.
 The registration identifies the model and owns no native execution slot.
-When the queue invokes the node, the framework calls `simpler_prepare_caller_run`
+When the queue invokes the node, the framework calls `simpler_prepare_caller_run_v2`
 and calls `simpler_submit_run_on_stream` on the caller stream. A successful submission returns the slot
 for another node and leaves the original run with the ticket. The recorded
 tasks can execute zero or more times. After the caller ends all model uses,
@@ -66,7 +66,7 @@ Native callers can prepare before entering capture. Each node has its own
 original run handle and storage address through finalization.
 
 ```text
-simpler_prepare_caller_run -> RTS CaptureBegin -> simpler_submit_run_on_stream -> RTS CaptureEnd
+simpler_prepare_caller_run_v2 -> RTS CaptureBegin -> simpler_submit_run_on_stream -> RTS CaptureEnd
   -> RTS model execute / synchronize (zero or more times)
   -> destroy the model -> simpler_finalize_run
 ```

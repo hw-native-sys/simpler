@@ -213,5 +213,5 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
 
 // L2 runtime ABI: fixed POD matching runtime.so byte-for-byte, and the sole ChipTensor-typed args
 // container — the materialized form a chip child decodes the L3->L2 Tensor blob into, just before
-// simpler_run.
+// simpler_run_v2.
 using ChipStorageTaskArgs = TaskArgsTpl<ChipTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS>;

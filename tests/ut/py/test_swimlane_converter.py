@@ -568,6 +568,66 @@ def test_l3_directory_merge_persists_hbg_alignment(tmp_path):
     assert worker["ts"] == decoded["tasks"][0]["receive_time_us"]
 
 
+def test_l3_calendar_scan_keeps_both_endpoints_in_each_ranks_host_window(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    for rank in (0, 1):
+        task = 7 + rank
+        raw_path = (
+            _write_hbg_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=task) / "chip_swimlane_records.json"
+        )
+        base = (1 << 42) + rank * 100_000
+        raw = (
+            Capture(
+                runtime=HBG_RUNTIME,
+                scheduler_model=CALENDAR_MODEL,
+                level=2,
+                clock_freq_hz=1_000_000_000,
+                scheduler_producer="aicore",
+            )
+            .host_orchestrated(origin_ns=rank * 10_000 + 1_500, clock_domain_id="same-boot")
+            .task(task_id=task, start=base + 400, end=base + 600)
+            .build()
+        )
+        raw["calendar_task_events"] = {
+            "records": [],
+            "range_records": [
+                {
+                    "kind": "ready_row_scan",
+                    "cycles": base + end,
+                    "scan_start_cycles": base + start,
+                    "run_epoch": 0,
+                    "worker_id": 0,
+                    "cluster_index": 0,
+                    "cluster_lane": 0,
+                    "range_index": 1,
+                }
+                for start, end in [(17, 320), (700, 1_017)]
+            ],
+            "dropped": 0,
+            "unmatched_deferred_updates": 0,
+            "folded_task_ids": [],
+            "inline_completed_task_ids": [],
+        }
+        raw_path.write_text(json.dumps(raw))
+        assert containment.capture_windows(raw).extent == (base + 17, base + 1_017)
+    output = tmp_path / "two-rank.json"
+    args = sc._build_parser().parse_args(
+        [str(root), "--dispatch", "d0", "--rank-pid", "0=1000:1", "--rank-pid", "1=1001:1", "-o", str(output)]
+    )
+    sc._generate_l3_trace(args, root)
+    trace = json.loads(output.read_text())
+    for rank in (0, 1):
+        # The 1,000 ns capture is centered in the 2,000 ns device wall of each Host window.
+        first_ns = 1_000 + rank * 10_000 + 500 - trace["metadata"]["global_origin_ns"]
+        spans = [
+            e
+            for e in trace["traceEvents"]
+            if e["ph"] == "X" and e["pid"] == (rank + 1) * 100 + 3 and e["args"].get("kind") == "ready_row_scan"
+        ]
+        assert [e["ts"] for e in spans] == pytest.approx([first_ns / 1000, (first_ns + 683) / 1000])
+        assert [e["ts"] + e["dur"] for e in spans] == pytest.approx([(first_ns + 303) / 1000, (first_ns + 1000) / 1000])
+
+
 def test_l3_directory_merge_uses_new_alignment_when_writeback_fails(tmp_path, monkeypatch, capsys):
     root = tmp_path / "dfx_outputs"
     capture_dir = _write_hbg_l3_rank(root, 0, host_shift_ns=0, task_id=7)

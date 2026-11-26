@@ -405,7 +405,7 @@ inline bool publish_calendar_state(
         }
         if (!build_range_calendar(
                 range_inputs, graph_plan, static_cast<uint32_t>(task_count), cluster_count, &calendar,
-                api->pmu_enabled() ? task_metadata.data() : nullptr, enable_peer_hints
+                api->pmu_enabled() ? task_metadata.data() : nullptr, enable_peer_hints, !api->urma.domains.empty()
             )) {
             LOG_ERROR("A5 calendar: could not plan execution ranges or completion counters");
             return false;
@@ -433,7 +433,16 @@ inline bool publish_calendar_state(
     constexpr uint64_t alignment = 128;
     if (layout.total_size > SIZE_MAX - alignment - calendar.bytes.size()) return false;
     const uint64_t calendar_offset = (layout.total_size + alignment - 1) & ~(alignment - 1);
-    const uint64_t calendar_end = calendar_offset + calendar.bytes.size();
+    uint64_t calendar_end = calendar_offset + calendar.bytes.size();
+    uint64_t bindings_offset = 0;
+    const auto &urma_domains = api->urma.domains;
+    if (!urma_domains.empty()) {
+        constexpr uint64_t mask = alignof(UrmaRunBinding) - 1;
+        if (calendar_end > SIZE_MAX - mask || urma_domains.size() > UINT32_MAX) return false;
+        bindings_offset = (calendar_end + mask) & ~mask;
+        if (urma_domains.size() > (SIZE_MAX - bindings_offset) / sizeof(UrmaRunBinding)) return false;
+        calendar_end = bindings_offset + urma_domains.size() * sizeof(UrmaRunBinding);
+    }
     uint64_t allocation_size = calendar_end;
     uint64_t dump_offset = 0;
     if (dump.layout.total_size != 0) {
@@ -540,6 +549,12 @@ inline bool publish_calendar_state(
     }
     {
         auto *control = region_at<PercounterControl>(host_base, layout.control_offset);
+        if (!urma_domains.empty()) {
+            auto *bindings = region_at<UrmaRunBinding>(host_base, bindings_offset);
+            for (size_t i = 0; i < urma_domains.size(); ++i)
+                bindings[i] = urma_domains[i].binding;
+            control->urma = {device_base + bindings_offset, static_cast<uint32_t>(urma_domains.size())};
+        }
         control->calendar_offset = calendar_offset - layout.control_offset;
         control->image_bytes = allocation_size;
         if (dump_offset != 0) {
@@ -562,7 +577,7 @@ inline bool publish_calendar_state(
         auto *host_calendar = region_at<std::byte>(host_base, calendar_offset);
         std::memcpy(host_calendar, calendar.bytes.data(), calendar.bytes.size());
         runtime->add_pending_metadata(
-            static_cast<std::byte *>(device_state) + calendar_offset, host_calendar, calendar.bytes.size(),
+            static_cast<std::byte *>(device_state) + calendar_offset, host_calendar, calendar_end - calendar_offset,
             HostPhaseKind::Count, {}
         );
         for (size_t p = 0; log_cache_events && p < range_inputs.size(); ++p) {

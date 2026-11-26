@@ -148,7 +148,7 @@ def _run(arch, runtime, device, faults_path=None):
             stream = streams[epoch % 2]
             descriptor = NativeRunDescriptor(generation=1, run_epoch=epoch)
             assert (
-                lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
+                lib.simpler_prepare_run_v2(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
                 == 0
             )
             pending = True
@@ -166,7 +166,9 @@ def _run(arch, runtime, device, faults_path=None):
                 assert ctypes.string_at(run, 8) == bytes(8)
                 descriptor.run_epoch += 1
                 assert (
-                    lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
+                    lib.simpler_prepare_run_v2(
+                        ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor)
+                    )
                     != 0
                 )
                 assert faults.entry_record_failures() == 1

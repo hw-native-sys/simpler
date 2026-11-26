@@ -13,7 +13,7 @@
  * The runtime entry points an orchestration .so calls through.
  *
  * ChipWorker dlopens each runtime RTLD_LOCAL so two runtimes' identically-named
- * exports (simpler_init, simpler_run, ...) cannot collide when a process switches
+ * exports (simpler_init, simpler_run_v2, ...) cannot collide when a process switches
  * between them, and so dlclose can actually unload one. A runtime's symbols
  * therefore never reach the global symbol table, and the orchestration .so — itself
  * dlopened RTLD_NOW|RTLD_LOCAL — has no way to bind them by name. This table is how

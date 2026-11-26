@@ -48,6 +48,10 @@ def _require_compatible_cann_headers(cann, compiler):
 
 @pytest.fixture(scope="module")
 def urma_lifecycle_binary(tmp_path_factory):
+    return _build_urma_lifecycle(tmp_path_factory)
+
+
+def _build_urma_lifecycle(tmp_path_factory, *, hbg=False):
     build = tmp_path_factory.mktemp("urma_lifecycle")
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann"))
     compiler = shlex.split(os.environ["CXX"]) if os.environ.get("CXX") else [shutil.which("g++-15") or "c++"]
@@ -80,9 +84,11 @@ def urma_lifecycle_binary(tmp_path_factory):
         + [
             "-std=c++17",
             "-UNDEBUG",
+            *(['-DSIMPLER_RUNTIME_NAME="host_build_graph"'] if hbg else []),
             "-ffunction-sections",
             "-fdata-sections",
             "-Wl,--gc-sections",
+            "-Wl,--wrap=_Znwm",
             *[f"-I{p}" for p in includes],
             str(Path(__file__).with_name("urma_lifecycle_host.cpp")),
             str(ROOT / "src/common/platform_comm/ccu/ccu_domain_owner.cpp"),
@@ -138,6 +144,25 @@ def test_urma_lifecycle(urma_lifecycle_binary, scenario):
         check=True,
         timeout=5 if scenario == "abort_unpublished" else 20,
     )
+
+
+@pytest.mark.requires_toolkit
+@pytest.mark.platforms(["a5"])
+def test_hbg_run_keeps_urma_storage_until_drained(tmp_path_factory):
+    binary = _build_urma_lifecycle(tmp_path_factory, hbg=True)
+    for scenario in (
+        "hbg_lease",
+        "overlap_subset",
+        "overlap_reordered",
+        "foreground_d2h",
+        "wide_poll",
+        "abandon_poll",
+        "revoke_poll",
+        "reset_active_poll",
+        "reset_idle_poll",
+        "reset_unstarted_poll",
+    ):
+        subprocess.run([str(binary), scenario], check=True, timeout=20)
 
 
 @pytest.mark.parametrize("compile_success", [True, False])

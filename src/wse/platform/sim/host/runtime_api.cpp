@@ -933,7 +933,7 @@ static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc) 
     return execution_rc;
 }
 
-int simpler_prepare_run(
+int simpler_prepare_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
@@ -1404,11 +1404,11 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return simpler_finalize_run_with_delivery(ctx, runtime, 1);
 }
 
-int simpler_run(
+int simpler_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
-    int rc = simpler_prepare_run(ctx, runtime, callable_id, args, config, descriptor);
+    int rc = simpler_prepare_run_v2(ctx, runtime, callable_id, args, config, descriptor);
     if (rc != 0) return rc;
     rc = simpler_launch_run(ctx, runtime);
     if (rc == 0) rc = simpler_wait_run(ctx, runtime);
@@ -1416,7 +1416,7 @@ int simpler_run(
     return finalize_rc != 0 ? finalize_rc : rc;
 }
 
-// Sim prepares under the exclusive execution claim: `simpler_prepare_run` takes
+// Sim prepares under the exclusive execution claim: `simpler_prepare_run_v2` takes
 // `try_acquire_native_run` before it binds, and rejects a second run with
 // "another native run is active on this device context". There is also no
 // `try_reserve_native_run` on this base for a successor to hold — reservation
@@ -1444,7 +1444,7 @@ int simpler_validate_caller_stream(DeviceContextHandle, void *) { return PTO_RUN
 
 int simpler_submit_run_on_stream(DeviceContextHandle, RuntimeHandle, void *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
-int simpler_prepare_caller_run(
+int simpler_prepare_caller_run_v2(
     DeviceContextHandle, RuntimeHandle, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *
 ) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;

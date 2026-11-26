@@ -65,7 +65,7 @@ static void check_program_packet(
     NativeRunDescriptor descriptor{};
     descriptor.run_epoch = descriptor.generation = 1;
     auto run = reinterpret_cast<void *>(aligned);
-    check(simpler_prepare_run(ctx, run, 0, &args, &config, &descriptor), "program-prepare");
+    check(simpler_prepare_run_v2(ctx, run, 0, &args, &config, &descriptor), "program-prepare");
     capture_test::begin_capture_publication_probe();
     check(simpler_launch_run(ctx, run), "program-launch");
     const auto record = capture_test::finish_capture_publication_probe();
@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
         descriptor.generation = cycle + 1;
         descriptor.run_epoch = cycle + 1;
         const size_t publishes_before = capture_test::prepare_snapshot(ctx, scenario);
-        check(simpler_prepare_caller_run(ctx, run, 0, &args, &config, &descriptor), "prepare-once");
+        check(simpler_prepare_caller_run_v2(ctx, run, 0, &args, &config, &descriptor), "prepare-once");
         capture_test::check_prepare(ctx, scenario, publishes_before);
         host_control = 93;  // Changing the source must not change the prepared task arguments.
         aclmdlRI model = nullptr;
@@ -348,7 +348,9 @@ int main(int argc, char **argv) {
                 eager_args.add_scalar(same_size ? 6 : 16);
                 NativeRunDescriptor eager_descriptor{};
                 eager_descriptor.generation = eager_descriptor.run_epoch = round + 2;
-                check(simpler_prepare_run(ctx, eager_run, 0, &eager_args, &config, &eager_descriptor), "prepare-eager");
+                check(
+                    simpler_prepare_run_v2(ctx, eager_run, 0, &eager_args, &config, &eager_descriptor), "prepare-eager"
+                );
                 capture_test::begin_capture_publication_probe();
                 check(simpler_launch_run_on_stream(ctx, eager_run, caller, nullptr), "launch-eager");
                 const auto eager_submission = capture_test::finish_capture_publication_probe();

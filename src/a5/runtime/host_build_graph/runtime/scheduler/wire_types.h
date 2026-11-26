@@ -31,6 +31,7 @@
 #include "common/lane_mask.h"
 #include "scheduler/ssbuf.h"
 #include "invocation_context.h"
+#include "platform_comm/urma_run_binding.h"
 #include "scheduler/scheduler_types.h"
 
 // Bootstrap marker shared between Host, AICPU and AICore.
@@ -80,6 +81,7 @@ struct alignas(128) PercounterAsyncCompletion {
     uint64_t completion_add_cmd;
     uint64_t calendar_sample;
     uint64_t calendar_shell_add_cmd;
+    uint32_t urma_sender_plus_one;  // Source AIV; any lane may observe this record.
     alignas(64) DeferredCompletionEntry entries[PERCOUNTER_ASYNC_CAPACITY];
 };
 static_assert(sizeof(PercounterAsyncCompletion) == 2176);
@@ -222,6 +224,7 @@ struct alignas(128) PercounterControl {
     uint64_t lane_error_claim;
     uint64_t lane_error_task;
     uint64_t lane_error_detail;
+    UrmaRunBindings urma;
 
     // Allocation precedes the corresponding block's completed publication.
     // Both counters are monotone; equality after all blocks ran permits exit.

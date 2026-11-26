@@ -45,7 +45,7 @@ class TestHostCommDomain(SceneTestCase):
         if probe.returncode == 77:
             pytest.skip(_PCIE_SKIP)
         probe.check_returncode()
-        from .run import run  # noqa: PLC0415 -- only the transfer path needs the worker
+        from .run import run_gathers  # noqa: PLC0415 -- only the transfer path needs the worker
 
         compiled = self._compile_l3_callables(st_platform)["gather"]
-        run(devices, compiled=compiled, staged=staged, aiv_blocks=aiv_blocks)
+        run_gathers(devices, compiled=compiled, staged=staged, aiv_blocks=aiv_blocks, runtime=self._st_runtime)

@@ -11,16 +11,18 @@ different addresses.
 The Host does not become an additional rank, and the table needs no matching
 HBM allocation.
 
-This A5 implementation supports one machine. Synchronous MTE works with
-`tensormap_and_ringbuffer` and `host_build_graph`; URMA requires
-`tensormap_and_ringbuffer`. Cross-machine Host windows and automatic
-table partitioning are outside its current support. A2/A3 uses the same domain
-API with MTE and SDMA; see [A2/A3 Host-source windows](comm-domain.md#a2a3-host-source-windows).
+On one A5 machine, the application chooses the weight location per domain.
+With `memory_source=AddressSpace.HOST`, each rank's weight shard lives in its
+L2-owned Host DDR. With the default `AddressSpace.DEVICE`, each shard lives
+in its rank's HBM. Both domains can stay open in one Worker. For a Host table,
+the issuing AIV submits the selected peer rows into its local HBM, where the
+dependent consumer can use them after completion. A2/A3 uses the same domain
+API with MTE and SDMA. [A2/A3 Host-source windows](comm-domain.md#a2a3-host-source-windows)
 
-| Host-source path | TMR | HBG | Workspace |
-| ---------------- | --- | --- | --------- |
+| Host-source path | TMR | HBG calendar | Workspace |
+| ---------------- | --- | ------------ | --------- |
 | Synchronous peer MTE, A5 PR and DT | Supported | Supported | `()` |
-| Asynchronous peer URMA | DT qualified; PR unresolved | Unsupported | `("urma",)` |
+| Asynchronous peer URMA | Verified on DT with a UB Host link | Gather uses UB or HCCS | `("urma",)` |
 
 MTE mappings use `aclrtHostRegisterV2(..., ACL_HOST_REG_MAPPED)` followed by
 `aclrtHostGetDevicePointer` in the requesting rank's process. Each address belongs
@@ -29,7 +31,9 @@ peer. With `workspace_engines=()`, no URMA or SDMA workspace or capability query
 is involved in this path.
 Peer Host writes and `MAPPED | PINNED` registration are outside this contract.
 
-Host-source URMA has passed on Ascend950DT_9581, including CANN 9.3.0 validation.
+TMR Host-source URMA has passed on Ascend950DT_9581, including CANN 9.3.0 validation.
+The TMR and HBG tests query the Host–Device link on both allocated
+devices. They execute for UB and HCCS and skip the cross-rank Host read on PCIe.
 On the A5 PR PCIe CI machine, Host mapping and segment registration succeeded
 but Host-source URMA reported an ACK timeout; this remains an unresolved
 [hardware-specific failure](https://github.com/hw-native-sys/simpler/pull/2913#issuecomment-6681762026).
@@ -173,11 +177,13 @@ send_request_entry(async, UrmaTget(local_destination, peer_source_tensor, urma, 
 ```
 
 The destination and source in `UrmaTget` are PTO GlobalTensors. The runnable
-example constructs them for each requested row on a non-self peer. Kernel return alone does not prove URMA completion: the
-runtime's deferred-completion path holds the producer's output dependencies
-until the transfer completes.
+example constructs them for each requested row on a non-self peer. TMR and
+HBG submit these reads through the same URMA request code. TMR's
+AICPU polls the registered queue targets. HBG stores the targets
+in its deferred condition group. An observing Core checks the CQ and publishes
+the producer's completion once all its reads have finished.
 
-A5 TMR also accepts single-segment URMA Gather PUT and Scatter GET requests.
+A5 TMR and HBG also accept single-segment URMA Gather PUT and Scatter GET requests.
 The local segment length must be **1 byte through 256 MiB, inclusive**, for both
 directions. Split a larger transfer into separate requests before submission.
 
@@ -202,7 +208,7 @@ request.
 ```cpp
 simpler::urma::UrmaSession session;
 if (!simpler::urma::build_urma_session(async, urma, session)) {
-    pto2::detail::set_urma_error(async, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    pto2::detail::defer_error(async, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     pto2::detail::defer_flush(async);
     return;
 }
@@ -219,9 +225,9 @@ that header. All headers point to the domain's original queues, registered
 memory and staging storage. The communication window remains available for
 tensor data at the offsets assigned during allocation.
 
-Use the domain's `CommWorkspace` for sender-aware binding. The legacy tensor
-overload that accepts only a raw ISA workspace address retains its original
-block-indexed staging behavior when it builds its own session.
+Use the domain's `CommWorkspace` for sender-aware binding. HBG also
+resolves a raw workspace address against the bindings held by its current Run.
+TMR's raw-address tensor overload uses block-indexed staging when it builds its own session.
 
 Each call submits one immediate operation. Both local and peer payload ranges
 must belong to their respective registered memory regions. Keep payloads live
@@ -230,8 +236,10 @@ consuming the result. The AIV reserves one completion entry before submission.
 A native descriptor operation issued on the same session after a combined call
 uses the same sender staging area. Check the return value of any native
 `event.Wait(session)`. A native wait consumes CQ entries, so its queue must
-have a single consumer during that wait. After FIN, the AICPU uses the original domain workspace
-to check the registered queue progress and propagate observable CQ errors.
+have a single consumer during that wait. After FIN, TMR's AICPU uses the original domain workspace
+to check the registered queue progress and propagate observable CQ errors. In
+HBG the Core observing a deferred target acquires the corresponding queue
+row before reading CQ entries and updating its tails.
 Multi-segment descriptors and deferred batches require separate support.
 
 The selected MTE mappings or URMA workspace belong to this communication domain. They do not replace the
@@ -319,4 +327,10 @@ Host-source domain is released.
 The one-AIV and four-AIV variants both run in serial and staged modes. In the
 four-AIV variant, resident blocks write disjoint rows while fetching from the
 same peer through the domain's URMA workspace; the consumer waits for every
-block's deferred completion.
+block's deferred completion. The HBG scene runs the same table, consumer
+and CPU update checks with its own compiled kernels. It also checks that a CPU
+view keeps the Host backing alive across a release attempt. Its final Run
+submits reads before requesting release and checks the data after that Run
+reclaims the Host window. Run it with
+`--platform a5 --manual include` on two devices with a supported Host link.
+[HBG Host gather scene](../tests/st/a5/host_build_graph/urma_host/test_urma_host.py)

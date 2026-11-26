@@ -142,10 +142,10 @@ size_t alignment = get_runtime_alignment();
 void *runtime = allocate_zeroed_aligned(size, alignment); // stable until finalize
 simpler_register_callable(ctx, cid, callable);        // one-time per callable
 
-// Progressable form; simpler_run(...) composes these phases synchronously.
+// Progressable form; simpler_run_v2(...) composes these phases synchronously.
 // `descriptor` carries this run's slot/bank/identity and the optional
 // launch-acceptance target published at the kernel-launch marker.
-simpler_prepare_run(ctx, runtime, cid, args, config, &descriptor); // bind, no device launch
+simpler_prepare_run_v2(ctx, runtime, cid, args, config, &descriptor); // bind, no device launch
 simpler_launch_run(ctx, runtime);  // publishes descriptor acceptance and returns after launch fence
 simpler_wait_run(ctx, runtime);                                    // or poll until complete
 simpler_finalize_run(ctx, runtime);                                // validate, copy back, destroy

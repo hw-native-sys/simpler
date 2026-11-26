@@ -2003,8 +2003,24 @@ int DeviceRunnerBase::recover_failed_close(int rc) {
         return rc;
     }
     mark_device_unusable(rc);
-    const int recovery_rc = finalize_impl();
+    const int recovery_rc = finalize_after_urma_scans();
     return recovery_rc != 0 ? recovery_rc : rc;
+}
+
+UrmaLaunchPermission
+DeviceRunnerBase::acquire_urma_launch_permission(uint64_t generation, const std::shared_ptr<UrmaScanThread> &scan) {
+    std::lock_guard lock(urma_scans_mutex_);
+    if (!can_accept_run() || generation != device_health_.generation()) return {};
+    if (!urma_launch_gate_) urma_launch_gate_ = std::make_shared<UrmaLaunchGate>();
+    if (scan) urma_launch_gate_->track(scan);
+    return urma_launch_gate_;
+}
+
+void DeviceRunnerBase::stop_urma_scans() {
+    std::lock_guard lock(urma_scans_mutex_);
+    if (!urma_launch_gate_) return;
+    urma_launch_gate_->stop_scans();
+    urma_launch_gate_.reset();
 }
 
 int DeviceRunnerBase::finalize() {
@@ -2016,6 +2032,12 @@ int DeviceRunnerBase::finalize() {
     if (device_id_ == -1) return finalize_unbound();
     const int rc = validate_current_context();
     if (rc != 0) return rc;
+    return finalize_after_urma_scans();
+}
+
+int DeviceRunnerBase::finalize_after_urma_scans() {
+    // Both fatal Program close and its immediate recovery can reset with a live carrier.
+    stop_urma_scans();
     return finalize_impl();
 }
 

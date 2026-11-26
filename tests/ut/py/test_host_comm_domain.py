@@ -102,7 +102,7 @@ def test_memory_source_is_part_of_reuse_identity():
         ("a5", "tensormap_and_ringbuffer", (), True),
         ("a5", "tensormap_and_ringbuffer", ("urma",), True),
         ("a5", "host_build_graph", (), True),
-        ("a5", "host_build_graph", ("urma",), False),
+        ("a5", "host_build_graph", ("urma",), True),
         ("a5", "unknown", (), False),
         ("a2a3", "tensormap_and_ringbuffer", (), True),
         ("a2a3", "tensormap_and_ringbuffer", ("urma",), False),

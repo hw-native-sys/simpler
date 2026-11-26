@@ -153,7 +153,7 @@ accept `memory_source=AddressSpace.HOST` with `workspace_engines=()` for
 synchronous peer MTE reads on PR and DT.
 The default remains `AddressSpace.DEVICE`. Each participating L2 owns independent
 Host shared memory, maps it to its Device, and optionally registers an URMA
-workspace with `workspace_engines=("urma",)` on TMR. Other Host workspace engines and
+workspace with `workspace_engines=("urma",)` on TMR or HBG. Other Host workspace engines and
 L4 Host domains are rejected before allocation.
 
 The L3 creator accesses the rank's entire Host window through
@@ -564,7 +564,8 @@ and size.
 Before submitting a URMA task, obtain its context through the checked host API:
 
 ```python
-args.add_scalar(handle.device_context(rank, workspace_engines=("urma",)))
+worker_id = handle.member(rank).local_worker_id
+args.add_scalar(handle.device_context(worker_id, workspace_engines=("urma",)))
 ```
 
 The required engines must have been selected when allocating that live domain.
@@ -577,20 +578,43 @@ or zero size before publishing the context, and propagates initialization failur
 as host errors. Callers must treat handle/context metadata as read-only and obtain
 the checked context in every orchestration run rather than caching its raw address.
 
-URMA requests require A5 TMR L3 domains. Device domains take an ordered subset of
+A5 TMR and HBG L3 Device domains take an ordered subset of
 the Worker's chips. For example, chip 1 has domain rank 0 in `[1, 2]` and domain
 rank 1 in `[2, 1]`. The HCCL child communicator and the window and peer MR tables
 use that same domain-rank order. Overlapping Device domains can stay live and be
 used in successive runs, with each domain owning its communicator and URMA
 workspace. Host-source URMA domains require ranks in dense prefix order.
 
+HBG retains every URMA domain passed as a context scalar to a native Run.
+The submitting physical AIV picks a queue row within that domain. A Core that
+observes the deferred condition owns the row while advancing its SQ and CQ tails
+and ringing its CQ doorbell. The next Run can submit to the same domain once the
+previous chip execution and its queues have drained. Any Host copy-back still
+holds the domain backing until its original Run finalizes.
+
+If a failed Run posts a request and its cores stop before consuming the CQE,
+the Run keeps its exclusive queue claim. The first queue check starts a Host
+thread in the Run's device context. The same thread reads the software queue
+positions for all bound domains. HCCL exposes the CQ entries and doorbell to
+the AIV, so this thread launches a small AIV kernel to check the CQE owner and
+status. It advances the CQ tail, rings the doorbell through the AIV, and then
+advances the SQ tail. A retry uses the same absolute targets. `poll` requests
+a check and returns `NOT_READY` while it runs. A blocking wait can share that
+check. The polling thread performs no synchronous copies for the URMA scan.
+Quarantining a device closes admission for new recovery kernels. Before a
+forced reset, the runner stops and joins its queue-scanning threads so that
+their ACL calls have returned before the device context is reset.
+
+Pending entries, error CQEs, and a control kernel whose stop cannot be confirmed
+keep the domain and operands held. If the device cannot launch a recovery kernel,
+an outstanding request stays held. Cleanup preserves the Run's original result.
+
 Single-rank requests reach the provider, and initialization failures are
 reported on the host. The currently pinned PTO URMA manager rejects single-rank
 initialization. The successful
 [single-device CANN Hcomm loopback probe](https://github.com/hw-native-sys/simpler/pull/2714#issuecomment-6491020508)
 uses two endpoints and has not been integrated into that provider; the provider
-restriction is not a hardware limitation. HBG URMA completion and L4 async
-domains are unsupported.
+restriction is not a hardware limitation. L4 async domains are unsupported.
 
 URMA domains use `PER_PEER`: each resident AIV owns a separate queue group
 for each remote peer. `UrmaConfig(jetties_per_aiv=1, sq_depth=0)` preserves one
@@ -621,7 +645,8 @@ that require ordering must establish completion dependencies.
 
 Before posting, the runtime checks the entire request against each queue's
 actual chunk count and the task's remaining completion capacity. Each chunk
-uses one completion slot (64 slots per task, shared with other deferred work).
+uses one completion slot. TMR provides 64 slots per task. The HBG calendar provides
+64 per physical kernel invocation, shared with its other deferred conditions.
 All participating queue targets must complete before dependent tasks start.
 See the [multi-jetty acceptance tests](../tests/st/a5/tensormap_and_ringbuffer/urma_multi_jetty/README.md)
 for real queue-counter checks, boundary cases and the timing comparison.
@@ -658,11 +683,12 @@ requests and enter its failure-recovery path. `finish` ends the reservation;
 it does not establish network completion or permit freeing resources still
 used by submitted work.
 
-The queue's submitted and completed counters persist across task switches;
-the AICPU completion poller is the only tail publisher. An AIV returning does
-not complete its network requests: dependencies and buffer lifetimes remain
-protected by the existing deferred-completion protocol. Requests that exceed
-the available queue or completion-slab capacity fail before posting.
+The queue's submitted and completed counters persist across task switches.
+TMR's AICPU publishes its queue tails. HBG's deferred Core observers
+serialize updates per physical queue row and check cumulative BB and CQE targets.
+An AIV can return after submission. Downstream tasks wait for all targets, and a
+failed Run retains operands and domains until physical stop is confirmed.
+Requests that exceed the available queue or completion capacity fail before posting.
 
 The legacy `device_ctx` field remains a raw address for synchronous consumers;
 it does not declare or validate an asynchronous engine requirement. No compiled
@@ -783,11 +809,10 @@ on global-domain paths. Rebuild/reinstall the complete artifact set after a
 layout or C API change. The global-domain descriptor wire version is a separate
 protocol field and does not establish build compatibility.
 
-SDMA domains reference the shared CommHandle-owned manager; URMA/RDMA managers
-belong to individual dynamic domains. URMA/RDMA deferred-completion kernels
-remain specific to `tensormap_and_ringbuffer`; workspace storage does not add
-completion backends to `host_build_graph`. Domain cleanup does not release another
-domain's workspace or the shared SDMA resource.
+SDMA domains reference the shared CommHandle-owned manager. URMA and RDMA managers
+belong to individual dynamic domains. TMR and HBG implement URMA deferred
+completion, and TMR also implements RDMA deferred completion. Domain cleanup
+reclaims the resources of its own domain.
 
 Each A5 URMA domain owns an HCCL subcommunicator, including its registrations
 and channels. The L2 host process keeps that owner from the first initialization
@@ -821,6 +846,7 @@ The workspace coverage is split by platform and execution layer:
 | ---------------- | ------------------ | -------- |
 | A5 host | SDMA and URMA plus optional RDMA in one build; URMA and RDMA each require a dedicated domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/a5/toolkit/test_a5_comm_workspaces.py` |
 | A5 TMR | URMA peer MR addressing | Two-rank transfer with a nonzero input offset in `urma_deferred_completion_demo` |
+| A5 HBG | Retained Device and Host URMA domains, Core CQ observation | Device GET/PUT and row reuse in `tests/st/a5/host_build_graph/urma_device` and `urma_row_reuse`, Host table reuse and CPU updates in `urma_host` |
 | A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
 | A2/A3 | Worker-owned SDMA and optional peer mappings for L3 TMR Host domains | SDMA and prefetch examples, and `test_a3_host_source_domain.py` for Host MTE and peer SDMA |
 | Simulation | Communication windows and zero backend descriptors | Existing domain/window tests; explicit nonempty engine selections are rejected |

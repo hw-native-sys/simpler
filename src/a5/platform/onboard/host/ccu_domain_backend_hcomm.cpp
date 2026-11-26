@@ -10,6 +10,7 @@
  */
 
 #include "ccu_domain_backend_hcomm.h"
+#include "aiv_control_binary.h"
 
 #include <array>
 #include <algorithm>
@@ -71,12 +72,9 @@ void check_communicator(int code, const char *operation, CommCcuMode mode) {
 CcuResult probe_channel_die(const ChannelHandle *channel) { return CcuNotifyWait(*channel, 0, 1); }
 
 std::string sibling_trigger_binary() {
-    Dl_info info{};
-    if (::dladdr(reinterpret_cast<const void *>(&prepare_hcomm_ccu_callable), &info) == 0 || info.dli_fname == nullptr)
-        throw std::runtime_error("cannot locate the A5 host runtime for the CCU trigger binary");
-    std::string path(info.dli_fname);
-    const size_t slash = path.find_last_of('/');
-    return (slash == std::string::npos ? std::string(".") : path.substr(0, slash)) + "/ccu_event_trigger.o";
+    const auto path = a5::aiv_control_binary(reinterpret_cast<const void *>(&prepare_hcomm_ccu_callable));
+    if (path.empty()) throw std::runtime_error("cannot locate the A5 host runtime for the CCU trigger binary");
+    return path.string();
 }
 
 std::array<uint64_t, SIMPLER_CCU_MAX_RANKS>

@@ -190,12 +190,13 @@ enum class PercounterTaskEventKind : uint32_t {
     PeerDmbMovAtEntry,
     PeerDmbMovChanged,
     PeerPeriodicReady,
+    ReadyRowScan,
 };
 
 struct PercounterTaskEvent {
     uint64_t cycles;
     uint64_t entry;
-    uint64_t detail;  // Completion contribution or deferred group reference.
+    uint64_t detail;  // Event payload, including the start cycle of a ready-row scan.
     PercounterTaskEventKind kind;
     uint32_t previous_poll_delta;  // MOV samples only; UINT32_MAX when no previous poll is available.
 };

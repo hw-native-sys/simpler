@@ -1191,12 +1191,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         _track(int(d))
         _track(int(f))
     if calendar_events_raw is not None:
-        for record in calendar_events_raw["records"]:
-            _track(record["cycles"])
-            _track(record.get("claim_start_cycles", 0))
-            _track(record.get("kernel_start_cycles", 0))
-        for record in calendar_events_raw["range_records"]:
-            _track(record["cycles"])
+        for cycles in containment.calendar_event_cycles(calendar_events_raw):
+            _track(cycles)
     for thread_records in sched_phases_raw:
         for pr in thread_records:
             _track(int(pr.get("start_cycles", 0)))

@@ -1,7 +1,7 @@
 # A5 Host Build Graph calendar scheduler
 
 The Host places each kernel block and role on an AICore and uploads a calendar
-for each physical lane. A lane executes its rows in order. Ordinary tasks and
+for each physical lane. A lane normally executes its rows in order. Ordinary tasks and
 Graph invocations can appear in the same submission. The Host partitions the
 outer DAG by dependency and uses a separate range for each Graph body.
 
@@ -136,6 +136,28 @@ registration only when the marker is set and clears it on a successful check.
 A single predecessor can have multiple registrations when different blocks or
 roles defer. Each registration has its own owner and can contain up to 64
 signals.
+
+The sending AIV reserves every target of a URMA request before posting its
+first WQE. Each target identifies the domain, the physical queue row, and the
+cumulative SQ basic-block and CQ entry counts. For `PER_PEER`, the row is
+`peer * rows_per_peer + physical_aiv * jetties_per_aiv + jetty`. The calendar
+saves the submitting AIV with the group, so a successor on another core can
+check exactly those rows. Observers take a per-row claim while checking CQEs
+and advancing the SQ tail, CQ tail and CQ doorbell. A later target may retire
+first. When the earlier observer finds its target already reached, it leaves
+the queue counters in place and publishes its own completion credit.
+
+A deferred GET may depend on an independent notifier assigned to the same AIV
+as a blocked consumer. For phases of at least three tasks in a Run with URMA,
+the Host checks each lane's sequence of ordinary rows between MIX and
+`sync_start` rendezvous. If a row with predecessors has more ordinary work behind
+it, the Host preserves all DAG inputs in that phase. When the first unfinished row
+is blocked and a deferred invocation is outstanding, the lane checks later rows
+for ready inputs. It remembers which rows have retired and where to resume its
+search. It checks the earliest unfinished row first on each pass. A Graph
+body publishes all its bindings before its lanes use this path. The scan stops
+at that lane's next rendezvous or phase boundary. A later collective can wait
+for those consumers while their notifier runs ahead of them.
 
 For an independent multi-block consumer with multiple predecessors, the Host
 can assign the dependency checks to distinct consumer lanes. Each assigned lane

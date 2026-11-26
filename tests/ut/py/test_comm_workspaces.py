@@ -113,7 +113,7 @@ def test_invalid_static_workspace_kind_is_rejected_by_compiler(tmp_path, kind):
     [
         ("a2a3sim", "tensormap_and_ringbuffer", "requires A5"),
         ("a5sim", "tensormap_and_ringbuffer", "requires A5"),
-        ("a5", "host_build_graph", "tensormap_and_ringbuffer"),
+        ("a5sim", "host_build_graph", "requires A5"),
     ],
 )
 def test_unsupported_urma_domains_are_rejected_before_control(platform, runtime, message):
@@ -124,11 +124,12 @@ def test_unsupported_urma_domains_are_rejected_before_control(platform, runtime,
         worker._domain_config([0, 1], 4096, [], False, ("urma",))
 
 
+@pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("members", [(1, 2), (2, 1)])
-def test_device_urma_configuration_preserves_ordered_members(members):
+def test_device_urma_configuration_preserves_ordered_members(members, runtime):
     from simpler.worker import Worker  # noqa: PLC0415
 
-    worker = Worker(level=3, platform="a5", runtime="tensormap_and_ringbuffer", device_ids=[1, 2, 3], num_sub_workers=0)
+    worker = Worker(level=3, platform="a5", runtime=runtime, device_ids=[1, 2, 3], num_sub_workers=0)
     config = worker._domain_config(members, 4096, [], False, ("urma",))
     assert config.members == members
     assert config.workspace_engines == ("urma",)

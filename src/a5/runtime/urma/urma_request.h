@@ -255,9 +255,7 @@ struct UrmaSession : pto::comm::AsyncSession {
 
 namespace detail {
 inline __aicore__ bool
-bind_urma_session(uint32_t sender_id, const __gm__ CommWorkspace &urma, UrmaSession &session, uint32_t peer) {
-    const uint64_t addr = urma.addr;
-    const uint64_t size = urma.size;
+bind_urma_session(uint32_t sender_id, uint64_t addr, uint64_t size, UrmaSession &session, uint32_t peer) {
     session.valid = false;
     session.domain_workspace = nullptr;
     auto *workspace = reinterpret_cast<__gm__ uint8_t *>(addr);
@@ -298,11 +296,6 @@ bind_urma_session(uint32_t sender_id, const __gm__ CommWorkspace &urma, UrmaSess
 }
 
 }  // namespace detail
-
-inline __aicore__ bool
-build_urma_session(const AsyncCtx &ctx, const __gm__ CommWorkspace &urma, UrmaSession &session, uint32_t peer = 0) {
-    return detail::bind_urma_session(ctx.urma_sender_id, urma, session, peer);
-}
 
 template <typename TensorT>
 inline __aicore__ auto make_tensor_slice(TensorT &tensor, uint64_t elem_offset, uint64_t elem_count) {
@@ -468,14 +461,17 @@ submit_segmented_request(Runtime &runtime, UrmaSegmentedRequest<Remote, Local> d
     }
 
     const auto event = post_urma_segment(desc.remote, desc.local, session);
+    bool registered = false;
     if (event.postFailed || event.urmaJettyCount != pto::comm::urma::kUrmaGatherInlineEvent ||
         event.urmaJettyBase != jetty) {
         runtime.set_error(RequestError::INVALID);
-        return false;
+    } else {
+        // The per-jetty CQ field is the begin sequence. The inline event carries the end CQ sequence at top level.
+        registered = runtime.register_target(
+            {session.domain_workspace, row, event.urmaTargetBbPerJetty[0], event.urmaTargetCqe}
+        );
     }
-    // In an inline descriptor event the per-jetty CQ field is the *begin*
-    // sequence. ISA waits on urmaTargetCqe and the end BB sequence.
-    return runtime.register_target({session.domain_workspace, row, event.urmaTargetBbPerJetty[0], event.urmaTargetCqe});
+    return runtime.finish() && registered;
 }
 #endif
 
@@ -555,7 +551,8 @@ inline __aicore__ bool submit_tensor_chunks(
 
 template <typename Runtime, typename DstTensor, typename SrcTensor>
 inline __aicore__ bool submit_chunked_urma_request(
-    Runtime &runtime, UrmaRequestDescriptor<DstTensor, SrcTensor> desc, [[maybe_unused]] UrmaSession *bound = nullptr
+    Runtime &runtime, UrmaRequestDescriptor<DstTensor, SrcTensor> desc, [[maybe_unused]] UrmaSession *bound = nullptr,
+    [[maybe_unused]] uint64_t registered_workspace_bytes = 0
 ) {
     using RawDType = typename DstTensor::RawDType;
     static_assert(std::is_same_v<RawDType, typename SrcTensor::RawDType>, "URMA transfer requires matching dtypes");
@@ -573,9 +570,12 @@ inline __aicore__ bool submit_chunked_urma_request(
 #if defined(PTO_URMA_SUPPORTED)
     if (bound == nullptr) {
         UrmaSession session;
-        // The raw-pointer overload predates domain-owned sender headers.
-        const bool built = desc.domain ?
-                               detail::bind_urma_session(runtime.sender_id(), *desc.domain, session, desc.remote_rank) :
+        // A runtime that retains the domain can recover the physical sender's header even for a raw-pointer request.
+        const bool use_descriptor = desc.domain && registered_workspace_bytes == 0;
+        const uint64_t addr = use_descriptor ? desc.domain->addr : reinterpret_cast<uint64_t>(desc.workspace);
+        const uint64_t size = use_descriptor ? desc.domain->size : registered_workspace_bytes;
+        const bool built = desc.domain || size != 0 ?
+                               detail::bind_urma_session(runtime.sender_id(), addr, size, session, desc.remote_rank) :
                                build_urma_session(runtime.sender_id(), desc.workspace, desc.remote_rank, session);
         if (built && (!desc.domain || session.domain_workspace == desc.workspace)) {
             session.domain_workspace = desc.workspace;
