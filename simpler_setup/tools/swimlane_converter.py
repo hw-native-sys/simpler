@@ -235,7 +235,7 @@ def _is_recorded_window(raw):
     return isinstance(collection, dict) and collection.get("recorded_window") is True
 
 
-def _hbg_l1_worker_lanes(core_types):
+def _l1_worker_lanes(core_types):
     """Map captured worker IDs to type-local names and numeric display order, counting idle cores."""
     lanes = {}
     for kind in ("aic", "aiv"):
@@ -304,13 +304,14 @@ def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
         )
 
     runtime = resolve_runtime(metadata.get("runtime"))
-    worker_lanes = (
-        _hbg_l1_worker_lanes(metadata.get("core_types") or []) if runtime == "host_build_graph" and level == 1 else {}
-    )
-    if runtime == "percounter":
+    core_types = metadata.get("core_types") or []
+    worker_lanes = {}
+    if level == 1:
+        worker_lanes = _l1_worker_lanes(core_types)
+    elif runtime == "percounter":
         worker_lanes = {
             worker: percounter_scheduler_view.worker_lane(cluster, role)
-            for worker, (cluster, role) in _percounter_worker_lanes(metadata.get("core_types") or []).items()
+            for worker, (cluster, role) in _percounter_worker_lanes(core_types).items()
         }
     for index, row in enumerate(rows(raw.get("aicore_tasks", []), "aicore_tasks")):
         row_fields = _aicore_record_fields(row, runtime, index)
@@ -1347,8 +1348,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     elif aicore_rows:
         raise ValueError(f"level {level} requires Scheduler task timing records")
 
-    if runtime_name == "host_build_graph" and level == 1:
-        lanes = _hbg_l1_worker_lanes(core_types)
+    if level == 1:
+        lanes = _l1_worker_lanes(core_types)
         for task in tasks:
             task["worker_lane"] = lanes.get(task["core_id"])
 
@@ -2802,12 +2803,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             {"args": {"sort_index": 3}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 3}
         )
 
-    hbg_l1 = runtime_name == "host_build_graph" and chip_swimlane_level == 1
     for core_id, tid in core_to_tid.items():
         task = worker_rows[core_id]
         track = {"ph": "M", "cat": "__metadata", "pid": 4, "tid": tid}
-        worker_lane = task.get("worker_lane") if hbg_l1 else None
-        if runtime_name == "percounter" and "cluster_index" in task:
+        worker_lane = task.get("worker_lane")
+        if worker_lane is None and runtime_name == "percounter" and "cluster_index" in task:
             cluster, role = task["cluster_index"], task["cluster_lane"]
             worker_lane = percounter_scheduler_view.worker_lane(cluster, role)
         if worker_lane is not None:
@@ -4198,7 +4198,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         if verbose:
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
-    if runtime_name == "host_build_graph" and not hbg_l1:
+    if runtime_name == "host_build_graph" and chip_swimlane_level != 1:
         _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams, compact_workers=hbg_l2)
 
     if chip_swimlane_level == 2 and runtime_name in ("host_build_graph", "percounter"):

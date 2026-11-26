@@ -136,7 +136,7 @@ backward-compatible with the old boolean behavior).
 | 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
 | 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
-HBG L1 groups Worker View lanes by core type, with AIC first and AIV second.
+L1 groups worker lanes by core type, with AIC first and AIV second.
 Each type is numbered from zero using the complete captured core list, so idle
 cores keep their indices. A 32-AIC, 64-AIV capture shows active lanes from
 `AIC0`–`AIC31` followed by `AIV0`–`AIV63`. Task details retain the global worker ID.
