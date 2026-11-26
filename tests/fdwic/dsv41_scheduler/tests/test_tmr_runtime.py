@@ -51,7 +51,7 @@ def test_overlay_changes_only_the_source_copy(tmp_path):
     assert set(report["patched_sources"]) == set(PATHS)
     assert "work_start_cycle" not in (source / PATHS[0]).read_text()
     assert "work_start_cycle" in (snapshot / PATHS[0]).read_text()
-    assert "cache_invalidate_range(runtime->dev.workers" in (snapshot / PATHS[1]).read_text()
+    assert "cache_invalidate_range(runtime->get_workers()" in (snapshot / PATHS[1]).read_text()
     assert "work_end_cycle" in (snapshot / PATHS[2]).read_text()
     with pytest.raises(ValueError, match="new"):
         module()["stage_sources"](source, snapshot)
