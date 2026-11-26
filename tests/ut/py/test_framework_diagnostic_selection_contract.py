@@ -31,7 +31,7 @@ from _task_ids import hbg_sub_task, tmr_task
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 _ROOT = Path(__file__).resolve().parents[3]
-_CONSUMER = _ROOT / "examples/workers/l2/framework_eager/diagnostic_selection.py"
+_CONSUMER = _ROOT / "examples/workers/l2/framework_kernel/diagnostic_selection.py"
 
 
 def _load(path, name):
@@ -269,7 +269,7 @@ def test_whole_consumer_unknown_completion_keeps_owners(consumer, transport, tmp
 @pytest.mark.parametrize("defect", [None, "wrong_value", "wrong_selection", "mixed_epoch", "missing_mutation"])
 @pytest.mark.parametrize("platform", ["a2a3", "a5"])
 def test_real_st_rejects_incomplete_summary(tmp_path, monkeypatch, defect, platform):
-    st = _load(_ROOT / "tests/st/worker/framework_eager/test_diagnostic_selection.py", "diagnostic_st")
+    st = _load(_ROOT / "tests/st/worker/framework_kernel/test_diagnostic_selection.py", "diagnostic_st")
     summary = dict(
         platform=platform,
         runtime="host_build_graph",

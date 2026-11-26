@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Live framework-queue consumer of the ordinary public Worker."""
+"""Persistent DEVICE controls and caller-owned weighted cache through real callbacks."""
 
 import json
 import os
@@ -16,8 +16,7 @@ from pathlib import Path
 
 import pytest
 
-_ROOT = Path(__file__).resolve().parents[4]
-_EXAMPLE = _ROOT / "examples/workers/l2/framework_eager/lifecycle.py"
+_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_kernel/persistent_state.py"
 pytestmark = [
     pytest.mark.runtime_product("kernel"),
     pytest.mark.execution_mode("eager"),
@@ -29,39 +28,25 @@ pytestmark = [
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_worker_close_recreate(runtime, task_queue, framework_module, tmp_path, request):
-    _run_lifecycle(runtime, runtime, task_queue, framework_module, tmp_path, request)
-
-
-@pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
-@pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_worker_runtime_transition(runtime, task_queue, framework_module, tmp_path, request):
-    successor = "host_build_graph" if runtime == "tensormap_and_ringbuffer" else "tensormap_and_ringbuffer"
-    _run_lifecycle(runtime, successor, task_queue, framework_module, tmp_path, request)
-
-
-def _run_lifecycle(runtime, successor, task_queue, framework_module, tmp_path, request):
+def test_framework_persistent_state(runtime, task_queue, framework_module, tmp_path, request):
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
     logs.mkdir()
-    command = [
-        sys.executable,
-        "-u",
-        str(_EXAMPLE),
-        "--platform",
-        platform,
-        "--runtime",
-        runtime,
-        "--device",
-        device,
-        "--build-dir",
-        str(framework_module),
-    ]
-    if successor != runtime:
-        command += ["--successor-runtime", successor]
     result = subprocess.run(
-        command,
+        [
+            sys.executable,
+            "-u",
+            str(_EXAMPLE),
+            "--platform",
+            platform,
+            "--runtime",
+            runtime,
+            "--device",
+            device,
+            "--build-dir",
+            str(framework_module),
+        ],
         capture_output=True,
         text=True,
         timeout=180,
@@ -75,26 +60,37 @@ def _run_lifecycle(runtime, successor, task_queue, framework_module, tmp_path, r
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
-    print("FRAMEWORK_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print("FRAMEWORK_PERSISTENT_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
     records = [
-        line.removeprefix("FRAMEWORK_LIFECYCLE_PASS ")
+        line.removeprefix("FRAMEWORK_PERSISTENT_STATE_PASS ")
         for line in result.stdout.splitlines()
-        if line.startswith("FRAMEWORK_LIFECYCLE_PASS ")
+        if line.startswith("FRAMEWORK_PERSISTENT_STATE_PASS ")
     ]
     assert len(records) == 1, result.stdout + result.stderr
     summary = json.loads(records[0])
-    assert summary["verified"] and summary["calls"] == 8 and summary["generations"] == 2
     assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["runtimes"] == [runtime, successor]
-    assert summary["orchestration_load_counts"] == [
-        [2, 0] if backend == "host_build_graph" else [0, 2] for backend in (runtime, successor)
+    assert summary["verified"] and summary["calls"] == 12
+    assert summary["controls"] == [
+        [0, 0],
+        [1, 2],
+        [6, 1],
+        [0, 4],
+        [4, 0],
+        [3, 3],
+        [2, 2],
+        [7, 1],
+        [4, 4],
+        [0, 0],
+        [5, 2],
+        [1, 3],
     ]
-    assert summary["observed"] == summary["expected"] == [3, 7, 13, 17, 22, 34, 41, 57]
-    assert summary["generation_calls"] == [4, 4]
-    assert summary["original_handles_preserved"] and summary["guards_verified"]
-    assert summary["caller_tensors_retained"] and summary["caller_stream_after_each_close"]
-    assert all(context == summary["caller_context"] for context in summary["callback_contexts"])
+    assert summary["cache_shape"] == [8, 32] and summary["cache_strides"] == [64, 1]
+    assert summary["cache_byte_offset"] == 256
+    assert summary["checksums"] == [-38, 1018, 2602, 6826, 6826, 490, -3206, -7430, -16934, -16934, -22742, -35414]
+    assert summary["caller_frame_retained"] and summary["guard_verified"] and summary["zero_accept_verified"]
+    assert summary["weights_verified"] and summary["persistent_state_verified"]
+    assert len(summary["callback_threads"]) == 12
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

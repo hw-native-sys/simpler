@@ -23,8 +23,8 @@ from simpler.buffer import Buffer, BufferLocation, LocalEndpointBufferIdentityAl
 from simpler.task_interface import TensorArgType
 
 _ROOT = Path(__file__).resolve().parents[3]
-_CONSUMER = _ROOT / "examples/workers/l2/framework_eager/alias_inout.py"
-_ST = _ROOT / "tests/st/worker/framework_eager/test_alias_inout.py"
+_CONSUMER = _ROOT / "examples/workers/l2/framework_kernel/alias_inout.py"
+_ST = _ROOT / "tests/st/worker/framework_kernel/test_alias_inout.py"
 
 
 def _load(path, name):

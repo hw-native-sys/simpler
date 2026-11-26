@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Real framework source/context preflight refusal followed by healthy work."""
+"""Actual cross-stream framework execution through a single public Worker."""
 
 import json
 import os
@@ -16,7 +16,8 @@ from pathlib import Path
 
 import pytest
 
-_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/preflight_recovery.py"
+_ROOT = Path(__file__).resolve().parents[4]
+_EXAMPLE = _ROOT / "examples/workers/l2/framework_kernel/cross_stream.py"
 pytestmark = [
     pytest.mark.runtime_product("kernel"),
     pytest.mark.execution_mode("eager"),
@@ -28,7 +29,7 @@ pytestmark = [
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_preflight_recovery(runtime, task_queue, framework_module, tmp_path, request):
+def test_framework_cross_stream_orders_public_worker(runtime, task_queue, framework_module, tmp_path, request):
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
@@ -60,21 +61,35 @@ def test_framework_preflight_recovery(runtime, task_queue, framework_module, tmp
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
-    print("FRAMEWORK_PREFLIGHT_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print("FRAMEWORK_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
     records = [
-        json.loads(line.removeprefix("FRAMEWORK_PREFLIGHT_RECOVERY_PASS "))
+        json.loads(line.removeprefix("FRAMEWORK_CROSS_STREAM_PASS "))
         for line in result.stdout.splitlines()
-        if line.startswith("FRAMEWORK_PREFLIGHT_RECOVERY_PASS ")
+        if line.startswith("FRAMEWORK_CROSS_STREAM_PASS ")
     ]
     assert len(records) == 1, result.stdout + result.stderr
     summary = records[0]
     assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["verified"] and summary["calls"] == 3 and summary["observed"] == [8.0, 12.0, 16.0]
-    assert summary["refusals"] == ["source", "context"] and summary["source_registration_replaced"]
-    assert summary["caller_context_preserved"] and summary["alternate_destroyed"]
-    assert summary["caller_stream_after_close"] and summary["caller_tensors_retained"]
-    assert len(summary["callback_threads"]) == 3
+    assert summary["verified"] and summary["calls"] == 3
+    assert summary["observed"] == summary["expected"] == [8, 12, 16]
+    assert summary["caller_tensors_retained"] and summary["consumer_drained_before_retirement"]
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])
+    streams = summary["raw_streams"]
+    assert len(set(streams.values())) == 4
+    assert [submission["caller"] for submission in summary["submissions"]] == ["caller_A", "caller_B", "caller_A"]
+    assert [submission["raw_stream"] for submission in summary["submissions"]] == [
+        streams["caller_A"],
+        streams["caller_B"],
+        streams["caller_A"],
+    ]
+    assert summary["edges"] == [
+        edge
+        for index, caller in enumerate(("caller_A", "caller_B", "caller_A"))
+        for edge in (
+            {"call": index, "source": "producer", "target": caller, "event": "ready"},
+            {"call": index, "source": caller, "target": "consumer", "event": "done"},
+        )
+    ]

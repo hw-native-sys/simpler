@@ -946,7 +946,7 @@ host drain/replenish path has more buffer headroom.
 
 PMU alone is supported by native Kernel cold capture on A3 TMR and HBG.
 Both use their AICPU task-completion PMU producer and the common native
-caller-owned run path. Program remains eager-only. A5,
+caller-owned run path. Program has no eager/capture mode selection. A5,
 framework graph capture and combinations with other diagnostic families are
 not supported by this contract.
 

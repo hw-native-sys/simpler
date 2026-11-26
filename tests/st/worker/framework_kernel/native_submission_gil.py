@@ -53,7 +53,7 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[4]
     spec = importlib.util.spec_from_file_location(
-        "native_submit_helpers", root / "examples/workers/l2/framework_eager/main.py"
+        "native_submit_helpers", root / "examples/workers/l2/framework_kernel/main.py"
     )
     assert spec is not None and spec.loader is not None
     helpers = importlib.util.module_from_spec(spec)

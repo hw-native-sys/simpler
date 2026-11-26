@@ -132,11 +132,14 @@ or replace a stream.
 
 On an execution failure, an owned Program context keeps its bounded device drain
 and reset policy. A borrowed kernel context is poisoned without a device-wide
-drain or reset; the caller owns device recovery. The native eager entry
+drain or reset; the caller owns device recovery. The native entry
 `simpler_launch_run_on_stream` binds a borrowed caller stream to an already
 prepared run. Public `Worker.init(borrowed_context_generation=...)` and
-`Worker.submit(..., caller_stream=...)` use this same native path. Kernel capture uses the same launch entry with explicitly retained preparation
-resources; Program remains eager-only. The [capture execution contract](native-capture-common-contract.md)
+`Worker.submit(..., caller_stream=...)` use this same native path. Caller-owned
+Kernel submissions use `simpler_prepare_caller_run` and
+`simpler_submit_run_on_stream` over the common preparation and launch machinery,
+retaining the original run through all model uses when recorded.
+Program has no eager/capture mode selection. The [capture execution contract](native-capture-common-contract.md)
 specifies preparation purpose, recording behavior and support limits.
 
 ## Borrowed caller ordering

@@ -206,7 +206,7 @@ figure does not certify that every attempted sample reached the host.
 
 A3 native Kernel capture supports ScopeStats as the only enabled diagnostic
 family. It uses the same caller-owned preparation and submission APIs as
-DFX-off capture. Program mode remains eager-only. HBG has no ScopeStats device
+DFX-off capture. Program has no eager/capture mode selection. HBG has no ScopeStats device
 producer; enabling this flag does not add one. A5 capture and framework graph
 capture are outside this collection contract.
 

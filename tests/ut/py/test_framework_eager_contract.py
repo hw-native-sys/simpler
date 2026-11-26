@@ -21,7 +21,7 @@ import yaml
 from simpler_setup.test_environments import verify_results
 
 _ROOT = Path(__file__).resolve().parents[3]
-_ST_RELATIVE = Path("tests/st/worker/framework_eager/test_framework_eager.py")
+_ST_RELATIVE = Path("tests/st/worker/framework_kernel/test_framework_eager.py")
 _ST = _ROOT / _ST_RELATIVE
 _CASES = {
     f"test_framework_queue_orders_public_worker[{queue}-{runtime}]"
@@ -43,7 +43,7 @@ def test_kernel_warmup_refuses_device_allocation_before_import_or_compile(tmp_pa
     result = subprocess.run(
         [
             sys.executable,
-            str(_ROOT / "examples/workers/l2/framework_eager/warm_kernels.py"),
+            str(_ROOT / "examples/workers/l2/framework_kernel/warm_kernels.py"),
             "--platform",
             "a2a3",
             "--output",
@@ -65,7 +65,7 @@ def test_prepared_bridge_entry_does_not_compile(tmp_path, monkeypatch):
     import importlib.util  # noqa: PLC0415
 
     spec = importlib.util.spec_from_file_location(
-        "framework_bridge_entry", _ROOT / "examples/workers/l2/framework_eager/main.py"
+        "framework_bridge_entry", _ROOT / "examples/workers/l2/framework_kernel/main.py"
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

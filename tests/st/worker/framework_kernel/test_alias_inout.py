@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/alias_inout.py"
+_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_kernel/alias_inout.py"
 pytestmark = [
     pytest.mark.runtime_product("kernel"),
     pytest.mark.execution_mode("eager"),

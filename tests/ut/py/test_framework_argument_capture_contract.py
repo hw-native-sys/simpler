@@ -24,8 +24,8 @@ from simpler.task_interface import DataType, RunPreparationRefused
 from simpler.worker import Worker, _Lifecycle
 
 _ROOT = Path(__file__).resolve().parents[3]
-_EXAMPLE = _ROOT / "examples/workers/l2/framework_eager/argument_capture.py"
-_ST = _ROOT / "tests/st/worker/framework_eager/test_argument_capture.py"
+_EXAMPLE = _ROOT / "examples/workers/l2/framework_kernel/argument_capture.py"
+_ST = _ROOT / "tests/st/worker/framework_kernel/test_argument_capture.py"
 _KNOWN = (
     {
         "a": [-8, -7, -6, -5, -4, -3],

@@ -80,8 +80,10 @@ module owner exits. Failed close keeps the binding for retry.
 If destruction cannot prove teardown, the context and abandoned storage remain
 retained and their module is kept loaded for the process lifetime. Ordinary
 C++ reference destruction cannot unload code that retained state may call.
-This is terminal retention, not proof that device work stopped. Captured-graph
-ownership is a separate consumer; this eager owner does not enable capture.
+This is terminal retention, not proof that device work stopped. The framework
+adapter retains the original run and its module through recorded model uses;
+the [common execution contract](design/native-capture-common-contract.md)
+defines that last-use boundary and checked cleanup.
 
 `-fno-gnu-unique` permits actual unload after the final reference on supported
 ELF builds. The process-owned simulator context retains its separate lifetime.

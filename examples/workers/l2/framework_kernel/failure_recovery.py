@@ -137,7 +137,7 @@ def main():
     parser.add_argument("--runtime", choices=["tensormap_and_ringbuffer", "host_build_graph"], required=True)
     parser.add_argument("--platform", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--build-dir", type=Path, default=reference.ROOT / "build/framework_eager")
+    parser.add_argument("--build-dir", type=Path, default=reference.ROOT / "build/framework_kernel")
     options = parser.parse_args()
     modules = list(options.build_dir.glob("_simpler_framework_queue*.so"))
     if len(modules) > 1:

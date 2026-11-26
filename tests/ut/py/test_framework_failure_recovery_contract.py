@@ -26,8 +26,8 @@ from types import SimpleNamespace
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
-_CONSUMER = _ROOT / "examples/workers/l2/framework_eager/failure_recovery.py"
-_ST = _ROOT / "tests/st/worker/framework_eager/test_failure_recovery.py"
+_CONSUMER = _ROOT / "examples/workers/l2/framework_kernel/failure_recovery.py"
+_ST = _ROOT / "tests/st/worker/framework_kernel/test_failure_recovery.py"
 
 
 def _load(path, name):

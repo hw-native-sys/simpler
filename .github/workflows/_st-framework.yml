@@ -67,14 +67,14 @@ jobs:
           source "$CANN_ENV"
           export PYTHONPATH="$FRAMEWORK_WHEEL_SITE${PYTHONPATH:+:$PYTHONPATH}"
           mkdir -p outputs/framework-ci
-          .venv-framework/bin/python examples/workers/l2/framework_eager/main.py \
+          .venv-framework/bin/python examples/workers/l2/framework_kernel/main.py \
             --compile-only --build-dir "$PWD/outputs/framework-ci/bridge"
           cc -std=c11 -O2 -fPIC -shared -Wall -Wextra -Werror \
-            tests/st/worker/framework_eager/native_capture_destroy_shim.c \
+            tests/st/worker/framework_kernel/native_capture_destroy_shim.c \
             -o outputs/framework-ci/native_capture_destroy_shim.so -ldl
           .venv-framework/bin/python tools/framework_queue_gil/probe.py build \
             --output "$PWD/outputs/framework-ci/native-probe"
-          .venv-framework/bin/python examples/workers/l2/framework_eager/warm_kernels.py \
+          .venv-framework/bin/python examples/workers/l2/framework_kernel/warm_kernels.py \
             --platform "$PLATFORM" --output outputs/framework-ci/kernel-warmup.json
           .venv-framework/bin/python - <<'PY'
           import json
@@ -151,7 +151,7 @@ jobs:
           name: framework-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             outputs/framework-ci
-            !outputs/framework-ci/pytest/framework-eager-module*/**
+            !outputs/framework-ci/pytest/framework-kernel-module*/**
             !outputs/framework-ci/bridge/**
             !outputs/framework-ci/native-probe/**
             !outputs/framework-ci/native_capture_destroy_shim.so

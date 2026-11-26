@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Queued per-call DFX selections retain their own exported records."""
+"""Framework callback value semantics, with a real downstream Torch reader."""
 
 import json
 import os
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/diagnostic_selection.py"
+_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_kernel/value_arguments.py"
 pytestmark = [
     pytest.mark.runtime_product("kernel"),
     pytest.mark.execution_mode("eager"),
@@ -28,7 +28,7 @@ pytestmark = [
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_diagnostic_selection(runtime, task_queue, framework_module, tmp_path, request):
+def test_framework_value_arguments(runtime, task_queue, framework_module, tmp_path, request):
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
@@ -46,8 +46,6 @@ def test_framework_diagnostic_selection(runtime, task_queue, framework_module, t
             device,
             "--build-dir",
             str(framework_module),
-            "--output-dir",
-            str(tmp_path / "diagnostics"),
         ],
         capture_output=True,
         text=True,
@@ -62,22 +60,23 @@ def test_framework_diagnostic_selection(runtime, task_queue, framework_module, t
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
-    print("FRAMEWORK_DIAGNOSTICS_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print("FRAMEWORK_VALUES_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
     records = [
-        json.loads(line.removeprefix("FRAMEWORK_DIAGNOSTIC_SELECTION_PASS "))
+        json.loads(line.removeprefix("FRAMEWORK_VALUE_ARGUMENTS_PASS "))
         for line in result.stdout.splitlines()
-        if line.startswith("FRAMEWORK_DIAGNOSTIC_SELECTION_PASS ")
+        if line.startswith("FRAMEWORK_VALUE_ARGUMENTS_PASS ")
     ]
     assert len(records) == 1, result.stdout + result.stderr
     summary = records[0]
+    host = runtime == "host_build_graph"
+    expected = [49.0, 8.0, 83.5] + ([54.0, 1.0, 92.5] if host else [])
     assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["verified"] and summary["observed"] == [8.0, 12.0, 16.0, 20.0]
-    assert summary["calls"] == 4 and summary["selections"] == [[0, 0], [1, 2], [3, 4], [0, 0]]
-    assert summary["caller_configs_mutated"]
-    assert len(summary["run_epochs"]) == len(set(summary["run_epochs"])) == 2
-    assert all(epoch > 0 for epoch in summary["run_epochs"])
-    assert len(summary["callback_threads"]) == 4
+    assert summary["verified"] and summary["observed"] == expected and summary["calls"] == len(expected)
+    assert summary["caller_args_cleared"] and summary["wrappers_mutated"] and summary["host_backing_retained"]
+    assert summary["host_controls_changed"] == host
+    assert summary["clean_host_refusals"] == (0 if host else 1)
+    assert len(summary["callback_threads"]) == len(expected)
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

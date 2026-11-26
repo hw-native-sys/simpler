@@ -139,7 +139,7 @@ run lifecycle. The following decisions must be implemented together:
 The candidate implementation now exposes `Worker.prepare_submission` and the
 `src/common/worker/native_submission.h` capsule SDK. See the framework eager
 `native_submission.py` numerical example and its system test. The independent
-`tests/st/worker/framework_eager/native_submission_gil.py` driver loads this probe
+`tests/st/worker/framework_kernel/native_submission_gil.py` driver loads this probe
 for GIL drain and native-reference destruction checks; the numerical example
 has no diagnostic-tool dependency. The baseline diagnostic
 results above describe the original Python callback, not this candidate.

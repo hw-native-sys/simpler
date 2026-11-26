@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[4]
-_EXAMPLE = _ROOT / "examples/workers/l2/framework_eager/main.py"
+_EXAMPLE = _ROOT / "examples/workers/l2/framework_kernel/main.py"
 
 
 @pytest.fixture(scope="session")
@@ -39,7 +39,7 @@ def framework_module(tmp_path_factory):
             pytest.fail(f"selected framework consumer requires matching torch and torch_npu; missing {module}")
         dependencies[module] = {"version": importlib.metadata.version(distribution), "path": spec.origin}
     print("FRAMEWORK_DEPENDENCIES " + json.dumps(dependencies, sort_keys=True), flush=True)
-    directory = tmp_path_factory.mktemp("framework-eager-module")
+    directory = tmp_path_factory.mktemp("framework-kernel-module")
     result = subprocess.run(
         [sys.executable, str(_EXAMPLE), "--compile-only", "--build-dir", str(directory)],
         capture_output=True,

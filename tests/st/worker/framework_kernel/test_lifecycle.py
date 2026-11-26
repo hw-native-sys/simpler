@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[4]
-_EXAMPLE = _ROOT / "examples/workers/l2/framework_eager/main.py"
+_EXAMPLE = _ROOT / "examples/workers/l2/framework_kernel/lifecycle.py"
 pytestmark = [
     pytest.mark.runtime_product("kernel"),
     pytest.mark.execution_mode("eager"),
@@ -29,27 +29,39 @@ pytestmark = [
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_queue_orders_public_worker(runtime, task_queue, framework_module, tmp_path, request):
+def test_framework_worker_close_recreate(runtime, task_queue, framework_module, tmp_path, request):
+    _run_lifecycle(runtime, runtime, task_queue, framework_module, tmp_path, request)
+
+
+@pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
+@pytest.mark.parametrize("task_queue", ["0", "1"])
+def test_framework_worker_runtime_transition(runtime, task_queue, framework_module, tmp_path, request):
+    successor = "host_build_graph" if runtime == "tensormap_and_ringbuffer" else "tensormap_and_ringbuffer"
+    _run_lifecycle(runtime, successor, task_queue, framework_module, tmp_path, request)
+
+
+def _run_lifecycle(runtime, successor, task_queue, framework_module, tmp_path, request):
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
     logs.mkdir()
+    command = [
+        sys.executable,
+        "-u",
+        str(_EXAMPLE),
+        "--platform",
+        platform,
+        "--runtime",
+        runtime,
+        "--device",
+        device,
+        "--build-dir",
+        str(framework_module),
+    ]
+    if successor != runtime:
+        command += ["--successor-runtime", successor]
     result = subprocess.run(
-        [
-            sys.executable,
-            "-u",
-            str(_EXAMPLE),
-            "--platform",
-            platform,
-            "--runtime",
-            runtime,
-            "--device",
-            device,
-            "--bridge",
-            str(next(framework_module.glob("_simpler_framework_queue*.so"))),
-            "--calls",
-            "3",
-        ],
+        command,
         capture_output=True,
         text=True,
         timeout=180,
@@ -67,15 +79,22 @@ def test_framework_queue_orders_public_worker(runtime, task_queue, framework_mod
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
     records = [
-        line.removeprefix("FRAMEWORK_EAGER_PASS ")
+        line.removeprefix("FRAMEWORK_LIFECYCLE_PASS ")
         for line in result.stdout.splitlines()
-        if line.startswith("FRAMEWORK_EAGER_PASS ")
+        if line.startswith("FRAMEWORK_LIFECYCLE_PASS ")
     ]
     assert len(records) == 1, result.stdout + result.stderr
     summary = json.loads(records[0])
-    assert summary["verified"] and summary["calls"] == 3
+    assert summary["verified"] and summary["calls"] == 8 and summary["generations"] == 2
     assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["caller_tensors_retained"] and summary["caller_stream_after_close"]
-    assert summary["callback_error_observed"] and summary["zero_stream_preflight_refusals"] == 1
+    assert summary["runtimes"] == [runtime, successor]
+    assert summary["orchestration_load_counts"] == [
+        [2, 0] if backend == "host_build_graph" else [0, 2] for backend in (runtime, successor)
+    ]
+    assert summary["observed"] == summary["expected"] == [3, 7, 13, 17, 22, 34, 41, 57]
+    assert summary["generation_calls"] == [4, 4]
+    assert summary["original_handles_preserved"] and summary["guards_verified"]
+    assert summary["caller_tensors_retained"] and summary["caller_stream_after_each_close"]
+    assert all(context == summary["caller_context"] for context in summary["callback_contexts"])
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

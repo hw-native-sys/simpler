@@ -5,16 +5,21 @@
 
 ## Execution scope
 
-Kernel eager submission and capture recording use the same native preparation,
-launch and ownership path. Capture records the publication, stream dependencies
+Kernel has no eager/capture execution-mode selection. Ordinary submission and
+framework graph recording use the same native preparation and launch path.
+Capture records the publication, stream dependencies
 and actual device launches; RTS model execution performs the recorded work.
 Replay does not call Host orchestration again. Preparing and recording a model
 require no preliminary eager execution of the user's computation.
 
-Program is eager-only. Simpler's Program layer manages its device environment
+Program has no eager/capture mode selection. Simpler's Program layer manages its device environment
 and necessary input/output allocation and transfers. Kernel borrows the caller's device context, stream and
 tensor storage; retaining an address does not transfer ownership of those objects.
 There is no separate capture executor or prepared-call cache.
+
+The framework adapter attaches the common submission token to its graph's
+lifetime. Simpler's native model-notice helper validates that attachment and
+reports model destruction; it does not select another execution engine.
 
 The native interfaces are declared in
 [`runtime_c_api.h`](../../src/common/worker/runtime_c_api.h).

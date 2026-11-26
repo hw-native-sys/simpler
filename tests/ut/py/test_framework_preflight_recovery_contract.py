@@ -27,8 +27,8 @@ from simpler.task_interface import ExecutionContextRefused
 from simpler.worker import Worker, _Lifecycle
 
 _ROOT = Path(__file__).resolve().parents[3]
-_CONSUMER = _ROOT / "examples/workers/l2/framework_eager/preflight_recovery.py"
-_ST = _ROOT / "tests/st/worker/framework_eager/test_preflight_recovery.py"
+_CONSUMER = _ROOT / "examples/workers/l2/framework_kernel/preflight_recovery.py"
+_ST = _ROOT / "tests/st/worker/framework_kernel/test_preflight_recovery.py"
 
 
 def _load(path, name):
