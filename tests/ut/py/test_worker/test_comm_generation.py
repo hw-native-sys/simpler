@@ -19,6 +19,27 @@ import pytest
 from simpler.comm_generation import CommGeneration
 
 
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_worker_rootinfo_uses_managed_generation(tmp_path, monkeypatch, platform):
+    import simpler.comm_generation as generation_module  # noqa: PLC0415
+    import simpler.worker as worker_module  # noqa: PLC0415
+
+    monkeypatch.setattr(generation_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    simulation_root = tmp_path / "simulation"
+    monkeypatch.setattr(worker_module, "_COMM_ROOTINFO_DIR", str(simulation_root))
+    worker = worker_module.Worker(level=3, platform=platform, runtime="tensormap_and_ringbuffer", device_ids=[0])
+    try:
+        path = Path(worker._comm_plan_rootinfo_path())
+        assert path.name == "rootinfo.bin"
+        assert (path.parent / ".lease").is_file()
+        assert worker._comm_plan_rootinfo_path() == str(path)
+        assert not simulation_root.exists()
+    finally:
+        worker.close()
+    assert worker._comm_generation is None
+    assert not path.parent.exists()
+
+
 def test_active_and_surviving_rank_leases_are_preserved(tmp_path):
     root = str(tmp_path / f"simpler-comm-{os.getuid()}")
     first = CommGeneration(root)

@@ -401,6 +401,14 @@ controls on its native chip binding. Failed initialization leaves the loop's
 previous handle unchanged. Native
 finalization retains ownership of communicator teardown.
 
+Simulator communication paths use a private directory per startup token and
+owner process group. Worker teardown scans only those owned directories after
+their readers exit, without scanning `/tmp`. It also reclaims rootinfo and barrier
+files left by failed initialization, including temporary files, and removes empty
+directories. Failed cleanup remains tracked for retry.
+Onboard communicators use the
+[leased generation lifecycle](#file-handshake-retirement-on-onboard-backends).
+
 Consequently, when a `Worker` runs multiple times, or `allocate_domain` is
 called many times:
 

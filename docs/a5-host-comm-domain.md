@@ -268,6 +268,8 @@ Host windows use the owning Worker's `sp-<token>-h-<pgid>-...` namespace. Worker
 teardown also unlinks orphan windows left by an abruptly terminated L2,
 including allocations that never returned a reply. Other Worker trees are
 outside that namespace and are not swept.
+Communication handshake files follow the
+[onboard generation and retirement contract](comm-domain.md#file-handshake-retirement-on-onboard-backends).
 
 Each `.shm.buf` access returns a managed, zero-copy memoryview. NumPy arrays
 created with either `np.ndarray(buffer=...)` or `np.frombuffer(...)`, including
