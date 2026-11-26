@@ -9,9 +9,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Validation contracts for framework-owned scene-test configuration."""
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from simpler_setup import scene_test
+from simpler_setup.scene_test import _temporary_env
 
 
 def _decorate(cases):
@@ -66,3 +70,26 @@ def test_scene_test_rejects_unknown_runtime_env_key() -> None:
 def test_scene_test_rejects_non_mapping_config_layers(config, match) -> None:
     with pytest.raises(TypeError, match=match):
         _decorate([{"name": "bad", "config": config}])
+
+
+@pytest.mark.parametrize("first_override,second_override", [(True, True), (True, False), (False, True), (False, False)])
+def test_overlapping_scene_environment_scopes(monkeypatch, first_override, second_override):
+    key = "SIMPLER_TEST_SCENE_COLOR"
+    monkeypatch.setenv(key, "baseline")
+
+    def enter_second():
+        with _temporary_env({key: "blue"} if second_override else {}):
+            return os.environ[key]
+
+    with ThreadPoolExecutor(1) as pool:
+        with _temporary_env({key: "red"} if first_override else {}):
+            future = pool.submit(enter_second)
+            if first_override or second_override:
+                with pytest.raises(RuntimeError, match="exclusive"):
+                    future.result(timeout=5)
+            else:
+                assert future.result(timeout=5) == "baseline"
+            assert os.environ[key] == ("red" if first_override else "baseline")
+    with _temporary_env({key: "green"}):
+        assert os.environ[key] == "green"
+    assert os.environ[key] == "baseline"
