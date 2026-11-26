@@ -118,3 +118,13 @@ def test_integer_offenders_are_reported_as_integers():
     report = _describe_mismatch(actual, expected, rtol=0.0, atol=0.0)
 
     assert "(2,)=7 vs 0" in report
+
+
+def test_adjacent_large_int32_reports_correct_index_and_magnitude():
+    expected = torch.full((8,), 2**30, dtype=torch.int32)
+    actual = expected.clone()
+    actual[-1] += 1
+    report = _describe_mismatch(actual, expected, rtol=0.0, atol=0.0)
+
+    assert "max_diff=1.0," in report
+    assert "worst=[(7,)=1073741825 vs 1073741824]" in report

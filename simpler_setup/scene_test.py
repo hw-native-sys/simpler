@@ -1712,14 +1712,14 @@ def _describe_mismatch(actual, expected, rtol, atol) -> str:
     """
     import torch  # noqa: PLC0415
 
-    # Widen before subtracting so an fp16 difference cannot overflow to inf on
-    # its own. Complex is carried rather than dropped because the caller decides
-    # failure with torch.allclose, which accepts complex: .float() on a complex
-    # tensor discards the imaginary part with only a warning, so an
-    # imaginary-only mismatch would be reported as max_diff=0.0 -- the exact
-    # misleading number this census exists to replace. abs() of a complex
-    # difference is its real magnitude, so everything below stays real.
-    work = torch.complex64 if actual.is_complex() or expected.is_complex() else torch.float32
+    # All differences between two int32 values fit in int64, including
+    # adjacent integers that round to the same float32 value.
+    if actual.dtype == expected.dtype == torch.int32:
+        work = torch.int64
+    elif actual.is_complex() or expected.is_complex():
+        work = torch.promote_types(actual.dtype, torch.complex64)
+    else:
+        work = torch.promote_types(actual.dtype, torch.float32)
     diff = (actual.to(work) - expected.to(work)).abs()
     finite = torch.isfinite(diff)
     max_diff = float(diff[finite].max()) if bool(finite.any()) else float("nan")
@@ -1744,7 +1744,7 @@ def _describe_mismatch(actual, expected, rtol, atol) -> str:
     if worst:
         # topk over the offending elements only; nonzero() would allocate one
         # row per mismatch, which is the whole tensor in the all-wrong case.
-        ranked = torch.where(over.reshape(-1), diff.reshape(-1), torch.zeros_like(diff.reshape(-1)))
+        ranked = torch.where(over.reshape(-1), diff.reshape(-1), -1)
         shape = tuple(actual.shape)
         samples = []
         for flat in torch.topk(ranked, worst).indices.tolist():
