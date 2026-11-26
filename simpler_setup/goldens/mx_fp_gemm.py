@@ -24,14 +24,14 @@ import torch.nn.functional as F
 
 
 def decode_e4m3fn(byte: int) -> float:
-    """Decode one IEEE-style E4M3FN byte (bias=7, no Inf; exp=15 → NaN)."""
+    """Decode one IEEE-style E4M3FN byte (bias=7, no Inf; all-ones exponent and mantissa → NaN)."""
     b = int(byte) & 0xFF
     sign = (b >> 7) & 1
     exp = (b >> 3) & 0xF
     mant = b & 0x7
     if exp == 0:
         val = 0.0 if mant == 0 else (mant / 8.0) * (2.0 ** (1 - 7))
-    elif exp == 0xF:
+    elif exp == 0xF and mant == 0x7:
         return math.nan
     else:
         val = (1.0 + mant / 8.0) * (2.0 ** (exp - 7))
@@ -53,7 +53,12 @@ def decode_e2m1(nibble: int) -> float:
 
 def decode_e8m0(byte: int) -> float:
     """Decode one E8M0 shared-exponent byte as ``2**(x - 127)`` (OCP MX scale)."""
-    return math.ldexp(1.0, (int(byte) & 0xFF) - 127)
+    bits = int(byte) & 0xFF
+    return math.nan if bits == 0xFF else math.ldexp(1.0, bits - 127)
+
+
+def _decode_e8m0_scales(bits: torch.Tensor) -> torch.Tensor:
+    return torch.pow(2.0, bits.to(torch.float64) - 127).masked_fill(bits == 0xFF, math.nan)
 
 
 def fp8_e4m3fn_to_float32(t: torch.Tensor) -> torch.Tensor:
@@ -136,8 +141,8 @@ def mx_fp8_matmul_golden(
     _m, k = a_fp8.shape
     k2, _n = b_fp8.shape
     assert k == k2
-    a_mx = torch.pow(2.0, a_scale_u8.to(torch.float64) - 127)  # [M, KMX]
-    b_mx = torch.pow(2.0, b_scale_u8.to(torch.float64) - 127)  # [KMX, N]
+    a_mx = _decode_e8m0_scales(a_scale_u8)  # [M, KMX]
+    b_mx = _decode_e8m0_scales(b_scale_u8)  # [KMX, N]
     k_idx = torch.arange(k) // 32
     a_scaled = a_fp8.to(torch.float64) * a_mx[:, k_idx]
     b_scaled = b_fp8.to(torch.float64) * b_mx[k_idx, :]
@@ -202,8 +207,8 @@ def mx_fp4_matmul_golden(
     _m, k = a_f.shape
     k2, _n = b_f.shape
     assert k == k2
-    a_mx = torch.pow(2.0, a_scale_u8.to(torch.float64) - 127)
-    b_mx = torch.pow(2.0, b_scale_u8.to(torch.float64) - 127)
+    a_mx = _decode_e8m0_scales(a_scale_u8)
+    b_mx = _decode_e8m0_scales(b_scale_u8)
     k_idx = torch.arange(k) // 32
     a_scaled = a_f * a_mx[:, k_idx]
     b_scaled = b_f * b_mx[k_idx, :]
