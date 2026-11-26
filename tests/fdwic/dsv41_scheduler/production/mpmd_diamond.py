@@ -60,7 +60,7 @@ def write_snapshot(dest, seed, steps):
     (dest / "snapshot.txt").write_text("analytical\n")
 
 
-def build(output, runner, runtime, pto_isa, slow_steps=4096, legacy=False):
+def build(output, runner, runtime, pto_isa, slow_steps=4096):
     from simpler_setup import KernelCompiler, extract_text_section  # noqa: PLC0415
 
     output = output.resolve()
@@ -90,8 +90,7 @@ def build(output, runner, runtime, pto_isa, slow_steps=4096, legacy=False):
     manifest = ["5 1 3 3 3 3", "4"]
     for task, (name, _, _, dirs) in enumerate(STAGES):
         signature = " ".join(map(str, dirs))
-        decl = " 1 1 0 0" if legacy else ""
-        manifest.append(f'{task} {len(dirs)} {signature} "{name}.bin"{decl}')
+        manifest.append(f'{task} {len(dirs)} {signature} "{name}.bin" on_return')
     (output / "kernels.txt").write_text("\n".join(manifest) + "\n")
     subprocess.run(
         [runner, "--assemble-orchestration", "kernels.txt", "orchestration.so", "callable.bin"], cwd=output, check=True
@@ -144,8 +143,7 @@ if __name__ == "__main__":
     parser.add_argument("--runtime", choices=("percounter", "host_build_graph"), default="percounter")
     parser.add_argument("--pto-isa", type=Path, default=SUITE.parents[2] / "build/pto-isa")
     parser.add_argument("--slow-steps", type=int, default=4096, help="Checksum iterations on the selected long branch")
-    parser.add_argument("--legacy-sync", action="store_true", help="Declare synchronous kernels for the pre-PGO packer")
     args = parser.parse_args()
     if args.slow_steps <= 0:
         parser.error("--slow-steps must be positive")
-    build(args.output, args.runner, args.runtime, args.pto_isa, args.slow_steps, args.legacy_sync)
+    build(args.output, args.runner, args.runtime, args.pto_isa, args.slow_steps)

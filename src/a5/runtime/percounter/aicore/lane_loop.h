@@ -61,6 +61,8 @@ struct LaneConfig {
     mutable bool pending_task_valid{false};
     mutable AicoreWorkWindow work_window{};
     mutable __gm__ ChipSwimlaneAicoreTaskRecord *pending_stream_record{nullptr};
+    mutable const __gm__ CalendarPeerEndpoint *peer_endpoints{nullptr};
+    mutable bool peer_dmb_source_in_use{false};
     __gm__ volatile uint32_t *lifecycle_notify;
     mutable uint64_t last_exit_poll{0};
     __gm__ PercounterControl *control;
@@ -76,6 +78,19 @@ struct LaneConfig {
     uint32_t aiv_per_cluster;
     PERCOUNTER_SSBUF PercounterSsbufRegion *ssbuf;
 };
+
+// The next callable owns the entire UB. A previous DMA must finish reading our
+// word before the callable can overwrite it, or before the lane retires.
+inline __aicore__ void percounter_release_dmb_source(const LaneConfig &cfg) {
+#if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
+    if (cfg.peer_dmb_source_in_use) {
+        wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+        cfg.peer_dmb_source_in_use = false;
+    }
+#else
+    (void)cfg;
+#endif
+}
 
 inline __aicore__ void percounter_publish_stream_records(ChipSwimlaneAicoreLocalState *profile) {
     auto *records = reinterpret_cast<__gm__ uint8_t *>(profile->cached_buf->records);
@@ -128,21 +143,23 @@ inline __aicore__ uint64_t percounter_task_event_clock(const LaneConfig &cfg) {
     return 0;
 }
 
-inline __aicore__ void percounter_record_task_event(
+inline __aicore__ __gm__ PercounterTaskEvent *percounter_record_task_event(
     const LaneConfig &cfg, PercounterTaskEventKind kind, uint64_t entry, uint64_t cycles, uint64_t detail = 0
 ) {
     if constexpr (task_profile_compiled) {
-        if (cycles == 0) return;
+        if (cycles == 0) return nullptr;
         if (cfg.task_event_count == cfg.task_event_capacity) {
             if (cfg.task_event_dropped != UINT32_MAX) ++cfg.task_event_dropped;
-            return;
+            return nullptr;
         }
         auto *record = &cfg.task_events[cfg.task_event_count++];
         record->cycles = cycles;
         record->entry = entry;
         record->detail = detail;
         record->kind = kind;
+        return record;
     }
+    return nullptr;
 }
 
 __attribute__((noinline, cold)) __aicore__ void
@@ -226,6 +243,7 @@ inline __aicore__ bool percounter_run_task(
         }
     }
 
+    percounter_release_dmb_source(cfg);
     PercounterKernelFunc kernel = reinterpret_cast<PercounterKernelFunc>(function);
     const bool first_kernel = cfg.work_window.start_cycle == 0;
     const uint64_t start_time = timing_enabled || first_kernel || calendar_timing != nullptr ? get_sys_cnt_aicore() : 0;
@@ -394,6 +412,7 @@ inline __aicore__ AicoreWorkWindow run_percounter_lane(
     }
     setup_scope.close();
     percounter_calendar_loop(cfg);
+    percounter_release_dmb_source(cfg);
     percounter_commit_task_timing(cfg);
     if (cfg.profile != nullptr) percounter_flush_stream_records(&profile);
     if (cfg.profile_buffer != nullptr) {

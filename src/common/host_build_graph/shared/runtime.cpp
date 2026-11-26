@@ -92,7 +92,10 @@ size_t Runtime::get_prebuilt_runtime_offset() const { return dev.prebuilt_runtim
 // symbols stay in the platform's `CallableArtifacts`, because host_build_graph
 // resolves and runs them on the host.
 void Runtime::set_active_callable_id(int32_t callable_id) {
-    if (host_.active_callable_id_ != callable_id) host_.callable_input_cache_proofs_ = nullptr;
+    if (host_.active_callable_id_ != callable_id) {
+        host_.callable_input_cache_proofs_ = nullptr;
+        host_.synchronous_kernels_ = nullptr;
+    }
     host_.active_callable_id_ = callable_id;
 }
 
@@ -104,6 +107,16 @@ uint64_t Runtime::get_function_bin_addr(int func_id) const {
         return 0;
     }
     return host_.callable_table_host_[func_id];
+}
+
+bool Runtime::function_completes_on_return(int func_id) const {
+    return host_.synchronous_kernels_ != nullptr && get_function_bin_addr(func_id) != 0 &&
+           host_.synchronous_kernels_[func_id] != 0;
+}
+
+void Runtime::bind_synchronous_kernels(const std::vector<uint8_t> &declarations) {
+    host_.synchronous_kernels_ =
+        !declarations.empty() && declarations.size() == callable_table_len() ? declarations.data() : nullptr;
 }
 
 void bind_registered_input_cache_proofs(Runtime &runtime, const std::vector<CoreInputCacheProof> &proofs) {
@@ -125,6 +138,7 @@ void Runtime::set_callable_tables(
         return;
     }
     host_.callable_table_host_ = host_view;
+    host_.synchronous_kernels_ = nullptr;
     host_.callable_input_cache_proofs_ = nullptr;
     host_.callable_entry_table_addr_ = entry_table_addr;
     dev.callable_table_addr_ = object_table_addr;
@@ -133,6 +147,7 @@ void Runtime::set_callable_tables(
 
 void Runtime::clear_callable_tables() {
     host_.callable_table_host_ = nullptr;
+    host_.synchronous_kernels_ = nullptr;
     host_.callable_input_cache_proofs_ = nullptr;
     host_.callable_entry_table_addr_ = 0;
     dev.callable_table_addr_ = 0;

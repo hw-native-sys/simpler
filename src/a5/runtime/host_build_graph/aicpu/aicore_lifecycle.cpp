@@ -81,6 +81,7 @@ void record_lifecycle_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
 
 int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base) {
     core_count_ = 0;
+    peer_dmb_group_ = false;
     aicpu_thread_num_ = aicpu_thread_num;
     regs_base_ = regs_base;
     lifecycle_notify_ = nullptr;
@@ -552,14 +553,24 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
     if (core_count_ <= 0 || aicpu_thread_num_ <= 0 || thread_idx < 0 || thread_idx >= aicpu_thread_num_ ||
         thread_idx >= PLATFORM_MAX_AICPU_THREADS)
         return -SIMPLER_ERROR_INVALID_ARGS;
-    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
-    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
+    // A target can retire its last kernel before another partition has issued
+    // its final DMB write. Release the peer group only after every sender ACK.
+    if (peer_dmb_group_ && thread_idx != 0) return 0;
+    const int32_t lo = peer_dmb_group_ ?
+                           0 :
+                           static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
+    const int32_t hi =
+        peer_dmb_group_ ?
+            core_count_ :
+            static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
     AicoreExitTarget targets[kMaxWorkers];
     int32_t core_ids[kMaxWorkers];
     size_t count = 0;
     for (int32_t i = lo; i < hi; ++i) {
         if (cores_[i].reg_addr == 0) continue;
-        targets[count] = {cores_[i].reg_addr, &runtime->get_teardown_gates()[i], lifecycle_notify_ == nullptr};
+        targets[count] = {
+            cores_[i].reg_addr, &runtime->get_teardown_gates()[i], lifecycle_notify_ == nullptr, peer_dmb_group_
+        };
         core_ids[count] = i;
         ++count;
     }

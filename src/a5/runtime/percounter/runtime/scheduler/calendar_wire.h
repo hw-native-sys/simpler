@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace simpler::percounter {
@@ -77,6 +78,8 @@ struct CalendarRangeHeader {
     uint32_t sample_index_offset;
     uint32_t notify_slots_offset;
     uint32_t notify_slots_count;
+    uint32_t peer_endpoints_offset{0};  // One binding per logical worker when a peer edge exists.
+    uint32_t peer_fanouts_offset{0};    // List of distinct SPMD multicast destination sets.
 };
 
 struct alignas(32) CalendarRange {
@@ -102,6 +105,10 @@ enum : uint16_t {
     CALENDAR_EXEC_FANIN = 1 << 7,
     CALENDAR_EXEC_INPUT_OWNER = 1 << 8,
     CALENDAR_EXEC_INPUT_FOLLOWER = 1 << 9,
+    CALENDAR_EXEC_PEER = 1 << 10,
+    CALENDAR_EXEC_SPMD_WAIT = 1 << 11,
+    CALENDAR_EXEC_SPMD_SEND = 1 << 12,
+    CALENDAR_EXEC_PEER_PRODUCER = 1 << 13,  // Its consumers rely on synchronous completion.
 };
 
 struct alignas(16) CalendarExecutionRow {
@@ -129,6 +136,51 @@ struct CalendarExecutionExtra {
     uint64_t predicate_address;
 };
 
+// Only a selected dispatch has this larger extra. Worker numbers and ordinals
+// are static; startup binds the actual register and two launch-local tokens.
+struct CalendarPeerExtra {
+    CalendarExecutionExtra execution;
+    uint32_t sends_offset;
+    uint16_t send_count;
+    uint16_t input_count;
+    uint64_t join_read;
+    uint32_t join_target;
+    uint32_t reserved;
+};
+
+struct CalendarPeerSend {
+    uint64_t join_add;
+    uint32_t worker;
+    uint32_t ordinal;
+};
+
+// SPMD endpoints receive change notifications. The completion counter supplies the proof.
+inline constexpr uint32_t CALENDAR_PEER_SPMD_ENDPOINT = UINT32_MAX;
+
+struct CalendarPeerEndpoint {
+    uint64_t address;
+    uint32_t token_base;
+    uint32_t input_count;
+};
+
+// Each header is followed by three packed arrays: addresses (u64), token bases
+// (u32), and immutable logical workers (u32). Only startup writes the first two.
+struct CalendarPeerFanout {
+    uint32_t previous_offset;
+    uint16_t count;
+    uint16_t burst_count;
+    uint64_t common_token_base;  // UINT64_MAX when different destinations need different tokens.
+};
+// With a common token the launch binder can store a short burst list in the
+// otherwise unused per-target token-base array.
+struct CalendarPeerBurst {
+    uint64_t start;
+    uint32_t stride_bytes;
+    uint32_t targets;
+};
+static_assert(sizeof(CalendarPeerBurst) == 16);
+inline constexpr size_t CALENDAR_FANOUT_TARGET_BYTES = sizeof(uint64_t) + 2 * sizeof(uint32_t);
+
 enum : uint64_t {
     CALENDAR_WAIT_FUSED_FANIN = 0,
     CALENDAR_WAIT_NOTIFY = 1,
@@ -148,16 +200,28 @@ struct alignas(16) CalendarWait {
     uint64_t target;
 };
 
+struct CalendarSpmdPeerExtra {
+    CalendarExecutionExtra execution;
+    CalendarWait completion;
+    uint32_t single_worker;  // Used only by a single-target notification.
+    uint32_t target_count;
+    uint32_t token_begin;
+    uint32_t fanout_offset;
+};
+
 struct CalendarDispatchPatch {
     uint32_t dispatch_offsets[3];
     uint32_t predicate_extra_offset;
 };
 
-static_assert(sizeof(CalendarRangeHeader) == 32);
+static_assert(sizeof(CalendarRangeHeader) == 40 && sizeof(CalendarPeerFanout) == 16);
 static_assert(sizeof(CalendarRange) == 64);
 static_assert(sizeof(CalendarExecutionRow) == 16);
 static_assert(sizeof(CalendarDispatch) == 32);
 static_assert(sizeof(CalendarExecutionExtra) == 32);
+static_assert(sizeof(CalendarPeerExtra) == 56 && offsetof(CalendarPeerExtra, execution) == 0);
+static_assert(sizeof(CalendarPeerEndpoint) == 16 && sizeof(CalendarPeerSend) == 16);
 static_assert(sizeof(CalendarWait) == 16);
+static_assert(sizeof(CalendarSpmdPeerExtra) == 64 && offsetof(CalendarSpmdPeerExtra, completion) == 32);
 
 }  // namespace simpler::percounter

@@ -41,6 +41,30 @@ within that invocation. A deferred wait must never depend on a later Graph
 invocation making progress. Express dependencies between Graph invocations as
 explicit DAG edges.
 
+### Peer notifications on A5
+
+The A5 onboard planner automatically considers peer notifications for eligible
+waits in a single ordinary top-level phase. Active kernels must declare
+`completes_on_return`. Graph invocations, predicated tasks and tasks with
+unknown or deferred completion keep their existing calendar protocol.
+
+An AIV publisher writes the destination worker's DATA_MAIN_BASE register with
+MTE3. For a single predecessor, a change in DMB prompts the receiver to check
+the predecessor's original DONE counter and cumulative threshold for this
+launch. An old token can trigger an extra read. Only the current counter
+value can release the receiver. At a selected two-input join, each predecessor
+contributes one credit. AIV senders order their credits before their DMB write
+with `dsb(DSB_DDR)`. A join with two cube-only predecessors uses its original
+calendar waits and consumes no peer endpoint or additional peer counter.
+
+For ordinary multi-block, MIX and `sync_start` tasks, each selected SPMD wait
+retains its whole-task CntNotify threshold; the existing MIX rendezvous and
+`sync_start` placement constraints still apply. Counted waits read the counter
+on entry, on each new eligible token, and at the first DMB sample at least 300
+SYS_CNT ticks after the last check. Reaching the threshold releases the consumer.
+The [peer DMB design](../../../../docs/zh-cn/design/percounter-peer-dmb.md)
+describes eligibility, hardware ordering assumptions and A5 measurements.
+
 ## CntNotify capacity
 
 The Host requires a complete CntNotify lease for DONE, range tail and
@@ -60,9 +84,11 @@ EXIT generation for each worker without a validated register window. The Host
 upload clears these per-worker slots before launch. A late worker that first
 samples the current EXIT can acknowledge its matching slot and return. The
 run still reports incomplete retirement for those missing windows.
-The lease outlives every worker using it. Retirement still requires each
-discovered core to echo its fresh COND nonce before the AICPU releases that core.
-The calendar leaves DATA_MAIN_BASE available during startup, execution and teardown.
+The lease outlives every worker using it. START and EXIT use CntNotify.
+When a calendar binds peer notifications, the AICPU samples the subscribed
+workers' DATA_MAIN_BASE values before START. Those registers are reserved for
+peer notification tokens during execution. The AICPU retains the peer group
+through teardown until all discovered cores acknowledge their fresh COND nonces.
 
 ## Completion and defer
 

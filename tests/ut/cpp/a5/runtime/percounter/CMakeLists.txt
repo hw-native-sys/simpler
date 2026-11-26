@@ -56,4 +56,5 @@ simpler_ut_add_target(NAME test_a5_percounter_calendar_phases
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/runtime
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/common
         ${SIMPLER_SRC}/common/host_build_graph
+    LINK a5_ut_support
     LABEL no_hardware TIMEOUT 20)

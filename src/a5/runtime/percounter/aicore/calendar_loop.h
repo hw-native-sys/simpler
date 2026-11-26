@@ -486,20 +486,130 @@ inline __aicore__ bool percounter_calendar_wait_range(
     return true;
 }
 
+inline __aicore__ bool
+percounter_decode_counted_wait(const __gm__ CalendarWait &wait, uint64_t &address, uint32_t &threshold) {
+    const uint64_t command = wait.read_cmd;
+    const uint64_t tag = command & CALENDAR_WAIT_TAG_MASK;
+    address = command & ~CALENDAR_WAIT_TAG_MASK;
+    threshold = static_cast<uint32_t>(wait.target) & CALENDAR_COUNT_MASK;
+    return (tag == CALENDAR_WAIT_NOTIFY || tag == CALENDAR_WAIT_DEFER) && address != 0 && threshold != 0;
+}
+
+// The observation clock supplies the counted wait's retry deadline, including at L0.
+inline __aicore__ uint32_t percounter_read_dmb_sample(uint64_t &cycles) {
+#if defined(__CCE_AICORE__)
+    uint64_t token;
+    asm volatile("MOV %0, DATA_MAIN_BASE\nMOV %1, SYS_CNT" : "=&l"(token), "=&l"(cycles) : : "memory");
+    return static_cast<uint32_t>(token);
+#else
+    const auto token = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+    cycles = get_sys_cnt_aicore();
+    return token;
+#endif
+}
+
+inline __aicore__ void percounter_record_dmb_sample(
+    const LaneConfig &cfg, uint64_t entry, uint64_t cycles, uint64_t previous, uint32_t token, uint32_t sequence
+) {
+    if constexpr (task_profile_compiled) {
+        const auto kind =
+            previous == 0 ? PercounterTaskEventKind::PeerDmbMovAtEntry : PercounterTaskEventKind::PeerDmbMovChanged;
+        if (auto *sample = percounter_record_task_event(cfg, kind, entry, cycles, (uint64_t{token} << 32) | sequence)) {
+            const auto delta = cycles - previous;
+            sample->previous_poll_delta =
+                previous != 0 && delta < UINT32_MAX ? static_cast<uint32_t>(delta) : UINT32_MAX;
+        }
+    }
+}
+
+// A changed DMB is a prompt. Only this row's CntNotify threshold proves completion.
+inline constexpr uint64_t CALENDAR_DMB_RECHECK_CYCLES = 300;
+
+template <uint32_t TokenCount>
+inline __aicore__ bool percounter_wait_dmb_count(
+    const LaneConfig &cfg, __gm__ volatile uint32_t &counter, uint32_t threshold, uint32_t token_base, uint64_t entry
+) {
+    constexpr bool spmd = TokenCount == CALENDAR_PEER_SPMD_ENDPOINT;
+    const uint64_t begin = percounter_task_event_clock(cfg);
+    uint64_t mov_cycles = 0;
+    uint64_t last_check = 0;
+    uint64_t seen = UINT64_MAX;
+    const bool ready = percounter_calendar_wait(cfg, [&]() __aicore__ {
+        const uint64_t previous_poll = mov_cycles;
+        const uint32_t token = percounter_read_dmb_sample(mov_cycles);
+        const bool initial = seen == UINT64_MAX;
+        const bool changed = token != seen && (spmd || token - token_base < TokenCount);
+        seen = token;
+        const uint64_t elapsed = mov_cycles - last_check;
+        if (!initial && !changed && elapsed < CALENDAR_DMB_RECHECK_CYCLES) return false;
+
+        const uint32_t count = percounter_notify_query(counter) & CALENDAR_COUNT_MASK;
+        const bool satisfied = count >= threshold;
+        if constexpr (!task_profile_compiled) {
+            if (satisfied) return true;
+        }
+        last_check = get_sys_cnt_aicore();
+        if constexpr (task_profile_compiled) {
+            if (cfg.task_events != nullptr) {
+                if (initial || changed) {
+                    percounter_record_dmb_sample(
+                        cfg, entry, mov_cycles, previous_poll, token, spmd ? token ^ token_base : 0
+                    );
+                    const auto kind =
+                        initial ? PercounterTaskEventKind::PeerInitialProof : PercounterTaskEventKind::PeerObserved;
+                    percounter_record_task_event(cfg, kind, entry, last_check, (uint64_t{token} << 32) | count);
+                } else if (satisfied) {
+                    const uint64_t interval = elapsed > UINT32_MAX ? UINT32_MAX : elapsed;
+                    percounter_record_task_event(
+                        cfg, PercounterTaskEventKind::PeerPeriodicReady, entry, last_check, (interval << 32) | count
+                    );
+                }
+            }
+        }
+        return satisfied;
+    });
+    percounter_record_task_event(cfg, PercounterTaskEventKind::PeerWaitBegin, entry, begin, threshold);
+    return ready;
+}
+
+inline __aicore__ bool percounter_wait_spmd_input(
+    const LaneConfig &cfg, const __gm__ CalendarWait *waits, uint32_t count, uint64_t entry, uint32_t worker
+) {
+    uint64_t address;
+    uint32_t threshold;
+    if (count != 1 || !percounter_decode_counted_wait(waits[0], address, threshold)) {
+        percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, percounter_order_task_id(entry));
+        return false;
+    }
+
+    auto *counter = reinterpret_cast<__gm__ volatile uint32_t *>(address);
+    uint32_t token_base = 0;
+    if constexpr (task_profile_compiled) {
+        if (cfg.task_events != nullptr && cfg.peer_endpoints != nullptr)
+            token_base = cfg.peer_endpoints[worker].token_base;
+    }
+    return percounter_wait_dmb_count<CALENDAR_PEER_SPMD_ENDPOINT>(cfg, *counter, threshold, token_base, entry);
+}
+
 inline __aicore__ bool percounter_calendar_enter(
     const LaneConfig &cfg, const __gm__ CalendarLocalJoin *join, const __gm__ CalendarWait *waits, uint32_t wait_count,
-    uint32_t sequence_base, uint32_t blocks, bool sync, uint64_t entry
+    uint32_t sequence_base, uint32_t blocks, bool sync, uint64_t entry, bool spmd_wait, uint32_t worker
 ) {
     // Keep the first probes immediate. Longer groups use a staggered
     // retry interval so idle lanes do not flood one completion word.
     const uint32_t retry_cycles = wait_count == 1 && !sync ? percounter_calendar_retry_cycles(cfg, blocks, true) : 0;
-    if (join == nullptr) {
-        if (!percounter_calendar_wait_list(cfg, waits, wait_count, entry, UINT64_MAX, retry_cycles)) return false;
+    const auto enter = [&]() __aicore__ {
+        if (spmd_wait) {
+            if (!percounter_wait_spmd_input(cfg, waits, wait_count, entry, worker)) return false;
+        } else if (!percounter_calendar_wait_list(cfg, waits, wait_count, entry, UINT64_MAX, retry_cycles)) {
+            return false;
+        }
         percounter_record_task_event(
             cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg)
         );
         return true;
-    }
+    };
+    if (join == nullptr) return enter();
 
     ProfileScope mix_scope(cfg.scalar, ProfilePhase::MixRendezvous, entry);
     const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
@@ -533,8 +643,7 @@ inline __aicore__ bool percounter_calendar_enter(
         return false;
     // Only the selected role checks data dependencies after all local roles
     // have reached the same calendar block.
-    if (!percounter_calendar_wait_list(cfg, waits, wait_count, entry, UINT64_MAX, retry_cycles)) return false;
-    percounter_record_task_event(cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg));
+    if (!enter()) return false;
     percounter_ssbuf_store_release(&signal->release[lane], arrivals[lane]);
     return true;
 }
@@ -587,9 +696,282 @@ inline __aicore__ bool percounter_calendar_wait_cluster_input(
     return true;
 }
 
+inline __aicore__ bool percounter_wait_peer_inputs(
+    const LaneConfig &cfg, const __gm__ CalendarPeerExtra &peer, const __gm__ CalendarWait *waits, uint32_t wait_count,
+    uint32_t worker, uint64_t entry
+) {
+    const uint32_t inputs = peer.input_count;
+    if (cfg.peer_endpoints == nullptr || inputs == 0 || inputs > 2 ||
+        inputs != cfg.peer_endpoints[worker].input_count ||
+        (inputs == 2 && (peer.join_read == 0 || peer.join_target == 0))) {
+        percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, peer.execution.task_id);
+        return false;
+    }
+    const uint32_t base = cfg.peer_endpoints[worker].token_base;
+    if (inputs == 2) {
+        auto *counter = reinterpret_cast<__gm__ volatile uint32_t *>(peer.join_read);
+        return percounter_wait_dmb_count<2>(cfg, *counter, peer.join_target, base, entry);
+    }
+    // A delayed DMB write can match this launch's token. The original wait
+    // carries the producer's threshold, including earlier credits on its chain.
+    uint64_t address;
+    uint32_t threshold;
+    if (wait_count != 1 || !percounter_decode_counted_wait(waits[0], address, threshold)) {
+        percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, peer.execution.task_id);
+        return false;
+    }
+    auto *counter = reinterpret_cast<__gm__ volatile uint32_t *>(address);
+    return percounter_wait_dmb_count<1>(cfg, *counter, threshold, base, entry);
+}
+
+#if !defined(__DAV_CUBE__)
+inline __aicore__ void percounter_write_peer_dmb(
+    const LaneConfig &cfg, __gm__ uint32_t *dmb, uint32_t worker, uint32_t token, uint64_t entry
+) {
+#if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
+    percounter_release_dmb_source(cfg);
+    pipe_barrier(PIPE_ALL);
+    set_atomic_none();
+    set_loop_size_ubtoout((1U << 21) | 1U);
+    auto *word = reinterpret_cast<__ubuf__ uint32_t *>(32);
+    *word = token;
+    set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+#endif
+    const uint64_t write_begin = percounter_task_event_clock(cfg);
+#if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
+    copy_ubuf_to_gm_align_v2(dmb, word, 0, 1, sizeof(token), 0, 0, 0);
+#else
+    __atomic_store_n(dmb, token, __ATOMIC_RELEASE);
+#endif
+    const uint64_t issued = percounter_task_event_clock(cfg);
+#if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    cfg.peer_dmb_source_in_use = true;
+    constexpr auto published = PercounterTaskEventKind::PeerMtePublished;
+#else
+    constexpr auto published = PercounterTaskEventKind::PeerPublished;
+#endif
+    const uint64_t detail = (uint64_t{worker} << 32) | token;
+    percounter_record_task_event(cfg, PercounterTaskEventKind::PeerWriteBegin, entry, write_begin, detail);
+    percounter_record_task_event(cfg, published, entry, issued, detail);
+}
+
+// A DMB wakeup can make its receiver read CntNotify immediately.
+inline __aicore__ void percounter_order_credit_before_dmb() {
+#if defined(__CCE_AICORE__)
+    dsb(DSB_DDR);
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+#endif  // !__DAV_CUBE__
+
+inline __aicore__ bool percounter_send_peer_notifications(
+    const LaneConfig &cfg, const __gm__ uint8_t *image, uint64_t bytes, const __gm__ CalendarPeerExtra &peer,
+    uint64_t entry, bool credited_done
+) {
+    const uint32_t count = peer.send_count;
+    const auto *sends = percounter_calendar_table<CalendarPeerSend>(image, bytes, peer.sends_offset, count);
+    if (sends == nullptr) return false;
+#if !defined(__DAV_VEC__)
+    // Only non-exclusive joins give a cube producer an extra credit to publish.
+    if (cfg.cluster_lane == 0) {
+        for (uint32_t i = 0; i < count; ++i)
+            percounter_calendar_add(sends[i].join_add);
+        return true;
+    }
+#endif
+#if !defined(__DAV_CUBE__)
+    if (cfg.peer_endpoints == nullptr) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto &send = sends[i];
+        const uint32_t worker = send.worker;
+        if (worker >= cfg.cluster_count * PLATFORM_CORES_PER_BLOCKDIM) return false;
+        const auto &target = cfg.peer_endpoints[worker];
+        const uint32_t ordinal = send.ordinal;
+        if (ordinal >= target.input_count || target.address == 0) return false;
+        const uint32_t token = target.token_base + ordinal;
+        auto *dmb = reinterpret_cast<__gm__ uint32_t *>(target.address);
+        // An exclusive join shares DONE. A separate join contributes its own INC.
+        const uint64_t join_add = target.input_count == 2 ? send.join_add : 0;
+        percounter_calendar_add(join_add);
+        if ((i == 0 && credited_done) || join_add != 0) percounter_order_credit_before_dmb();
+        percounter_write_peer_dmb(cfg, dmb, worker, token, entry);
+    }
+#endif
+    return true;
+}
+
+#if !defined(__DAV_CUBE__)
+#if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
+inline __aicore__ void percounter_finish_dmb_batch(
+    const LaneConfig &cfg, uint64_t entry, uint64_t begin, uint32_t count, uint32_t commands, uint32_t sequence
+) {
+    const uint64_t issued = percounter_task_event_clock(cfg);
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    cfg.peer_dmb_source_in_use = true;
+    const uint64_t detail = (uint64_t{commands} << 48) | (uint64_t{count} << 32) | sequence;
+    percounter_record_task_event(cfg, PercounterTaskEventKind::PeerBatchBegin, entry, begin, detail);
+    percounter_record_task_event(cfg, PercounterTaskEventKind::PeerMteBatchIssued, entry, issued, detail);
+}
+
+template <bool SharedWord, uint32_t Width = 0>
+inline __aicore__ void percounter_issue_dmb_batch(
+    const LaneConfig &cfg, const __ubuf__ uint64_t *addresses, uint32_t count, __ubuf__ uint32_t *words, uint64_t entry,
+    uint32_t sequence
+) {
+    constexpr uint32_t words_per_line = 32 / sizeof(uint32_t);
+    const uint64_t first = addresses[0];
+    if constexpr (task_profile_compiled) asm volatile("" : : "l"(first) : "memory");
+    const uint64_t begin = percounter_task_event_clock(cfg);
+    copy_ubuf_to_gm_align_v2(reinterpret_cast<__gm__ uint32_t *>(first), words, 0, 1, sizeof(uint32_t), 0, 0, 0);
+    const auto write = [&](uint32_t i) __aicore__ {
+        auto *destination = reinterpret_cast<__gm__ uint32_t *>(addresses[i]);
+        auto *source = SharedWord ? words : words + i * words_per_line;
+        copy_ubuf_to_gm_align_v2(destination, source, 0, 1, sizeof(uint32_t), 0, 0, 0);
+    };
+    if constexpr (Width != 0) {
+#pragma clang loop unroll(full)
+        for (uint32_t i = 1; i < Width; ++i)
+            write(i);
+    } else {
+        for (uint32_t i = 1; i < count; ++i)
+            write(i);
+    }
+    percounter_finish_dmb_batch(cfg, entry, begin, count, count, sequence);
+}
+
+#endif
+
+__attribute__((noinline)) __aicore__ bool percounter_send_prepared_fanout(
+    const LaneConfig &cfg, const __gm__ uint8_t *image, uint64_t bytes, uint32_t offset, uint32_t count,
+    uint32_t sequence, uint64_t entry
+) {
+    const auto *fanout = percounter_calendar_table<CalendarPeerFanout>(image, bytes, offset, 1);
+    if (fanout == nullptr || count > SCHEDULER_WORKER_CAPACITY || fanout->count != count ||
+        sizeof(*fanout) + uint64_t{count} * CALENDAR_FANOUT_TARGET_BYTES > bytes - offset)
+        return false;
+    const auto *addresses = reinterpret_cast<const __gm__ uint64_t *>(fanout + 1);
+    const auto *bases = reinterpret_cast<const __gm__ uint32_t *>(addresses + count);
+    const uint64_t common = fanout->common_token_base;
+#if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
+    constexpr uint32_t words_per_line = 32 / sizeof(uint32_t);
+    auto *words = reinterpret_cast<__ubuf__ uint32_t *>(32);
+
+    percounter_release_dmb_source(cfg);
+    pipe_barrier(PIPE_ALL);
+    set_atomic_none();
+    set_loop_size_ubtoout((1U << 21) | 1U);
+    const uint32_t commands = fanout->burst_count;
+    if (commands != 0) {
+        if (common == UINT64_MAX || commands > count * sizeof(uint32_t) / sizeof(CalendarPeerBurst)) return false;
+        const auto *bursts = reinterpret_cast<const __gm__ CalendarPeerBurst *>(bases);
+        *words = static_cast<uint32_t>(common) ^ sequence;
+        set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+        const uint64_t first_address = bursts[0].start;
+        const uint32_t first_count = bursts[0].targets;
+        const uint32_t first_stride = bursts[0].stride_bytes;
+        if constexpr (task_profile_compiled)
+            asm volatile("" : : "l"(first_address), "l"(uint64_t{first_count}), "l"(uint64_t{first_stride}) : "memory");
+        const uint64_t begin = percounter_task_event_clock(cfg);
+        copy_ubuf_to_gm_align_v2(
+            reinterpret_cast<__gm__ uint32_t *>(first_address), words, 0, first_count, sizeof(uint32_t), 0,
+            first_stride, 0
+        );
+        for (uint32_t i = 1; i < commands; ++i) {
+            auto *destination = reinterpret_cast<__gm__ uint32_t *>(bursts[i].start);
+            copy_ubuf_to_gm_align_v2(
+                destination, words, 0, bursts[i].targets, sizeof(uint32_t), 0, bursts[i].stride_bytes, 0
+            );
+        }
+        percounter_finish_dmb_batch(cfg, entry, begin, count, commands, sequence);
+        return true;
+    }
+    // Copy the immutable multicast list in one transfer while Scalar prepares the payload.
+    auto *local_addresses = reinterpret_cast<__ubuf__ uint64_t *>(32 * (1 + SCHEDULER_WORKER_CAPACITY));
+    set_loop_size_outtoub((1U << 21) | 1U);
+    copy_gm_to_ubuf_align_v2(
+        reinterpret_cast<__ubuf__ uint8_t *>(local_addresses),
+        reinterpret_cast<__gm__ uint8_t *>(const_cast<__gm__ uint64_t *>(addresses)), 0, 1, count * sizeof(uint64_t), 0,
+        0, false, 0, 0, 0
+    );
+    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+    if (common != UINT64_MAX) {
+        *words = static_cast<uint32_t>(common) ^ sequence;
+        set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+        // A full cube wave, vector wave and mixed wave have fixed multicast widths on A5.
+        if (count == 32) percounter_issue_dmb_batch<true, 32>(cfg, local_addresses, count, words, entry, sequence);
+        else if (count == 64) percounter_issue_dmb_batch<true, 64>(cfg, local_addresses, count, words, entry, sequence);
+        else if (count == 96) percounter_issue_dmb_batch<true, 96>(cfg, local_addresses, count, words, entry, sequence);
+        else percounter_issue_dmb_batch<true>(cfg, local_addresses, count, words, entry, sequence);
+    } else {
+        // Distinct source lines stay immutable while the whole batch is in flight.
+        for (uint32_t i = 0; i < count; ++i)
+            words[i * words_per_line] = bases[i] ^ sequence;
+        set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+        percounter_issue_dmb_batch<false>(cfg, local_addresses, count, words, entry, sequence);
+    }
+#else
+    const uint32_t shared_word = static_cast<uint32_t>(common) ^ sequence;
+    const uint64_t begin = percounter_task_event_clock(cfg);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t token = common == UINT64_MAX ? bases[i] ^ sequence : shared_word;
+        auto *destination = reinterpret_cast<__gm__ uint32_t *>(addresses[i]);
+        __atomic_store_n(destination, token, __ATOMIC_RELEASE);
+    }
+    const uint64_t issued = percounter_task_event_clock(cfg);
+    const uint64_t detail = (uint64_t{count} << 32) | sequence;
+    percounter_record_task_event(cfg, PercounterTaskEventKind::PeerBatchBegin, entry, begin, detail);
+    percounter_record_task_event(cfg, PercounterTaskEventKind::PeerScalarBatchIssued, entry, issued, detail);
+#endif
+    return true;
+}
+
+inline __aicore__ bool percounter_complete_spmd_and_notify(
+    const LaneConfig &cfg, const __gm__ uint8_t *image, uint64_t bytes, const __gm__ CalendarSpmdPeerExtra &peer,
+    uint64_t done_add_cmd, uint32_t block, uint32_t role, uint64_t entry
+) {
+    const uint32_t count = peer.target_count;
+    const uint32_t sequence = peer.token_begin + PLATFORM_CORES_PER_BLOCKDIM * block + role;
+    if (count > 1) {
+        uint64_t read_address;
+        uint32_t threshold;
+        if (!percounter_decode_counted_wait(peer.completion, read_address, threshold)) return false;
+#if defined(__CCE_AICORE__)
+        // Materialize the untagged read address before issuing the completion credit.
+        asm volatile("" : "+l"(read_address) : : "memory");
+#endif
+        auto *counter = reinterpret_cast<__gm__ volatile uint32_t *>(read_address);
+        percounter_calendar_add(done_add_cmd);
+        percounter_order_credit_before_dmb();
+        if ((percounter_notify_query(*counter) & CALENDAR_COUNT_MASK) < threshold) return true;
+        return percounter_send_prepared_fanout(cfg, image, bytes, peer.fanout_offset, count, sequence, entry);
+    }
+    percounter_calendar_add(done_add_cmd);
+    percounter_order_credit_before_dmb();
+    const uint32_t worker = peer.single_worker;
+    if (count != 1 || cfg.peer_endpoints == nullptr || worker >= cfg.cluster_count * PLATFORM_CORES_PER_BLOCKDIM)
+        return false;
+    const auto &target = cfg.peer_endpoints[worker];
+    if (target.input_count != CALENDAR_PEER_SPMD_ENDPOINT || target.address == 0) return false;
+    percounter_write_peer_dmb(
+        cfg, reinterpret_cast<__gm__ uint32_t *>(target.address), worker, target.token_base ^ sequence, entry
+    );
+    return true;
+}
+
+#endif  // !__DAV_CUBE__
+
 inline __aicore__ bool percounter_calendar_execute_range(
     const LaneConfig &cfg, const __gm__ uint8_t *image, uint64_t bytes, const __gm__ CalendarRange &range,
-    uint32_t sample_offset, uint32_t worker_row_begin, uint32_t range_index
+    uint32_t sample_offset, uint32_t worker_row_begin, uint32_t range_index, uint32_t worker
 ) {
     const uint32_t row_count = range.row_count;
     const uint32_t binding_offset = range.binding_offset;
@@ -648,6 +1030,8 @@ inline __aicore__ bool percounter_calendar_execute_range(
         const auto *dispatch = reinterpret_cast<const __gm__ CalendarDispatch *>(binding + row->dispatch_offset);
         const auto *waits = reinterpret_cast<const __gm__ CalendarWait *>(binding + dispatch->waits_offset);
         const auto *extra = reinterpret_cast<const __gm__ CalendarExecutionExtra *>(binding + dispatch->extra_offset);
+        const auto *peer =
+            (flags & CALENDAR_EXEC_PEER) != 0 ? reinterpret_cast<const __gm__ CalendarPeerExtra *>(extra) : nullptr;
         bool deferred = false;
         const uint32_t mix_delta = row->mix_delta;
         constexpr uint16_t non_join_flags =
@@ -667,7 +1051,12 @@ inline __aicore__ bool percounter_calendar_execute_range(
                 );
         }
         percounter_record_task_event(cfg, PercounterTaskEventKind::RowBegin, entry, row_begin);
-        if ((flags & CALENDAR_EXEC_INPUT_FOLLOWER) != 0) {
+        if (peer != nullptr && peer->input_count != 0) {
+            if (!percounter_wait_peer_inputs(cfg, *peer, waits, row->wait_count, worker, entry)) return false;
+            percounter_record_task_event(
+                cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg)
+            );
+        } else if ((flags & CALENDAR_EXEC_INPUT_FOLLOWER) != 0) {
             if (row->wait_count != 0) {
                 percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, percounter_order_task_id(entry));
                 return false;
@@ -684,7 +1073,10 @@ inline __aicore__ bool percounter_calendar_execute_range(
             percounter_record_task_event(
                 cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg)
             );
-        } else if (!percounter_calendar_enter(cfg, join, waits, row->wait_count, sequence_base, blocks, sync, entry)) {
+        } else if (!percounter_calendar_enter(
+                       cfg, join, waits, row->wait_count, sequence_base, blocks, sync, entry,
+                       (flags & CALENDAR_EXEC_SPMD_WAIT) != 0, worker
+                   )) {
             return false;
         }
         if ((flags & CALENDAR_EXEC_INPUT_OWNER) != 0) {
@@ -719,9 +1111,33 @@ inline __aicore__ bool percounter_calendar_execute_range(
                 percounter_ssbuf_store_field(touched, uint32_t{0});
             }
         }
+        if (deferred && (flags & CALENDAR_EXEC_PEER_PRODUCER) != 0) {
+            // The registered completion-on-return contract was violated. The supervisor
+            // releases the still-waiting subscribers through its regular error shutdown.
+            percounter_fail(cfg, SchedulerGraphResult::ASYNC_REGISTRATION_FAILED, extra->task_id);
+            return false;
+        }
         if (!deferred) {
             ProfileScope profile_scope(cfg.scalar, ProfilePhase::Complete, entry);
-            percounter_calendar_add(done_add_cmd);
+#if !defined(__DAV_CUBE__)
+            if ((flags & CALENDAR_EXEC_SPMD_SEND) != 0) {
+                if (!percounter_complete_spmd_and_notify(
+                        cfg, image, bytes, *reinterpret_cast<const __gm__ CalendarSpmdPeerExtra *>(extra), done_add_cmd,
+                        block, role, entry
+                    )) {
+                    percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, extra->task_id);
+                    return false;
+                }
+            } else
+#endif
+            {
+                percounter_calendar_add(done_add_cmd);
+                if (peer != nullptr && peer->send_count != 0 &&
+                    !percounter_send_peer_notifications(cfg, image, bytes, *peer, entry, done_add_cmd != 0)) {
+                    percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, extra->task_id);
+                    return false;
+                }
+            }
             const uint64_t issued = percounter_task_event_clock(cfg);
             if (sink) percounter_calendar_add(extra->shell_add_cmd);
             percounter_record_task_event(
@@ -771,6 +1187,14 @@ inline __aicore__ void percounter_calendar_loop(const LaneConfig &cfg) {
     const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
     const uint32_t cluster = static_cast<uint32_t>(cfg.cluster_index);
     const uint32_t worker = lane == 0 ? cluster : cfg.cluster_count + cluster * cfg.aiv_per_cluster + lane - 1;
+    if (calendar->peer_endpoints_offset != 0) {
+        cfg.peer_endpoints =
+            percounter_calendar_table<CalendarPeerEndpoint>(image, bytes, calendar->peer_endpoints_offset, workers);
+        if (cfg.peer_endpoints == nullptr) {
+            percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS);
+            return;
+        }
+    }
     const uint32_t begin = indices[worker];
     const uint32_t end = indices[worker + 1];
     if (begin > end || end > range_count) {
@@ -780,7 +1204,8 @@ inline __aicore__ void percounter_calendar_loop(const LaneConfig &cfg) {
     uint32_t worker_row_begin = 0;
     for (uint32_t i = begin; i < end; ++i) {
         if (!percounter_calendar_execute_range(
-                cfg, image, bytes, ranges[i], sample_indices != nullptr ? sample_indices[i] : 0, worker_row_begin, i
+                cfg, image, bytes, ranges[i], sample_indices != nullptr ? sample_indices[i] : 0, worker_row_begin, i,
+                worker
             ))
             return;
         worker_row_begin += ranges[i].row_count;

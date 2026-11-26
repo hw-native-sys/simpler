@@ -13,6 +13,7 @@ import json
 import pytest
 from _capture_builder import Capture
 
+from simpler_setup.tools.percounter import scheduler_view
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
 
 
@@ -174,3 +175,130 @@ def test_calendar_scheduler_tracks_preserve_role_and_defer_actor(tmp_path, level
     )
     assert observed["ts"] > published["ts"]
     assert observed["args"]["watermark"] == 16
+
+
+@pytest.mark.parametrize("mte3", [False, True])
+def test_calendar_peer_dmb_markers_keep_target_token_and_observed_count(mte3):
+    identity = {"run_epoch": 1, "block_index": 0, "block_count": 1, "cluster_index": 0}
+    sender = {**identity, "kind": "peer_dmb_published", "task_id": 7, "worker_id": 0, "cluster_lane": 0, "cycles": 10}
+    receiver = {**identity, "kind": "peer_dmb_observed", "task_id": 8, "worker_id": 1, "cluster_lane": 1, "cycles": 11}
+    section = {
+        "records": [
+            {**sender, "kind": "peer_dmb_write_begin", "target_worker": 1, "token": 2, "cycles": 8},
+            {**sender, "target_worker": 1, "token": 2, **({"transport": "MTE3"} if mte3 else {})},
+            {**receiver, "token": 2, "count": 1},
+            {**receiver, "token": 3, "count": 2, "cycles": 12},
+            {**receiver, "kind": "peer_dmb_wait_begin", "join_threshold": 2, "cycles": 6},
+        ],
+        "range_records": [],
+        "dropped": 0,
+        "unmatched_deferred_updates": 0,
+        "folded_task_ids": [],
+        "inline_completed_task_ids": [],
+    }
+    capture = scheduler_view.decode_capture(scheduler_view.parse_capture(section), float)
+    events = list(scheduler_view.trace_events(capture, 3, str))
+    ticks = [e for e in events if e["ph"] == "i"]
+    assert [e["args"]["token"] for e in ticks] == [2, 2, 3]
+    assert ticks[0]["args"]["target_worker"] == 1
+    assert [e["args"]["count"] for e in ticks[1:]] == [1, 2]
+    assert ticks[0]["tid"] != ticks[1]["tid"] == ticks[2]["tid"]
+    write, wait = (e for e in events if e["cat"] == "percounter_dmb")
+    assert (write["tid"], write["ts"], write["dur"]) == (ticks[0]["tid"], 8, 2)
+    assert (wait["tid"], wait["ts"], wait["dur"]) == (ticks[1]["tid"], 6, 6)
+    assert write["name"].endswith("Issue MTE3 DMB write → 8" if mte3 else "Write DMB → 8")
+    assert write["args"]["transport"] == ("MTE3" if mte3 else "Scalar")
+    assert wait["args"]["observed_tokens"] == wait["args"]["join_threshold"] == 2
+    partial = {**capture, "records": [r for r in capture["records"] if r.get("count") != 2]}
+    assert not any("Wait on local DMB" in e["name"] for e in scheduler_view.trace_events(partial, 3, str))
+    with pytest.raises(ValueError, match="completion count"):
+        scheduler_view.parse_capture({**section, "records": [{**receiver, "token": 2}]})
+    with pytest.raises(ValueError, match="join threshold"):
+        scheduler_view.parse_capture(
+            {**section, "records": [{**receiver, "kind": "peer_dmb_wait_begin", "join_threshold": 0}]}
+        )
+
+
+def test_dmb_register_observation_precedes_completion_check_on_receiver_lane():
+    identity = dict(run_epoch=1, task_id=8, worker_id=1, block_index=0, block_count=1, cluster_index=0, cluster_lane=1)
+    records = [
+        dict(identity, kind="peer_dmb_mov_at_entry", cycles=12, token=7, sequence=0),
+        dict(identity, kind="peer_dmb_mov_changed", cycles=25, token=10, sequence=13, previous_poll_cycles=22),
+        dict(identity, kind="peer_dmb_observed", cycles=38, token=10, count=2),
+    ]
+    section = dict(
+        records=records,
+        range_records=[],
+        dropped=0,
+        unmatched_deferred_updates=0,
+        folded_task_ids=[],
+        inline_completed_task_ids=[],
+    )
+    capture = scheduler_view.decode_capture(scheduler_view.parse_capture(section), float)
+    marks = [e for e in scheduler_view.trace_events(capture, 3, str) if e["ph"] == "i"]
+    assert [e["args"]["kind"] for e in marks] == [r["kind"] for r in records]
+    assert [e["ts"] for e in marks] == [12, 25, 38]
+    assert len({e["tid"] for e in marks}) == 1
+    assert marks[1]["args"]["previous_poll_cycles"] == 22
+    assert marks[1]["args"]["sequence"] == 13
+    records[0]["previous_poll_cycles"] = 11
+    with pytest.raises(ValueError, match="previous sample time"):
+        scheduler_view.parse_capture(section)
+
+
+def test_periodic_count_releases_wait_without_a_new_dmb_token():
+    row = dict(run_epoch=1, task_id=3, worker_id=0, block_index=0, block_count=1, cluster_index=0, cluster_lane=0)
+    records = [
+        dict(row, kind="peer_dmb_wait_begin", cycles=1, join_threshold=2),
+        dict(row, kind="peer_dmb_initial_proof", cycles=12, token=9, count=1),
+        dict(row, kind="peer_dmb_periodic_ready", cycles=336, cycles_since_last_check=310, count=2),
+    ]
+    section = dict(
+        records=records,
+        range_records=[],
+        dropped=0,
+        unmatched_deferred_updates=0,
+        folded_task_ids=[],
+        inline_completed_task_ids=[],
+    )
+    capture = scheduler_view.decode_capture(scheduler_view.parse_capture(section), float)
+    events = list(scheduler_view.trace_events(capture, 3, str))
+    (wait,) = [e for e in events if e["cat"] == "percounter_dmb" and e["ph"] == "X"]
+    assert (wait["ts"], wait["dur"]) == (1, 335)
+    assert wait["args"]["observed_tokens"] == 0
+    assert wait["args"]["join_threshold"] == wait["args"]["count"] == 2
+    assert wait["args"]["cycles_since_last_check"] == 310
+    assert "token" not in wait["args"]
+    assert any(e["ph"] == "i" and e["args"].get("kind") == "peer_dmb_periodic_ready" for e in events)
+
+
+@pytest.mark.parametrize("transport", ["Scalar", "MTE3"])
+def test_dmb_batch_shows_one_first_to_last_issue_span(transport):
+    identity = dict(
+        run_epoch=1,
+        task_id=1,
+        worker_id=32,
+        block_index=0,
+        block_count=32,
+        cluster_index=0,
+        cluster_lane=1,
+        target_count=64,
+        sequence=7,
+    )
+    begin = dict(identity, kind="peer_dmb_batch_begin", cycles=12)
+    end = dict(identity, kind="peer_dmb_batch_issued", transport=transport, cycles=25)
+    if transport == "MTE3":
+        end["command_count"] = 9
+    section = dict(
+        records=[begin, end],
+        range_records=[],
+        dropped=0,
+        unmatched_deferred_updates=0,
+        folded_task_ids=[],
+        inline_completed_task_ids=[],
+    )
+    capture = scheduler_view.decode_capture(scheduler_view.parse_capture(section), float)
+    (span,) = [e for e in scheduler_view.trace_events(capture, 3, str) if e["cat"] == "percounter_dmb"]
+    assert (span["ts"], span["dur"], span["args"]["transport"], span["args"]["target_count"]) == (12, 13, transport, 64)
+    if transport == "MTE3":
+        assert span["args"]["command_count"] == 9

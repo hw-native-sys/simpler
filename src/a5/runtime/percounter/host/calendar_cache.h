@@ -189,7 +189,7 @@ inline CalendarKey make_calendar_key(
             key.end(),
             {task.active_mask, static_cast<uint64_t>(task.block_num), static_cast<uint64_t>(task.subtask_count),
              task.sync_start, task.inline_completed, static_cast<uint64_t>(task.fanin_count),
-             static_cast<uint64_t>(task.graph_invocation), task.has_predicate}
+             static_cast<uint64_t>(task.graph_invocation), task.has_predicate, task.known_synchronous}
         );
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             if ((task.active_mask & (1U << lane)) != 0) key.push_back(metadata[id].kernel_ids[lane]);

@@ -44,9 +44,15 @@ add_custom_command(TARGET test_a5_aicpu_topology_fallback POST_BUILD
         "$<TARGET_FILE_DIR:test_a5_aicpu_topology_fallback>/aicpu_cpu_topo_fallback.json"
 )
 
+# Only this test drives the retirement owner's clock and observes its MMIO reads.
+add_library(a5_test_retirement_owner OBJECT ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp)
+simpler_ut_common_includes(a5 aicpu retirement_owner_contract)
+target_include_directories(a5_test_retirement_owner PRIVATE ${retirement_owner_contract})
+target_compile_definitions(a5_test_retirement_owner PRIVATE
+    read_reg=retirement_test_read_reg get_sys_cnt_aicpu=retirement_test_sys_cnt)
 a5_platform_case(test_aicore_retirement.cpp
+    OBJS a5_test_retirement_owner
     SOURCES
-        ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
         ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
         ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
         ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp

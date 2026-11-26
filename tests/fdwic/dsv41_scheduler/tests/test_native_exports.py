@@ -10,6 +10,9 @@
 
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -53,3 +56,49 @@ def test_export_keeps_native_plans_and_uses_host_entry_for_moe(monkeypatch, tmp_
         for rank in range(2):
             captured = (capture / f"rank{rank}/submissions.bin").read_bytes()
             assert (case / f"plan-rank{rank}.bin").read_bytes() == captured
+
+
+@pytest.fixture(scope="module")
+def native_runner(tmp_path_factory):
+    runner = os.environ.get("DSV41_RUNNER")
+    if runner:
+        return runner
+    if not shutil.which("cmake"):
+        pytest.skip("cmake or a built DSV41_RUNNER is required")
+    build = tmp_path_factory.mktemp("tools")
+    subprocess.run(["cmake", "-S", PRODUCTION, "-B", build, f"-DSIMPLER_ROOT={PRODUCTION.parents[3]}"], check=True)
+    subprocess.run(["cmake", "--build", build, "--target", "native-runner", "-j4"], check=True)
+    return build / "native-runner"
+
+
+def test_kernel_completion_declaration_survives_packing_and_orchestration_replacement(tmp_path, native_runner):
+    kernel = tmp_path / "kernel.bin"
+    kernel.write_bytes(bytes(range(32)))
+    host = tmp_path / "host.so"
+    host.write_bytes(bytes(range(64)))
+    manifest = tmp_path / "kernels.txt"
+    manifest.write_text(f'1 3\n2\n0 1 3 "{kernel}"\n1 1 3 "{kernel}" on_return\n')
+    packed, repacked = tmp_path / "callable.bin", tmp_path / "replacement.bin"
+    subprocess.run([native_runner, "--assemble-orchestration", manifest, host, packed], check=True)
+    host.write_bytes(b"changed orchestration")
+    subprocess.run([native_runner, "--repack-orchestration", packed, host, repacked], check=True)
+    for path in (packed, repacked):
+        description = json.loads(subprocess.check_output([native_runner, "--describe-callable", path], text=True))
+        assert [k["completes_on_return"] for k in description["kernels"]] == [False, True]
+
+
+@pytest.mark.parametrize("declaration", ["1 1 0 0", "1 2 2 1", "1 0 0 0", "unknown", "on_return extra"])
+def test_native_assembly_rejects_invalid_completion_declarations(tmp_path, native_runner, declaration):
+    kernel = tmp_path / "kernel.bin"
+    kernel.write_bytes(bytes(range(32)))
+    host = tmp_path / "host.so"
+    host.write_bytes(bytes(range(64)))
+    manifest = tmp_path / "kernels.txt"
+    manifest.write_text(f'1 3\n1\n0 1 3 "{kernel}" {declaration}\n')
+    output = tmp_path / "callable.bin"
+    result = subprocess.run(
+        [native_runner, "--assemble-orchestration", manifest, host, output], capture_output=True, text=True, check=False
+    )
+    assert result.returncode != 0
+    assert "kernel completion declaration" in result.stderr
+    assert not output.exists()

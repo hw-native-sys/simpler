@@ -149,6 +149,7 @@ struct AicoreExitTarget {
     uint64_t reg_addr;
     AicoreTeardownControl *teardown;
     bool uses_dispatch_register{true};  // False when EXIT was broadcast by CntNotify.
+    bool retain_until_all_ack{false};   // A peer can still write this core until its own EXIT ACK.
 };
 
 // Enable exit signalling without releasing a core into normal initialization.
@@ -164,6 +165,7 @@ void platform_open_aicore_exit_window(uint64_t reg_addr);
 // values against one shared deadline. Close/read back every acknowledged
 // window, drain the closes, then release only those cores. An unacknowledged
 // core is neither closed nor released; it remains owned by host recovery.
+// For a target retained by peer writers, a partial group ACK also holds its return gate.
 // ACK arriving after return does not run another close/release pass. A failed
 // group remains retained until device-owner recovery proves it safe to retire;
 // repeating a kernel or publishing another request is not that proof.

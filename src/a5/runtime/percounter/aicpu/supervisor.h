@@ -27,12 +27,14 @@
 #include "aicore_scheduler_error.h"
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/device_time.h"
+#include "aicpu/platform_regs.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/shared_memory.h"
 #include "graph_prepare.h"
+#include "peer_fanout.h"
 #include "runtime.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "scheduler/wire_types.h"
@@ -71,6 +73,42 @@ inline void percounter_reset_calendar_notifications(const CalendarRangeHeader &c
         *reinterpret_cast<volatile uint32_t *>(slots[i]) = 0;
 }
 
+// Before START, these logical entries are private to the binder. Discovery
+// already rejected duplicate physical windows. Only subscribed workers need
+// their actual low DMB word sampled for this launch.
+inline bool percounter_bind_peer_endpoints(
+    CalendarRangeHeader &calendar, uint64_t bytes, int32_t aic_count, AicoreLifecycle &lifecycle
+) {
+    const uint32_t offset = calendar.peer_endpoints_offset;
+    if (offset == 0) return calendar.peer_fanouts_offset == 0;
+    const uint32_t workers = calendar.worker_count;
+    if (workers != static_cast<uint32_t>(lifecycle.core_count()) || offset < sizeof(calendar) ||
+        offset % alignof(CalendarPeerEndpoint) != 0 || offset > bytes ||
+        workers > (bytes - offset) / sizeof(CalendarPeerEndpoint))
+        return false;
+    auto *endpoints = reinterpret_cast<CalendarPeerEndpoint *>(reinterpret_cast<uint8_t *>(&calendar) + offset);
+    const size_t table_bytes = workers * sizeof(*endpoints);
+    cache_invalidate_range(endpoints, table_bytes);
+    rmb();
+    for (uint32_t worker = 0; worker < workers; ++worker) {
+        auto &endpoint = endpoints[worker];
+        if (endpoint.input_count == 0) continue;
+        const auto expected_type = worker < static_cast<uint32_t>(aic_count) ? CoreType::AIC : CoreType::AIV;
+        const bool spmd = endpoint.input_count == CALENDAR_PEER_SPMD_ENDPOINT;
+        if ((!spmd && endpoint.input_count > 2) || !lifecycle.core_reported(worker) ||
+            lifecycle.core_type(worker) != expected_type)
+            return false;
+        auto *cell = get_reg_ptr(lifecycle.core_reg_base(worker), RegId::DATA_MAIN_BASE);
+        endpoint.address = reinterpret_cast<uint64_t>(cell);
+        const uint32_t initial = reg_load_acquire(cell);
+        endpoint.token_base = spmd ? initial : ((initial ^ 2U) & 2U);
+    }
+    cache_flush_range(endpoints, table_bytes);
+    if (!percounter_bind_peer_fanouts(calendar, bytes, endpoints)) return false;
+    lifecycle.retain_peer_dmb_group();
+    return true;
+}
+
 /**
  * Publish the discovered topology into the control block. Leader only, after
  * every thread has handshaken its slice.
@@ -80,7 +118,7 @@ inline void percounter_reset_calendar_notifications(const CalendarRangeHeader &c
  * not exist -- the same topology contract the resident path checks.
  */
 inline int32_t
-percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycle, uint64_t scheduler_timeout_cycles) {
+percounter_post_handshake_init(Runtime *runtime, AicoreLifecycle &lifecycle, uint64_t scheduler_timeout_cycles) {
     PercounterControl *control = percounter_control(runtime);
     if (control == nullptr || runtime->dev.host_total_tasks < 0) return -1;
 
@@ -116,9 +154,16 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     control->scheduler_timeout_cycles = scheduler_timeout_cycles;
     cache_flush_range(control, sizeof(*control));
     percounter_graph_prepare_init(control);
-    const auto *calendar = scheduler_state_at<CalendarRangeHeader>(control, control->calendar_offset);
-    if (calendar == nullptr) return -1;
+    const uint64_t offset = control->calendar_offset;
+    if (offset < sizeof(*control) || offset % alignof(CalendarRangeHeader) != 0 || offset > control->image_bytes ||
+        sizeof(CalendarRangeHeader) > control->image_bytes - offset)
+        return -1;
+    auto *calendar = scheduler_state_at<CalendarRangeHeader>(control, offset);
     cache_invalidate_range(calendar, sizeof(*calendar));
+    if (!percounter_bind_peer_endpoints(*calendar, control->image_bytes - offset, aic_count, lifecycle)) {
+        LOG_ERROR("A5 percounter: invalid peer DMB endpoint table");
+        return -1;
+    }
     percounter_reset_calendar_notifications(*calendar);
     wmb();
     LOG_INFO("A5 percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);

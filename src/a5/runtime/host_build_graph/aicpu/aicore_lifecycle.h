@@ -71,6 +71,8 @@ public:
     // Whether `worker` reported to this run: only an accepted report fills its
     // register address, so a silent worker must not be told READY.
     bool core_reported(int32_t worker) const { return cores_[worker].reg_addr != 0; }
+    uint64_t core_reg_base(int32_t worker) const { return cores_[worker].reg_addr; }
+    void retain_peer_dmb_group() { peer_dmb_group_ = true; }
     void deinit();
 
 private:
@@ -106,6 +108,7 @@ private:
     std::atomic<int32_t> retired_core_count_{0};
     AicpuThreadLifecycleTrace *lifecycle_traces_{nullptr};
     bool pmu_initialized_{false};
+    bool peer_dmb_group_{false};
     int32_t core_count_{0};
     int32_t aicpu_thread_num_{0};
     uint64_t regs_base_{0};
