@@ -1,4 +1,4 @@
-#include "wse_graph_builder.h"
+#include "graph_builder.h"
 /*
  * Copyright (c) PyPTO Contributors.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -9,7 +9,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "wse_submission.h"
+#include "submission.h"
 #include <memory>
 #include <stdexcept>
 #include "host_build_graph/host/dep_compute.h"
@@ -126,7 +126,7 @@ TaskOutputTensors submit(OrchContext *ctx, int32_t kernel, const CoreTaskArgs &a
             static_cast<int32_t>(tensor_count), tensors.get(), tags.data(),
             static_cast<int32_t>(args.explicit_dep_count()), args.explicit_deps_data()
         };
-        const auto result = wse_submit_task_with_dependencies(
+        const auto result = wse::submit_task_with_dependencies(
             &orch, {kernel, INVALID_KERNEL_ID, INVALID_KERNEL_ID}, args, &dependencies
         );
         if (orch.is_fatal() || !result.task_id().is_valid() || (recording && recording->unsupported)) return result;
@@ -141,7 +141,7 @@ TaskOutputTensors submit(OrchContext *ctx, int32_t kernel, const CoreTaskArgs &a
 }
 }  // namespace
 
-void wse_bind_ops(OrchContext *ctx, WseOrchOps &ops, WseLaunchState &state) {
+void wse::bind_ops(OrchContext *ctx, WseOrchOps &ops, WseLaunchState &state) {
     static_cast<OrchOps &>(ops) = *ctx->ops;
     ops.submit_wse = submit;
     ops.launch_state = &state;

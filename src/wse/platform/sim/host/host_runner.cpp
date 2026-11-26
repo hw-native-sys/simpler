@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "wse_host_runner.h"
+#include "host_runner.h"
 
 #include <sys/stat.h>
 #include <stdlib.h>

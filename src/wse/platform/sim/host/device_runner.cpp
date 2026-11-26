@@ -21,6 +21,40 @@
 #include <fstream>
 #include <thread>
 
+namespace {
+// Admission has validated these immutable tables. The pipeline slot retains
+// its descriptor until drain finishes, including when another slot is bound.
+bool write_calendar(const std::filesystem::path &directory, const WseGraphDescriptor &descriptor, uint64_t epoch) {
+    const auto *base = reinterpret_cast<const std::byte *>(&descriptor);
+    const auto *indices = reinterpret_cast<const uint32_t *>(base + descriptor.calendar_indices_offset);
+    const auto *rows = reinterpret_cast<const wse::CalendarRow *>(base + descriptor.calendar_rows_offset);
+    const auto *nodes = reinterpret_cast<const WseNodePlan *>(descriptor.nodes_address);
+    std::ofstream out(directory / "calendar.json");
+    out << "{\"epoch\":" << epoch << ",\"cores\":[";
+    for (uint32_t core = 0; core < descriptor.calendar_core_count; ++core) {
+        out << (core ? ",[" : "[");
+        for (uint32_t i = indices[core]; i < indices[core + 1]; ++i) {
+            const auto &row = rows[i];
+            out << (i == indices[core] ? "" : ",") << "{\"task\":" << row.task << ",\"block\":" << row.block
+                << ",\"tick\":" << row.tick << "}";
+        }
+        out << "]";
+    }
+    out << "],\"waits\":[";
+    for (uint64_t task = 0; task < descriptor.graph.task_count; ++task) {
+        const auto &node = nodes[task];
+        const auto *waits = reinterpret_cast<const uint32_t *>(base + node.waits_offset);
+        out << (task ? ",[" : "[");
+        for (uint32_t i = 0; i < node.wait_count; ++i)
+            out << (i ? "," : "") << waits[i];
+        out << "]";
+    }
+    out << "]}\n";
+    out.close();
+    return !out.fail();
+}
+}  // namespace
+
 struct DeviceRunner::ActiveRun {
     SimThreadStartGate startup;
     WseRun *state{nullptr};
@@ -178,7 +212,7 @@ WseLaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution
         );
         completion_.abandon(PTO_RUNTIME_ERR_INTERNAL);
     });
-    auto result = wse_launch_transaction(prepared.identity, std::move(permit), [&](LaunchProgressSink &) -> int {
+    auto result = wse::launch_transaction(prepared.identity, std::move(permit), [&](LaunchProgressSink &) -> int {
         try {
             for (int worker = 0; worker < prepared.num_aicore; ++worker) {
                 run->threads.push_back(create_thread(
@@ -219,6 +253,11 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     const auto &config = active.prepared->config;
     if (config.output_prefix[0]) {
         std::filesystem::create_directories(config.output_prefix);
+        const auto *descriptor = reinterpret_cast<const WseGraphDescriptor *>(
+            active.prepared->runtime->dev.scheduler_bootstrap.worker_context_base
+        );
+        if (!write_calendar(config.output_prefix, *descriptor, active_run_->epoch))
+            return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
         std::ofstream trace(std::filesystem::path(config.output_prefix) / "wse_events.jsonl");
         trace << "{\"epoch\":" << active_run_->epoch << ",\"expected_tasks\":" << active_run_->expected
               << ",\"core_count\":" << active.prepared->num_aicore / WSE_PE_PER_CORE << "}\n";

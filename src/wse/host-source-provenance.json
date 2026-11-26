@@ -4,38 +4,38 @@
   "copies": [
     {
       "source": "src/common/platform/sim/host/device_runner_base.h",
-      "destination": "src/wse/platform/sim/host/wse_host_runner.h",
-      "sha256": "77d41997d74a21e1f55a7d3b0bf4d15601f030e2fae4a910454da78edf56c176"
+      "destination": "src/wse/platform/sim/host/host_runner.h",
+      "sha256": "03d397ebea8aac1b1569f06217410f02cfc03ba716969163a8355f6aaa9ff811"
     },
     {
       "source": "src/common/platform/sim/host/device_runner_base.cpp",
-      "destination": "src/wse/platform/sim/host/wse_host_runner.cpp",
-      "sha256": "1ed47c6d09c4ffe6dce11efa11a462fa7f296a4f850650842f0c1cc15fe5e06e"
+      "destination": "src/wse/platform/sim/host/host_runner.cpp",
+      "sha256": "6321310c74d7e2eae1659cff628756a678e20e22c9574d53c3fc0de1cc8d4256"
     },
     {
       "source": "src/common/platform/sim/host/c_api_shared.cpp",
-      "destination": "src/wse/platform/sim/host/wse_runtime_api.cpp",
-      "sha256": "06bf4349c2667cec4bf0def928517753045ff0c3122b705fcdd76868a87431d4"
+      "destination": "src/wse/platform/sim/host/runtime_api.cpp",
+      "sha256": "1a984f6aae8f8840c2b080d9be273479dd892e222c1ef5e3f0b5155a9970bb8d"
     },
     {
       "source": "src/common/worker/native_run_execution.h",
-      "destination": "src/wse/platform/sim/host/wse_launch_transaction.h",
-      "sha256": "171ceed6409bfe34df3c3023934705d84fe2051e85ac71723c64745ea146f1b5"
+      "destination": "src/wse/platform/sim/host/launch_transaction.h",
+      "sha256": "98a69161663913cda353f09a13d0208035b3280f7397f26eeeb161e5328bf0a5"
     },
     {
       "source": "src/common/host_build_graph/host/orchestrator.cpp",
-      "destination": "src/wse/runtime/host_build_graph/host/wse_graph_orchestrator.cpp",
-      "sha256": "df7776aea4c5dbf667e6d71f38193e6a6564aae5bf3f51f8c2bc0d9fc5334646"
+      "destination": "src/wse/runtime/host_build_graph/host/graph_orchestrator.cpp",
+      "sha256": "e48572d41971f6d1d93c5a80c36b4d897ebb99313873e65d6bfd42b36f94a689"
     },
     {
       "source": "src/common/host_build_graph/host/graph_submit.cpp",
-      "destination": "src/wse/runtime/host_build_graph/host/wse_graph_submit.cpp",
-      "sha256": "6a7e53d0e23a9e8b621f9c07e0f77e41ab67ba2182a06e9d9935393713c0bdf2"
+      "destination": "src/wse/runtime/host_build_graph/host/graph_submit.cpp",
+      "sha256": "d8599cecdba8a9ea8b6ff1ad79f202f8207401c6281cf5c271c9936acee42d59"
     },
     {
       "source": "src/common/worker/native_run_context.h",
-      "destination": "src/wse/platform/sim/host/wse_native_run_context.h",
-      "sha256": "42d1dfea41c452469189c05f8c5756060b05d2a73976daa32f5e3474ad455e9e"
+      "destination": "src/wse/platform/sim/host/run_context.h",
+      "sha256": "dd6e2e8d4ae87cc8146026a92a682653a730e37d27a79d82a6aa794651f09bd3"
     }
   ],
   "maintenance": "WSE-owned implementations of the existing runtime C ABI and HBG declarations; shared headers are not shadowed."

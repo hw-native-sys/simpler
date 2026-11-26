@@ -18,7 +18,7 @@
 
 #include "call_config.h"
 #include "common/host_api.h"
-#include "wse_launch_transaction.h"
+#include "launch_transaction.h"
 #include "native_run_phase.h"
 #include "native_run_storage_tag.h"
 #include "runtime_c_api.h"

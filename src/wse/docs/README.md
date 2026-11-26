@@ -57,6 +57,11 @@ See [SRAM layout and ownership](sram.md) for the exact address and lifetime cont
 
 ## Execution
 
+SS (SuperScalar) is WSE's single-Core unit of computation. Each Block runs
+one SS kernel entry, which can perform matrix operations, vector operations,
+or both. An SPMD launch runs the same SS program with a distinct `block_id`
+for each Block. A Graph expresses dependencies between these launches.
+
 Every run uses all configured Cores. A task's logical Block count comes from
 `CoreTaskArgs.launch_spec.block_num()`, independently of the device width.
 The default mapping is `core_id = block_id % core_count`. Cores with no work are
@@ -67,6 +72,21 @@ A Block has one to four logical Threads placed on distinct local PEs. WSE
 orchestration may specify Block placement and per-Block arguments, while the
 Python caller still uses ordinary `worker.submit(...)` or `worker.run(...)`.
 See [Block deployment](deployment.md).
+
+At bind, the Host builds a calendar for each Core from ordinary tasks and the
+bound Graph invocations. Each kernel Block occupies one row on its assigned
+Core. Among Blocks with the same earliest start, the Host favors the longest
+remaining dependency path, then the lower task and Block IDs. The functional
+simulator assigns each row a unit cost. Graph enter and exit nodes carry
+dependencies and occupy zero rows. All Blocks of a producer must retire before
+a dependent task can start, even when their Cores differ.
+
+The WSE planner adapts the Host scheduling policy from
+[A5 HBG #3262](https://github.com/hw-native-sys/simpler/pull/3262).
+The Host binds Graph instances and publishes one calendar per homogeneous
+Core. During admission, the PE runtime resolves each Block's arguments into
+Core SRAM. Each invocation of a Graph gets its own rows in the run's DAG.
+Its execution can overlap independent work subject to the DAG and Core order.
 
 Tensor access sets from all Blocks participate in dependency construction,
 including native Graph recording, rebinding and replay. Application Tensor
@@ -88,8 +108,12 @@ compatible PTO kernels. The temporary WSE operations are not a complete native
 Linx backend. PTO-ISA #418 is an operation-level integration reference, not a
 replacement for WSE scheduling, SRAM ownership or Worker lifetime management.
 
-With `CallConfig.output_prefix`, WSE emits `wse_events.jsonl` and
-`wse_sram.json`. Dependency capture additionally emits `deps.json`.
+With `CallConfig.output_prefix`, WSE emits `calendar.json`, `wse_events.jsonl`
+and `wse_sram.json`. The calendar groups planned `task`, `block` and `tick`
+rows by Core and lists each node's producer IDs in `waits`. A tick is the
+earliest start under the unit-cost model. Execution advances on real Block
+completion. Sort `BLOCK_BEGIN` events by `seq` within each Core to compare
+actual dispatch with its planned rows. Dependency capture also emits `deps.json`.
 `wse_prepare_error.txt` records a PE run-admission failure, including runtime SRAM
 capacity exhaustion, before the execution start gate opens. Legacy device PMU,
 chip swimlane, scope-stat and argument-dump collectors are unsupported.
@@ -97,8 +121,8 @@ chip swimlane, scope-stat and argument-dump collectors are unsupported.
 ## Implementation boundary
 
 WSE implements the existing runtime C ABI in its own Host sources. The explicit
-`wse_host_runner`, `wse_runtime_api`, `wse_native_run_context` and
-`wse_launch_transaction` files own WSE execution and memory lifetime. The WSE
+`host_runner`, `runtime_api`, `run_context` and
+`launch_transaction` files own WSE execution and memory lifetime. The WSE
 Graph submit units retain complete Block access sets while reusing unchanged
 common HBG declarations and other graph algorithms.
 

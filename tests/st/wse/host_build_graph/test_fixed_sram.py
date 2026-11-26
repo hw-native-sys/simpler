@@ -86,14 +86,14 @@ def test_standard_submission_uses_all_cores(tmp_path, st_platform, blocks):
     compiler = KernelCompiler(st_platform)
     source = Path(__file__).parent / "direct_launch/kernels"
     kernel = compiler.compile_incore(
-        str(source / "mixed.cpp"),
+        str(source / "matmul_add.cpp"),
         core_type="",
         extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
     )
     callable_ = ChipCallable.build(
         signature=[D.IN, D.IN, D.OUT, D.OUT, D.IN],
         func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(source / "mixed_orch.cpp")),
+        binary=compiler.compile_orchestration("host_build_graph", str(source / "matmul_add_orch.cpp")),
         children=[(0, CoreCallable.build(signature=[D.IN, D.IN, D.OUT, D.OUT], binary=kernel))],
     )
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)

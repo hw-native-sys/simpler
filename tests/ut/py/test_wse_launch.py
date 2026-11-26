@@ -18,7 +18,7 @@ def test_single_executor_launch_ownership(tmp_path):
     root = compiler.project_root
     source = tmp_path / "launch.cpp"
     source.write_text(r"""
-#include "wse_launch_transaction.h"
+#include "launch_transaction.h"
 #include <cassert>
 #include <stdexcept>
 #include <type_traits>
@@ -34,21 +34,21 @@ int main() {
     ++other.run_epoch;
     int calls=0;
     auto submit=[&](LaunchProgressSink &) { ++calls; return 0; };
-    auto mismatch=wse_launch_transaction(other,WseHostRunner::mint(identity),submit);
+    auto mismatch=wse::launch_transaction(other,WseHostRunner::mint(identity),submit);
     assert(calls==0 && !mismatch.receipt.valid());
     auto permit=WseHostRunner::mint(identity);
-    auto accepted=wse_launch_transaction(identity,std::move(permit),submit);
+    auto accepted=wse::launch_transaction(identity,std::move(permit),submit);
     assert(calls==1 && accepted.rc==0 && accepted.progress==LaunchProgress::Complete);
     assert(accepted.receipt.matches(identity) && !accepted.receipt.matches(other));
-    auto reused=wse_launch_transaction(identity,std::move(permit),submit);
+    auto reused=wse::launch_transaction(identity,std::move(permit),submit);
     assert(calls==1 && reused.rc!=0 && !reused.receipt.valid());
-    auto refused=wse_launch_transaction(identity,WseHostRunner::mint(identity),
+    auto refused=wse::launch_transaction(identity,WseHostRunner::mint(identity),
         [](LaunchProgressSink &) { return -7; });
     assert(refused.rc==-7 && refused.progress==LaunchProgress::NotStarted && !refused.receipt.valid());
-    auto partial=wse_launch_transaction(identity,WseHostRunner::mint(identity),
+    auto partial=wse::launch_transaction(identity,WseHostRunner::mint(identity),
         [](LaunchProgressSink &sink) { sink.mark_submitted(); return -8; });
     assert(partial.rc==-8 && partial.progress==LaunchProgress::Partial && !partial.receipt.valid());
-    auto uncertain=wse_launch_transaction(identity,WseHostRunner::mint(identity),
+    auto uncertain=wse::launch_transaction(identity,WseHostRunner::mint(identity),
         [](LaunchProgressSink &) -> int { throw std::bad_alloc(); });
     assert(uncertain.rc!=0 && uncertain.progress==LaunchProgress::Partial && !uncertain.receipt.valid());
 }

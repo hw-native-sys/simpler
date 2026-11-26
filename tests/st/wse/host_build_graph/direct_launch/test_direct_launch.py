@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Real PE coverage and mixed matrix/vector computation through the public Worker."""
+"""PE coverage for an SS kernel that performs matrix and vector operations through the public Worker."""
 
 import json
 from functools import lru_cache
@@ -27,13 +27,13 @@ HERE = Path(__file__).parent
 
 
 @lru_cache
-def build_mixed(platform):
+def build_matmul_add(platform):
     return build_callable(
         platform,
         HERE / "kernels",
-        "mixed_orch.cpp",
+        "matmul_add_orch.cpp",
         [D.IN, D.IN, D.OUT, D.OUT, D.IN],
-        [("mixed.cpp", [D.IN, D.IN, D.OUT, D.OUT])],
+        [("matmul_add.cpp", [D.IN, D.IN, D.OUT, D.OUT])],
     )
 
 
@@ -60,12 +60,12 @@ def audit_events(path, cores, blocks):
 
 
 @pytest.mark.parametrize("blocks", [1, 4, 9, 39, 40, 159, 160, 161, 323])
-def test_mixed_entry_and_independent_blocks(tmp_path, blocks, st_platform):
+def test_ss_kernel_and_independent_blocks(tmp_path, blocks, st_platform):
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     buffers = []
     try:
         worker.init()
-        handle = worker.register(build_mixed(st_platform))
+        handle = worker.register(build_matmul_add(st_platform))
         a = (torch.arange(1024, dtype=torch.float32).reshape(32, 32) % 7) - 3
         b = torch.eye(32, dtype=torch.float32) * 2
         tensors = [a, b, torch.full((blocks, 32, 32), -1.0), torch.full((blocks, 2), -1.0)]

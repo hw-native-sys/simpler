@@ -13,8 +13,11 @@
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/host/graph_submit.h"
 #include "host_build_graph/host/dep_compute.h"
+
+namespace wse {
 TaskOutputTensors
-wse_submit_task_with_dependencies(OrchestratorState *, const MixedKernels &, const CoreTaskArgs &, const DepInputs *);
-TaskOutputTensors wse_graph_record_submit_with_dependencies(
+submit_task_with_dependencies(OrchestratorState *, const MixedKernels &, const CoreTaskArgs &, const DepInputs *);
+TaskOutputTensors graph_record_submit_with_dependencies(
     OrchestratorState *, const CoreTaskArgs &, LaneMask, TaskAttrs, int32_t, int32_t, int32_t, const DepInputs *
 );
+}  // namespace wse

@@ -18,14 +18,14 @@
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
-#include "wse_host_runner.h"
+#include "host_runner.h"
 #include "host/dep_gen_collector.h"  // make_deps_json_path
 #include "host/kernel_entry_validation.h"
 #include "host/kernel_pipeline_contract.h"
 #include "worker/pipeline_contract.h"
 #include "prepare_callable_common.h"
 #include "task_args.h"
-#include "wse_native_run_context.h"
+#include "run_context.h"
 
 #include <dlfcn.h>
 

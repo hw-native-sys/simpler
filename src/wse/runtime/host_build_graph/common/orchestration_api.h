@@ -10,7 +10,7 @@
  */
 #pragma once
 #include "host_build_graph/host/orchestration/orchestration_api.h"
-#include "wse_submission.h"
+#include "launch_spec.h"
 
 static inline TaskOutputTensors
 rt_submit_wse_task(int32_t kernel_id, const CoreTaskArgs &args, const WseLaunchSpec &launch = {}) {

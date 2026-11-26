@@ -9,9 +9,9 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #pragma once
-#include "wse_host_runner.h"
+#include "host_runner.h"
 #include "sim_run_completion.h"
-#include "wse_launch.h"
+#include "launch.h"
 #include "sram_storage.h"
 
 class DeviceRunner : public WseHostRunner {
