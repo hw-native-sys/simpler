@@ -12,6 +12,16 @@ from collections import defaultdict
 
 _LABELS = {
     "row_begin": "Calendar row begins",
+    "peer_dmb_write_begin": "Begin peer DMB store",
+    "peer_dmb_batch_begin": "Begin DMB batch",
+    "peer_dmb_batch_issued": "DMB batch issued",
+    "peer_dmb_wait_begin": "Begin local DMB wait",
+    "peer_dmb_published": "Write peer DMB",
+    "peer_dmb_observed": "Accept DMB token / check completion",
+    "peer_dmb_mov_at_entry": "MOV DMB · first sample",
+    "peer_dmb_mov_changed": "MOV DMB · changed token",
+    "peer_dmb_initial_proof": "Check CntNotify on wait entry",
+    "peer_dmb_periodic_ready": "Periodic CntNotify check reached threshold",
     "inputs_ready": "Inputs satisfied",
     "mix_release_observed": "Observe local MIX release",
     "ready": "Ready",
@@ -73,6 +83,49 @@ def parse_capture(section):
     return section
 
 
+def _validate_peer_event(row):
+    if row["kind"] in ("peer_dmb_batch_begin", "peer_dmb_batch_issued"):
+        if row["kind"] == "peer_dmb_batch_issued" and row.get("transport") not in ("Scalar", "MTE3"):
+            raise ValueError("invalid percounter DMB batch transport")
+        count, sequence = row.get("target_count"), row.get("sequence")
+        if type(count) is not int or count < 2 or type(sequence) is not int or not 0 < sequence < 2**32:
+            raise ValueError("invalid percounter DMB batch")
+        commands = row.get("command_count")
+        if commands is not None and (type(commands) is not int or not 1 <= commands <= count):
+            raise ValueError("invalid percounter DMB command count")
+        return
+    if row["kind"] == "peer_dmb_wait_begin":
+        threshold = row.get("join_threshold")
+        if type(threshold) is not int or not 0 < threshold < 2**24:
+            raise ValueError("invalid percounter DMB join threshold")
+        return
+    if row["kind"] == "peer_dmb_periodic_ready":
+        interval = row.get("cycles_since_last_check")
+        count = row.get("count")
+        if type(interval) is not int or interval <= 0 or type(count) is not int or not 0 < count < 2**24:
+            raise ValueError("invalid periodic DMB completion check")
+        return
+    token = row.get("token")
+    if type(token) is not int or not 0 <= token < 2**32:
+        raise ValueError("invalid percounter DMB token")
+    if row["kind"] in ("peer_dmb_mov_at_entry", "peer_dmb_mov_changed"):
+        seq = row.get("sequence")
+        if type(seq) is not int or not 0 <= seq < 2**32:
+            raise ValueError("invalid DMB MOV sequence")
+        prev = row.get("previous_poll_cycles")
+        if prev is not None and (
+            row["kind"] == "peer_dmb_mov_at_entry" or type(prev) is not int or not 0 < prev <= row["cycles"]
+        ):
+            raise ValueError("invalid DMB MOV previous sample time")
+        return
+    if row["kind"] in ("peer_dmb_write_begin", "peer_dmb_published"):
+        target = row.get("target_worker")
+        if type(target) is not int or target < 0:
+            raise ValueError("invalid percounter DMB target worker")
+    elif type(row.get("count")) is not int or not 0 <= row["count"] < 2**24:
+        raise ValueError("invalid percounter DMB completion count")
+
+
 def _validate_task_event(row):
     if not isinstance(row, dict) or not isinstance(row.get("kind"), str) or row["kind"] not in _LABELS:
         raise ValueError("invalid percounter task event kind")
@@ -90,6 +143,8 @@ def _validate_task_event(row):
             raise ValueError(f"invalid percounter task event {field}")
     if not 0 <= row["block_index"] < row["block_count"] or row["cluster_lane"] >= 3 or row["cycles"] == 0:
         raise ValueError("invalid percounter task event coordinates or timestamp")
+    if row["kind"].startswith("peer_dmb_"):
+        _validate_peer_event(row)
     if row["kind"] == "kernel_end":
         dispatch, start, finish = (
             row.get(name) for name in ("dispatch_cycles", "kernel_start_cycles", "finish_cycles")
@@ -270,6 +325,72 @@ def _row_spans(rows):
         yield label, finish, retired
 
 
+def _dmb_spans(rows, waiting_tasks):
+    batch = next((r for r in rows if r["kind"] == "peer_dmb_batch_begin"), None)
+    if batch is not None:
+        end = next((r for r in rows if r["kind"] == "peer_dmb_batch_issued"), None)
+        if (
+            end is not None
+            and end["sequence"] == batch["sequence"]
+            and end["target_count"] == batch["target_count"]
+            and end["cycles"] >= batch["cycles"]
+        ):
+            detail = {
+                "transport": end["transport"],
+                "target_count": batch["target_count"],
+                "sequence": batch["sequence"],
+            }
+            if "command_count" in end:
+                detail["command_count"] = end["command_count"]
+            yield (
+                f"Issue {end['transport']} batch to {batch['target_count']} DMBs",
+                batch["time_us"],
+                end["time_us"],
+                detail,
+            )
+    writes = {(r["target_worker"], r["token"]): r for r in rows if r["kind"] == "peer_dmb_write_begin"}
+    for r in rows:
+        if r["kind"] != "peer_dmb_published":
+            continue
+        target = r["target_worker"]
+        start = writes.get((target, r["token"]))
+        if start is None or r["cycles"] < start["cycles"]:
+            continue
+        names = waiting_tasks.get((r["run_epoch"], target), set())
+        destination = next(iter(names)) if len(names) == 1 else f"worker {target}"
+        mte3 = r.get("transport") == "MTE3"
+        yield (
+            f"Issue MTE3 DMB write → {destination}" if mte3 else f"Write DMB → {destination}",
+            start["time_us"],
+            r["time_us"],
+            {"target_worker": target, "token": r["token"], "transport": "MTE3" if mte3 else "Scalar"},
+        )
+
+    start = next((r for r in rows if r["kind"] == "peer_dmb_wait_begin"), None)
+    if start is None:
+        return
+    threshold = start["join_threshold"]
+    checks = (
+        r for r in rows if r["kind"] in ("peer_dmb_initial_proof", "peer_dmb_observed", "peer_dmb_periodic_ready")
+    )
+    tokens = 0
+    for r in sorted(checks, key=lambda row: row["cycles"]):
+        tokens += r["kind"] == "peer_dmb_observed"
+        if r["cycles"] < start["cycles"] or r["count"] < threshold:
+            continue
+        args = {"observed_tokens": tokens, "join_threshold": threshold, "count": r["count"]}
+        if "token" in r:
+            args["token"] = r["token"]
+        label = "Wait on local DMB + CntNotify"
+        if r["kind"] == "peer_dmb_initial_proof":
+            label = "CntNotify ready on wait entry"
+        elif r["kind"] == "peer_dmb_periodic_ready":
+            label = "Wait until periodic CntNotify check succeeds"
+            args["cycles_since_last_check"] = r["cycles_since_last_check"]
+        yield label, start["time_us"], r["time_us"], args
+        break
+
+
 def trace_events(capture, pid, task_name):
     """Draw calendar transitions on the cores executing them."""
     yield _meta(pid, "process_name", {"name": "Scheduler View"})
@@ -286,6 +407,7 @@ def trace_events(capture, pid, task_name):
     yield from _range_events(ranges, lanes)
     rows_by_execution = defaultdict(list)
     deferred_by_group = defaultdict(dict)
+    waiting_tasks = defaultdict(set)
     for row in capture["records"]:
         worker = row["worker_id"]
         kind = row["kind"]
@@ -293,6 +415,10 @@ def trace_events(capture, pid, task_name):
             deferred_by_group[row["run_epoch"], row["deferred_group"]][kind] = row
         if kind not in _DEFER_EVENTS or kind == "defer_registered":
             rows_by_execution[row["run_epoch"], row["task_id"], row["block_index"], worker].append(row)
+        if kind == "peer_dmb_wait_begin":
+            waiting_tasks[row["run_epoch"], worker].add(task_name(row["task_id"]))
+        if kind in ("peer_dmb_wait_begin", "peer_dmb_write_begin", "peer_dmb_batch_begin", "peer_dmb_batch_issued"):
+            continue
         yield {
             **lanes[worker],
             "cat": "percounter_task_timing",
@@ -316,6 +442,16 @@ def trace_events(capture, pid, task_name):
                 "dur": end - start,
                 "name": f"{task_name(row['task_id'])} [{row['block_index']}] · {label}",
                 "args": args,
+            }
+        for label, start, end, detail in _dmb_spans(rows, waiting_tasks):
+            yield {
+                **lanes[row["worker_id"]],
+                "cat": "percounter_dmb",
+                "ph": "X",
+                "ts": start,
+                "dur": end - start,
+                "name": f"{task_name(row['task_id'])} [{row['block_index']}] · {label}",
+                "args": {**args, **detail},
             }
     for (epoch, group), stages in deferred_by_group.items():
         registered = stages.get("defer_registered")

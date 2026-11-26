@@ -77,6 +77,28 @@ const char *task_event_name(PercounterTaskEventKind kind) {
         return "range_enter_begin";
     case PercounterTaskEventKind::GraphReadyObserved:
         return "graph_ready_observed";
+    case PercounterTaskEventKind::PeerWriteBegin:
+        return "peer_dmb_write_begin";
+    case PercounterTaskEventKind::PeerWaitBegin:
+        return "peer_dmb_wait_begin";
+    case PercounterTaskEventKind::PeerBatchBegin:
+        return "peer_dmb_batch_begin";
+    case PercounterTaskEventKind::PeerScalarBatchIssued:
+    case PercounterTaskEventKind::PeerMteBatchIssued:
+        return "peer_dmb_batch_issued";
+    case PercounterTaskEventKind::PeerDmbMovAtEntry:
+        return "peer_dmb_mov_at_entry";
+    case PercounterTaskEventKind::PeerDmbMovChanged:
+        return "peer_dmb_mov_changed";
+    case PercounterTaskEventKind::PeerMtePublished:
+    case PercounterTaskEventKind::PeerPublished:
+        return "peer_dmb_published";
+    case PercounterTaskEventKind::PeerPeriodicReady:
+        return "peer_dmb_periodic_ready";
+    case PercounterTaskEventKind::PeerInitialProof:
+        return "peer_dmb_initial_proof";
+    case PercounterTaskEventKind::PeerObserved:
+        return "peer_dmb_observed";
     case PercounterTaskEventKind::RangeEntered:
         return "range_entered";
     }
@@ -134,6 +156,33 @@ bool export_profile(const ProfileOwner &owner) {
         if (timing != nullptr) {
             task_events << ",\"dispatch_cycles\":" << timing->dispatch << ",\"kernel_start_cycles\":" << timing->start
                         << ",\"finish_cycles\":" << timing->finish;
+        }
+        if (event.kind == PercounterTaskEventKind::PeerBatchBegin ||
+            event.kind == PercounterTaskEventKind::PeerScalarBatchIssued ||
+            event.kind == PercounterTaskEventKind::PeerMteBatchIssued)
+            task_events << ",\"target_count\":" << uint16_t(event.detail >> 32)
+                        << ",\"sequence\":" << uint32_t(event.detail);
+        if (event.kind == PercounterTaskEventKind::PeerScalarBatchIssued) task_events << ",\"transport\":\"Scalar\"";
+        if (event.kind == PercounterTaskEventKind::PeerMteBatchIssued)
+            task_events << ",\"transport\":\"MTE3\",\"command_count\":" << (event.detail >> 48);
+        if (event.kind == PercounterTaskEventKind::PeerMtePublished) task_events << ",\"transport\":\"MTE3\"";
+        if (event.kind == PercounterTaskEventKind::PeerDmbMovAtEntry ||
+            event.kind == PercounterTaskEventKind::PeerDmbMovChanged) {
+            task_events << ",\"token\":" << uint32_t(event.detail >> 32) << ",\"sequence\":" << uint32_t(event.detail);
+            if (event.previous_poll_delta != UINT32_MAX)
+                task_events << ",\"previous_poll_cycles\":" << (event.cycles - event.previous_poll_delta);
+        }
+        if (event.kind == PercounterTaskEventKind::PeerWaitBegin) task_events << ",\"join_threshold\":" << event.detail;
+        if (event.kind == PercounterTaskEventKind::PeerWriteBegin ||
+            event.kind == PercounterTaskEventKind::PeerPublished ||
+            event.kind == PercounterTaskEventKind::PeerMtePublished)
+            task_events << ",\"target_worker\":" << (event.detail >> 32) << ",\"token\":" << uint32_t(event.detail);
+        if (event.kind == PercounterTaskEventKind::PeerPeriodicReady)
+            task_events << ",\"cycles_since_last_check\":" << (event.detail >> 32)
+                        << ",\"count\":" << uint32_t(event.detail);
+        if (event.kind == PercounterTaskEventKind::PeerObserved ||
+            event.kind == PercounterTaskEventKind::PeerInitialProof) {
+            task_events << ",\"token\":" << (event.detail >> 32) << ",\"count\":" << uint32_t(event.detail);
         }
         if (event.kind == PercounterTaskEventKind::CompletionIssue) task_events << ",\"contribution\":" << event.detail;
         if (event.kind == PercounterTaskEventKind::DeferRegistered || source_worker != SIZE_MAX)

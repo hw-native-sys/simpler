@@ -93,6 +93,20 @@ struct Callable<void, MaxSig, 0> {
         return proof;
     }
 
+    // A compiler or packer may declare that the kernel returns with its outputs complete.
+    // Bind the declaration to these instructions, beside the independent cache footprint.
+    void declare_completion_on_return() {
+        static_assert(MaxSig == CORE_MAX_TENSOR_ARGS);
+        const uint64_t stamp = completion_stamp();
+        std::memcpy(storage_ + sizeof(CoreInputCacheProof), &stamp, sizeof(stamp));
+    }
+    bool completes_on_return() const {
+        static_assert(MaxSig == CORE_MAX_TENSOR_ARGS);
+        uint64_t stamp = 0;
+        std::memcpy(&stamp, storage_ + sizeof(CoreInputCacheProof), sizeof(stamp));
+        return binary_size_ != 0 && stamp != 0 && stamp == completion_stamp();
+    }
+
     // Binary data is placed at the next CALLABLE_ALIGN boundary after the fixed fields.
     // storage_ sits between the fixed fields and the aligned binary; binary_data()
     // skips the padding automatically.
@@ -104,6 +118,11 @@ struct Callable<void, MaxSig, 0> {
     }
 
 private:
+    uint64_t completion_stamp() const {
+        const uint64_t hash =
+            simpler::common::utils::fnv1a_64_append(UINT64_C(0x534e435f41355047), binary_data(), binary_size_);
+        return hash == 0 ? 1 : hash;
+    }
     Callable() = default;
 
     template <int MS>
@@ -251,7 +270,10 @@ static_assert(offsetof(CoreCallable, resolved_addr_) == 136, "CoreCallable wire 
 static_assert(offsetof(CoreCallable, storage_) == 144, "CoreCallable wire ABI: storage offset changed");
 static_assert(sizeof(CoreCallable) == 144, "CoreCallable wire ABI: header size changed");
 static_assert(CoreCallable::binary_data_offset() == 192, "CoreCallable wire ABI: binary data offset changed");
-static_assert(offsetof(CoreCallable, storage_) + sizeof(CoreInputCacheProof) <= CoreCallable::binary_data_offset());
+static_assert(
+    offsetof(CoreCallable, storage_) + sizeof(CoreInputCacheProof) + sizeof(uint64_t) <=
+    CoreCallable::binary_data_offset()
+);
 
 // ============================================================================
 // Factory: make_callable for static leaf

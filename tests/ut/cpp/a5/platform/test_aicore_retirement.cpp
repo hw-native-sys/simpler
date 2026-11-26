@@ -78,7 +78,37 @@ make_targets(const uint64_t (&addrs)[N], std::array<AicoreTeardownControl, N> &t
 // handful of cores cannot exhaust it on a loaded machine.
 uint64_t short_deadline() { return get_sys_cnt_aicpu() + PLATFORM_PROF_SYS_CNT_FREQ / 10; }
 
+struct PeerExitScript {
+    const AicoreExitTarget &receiver;
+    bool ack_sent{false};
+    uint32_t observed_cond{0};
+    bool expired_after_ack{false};
+};
+
+thread_local PeerExitScript *peer_exit_script = nullptr;
+
 }  // namespace
+
+uint64_t retirement_test_read_reg(uint64_t reg_addr, RegId reg) {
+    const uint64_t value = read_reg(reg_addr, reg);
+    if (peer_exit_script != nullptr && peer_exit_script->ack_sent && reg == RegId::COND &&
+        reg_addr == peer_exit_script->receiver.reg_addr)
+        peer_exit_script->observed_cond = static_cast<uint32_t>(value);
+    return value;
+}
+
+uint64_t retirement_test_sys_cnt() {
+    if (peer_exit_script == nullptr) return get_sys_cnt_aicpu();
+    auto &script = *peer_exit_script;
+    const uint32_t nonce = script.receiver.teardown->exit_request;
+    if (!script.ack_sent) {
+        write_reg(script.receiver.reg_addr, RegId::COND, nonce);
+        script.ack_sent = true;
+        return 0;
+    }
+    script.expired_after_ack = nonce != 0 && script.observed_cond == nonce;
+    return 1;
+}
 
 TEST(AicoreRetirement, ReturnGatesReleaseOnlyAcknowledgedCoresAfterClose) {
     std::array<CoreRegs, 2> cores;
@@ -117,6 +147,31 @@ TEST(AicoreRetirement, CntNotifyExitPreservesDispatchRegisterAndRequiresFreshCon
     EXPECT_TRUE(released);
     EXPECT_EQ(gate.post_close_release, AICORE_POST_CLOSE_RELEASE);
     EXPECT_EQ(core.dispatch(), sentinel);
+}
+
+TEST(AicoreRetirement, PeerDmbTargetStaysResidentIfAnotherPublisherHasNotAcknowledged) {
+    for (bool retain_receiver : {false, true}) {
+        SCOPED_TRACE(retain_receiver);
+        std::array<CoreRegs, 2> cores;
+        std::array<AicoreTeardownControl, 2> gates{};
+        const AicoreExitTarget targets[] = {
+            {cores[0].addr(), &gates[0], false, retain_receiver}, {cores[1].addr(), &gates[1], false, true}
+        };
+        // The first deadline check sends the ACK. The second expires the silent
+        // publisher after recording which COND the retirement owner actually read.
+        PeerExitScript script{targets[0]};
+        peer_exit_script = &script;
+        bool released[2];
+        const int32_t rc = platform_retire_aicore_group(targets, 2, 0, released);
+        peer_exit_script = nullptr;
+
+        ASSERT_TRUE(script.expired_after_ack);
+        EXPECT_EQ(rc, -1);
+        EXPECT_EQ(released[0], !retain_receiver);
+        EXPECT_EQ(gates[0].post_close_release, retain_receiver ? 0U : AICORE_POST_CLOSE_RELEASE);
+        EXPECT_FALSE(released[1]);
+        EXPECT_EQ(gates[1].post_close_release, 0U);
+    }
 }
 
 TEST(AicoreRetirement, CntNotifyExitRejectsRetainedCondWithoutAResponder) {

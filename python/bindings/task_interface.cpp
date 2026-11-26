@@ -3227,16 +3227,17 @@ NB_MODULE(_task_interface, m) {
     nb::class_<PyCoreCallable>(m, "CoreCallable")
         .def_static(
             "build",
-            [](std::vector<ArgDirection> signature, nb::bytes binary) -> PyCoreCallable {
+            [](std::vector<ArgDirection> signature, nb::bytes binary, bool completes_on_return) -> PyCoreCallable {
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto buf = make_callable<CORE_MAX_TENSOR_ARGS>(
                     signature.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size
                 );
+                if (completes_on_return) reinterpret_cast<CoreCallable *>(buf.data())->declare_completion_on_return();
                 return PyCoreCallable{std::move(buf)};
             },
-            nb::arg("signature"), nb::arg("binary"),
-            "Build a CoreCallable from a signature list and binary bytes. The dump "
+            nb::arg("signature"), nb::arg("binary"), nb::kw_only(), nb::arg("completes_on_return") = false,
+            "Declare completes_on_return only for a kernel whose outputs complete at return. The dump "
             "maps signature entry i to payload slot i positionally."
         )
 

@@ -64,6 +64,17 @@ const ChipCallable *as_chip(const std::vector<uint8_t> &buffer) {
     return reinterpret_cast<const ChipCallable *>(buffer.data());
 }
 
+TEST(CallableFunctionTables, CompletionDeclarationFollowsTheKernelBytes) {
+    auto bytes = make_core_child(0xab, 64);
+    auto &kernel = *reinterpret_cast<CoreCallable *>(bytes.data());
+    EXPECT_FALSE(kernel.completes_on_return());
+    kernel.declare_completion_on_return();
+    EXPECT_TRUE(kernel.completes_on_return());
+    EXPECT_EQ(kernel.input_cache_proof().magic, 0u);
+    bytes[CoreCallable::binary_data_offset()] ^= 1;
+    EXPECT_FALSE(kernel.completes_on_return());
+}
+
 TEST(CallableFunctionTables, TheLengthIsOnePastTheLargestFuncId) {
     struct Case {
         std::vector<int32_t> func_ids;

@@ -462,6 +462,7 @@ private:
         RunImagePublication pending_publication_;
         std::shared_ptr<const RunImagePublication> prepared_publication_;
         const CoreInputCacheProof *callable_input_cache_proofs_{nullptr};
+        const uint8_t *synchronous_kernels_{nullptr};
     };
     HostOnlyState host_;
 
@@ -642,6 +643,8 @@ public:
      * the descriptor carries is never dereferenced here.
      */
     uint64_t get_function_bin_addr(int func_id) const;
+    bool function_completes_on_return(int func_id) const;
+    void bind_synchronous_kernels(const std::vector<uint8_t> &declarations);
     const CoreInputCacheProof *get_function_input_cache_proof(int func_id) const;
     friend void bind_registered_input_cache_proofs(Runtime &runtime, const std::vector<CoreInputCacheProof> &proofs);
 

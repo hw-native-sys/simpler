@@ -250,6 +250,98 @@ TEST_F(CalendarDeferTest, TwoSuccessorsSettleEveryDeferredGroupOnce) {
     EXPECT_GE(second_sample.defer_completion, second_sample.defer_register);
 }
 
+TEST_F(CalendarDeferTest, PeerWaitSeparatesExitCancellationFromInvalidMetadata) {
+    struct Program {
+        CalendarRangeHeader header;
+        CalendarExecutionRow row;
+        CalendarDispatch dispatch;
+        CalendarPeerExtra peer;
+    } program{};
+    program.row.block_count = 1;
+    program.row.flags = CALENDAR_EXEC_PEER;
+    program.dispatch.extra_offset = offsetof(Program, peer) - offsetof(Program, dispatch);
+    program.peer.input_count = 2;
+    program.peer.join_read = reinterpret_cast<uint64_t>(&done);
+    program.peer.join_target = 2;
+    CalendarPeerEndpoint endpoint{};
+    endpoint.input_count = 2;
+    producer.peer_endpoints = &endpoint;
+    CalendarRange range{};
+    range.rows_offset = offsetof(Program, row);
+    range.row_count = 1;
+    range.binding_offset = offsetof(Program, dispatch);
+    const auto run = [&] {
+        // Offset 1 leaves EXIT detection to the pending input wait.
+        return percounter_calendar_execute_range(
+            producer, reinterpret_cast<const uint8_t *>(&program), sizeof(program), range, 0, 1, 0, 0
+        );
+    };
+
+    lifecycle = AICORE_LIFECYCLE_EXIT_BIT;
+    EXPECT_FALSE(run());
+    EXPECT_GT(producer.last_exit_poll, 0U);
+    EXPECT_EQ(control.lane_error, 0U);
+
+    endpoint.input_count = 1;
+    EXPECT_FALSE(run());
+    EXPECT_EQ(control.lane_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
+    EXPECT_EQ(control.lane_error_task, program.peer.execution.task_id + 1U);
+}
+
+TEST_F(CalendarDeferTest, SinglePeerWaitRequiresItsBoundCompletionEvenWithAMatchingOldToken) {
+    struct Program {
+        CalendarRangeHeader header;
+        CalendarExecutionRow row;
+        CalendarDispatch dispatch;
+        CalendarWait wait;
+        CalendarPeerExtra peer;
+    } program{};
+    program.row = {0, 0, 0, 1, 1, CALENDAR_EXEC_PEER};
+    DispatchPayload arguments{};
+    const PercounterKernelFunc kernel = [](int64_t *args) {
+        ++args[0];
+    };
+    program.dispatch = {
+        reinterpret_cast<uint64_t>(kernel), reinterpret_cast<uint64_t>(&arguments), 0,
+        offsetof(Program, wait) - offsetof(Program, dispatch), offsetof(Program, peer) - offsetof(Program, dispatch)
+    };
+    program.peer.input_count = 1;
+    program.wait = {reinterpret_cast<uint64_t>(&done) | CALENDAR_WAIT_DEFER, (uint64_t{25} << 24) | 3};
+    CalendarPeerEndpoint endpoint{0, 2, 1};
+    producer.peer_endpoints = &endpoint;
+    PercounterSsbufRegion cluster{};
+    producer.ssbuf = &cluster;
+    CalendarRange range{};
+    range.rows_offset = offsetof(Program, row);
+    range.row_count = 1;
+    range.binding_offset = offsetof(Program, dispatch);
+    const auto run = [&] {
+        return percounter_calendar_execute_range(
+            producer, reinterpret_cast<const uint8_t *>(&program), sizeof(program), range, 0, 1, 0, 0
+        );
+    };
+
+    // The previous launch's write lands after startup sampled zero and selected token two.
+    write_reg(RegId::DATA_MAIN_BASE, endpoint.token_base);
+    done = defer_bit | 2;
+    lifecycle = AICORE_LIFECYCLE_EXIT_BIT;
+    EXPECT_FALSE(run());
+    EXPECT_EQ(arguments.args[0], 0);
+    EXPECT_EQ(control.lane_error, 0U);
+
+    // The current launch's third credit suffices even if its DMB write has yet to arrive.
+    write_reg(RegId::DATA_MAIN_BASE, 0);
+    done = defer_bit | 3;
+    EXPECT_TRUE(run());
+    EXPECT_EQ(arguments.args[0], 1);
+    EXPECT_EQ(control.lane_error, 0U);
+
+    program.row.wait_count = 0;
+    EXPECT_FALSE(run());
+    EXPECT_EQ(arguments.args[0], 1);
+    EXPECT_EQ(control.lane_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
+}
+
 TEST_F(CalendarDeferTest, SharesADeferredCompletionOnlyAfterTheOwnerHasObservedIt) {
     struct Program {
         CalendarRangeHeader header;
@@ -290,7 +382,7 @@ TEST_F(CalendarDeferTest, SharesADeferredCompletionOnlyAfterTheOwnerHasObservedI
         range.binding_offset = offsetof(Program, binding);
         range.sequence_base = phase_base;
         return percounter_calendar_execute_range(
-            lane, reinterpret_cast<const uint8_t *>(&program), sizeof(program), range, 0, 1, 0
+            lane, reinterpret_cast<const uint8_t *>(&program), sizeof(program), range, 0, 1, 0, lane.cluster_lane
         );
     };
     percounter_gm_store(control.lane_error, uint64_t{1});
@@ -423,7 +515,7 @@ TEST_F(CalendarDeferTest, ASharedFusedOwnerKeepsItsOwnDeferredHelperAndRangeOrdi
         range.sequence_base = phase_base;
         range.phase_row_offset = phase_offset;
         return percounter_calendar_execute_range(
-            lane, reinterpret_cast<const uint8_t *>(&program), sizeof(program), range, 0, 1, 0
+            lane, reinterpret_cast<const uint8_t *>(&program), sizeof(program), range, 0, 1, 0, lane.cluster_lane
         );
     };
     percounter_gm_store(control.lane_error, uint64_t{1});

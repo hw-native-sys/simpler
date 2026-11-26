@@ -178,6 +178,18 @@ enum class PercounterTaskEventKind : uint32_t {
     RangeEnterBegin,
     GraphReadyObserved,
     RangeEntered,
+    PeerPublished,
+    PeerObserved,
+    PeerWriteBegin,
+    PeerWaitBegin,
+    PeerInitialProof,
+    PeerBatchBegin,
+    PeerScalarBatchIssued,
+    PeerMteBatchIssued,
+    PeerMtePublished,
+    PeerDmbMovAtEntry,
+    PeerDmbMovChanged,
+    PeerPeriodicReady,
 };
 
 struct PercounterTaskEvent {
@@ -185,7 +197,7 @@ struct PercounterTaskEvent {
     uint64_t entry;
     uint64_t detail;  // Completion contribution or deferred group reference.
     PercounterTaskEventKind kind;
-    uint32_t reserved;
+    uint32_t previous_poll_delta;  // MOV samples only; UINT32_MAX when no previous poll is available.
 };
 
 inline constexpr uint32_t PERCOUNTER_SCALAR_WORD_CAPACITY =
