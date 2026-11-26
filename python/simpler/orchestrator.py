@@ -341,6 +341,7 @@ class Orchestrator:
         _check_domain_initializer_context(self._worker, "Orchestrator.submit_next_level")
         cfg = config if config is not None else CallConfig()
         cpp_worker_id = _require_next_level_worker_id(worker, argument="worker")
+        remote_chip = self._worker is not None and self._worker._is_remote_chip(cpp_worker_id)
         expected_namespace = (
             None
             if isinstance(callable_handle, CallableHandle)
@@ -353,12 +354,14 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace=expected_namespace,
         )
-        if ccu_bindings is not None and target_namespace != "LOCAL_CHIP":
+        if ccu_bindings is not None and (target_namespace != "LOCAL_CHIP" or remote_chip):
             raise ValueError("ccu_bindings require a local CHIP submission")
         if target_namespace != "REMOTE_TASK_DISPATCHER" and self._worker is not None:
             self._worker._require_local_next_level_target(cpp_worker_id, api="submit_next_level")
         c_args, explicit_remote_sidecar = _split_next_level_args(args)
-        if target_namespace == "REMOTE_TASK_DISPATCHER":
+        if target_namespace == "REMOTE_TASK_DISPATCHER" or remote_chip:
+            if remote_chip:
+                eligible_worker_ids = (cpp_worker_id,)
             remote_sidecar = (
                 explicit_remote_sidecar if explicit_remote_sidecar is not None else _empty_remote_sidecar_for(c_args)
             )
@@ -373,7 +376,9 @@ class Orchestrator:
                 callable_handle, [cpp_worker_id], [c_args], ccu_bindings=ccu_bindings
             )[0]
         if worker is not None:
-            worker._acquire_child_host_args(c_args, cpp_worker_id, device_target=target_namespace == "LOCAL_CHIP")
+            worker._acquire_child_host_args(
+                c_args, cpp_worker_id, device_target=target_namespace == "LOCAL_CHIP" and not remote_chip
+            )
         # Provenance validation precedes run ownership publication. Once a remote
         # ref is published, only the run fence may release it because the native
         # submit can commit before an exception reaches Python.
@@ -455,6 +460,9 @@ class Orchestrator:
         if target_namespace != "REMOTE_TASK_DISPATCHER" and self._worker is not None:
             for worker_id in worker_ids:
                 self._worker._require_local_next_level_target(worker_id, api="submit_next_level_group")
+        remote_chips = [self._worker is not None and self._worker._is_remote_chip(w) for w in worker_ids]
+        if ccu_bindings is not None and any(remote_chips):
+            raise ValueError("ccu_bindings require local CHIP submissions")
         c_args_list = []
         explicit_remote_sidecars = []
         has_explicit_remote_sidecar = False
@@ -463,22 +471,31 @@ class Orchestrator:
             c_args_list.append(c_args)
             explicit_remote_sidecars.append(sidecar)
             has_explicit_remote_sidecar = has_explicit_remote_sidecar or sidecar is not None
-        if target_namespace == "REMOTE_TASK_DISPATCHER":
+        if target_namespace == "REMOTE_TASK_DISPATCHER" or any(remote_chips):
             remote_sidecars = [
-                sidecar if sidecar is not None else _empty_remote_sidecar_for(c_args)
-                for c_args, sidecar in zip(c_args_list, explicit_remote_sidecars)
+                (sidecar if sidecar is not None else _empty_remote_sidecar_for(c_args))
+                if target_namespace == "REMOTE_TASK_DISPATCHER" or remote_chip
+                else _RemoteTaskArgsSidecar()
+                for c_args, sidecar, remote_chip in zip(c_args_list, explicit_remote_sidecars, remote_chips)
             ]
+            for sidecar, remote_chip in zip(explicit_remote_sidecars, remote_chips):
+                if sidecar is not None and target_namespace != "REMOTE_TASK_DISPATCHER" and not remote_chip:
+                    raise TypeError("RemoteTensorRef requires a remote target")
         else:
             if has_explicit_remote_sidecar:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecars = None
         if remote_sidecars is not None:
             for c_args, remote_sidecar in zip(c_args_list, remote_sidecars):
-                _validate_remote_sidecar_access(c_args, remote_sidecar)
+                if remote_sidecar.tensors or remote_sidecar.inline_payload:
+                    _validate_remote_sidecar_access(c_args, remote_sidecar)
         worker_id_sets = (
             [
-                _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
-                for remote_sidecar in remote_sidecars
+                _remote_data_eligible_worker_ids(
+                    remote_sidecar,
+                    eligible_worker_ids if target_namespace == "REMOTE_TASK_DISPATCHER" else (worker_id,),
+                )
+                for remote_sidecar, worker_id in zip(remote_sidecars, worker_ids)
             ]
             if remote_sidecars is not None
             else [list(eligible_worker_ids) for _ in args_list]
@@ -496,7 +513,9 @@ class Orchestrator:
         member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
-                worker._acquire_child_host_args(c_args, worker_ids[g], device_target=target_namespace == "LOCAL_CHIP")
+                worker._acquire_child_host_args(
+                    c_args, worker_ids[g], device_target=target_namespace == "LOCAL_CHIP" and not remote_chips[g]
+                )
                 if worker._names_device_allocation(c_args):
                     member_checks.append((g, c_args))
         prov_guard: Any = (
@@ -511,7 +530,10 @@ class Orchestrator:
                 )
                 if remote_sidecars is not None:
                     remote_sidecars[index] = prepared
-                    worker_id_sets[index] = _remote_data_eligible_worker_ids(prepared, eligible_worker_ids)
+                    worker_id_sets[index] = _remote_data_eligible_worker_ids(
+                        prepared,
+                        eligible_worker_ids if target_namespace == "REMOTE_TASK_DISPATCHER" else (worker_ids[index],),
+                    )
             if worker is not None and remote_sidecars is not None:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:

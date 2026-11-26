@@ -176,15 +176,21 @@ void Worker::add_next_level_worker(
 
 void Worker::add_remote_l3_socket(
     int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &host, uint16_t port,
-    const std::string &health_host, uint16_t health_port, double attach_timeout_s, double runtime_timeout_s
+    const std::string &health_host, uint16_t health_port, double attach_timeout_s, double runtime_timeout_s,
+    int32_t remote_worker_level
 ) {
     if (initialized_) throw std::runtime_error("Worker: add_remote_l3_socket after init");
+    if (remote_worker_level != 2 && remote_worker_level != 3)
+        throw std::invalid_argument("Worker: remote worker level must be 2 or 3");
     auto transport = std::make_unique<RemoteL3SocketTransport>(
         host, port, health_host, health_port, attach_timeout_s, runtime_timeout_s
     );
-    transport->expect_hello_ready(session_id, worker_id, transport_name);
+    transport->expect_hello_ready(session_id, worker_id, transport_name, remote_worker_level);
     manager_.add_next_level_endpoint(
-        std::make_unique<RemoteL3Endpoint>(worker_id, session_id, transport_name, std::move(transport))
+        std::make_unique<RemoteL3Endpoint>(
+            worker_id, session_id, transport_name, std::move(transport),
+            remote_worker_level == 2 ? WorkerEndpointKind::REMOTE_L2 : WorkerEndpointKind::REMOTE_L3
+        )
     );
 }
 

@@ -41,6 +41,8 @@ def test_task_completed_runs_after_drain_before_completion(monkeypatch, failure)
                 events.append("reply")
 
     class InnerWorker:
+        level = 3
+
         def run(self, fn, args, config):
             events.append("entry")
             fn(None, args, config)

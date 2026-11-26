@@ -98,7 +98,7 @@ public:
     void add_remote_l3_socket(
         int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &host,
         uint16_t port, const std::string &health_host, uint16_t health_port, double attach_timeout_s,
-        double runtime_timeout_s
+        double runtime_timeout_s, int32_t remote_worker_level = 3
     );
     void add_mpi_group_mailbox(
         const std::vector<int32_t> &worker_ids, const std::vector<uint64_t> &session_ids, void *mailbox,

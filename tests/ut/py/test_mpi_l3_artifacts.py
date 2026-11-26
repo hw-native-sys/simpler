@@ -189,6 +189,7 @@ def session_harness(monkeypatch, tmp_path):
 
     class InnerWorker:
         def __init__(self, **kwargs):
+            self.level = kwargs["level"]
             self.initialized = False
             state.worker = self
 

@@ -18,8 +18,10 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.shared_memory import SharedMemory
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 import simpler.worker as worker_mod
@@ -68,6 +70,7 @@ from simpler.task_interface import (
 )
 from simpler.worker import (
     RemoteCallable,
+    RemoteChipSpec,
     RemoteWorkerSpec,
     Worker,
     _pack_py_callable_payload,
@@ -2856,6 +2859,181 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
         assert fake.calls.count(("free", worker_id, 7, 1)) == free_count + 1
     finally:
         worker.close()
+
+
+@pytest.mark.parametrize("operation", ["register", "unregister"])
+def test_remote_chip_registry_serializes_same_digest(operation, monkeypatch):
+    prepared_event = threading.Event()
+    allow_commit = threading.Event()
+    contender_reached = threading.Event()
+    contender_blocked = threading.Event()
+    contender_id = None
+    controls = []
+
+    def record_control(name):
+        controls.append(name)
+        if threading.get_ident() == contender_id:
+            contender_reached.set()
+
+    class FakeRemoteChip:
+        def __init__(self):
+            self.prepared = set()
+            self.ref_count = 0
+            self.pause_prepare = False
+
+        def remote_prepare_register(self, worker_id, _registry, _kind, _payload, digest):
+            record_control("prepare")
+            assert digest not in self.prepared, "overlapping prepares for the same digest"
+            self.prepared.add(digest)
+            if self.pause_prepare:
+                self.pause_prepare = False
+                prepared_event.set()
+                assert allow_commit.wait(5)
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_commit_register(self, worker_id, _registry, _kind, digest):
+            record_control("commit")
+            self.prepared.remove(digest)
+            self.ref_count += 1
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_unregister(self, worker_id, _registry, _kind, digest):
+            record_control("unregister")
+            self.prepared.discard(digest)
+            self.ref_count -= 1
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_abort_register(self, worker_id, _registry, _kind, digest):
+            self.prepared.discard(digest)
+            return _FakeRemoteControlResult(worker_id)
+
+        def broadcast_register_all(self, *_args):
+            return []
+
+        def broadcast_unregister_all(self, *_args):
+            return []
+
+    worker = Worker(level=3, device_ids=[0], num_sub_workers=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
+    worker.add_remote_chip(RemoteChipSpec(endpoint="127.0.0.1:19073", platform="a2a3sim", device_id=1))
+    fake = FakeRemoteChip()
+    worker._worker = fake  # type: ignore[assignment]
+    worker._lifecycle = worker_mod._Lifecycle.READY
+    chip = ChipCallable.build(signature=[], func_name="x", binary=b"\x01", children=[])
+    previous = worker.register(chip) if operation == "unregister" else None
+    controls.clear()
+    guard_for_digest = getattr(worker, "_chip_registry_guard", contextlib.nullcontext)
+
+    @contextlib.contextmanager
+    def observe_guard(digest):
+        lock = guard_for_digest(digest)
+        if threading.get_ident() != contender_id:
+            with lock:
+                yield
+            return
+        if lock.acquire(blocking=False):
+            lock.release()
+        else:
+            contender_blocked.set()
+        contender_reached.set()
+        with lock:
+            yield
+
+    monkeypatch.setattr(worker, "_chip_registry_guard", observe_guard, raising=False)
+
+    def compete():
+        nonlocal contender_id
+        contender_id = threading.get_ident()
+        if previous is not None:
+            worker.unregister(previous)
+            return None
+        return worker.register(chip)
+
+    fake.pause_prepare = True
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(worker.register, chip)
+        try:
+            assert prepared_event.wait(5)
+            second = executor.submit(compete)
+            assert contender_reached.wait(5)
+        finally:
+            allow_commit.set()
+        registered = first.result(timeout=5)
+        other = second.result(timeout=5)
+
+    expected = (
+        ["prepare", "commit", "prepare", "commit"] if operation == "register" else ["prepare", "commit", "unregister"]
+    )
+    assert controls == expected
+    assert contender_blocked.is_set()
+    assert not fake.prepared
+    assert registered.digest not in worker._uncertain_hashids
+    assert fake.ref_count == (2 if operation == "register" else 1)
+    worker.unregister(registered)
+    if other is not None:
+        assert other.digest == registered.digest
+        worker.unregister(other)
+    assert fake.ref_count == 0
+
+
+@pytest.mark.parametrize("failure", ["payload", "prepare", "commit"])
+def test_remote_chip_registration_failure_rolls_back_provisional_handle(failure, monkeypatch):
+    worker = Worker(level=3, device_ids=[0], num_sub_workers=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
+    remote_id = worker.add_remote_chip(RemoteChipSpec(endpoint="127.0.0.1:19073", platform="a2a3sim", device_id=1))
+    native = MagicMock()
+    result = _FakeRemoteControlResult(remote_id)
+    native.broadcast_register_all.return_value = []
+    native.remote_prepare_register.return_value = result
+    native.remote_commit_register.return_value = result
+    native.remote_abort_register.return_value = result
+    worker._worker = native
+    worker._lifecycle = worker_mod._Lifecycle.READY
+    chip = ChipCallable.build(signature=[], func_name="x", binary=b"\x01", children=[])
+    existing = worker.register(chip)
+    digest = existing.digest
+    native.reset_mock()
+
+    if failure == "payload":
+        error = ValueError
+        monkeypatch.setattr(
+            worker, "_inner_registry_entries_for_spec", MagicMock(side_effect=ValueError("payload failed"))
+        )
+    else:
+        error = KeyboardInterrupt
+        transport = native.remote_prepare_register if failure == "prepare" else native.remote_commit_register
+        transport.side_effect = KeyboardInterrupt
+
+    with pytest.raises(error):
+        worker.register(chip)
+
+    assert worker._live_handles == {existing._handle_id: digest}
+    assert worker._identity_registry[digest].ref_count == 1
+    if failure == "payload":
+        native.remote_prepare_register.assert_not_called()
+        native.remote_abort_register.assert_not_called()
+    else:
+        native.remote_abort_register.assert_called_once_with(remote_id, "REMOTE_CHIP_WORKER", "CHIP_CALLABLE", digest)
+    if failure == "commit":
+        assert digest in worker._uncertain_hashids
+    else:
+        assert worker._resolve_handle(existing).digest == digest
+
+
+def test_local_chip_unregister_error_allows_reregistration(capsys):
+    worker = Worker(level=3, device_ids=[0], num_sub_workers=0, platform="a2a3sim")
+    native = MagicMock()
+    native.broadcast_register_all.return_value = []
+    native.broadcast_unregister_all.return_value = ["local chip unregister failed"]
+    worker._worker = native
+    worker._lifecycle = worker_mod._Lifecycle.READY
+    chip = ChipCallable.build(signature=[], func_name="x", binary=b"\x01", children=[])
+
+    first = worker.register(chip)
+    worker.unregister(first)
+    second = worker.register(chip)
+
+    assert second.digest == first.digest
+    assert native.broadcast_register_all.call_count == 2
+    assert "local chip unregister failed" in capsys.readouterr().err
 
 
 def test_remote_register_prepare_exception_marks_hash_uncertain():

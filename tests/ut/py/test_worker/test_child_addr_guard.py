@@ -636,7 +636,7 @@ class TestSubmitDispatchGuard:
         # A LOCAL_CHIP callable pinned to a remote worker id would enqueue on the
         # remote endpoint, whose manifest lacks the local digest -> async unknown
         # hashid. The Python guard rejects it up front; a local chip id passes.
-        w = _l3()
+        w = Worker(level=4, num_sub_workers=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
         w._chip_shms = [object()]
         w._remote_worker_ids = [7]
         fake = MagicMock()
@@ -648,7 +648,7 @@ class TestSubmitDispatchGuard:
         fake.submit_next_level.assert_called_once()
 
     def test_local_group_rejects_remote_worker_target(self, _fake_handle):
-        w = _l3()
+        w = Worker(level=4, num_sub_workers=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
         w._chip_shms = [object()]
         w._remote_worker_ids = [7]
         fake = MagicMock()

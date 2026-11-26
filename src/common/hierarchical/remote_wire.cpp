@@ -166,6 +166,7 @@ bool valid_remote_registry_target(uint32_t v) {
     switch (static_cast<RemoteRegistryTarget>(v)) {
     case RemoteRegistryTarget::REMOTE_TASK_DISPATCHER:
     case RemoteRegistryTarget::INNER_L3_WORKER:
+    case RemoteRegistryTarget::REMOTE_CHIP_WORKER:
         return true;
     }
     return false;

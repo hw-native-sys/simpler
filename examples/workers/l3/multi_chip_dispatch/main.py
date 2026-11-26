@@ -26,6 +26,7 @@ Run:
 """
 
 import argparse
+import ctypes
 import os
 import sys
 
@@ -40,10 +41,12 @@ from simpler.task_interface import (
     CallConfig,
     ChipCallable,
     CoreCallable,
+    DataType,
+    RemoteTensorRef,
     TaskArgs,
     TensorArgType,
 )
-from simpler.worker import Worker
+from simpler.worker import RemoteChipSpec, Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
@@ -59,6 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-p", "--platform", required=True, choices=["a2a3sim", "a2a3", "a5sim", "a5"])
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1' or '4-5'. Two chips required.")
+    parser.add_argument("--remote-endpoint", help="Remote daemon IPv4 address and port, e.g. 192.0.2.20:19073")
+    parser.add_argument("--remote-device", default="0-1", help="Device range on the remote host")
     return parser.parse_args()
 
 
@@ -196,8 +201,95 @@ def run(platform: str, device_ids: list[int]) -> int:
     return 0
 
 
+def run_remote(platform: str, device_ids: list[int], endpoint: str, remote_device_ids: list[int]) -> int:
+    """Validate one L3 dispatching directly to local and remote single-card runtimes."""
+    worker = Worker(
+        level=3, platform=platform, runtime="tensormap_and_ringbuffer", device_ids=device_ids, num_sub_workers=0
+    )
+    remote_ids = [
+        worker.add_remote_chip(RemoteChipSpec(endpoint=endpoint, platform=platform, device_id=device_id))
+        for device_id in remote_device_ids
+    ]
+    callable_obj = build_chip_callable(platform)
+    chip = worker.register(callable_obj)
+    startup_alias = worker.register(callable_obj)
+    worker.init()
+    remote_outputs = []
+    try:
+        # Exercise dynamic registration as well as the startup registry snapshot.
+        dynamic_chip = worker.register(callable_obj)
+        count = len(device_ids) + len(remote_ids)
+        shape = (N_ROWS, N_COLS)
+        nbytes = N_ROWS * N_COLS * 4
+        local_outputs, expected, task_args = [], [], []
+        for rank in range(count):
+            a = torch.arange(N_ROWS * N_COLS, dtype=torch.float32).reshape(shape) + rank
+            b = torch.full(shape, rank + 0.5, dtype=torch.float32)
+            expected.append(a + b)
+            args = TaskArgs()
+            if rank < len(device_ids):
+                inputs = [worker.create_buffer(nbytes) for _ in range(2)]
+                output = worker.create_buffer(nbytes)
+                local_outputs.append(output)
+                for buffer, value in zip(inputs, (a, b)):
+                    ctypes.memmove(buffer.base, value.numpy().tobytes(), nbytes)
+                    args.add_tensor(buffer.tensor(shape, DataType.FLOAT32), TensorArgType.INPUT)
+                args.add_tensor(output.tensor(shape, DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+            else:
+                output = worker.remote_malloc(worker=remote_ids[rank - len(device_ids)], nbytes=nbytes)
+                remote_outputs.append(output)
+                args.add_tensor(RemoteTensorRef.host_inline(a.numpy().tobytes(), shape=shape, dtype=DataType.FLOAT32))
+                args.add_tensor(RemoteTensorRef.host_inline(b.numpy().tobytes(), shape=shape, dtype=DataType.FLOAT32))
+                args.add_tensor(
+                    RemoteTensorRef(output, shape=shape, dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING
+                )
+            task_args.append(args)
+
+        targets = list(range(len(device_ids))) + remote_ids
+        active_chip = dynamic_chip
+
+        def dispatch(orch, _args, config):
+            orch.submit_next_level_group(active_chip, task_args, config, workers=targets)
+
+        poison = torch.full(shape, -1.0, dtype=torch.float32)
+        poison_bytes = poison.numpy().tobytes()
+        for epoch in range(3):
+            if epoch == 1:
+                worker.unregister(dynamic_chip)
+                active_chip = startup_alias
+            elif epoch == 2:
+                worker.unregister(startup_alias)
+                active_chip = chip
+            for output in local_outputs:
+                ctypes.memmove(output.base, poison_bytes, nbytes)
+            for output in remote_outputs:
+                worker.remote_copy_to(output, poison.data_ptr(), nbytes)
+            worker.run(dispatch, TaskArgs(), CallConfig())
+            actual = [
+                torch.frombuffer(bytearray(ctypes.string_at(output.base, nbytes)), dtype=torch.float32).reshape(shape)
+                for output in local_outputs
+            ]
+            for output in remote_outputs:
+                result = torch.empty(shape, dtype=torch.float32)
+                worker.remote_copy_from(output, result.data_ptr(), nbytes)
+                actual.append(result)
+            for target, result, golden in zip(targets, actual, expected):
+                torch.testing.assert_close(result, golden, rtol=1e-5, atol=1e-5)
+                print(f"[remote_chip_dispatch] epoch={epoch} worker={target}: PASS")
+        for output in remote_outputs:
+            worker.remote_free(output)
+        worker.unregister(chip)
+    finally:
+        worker.close()
+    return 0
+
+
 def main() -> int:
     cli = parse_args()
+    if cli.remote_endpoint:
+        return run_remote(
+            cli.platform, parse_device_range(cli.device), cli.remote_endpoint, parse_device_range(cli.remote_device)
+        )
     return run(cli.platform, parse_device_range(cli.device))
 
 

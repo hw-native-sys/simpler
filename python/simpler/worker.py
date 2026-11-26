@@ -1153,6 +1153,23 @@ class RemoteWorkerSpec:
 
 
 @dataclass(frozen=True)
+class RemoteChipSpec(RemoteWorkerSpec):
+    """One remote device, runtime, command lane and independent health lane."""
+
+    device_ids: tuple[int, ...] = field(init=False, default=())
+    num_sub_workers: int = field(init=False, default=0)
+    device_id: int = 0
+
+    def __post_init__(self) -> None:
+        device_id = operator.index(self.device_id)
+        if device_id < 0 or device_id >= (1 << 31):
+            raise ValueError("RemoteChipSpec.device_id must be a non-negative int32")
+        object.__setattr__(self, "device_id", device_id)
+        object.__setattr__(self, "device_ids", (device_id,))
+        super().__post_init__()
+
+
+@dataclass(frozen=True)
 class MpiL3GroupSpec:
     """Describes L3 workers launched by one parent-owned ``mpirun``.
 
@@ -6404,6 +6421,9 @@ class Worker:
         # dispatch) is now handled at the C++ boundary via mailbox_mu_, so
         # no quiescent-state guard is needed.
         self._registry_lock = threading.Lock()
+        self._mixed_chip_registry_locks: weakref.WeakValueDictionary[bytes, threading.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._pending_unregister_cids: set[int] = set()
         self._pending_remote_unregister_hashids: set[bytes] = set()
         self._py_control_timeout_s = float(config.get("py_control_timeout_s", _PY_CONTROL_TIMEOUT_S))
@@ -6709,7 +6729,7 @@ class Worker:
                 raise RuntimeError("Worker.add_remote_worker after init")
             if self.level < 4:
                 raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
-            if not isinstance(spec, RemoteWorkerSpec):
+            if not isinstance(spec, RemoteWorkerSpec) or isinstance(spec, RemoteChipSpec):
                 raise TypeError("Worker.add_remote_worker expects a RemoteWorkerSpec")
             # Validate the endpoint here, before any startup resource exists, so a
             # non-numeric host fails at registration rather than mid-activation
@@ -6720,6 +6740,28 @@ class Worker:
             self._remote_worker_specs.append(spec)
             self._remote_worker_ids.append(worker_id)
             return worker_id
+
+    def add_remote_chip(self, spec: RemoteChipSpec) -> int:
+        """Attach one daemon-hosted L2 to this L3 before topology initialization."""
+        with self._hierarchical_start_cv:
+            if self._lifecycle is not _Lifecycle.NEW:
+                raise RuntimeError("Worker.add_remote_chip after init")
+            if self.level != 3:
+                raise TypeError("Worker.add_remote_chip requires a level-3 parent")
+            if not isinstance(spec, RemoteChipSpec):
+                raise TypeError("Worker.add_remote_chip expects a RemoteChipSpec")
+            host, _port = self._parse_remote_endpoint(spec.endpoint)
+            self._validate_numeric_endpoint_host(host)
+            self._next_level_worker_id_count = max(
+                self._next_level_worker_id_count, len(self._config.get("device_ids", ()))
+            )
+            worker_id = self._allocate_next_level_worker_id()
+            self._remote_worker_specs.append(spec)
+            self._remote_worker_ids.append(worker_id)
+            return worker_id
+
+    def _is_remote_chip(self, worker_id: int) -> bool:
+        return self.level == 3 and int(worker_id) in self._remote_worker_ids
 
     def add_mpirun_worker_group(self, spec: MpiL3GroupSpec) -> tuple[int, ...]:
         """Register L3 workers that will be launched by one parent-owned ``mpirun``.
@@ -6938,7 +6980,7 @@ class Worker:
         return entries
 
     def _inner_registry_entries_for_spec(
-        self, spec: RemoteWorkerSpec | _MpiL3RankSpec | MpiDirectExecutorSpec
+        self, spec: RemoteWorkerSpec | _MpiL3RankSpec | MpiDirectExecutorSpec, *, digest: bytes | None = None
     ) -> list[dict[str, Any]]:
         from .remote_l3_protocol import (  # noqa: PLC0415
             ChipCallableBlobLocation,
@@ -6948,7 +6990,7 @@ class Worker:
 
         entries: list[dict[str, Any]] = []
         with self._registry_lock:
-            states = list(self._identity_registry.values())
+            states = list(self._identity_registry.values()) if digest is None else [self._identity_registry[digest]]
         for state in states:
             if state.target_namespace != "LOCAL_CHIP":
                 continue
@@ -6972,15 +7014,16 @@ class Worker:
                     staged_blob_token=b"",
                 )
             )
-            entries.append(
-                {
-                    "hashid": state.digest.hex(),
-                    "kind": "CHIP_CALLABLE",
-                    "target_registry": "INNER_L3_WORKER",
-                    "payload_version": 1,
-                    "payload_hex": payload.hex(),
-                }
-            )
+            entry = {
+                "hashid": state.digest.hex(),
+                "kind": "CHIP_CALLABLE",
+                "target_registry": "INNER_L3_WORKER",
+                "payload_version": 1,
+                "payload_hex": payload.hex(),
+            }
+            if isinstance(spec, RemoteChipSpec) and digest is None:
+                entry["ref_count"] = state.ref_count
+            entries.append(entry)
         return entries
 
     @staticmethod
@@ -7122,7 +7165,7 @@ class Worker:
         return {
             "session_id": int(session_id),
             "parent_worker_level": int(self.level),
-            "remote_worker_level": 3,
+            "remote_worker_level": 2 if isinstance(spec, RemoteChipSpec) else 3,
             "worker_id": int(worker_id),
             "platform": spec.platform,
             "runtime": spec.runtime,
@@ -7142,8 +7185,16 @@ class Worker:
             "startup_remaining_s": float(startup_remaining_s),
             "listen_host": listen_host,
             "connect_host": daemon_host,
-            "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(worker_id),
-            "inner_l3_worker": self._inner_registry_entries_for_spec(spec),
+            "remote_task_dispatcher": []
+            if isinstance(spec, RemoteChipSpec)
+            else self._remote_dispatcher_entries_for_worker(worker_id),
+            "inner_l3_worker": [] if isinstance(spec, RemoteChipSpec) else self._inner_registry_entries_for_spec(spec),
+            "chip_worker": [
+                {**entry, "target_registry": "REMOTE_CHIP_WORKER"}
+                for entry in self._inner_registry_entries_for_spec(spec)
+            ]
+            if isinstance(spec, RemoteChipSpec)
+            else [],
             "feature_flags": [],
         }
 
@@ -7517,8 +7568,8 @@ class Worker:
         public lifecycle), so an operation legitimately admitted before a
         concurrent ``close()`` published CLOSED still completes during the drain
         instead of spuriously failing."""
-        if self.level < 4:
-            raise TypeError("remote memory APIs require a level >= 4 parent Worker")
+        if self.level < 4 and not self._is_remote_chip(worker_id):
+            raise TypeError("remote memory APIs require a remote child of a hierarchical Worker")
         if int(worker_id) not in self._remote_like_worker_ids():
             raise ValueError(
                 "remote memory APIs require a remote worker id returned by add_remote_worker or add_mpirun_worker_group"
@@ -8537,8 +8588,13 @@ class Worker:
             child_path = _format_worker_path(int(child.level), parent_path=path, index=int(child_index))
             self._append_endpoint_topology(entries, child, child_path, node_identity, include_self=True)
         for child_index, spec in zip(worker._remote_worker_ids, worker._remote_worker_specs):
-            remote_path = _format_worker_path(3, parent_path=path, index=int(child_index))
             remote_node_identity = self._node_identity_from_remote_endpoint(spec.endpoint)
+            if isinstance(spec, RemoteChipSpec):
+                remote_path = _format_worker_path(2, parent_path=path, index=int(child_index))
+                entries.append(_EndpointTopologyEntry(remote_path, DEVICE_AICORE, remote_node_identity))
+                entries.append(_EndpointTopologyEntry(remote_path, DEVICE_AICPU, remote_node_identity))
+                continue
+            remote_path = _format_worker_path(3, parent_path=path, index=int(child_index))
             entries.append(_EndpointTopologyEntry(remote_path, HOST_CPU, remote_node_identity))
             self._append_device_endpoint_topology(entries, remote_path, spec.device_ids, remote_node_identity)
         mpi_groups = {group.group_id: group for group in worker._mpi_l3_groups}
@@ -8862,6 +8918,14 @@ class Worker:
         with self._operation_lease("register"):
             return self._post_start_register_l2(reg, target)
 
+    def _chip_registry_guard(self, digest: bytes):
+        if self.level != 3 or not self._remote_worker_specs:
+            return contextlib.nullcontext()
+        # Remote PREPARE and UNREGISTER share the pending entry for this digest.
+        # Each in-flight operation holds its lock until the transaction ends.
+        with self._registry_lock:
+            return self._mixed_chip_registry_locks.setdefault(digest, threading.Lock())
+
     def _post_start_register_chip(self, reg: _CallableRegistration, target: ChipCallable) -> CallableHandle:
         """Publish a post-READY L3+ ChipCallable and broadcast it to the chip /
         next-level children via C++ after Host-side slot allocation.
@@ -8871,15 +8935,16 @@ class Worker:
         admission before anything is published. The slot is target-private; task
         dispatches carry only ``handle.digest``.
         """
-        with self._registry_lock:
-            handle, is_new = self._install_registration_locked(reg)
-        try:
-            self._post_init_register(target, handle.digest, is_new=is_new)
-        except Exception:
+        with self._chip_registry_guard(reg.digest):
             with self._registry_lock:
-                self._rollback_handle_locked(handle)
-            raise
-        return handle
+                handle, is_new = self._install_registration_locked(reg)
+            try:
+                self._post_init_register(target, handle.digest, is_new=is_new)
+            except BaseException:
+                with self._registry_lock:
+                    self._rollback_handle_locked(handle)
+                raise
+            return handle
 
     def _post_start_register_l2(self, reg: _CallableRegistration, target: ChipCallable) -> CallableHandle:
         """Publish a post-READY L2 registration and pre-warm its device slot, so
@@ -9030,7 +9095,9 @@ class Worker:
                     self._uncertain_hashids.add(reg.digest)
             raise
 
-    def _remote_abort_prepared(self, worker_ids: list[int], reg: _CallableRegistration) -> list[str]:
+    def _remote_abort_prepared(
+        self, worker_ids: list[int], reg: _CallableRegistration, *, registry: str = "REMOTE_TASK_DISPATCHER"
+    ) -> list[str]:
         if self._worker is None:
             return []
         errors: list[str] = []
@@ -9038,7 +9105,7 @@ class Worker:
             try:
                 result = self._worker.remote_abort_register(
                     worker_id,
-                    "REMOTE_TASK_DISPATCHER",
+                    registry,
                     reg.kind,
                     reg.digest,
                 )
@@ -9049,7 +9116,9 @@ class Worker:
                 errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
         return errors
 
-    def _remote_unregister_committed(self, worker_ids: list[int], reg: _CallableRegistration) -> list[str]:
+    def _remote_unregister_committed(
+        self, worker_ids: list[int], reg: _CallableRegistration, *, registry: str = "REMOTE_TASK_DISPATCHER"
+    ) -> list[str]:
         if self._worker is None:
             return []
         errors: list[str] = []
@@ -9057,7 +9126,7 @@ class Worker:
             try:
                 result = self._worker.remote_unregister(
                     worker_id,
-                    "REMOTE_TASK_DISPATCHER",
+                    registry,
                     reg.kind,
                     reg.digest,
                 )
@@ -9294,6 +9363,9 @@ class Worker:
         if not getattr(self, "_hierarchical_started", False):
             return
         assert self._worker is not None
+        if self.level == 3 and self._remote_worker_specs:
+            self._post_init_register_mixed_chip(target, digest)
+            return
         try:
             results = self._worker.broadcast_register_all(int(target.buffer_ptr()), int(target.buffer_size()), digest)
         except Exception:
@@ -9309,6 +9381,63 @@ class Worker:
                 with self._registry_lock:
                     self._uncertain_hashids.add(digest)
             raise RuntimeError(self._format_register_partial_failure(digest, errors, cleanup_errors))
+
+    def _post_init_register_mixed_chip(self, target: ChipCallable, digest: bytes) -> None:
+        """Publish a chip identity across mailbox and remote endpoints as one transaction."""
+        assert self._worker is not None
+        reg = _build_callable_registration(self, target)
+        prepared: list[int] = []
+        committed: list[int] = []
+        local_results: list[Any] = []
+        publication_uncertain = False
+        try:
+            for worker_id, spec in zip(self._remote_worker_ids, self._remote_worker_specs):
+                entry = self._inner_registry_entries_for_spec(spec, digest=digest)[0]
+                payload = bytes.fromhex(entry["payload_hex"])
+                # PREPARE can take effect before its reply reaches us. ABORT
+                # is idempotent and also covers that attempted target.
+                prepared.append(worker_id)
+                result = self._worker.remote_prepare_register(
+                    worker_id, "REMOTE_CHIP_WORKER", "CHIP_CALLABLE", payload, digest
+                )
+                if not result.ok:
+                    raise RuntimeError(result.error_message)
+            ptr, size = int(target.buffer_ptr()), int(target.buffer_size())
+            publication_uncertain = True
+            local_results = [
+                result
+                for result in self._worker.broadcast_register_all(ptr, size, digest)
+                if not self._is_remote_chip(int(result.worker_id))
+            ]
+            errors = self._control_errors(local_results)
+            if errors:
+                raise RuntimeError(errors[0])
+            publication_uncertain = False
+            for worker_id in prepared:
+                publication_uncertain = True
+                result = self._worker.remote_commit_register(worker_id, "REMOTE_CHIP_WORKER", "CHIP_CALLABLE", digest)
+                if not result.ok:
+                    raise RuntimeError(result.error_message)
+                committed.append(worker_id)
+                publication_uncertain = False
+        except BaseException:
+            cleanup_confirmed = False
+            try:
+                cleanup = self._remote_abort_prepared(
+                    [worker_id for worker_id in prepared if worker_id not in committed],
+                    reg,
+                    registry="REMOTE_CHIP_WORKER",
+                )
+                cleanup.extend(self._remote_unregister_committed(committed, reg, registry="REMOTE_CHIP_WORKER"))
+                cleanup.extend(self._cleanup_control_successes(local_results, _CTRL_UNREGISTER, digest))
+                cleanup_confirmed = not cleanup
+                if cleanup:
+                    _simpler_log.get_logger().error("Chip registration cleanup incomplete: %s", cleanup[0])
+            finally:
+                if publication_uncertain or not cleanup_confirmed:
+                    with self._registry_lock:
+                        self._uncertain_hashids.add(digest)
+            raise
 
     @staticmethod
     def _format_register_partial_failure(digest: bytes, errors: list[str], cleanup_errors: list[str]) -> str:
@@ -9414,11 +9543,13 @@ class Worker:
         # so a close claim in between rejects the operation rather than changing
         # it into a registry-only mutation on a CLOSED worker.
         with self._operation_lease("unregister"):
-            if (
-                isinstance(handle_or_slot, CallableHandle)
-                and handle_or_slot.target_namespace == "REMOTE_TASK_DISPATCHER"
-            ):
+            if not isinstance(handle_or_slot, CallableHandle):
+                self._unregister_handle(handle_or_slot)
+            elif handle_or_slot.target_namespace == "REMOTE_TASK_DISPATCHER":
                 self._unregister_remote_handle(handle_or_slot)
+            elif handle_or_slot.target_namespace == "LOCAL_CHIP":
+                with self._chip_registry_guard(handle_or_slot.digest):
+                    self._unregister_handle(handle_or_slot)
             else:
                 self._unregister_handle(handle_or_slot)
 
@@ -9620,6 +9751,17 @@ class Worker:
         """
         assert self._worker is not None
         errors = self._worker.broadcast_unregister_all(digest)
+        if self.level == 3 and self._remote_worker_ids:
+            for worker_id in self._remote_worker_ids:
+                try:
+                    result = self._worker.remote_unregister(worker_id, "REMOTE_CHIP_WORKER", "CHIP_CALLABLE", digest)
+                    if not result.ok:
+                        errors.append(result.error_message)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(self._format_remote_control_exception(worker_id, exc))
+            if errors:
+                with self._registry_lock:
+                    self._uncertain_hashids.add(digest)
         if errors:
             sys.stderr.write(
                 f"Worker.unregister(hash={_format_digest(digest)}): {len(errors)} chips reported errors "
@@ -10239,7 +10381,7 @@ class Worker:
             # remaining startup budget; runtime_timeout is the full runtime command
             # budget, never clamped by leftover startup time.
             try:
-                self._worker.add_remote_l3_socket(
+                attach_args = (
                     session.worker_id,
                     session.session_id,
                     spec.comm_profile,
@@ -10250,6 +10392,10 @@ class Worker:
                     remaining,
                     session_timeout,
                 )
+                if isinstance(spec, RemoteChipSpec):
+                    self._worker.add_remote_l3_socket(*attach_args, remote_worker_level=2)
+                else:
+                    self._worker.add_remote_l3_socket(*attach_args)
             except TimeoutError as exc:
                 raise TimeoutError(f"remote L3 endpoint attach failed for worker {worker_id}: {exc}") from exc
             except Exception as exc:
@@ -13884,16 +14030,13 @@ class Worker:
         )
 
     def _require_local_next_level_target(self, worker_id: int, *, api: str) -> None:
-        """Reject a local callable pinned to a remote NEXT_LEVEL worker.
+        """Validate NEXT_LEVEL routing for a local-namespace callable.
 
-        A LOCAL_PYTHON / LOCAL_CHIP callable is installed only in the local
-        children's registries; a remote-L3 worker's manifest carries only its
-        dispatcher callables, so routing a local digest to a remote worker id
-        fails asynchronously with an unknown-hashid on the remote endpoint. The
-        C++ target check only rejects unregistered ids, so a registered remote
-        worker slips through — this guards that hole.
+        Registered remote L2 runners carry the CHIP callable registry and can
+        receive CHIP tasks from their L3. Remote L3 dispatcher targets require
+        a RemoteCallable and cannot receive a local-namespace handle here.
         """
-        if worker_id in self._remote_like_worker_ids():
+        if worker_id in self._remote_like_worker_ids() and not self._is_remote_chip(worker_id):
             raise ValueError(
                 f"orch.{api}: worker {worker_id} is a remote NEXT_LEVEL worker; a local callable "
                 f"must target a local child (remote workers only run RemoteCallable dispatches)"

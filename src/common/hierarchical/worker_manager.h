@@ -528,6 +528,7 @@ enum class WorkerEndpointKind : int32_t {
     LOCAL_MAILBOX = 0,
     REMOTE_L3 = 1,
     MPI_GROUP_MAILBOX = 2,
+    REMOTE_L2 = 3,
 };
 
 struct WorkerEndpointCaps {
