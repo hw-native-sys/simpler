@@ -31,6 +31,7 @@
 #include "aicpu/platform_entry_args.h"
 #include "callable_protocol.h"
 #include "common/kernel_args.h"
+#include "common/l0_profiling.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
 #include "tensormap_and_ringbuffer/kernel_launch_admission.h"
@@ -1105,6 +1106,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // the run's final state can be read. Deciding the record here and
         // committing it after teardown is what keeps a teardown fault from
         // landing behind an already-published success.
+        // A failed core retirement prohibits sampler register reads even if
+        // execution failed first.
+        if (is_l0_swimlane_enabled() && sched_ctx_.cores_retired()) simpler_aicpu_l0_snapshot();
         snapshot_run_terminal(runtime);
         aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
         // Destroy the runtime context. sm_handle / rt are recreated every run so we

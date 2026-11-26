@@ -18,6 +18,7 @@
 #include <thread>
 
 #include "aicpu/device_run_result_base_aicpu.h"
+#include "common/l0_profiling.h"
 #include "runtime.h"
 #include "scheduler/scheduler_context.h"
 
@@ -119,6 +120,7 @@ protected:
 
     void SetUp() override {
         set_platform_run_result(0, 0);
+        set_l0_swimlane_enabled(false, 0);
         nonce_batches = 0;
         retirement_batches = 0;
         deadlines = 0;
@@ -253,6 +255,57 @@ TEST_F(SchedulerRetirement, EmergencyBeforeInitializationRetiresLateCores) {
     expect_once();
     EXPECT_EQ(context->shutdown(0), 0);
     EXPECT_EQ(context->shutdown(1), 0);
+    expect_once();
+}
+
+TEST_F(SchedulerRetirement, FailedEmergencyRetirementRemainsVisibleAtNormalShutdown) {
+    context->deinit();
+    set_l0_swimlane_enabled(true, 42);
+    ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, 0), 0);
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    silent_core = true;
+
+    context->abort_and_shutdown(runtime.get());
+
+    EXPECT_NE(context->shutdown(0), 0);
+    EXPECT_NE(context->shutdown(1), 0);
+    EXPECT_FALSE(context->cores_retired());
+    expect_once();
+}
+
+TEST_F(SchedulerRetirement, RetirementProofRequiresEveryCoreAcknowledgement) {
+    context->deinit();
+    set_l0_swimlane_enabled(true, 42);
+    ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, 0), 0);
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    EXPECT_FALSE(context->cores_retired());
+    ASSERT_EQ(context->shutdown(0), 0);
+    EXPECT_FALSE(context->cores_retired());
+    ASSERT_EQ(context->shutdown(1), 0);
+    EXPECT_TRUE(context->cores_retired());
+
+    context->deinit();
+    ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, 0), 0);
+    EXPECT_FALSE(context->cores_retired());
+    ASSERT_EQ(context->shutdown(0), 0);
+    EXPECT_FALSE(context->cores_retired());
+}
+
+TEST_F(SchedulerRetirement, DisabledL0KeepsOrdinaryRetirementResult) {
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    silent_core = true;
+
+    context->abort_and_shutdown(runtime.get());
+
+    EXPECT_EQ(context->shutdown(0), 0);
+    EXPECT_EQ(context->shutdown(1), 0);
+    EXPECT_FALSE(context->cores_retired());
     expect_once();
 }
 

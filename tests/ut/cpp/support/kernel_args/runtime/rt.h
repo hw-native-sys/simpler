@@ -8,9 +8,10 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// Minimal RTS declarations for the CPU-only KernelArgsHelper tests.
+// Minimal RTS declarations for CPU-only host tests.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 struct rtHostInputInfo_t {
@@ -28,6 +29,7 @@ rtError_t rtMalloc(void **ptr, uint64_t bytes, uint32_t type, uint16_t module_id
 rtError_t rtFree(void *ptr);
 rtError_t rtMallocHost(void **ptr, uint64_t bytes, uint16_t module_id);
 rtError_t rtFreeHost(void *ptr);
+rtError_t rtMemset(void *ptr, size_t capacity, int32_t value, size_t bytes);
 rtError_t
 rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream);
 rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind);

@@ -13,6 +13,7 @@
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/chip_swimlane_profiling.h"
+#include "common/l0_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
 
@@ -115,6 +116,11 @@ public:
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
 
+    bool cores_retired() const {
+        return is_l0_swimlane_enabled() && cores_total_num_ > 0 &&
+               retired_core_count_.load(std::memory_order_acquire) == cores_total_num_;
+    }
+
     // Claim each core independently; requests for unpublished cores stay pending.
     int32_t retire_cores(const int32_t *core_ids, int32_t core_num);
 
@@ -211,6 +217,8 @@ private:
     static constexpr uint8_t RETIREMENT_READY = 1;
     static constexpr uint8_t RETIREMENT_REQUESTED = 2;
     uint8_t retirement_state_[PLATFORM_MAX_CORES]{};
+    std::atomic<int32_t> retired_core_count_{0};
+    std::atomic<int32_t> retirement_error_{0};
     AicoreTeardownControl *teardown_gates_{nullptr};
     bool retirement_blocked_layout_{false};
     bool retirement_unassigned_{false};

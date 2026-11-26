@@ -846,6 +846,7 @@ struct ChipRunLaneState {
         const CallConfig &pred = predecessor.config;
         const CallConfig &succ = successor.config;
         if (pred.enable_chip_swimlane != succ.enable_chip_swimlane) return false;
+        if (pred.enable_l0_swimlane || succ.enable_l0_swimlane) return false;
         if (pred.enable_dump_args != succ.enable_dump_args) return false;
         if (pred.enable_pmu != succ.enable_pmu) return false;
         if (pred.enable_dep_gen != succ.enable_dep_gen) return false;

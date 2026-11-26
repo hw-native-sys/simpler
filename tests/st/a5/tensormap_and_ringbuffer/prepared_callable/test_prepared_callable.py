@@ -132,12 +132,14 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
         enable_dep_gen=False,
         enable_scope_stats=False,
         output_prefix="",
+        *,
+        enable_l0_swimlane=False,
     ):
         params = case.get("params", {})
         config_dict = case.get("config", {})
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
-        config = self._build_config(config_dict)
+        config = self._build_config(config_dict, enable_l0_swimlane=enable_l0_swimlane, output_prefix=output_prefix)
         chip_worker = self._chip_worker(worker)
 
         # 1) prepare two private slots with the SAME callable.

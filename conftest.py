@@ -318,6 +318,13 @@ def pytest_addoption(parser):
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption(
+        "--enable-l0-swimlane",
+        action="store_true",
+        default=False,
+        help="Enable the L0 hardware-sampler capture (writes <output_prefix>/l0_dfx_capture/). "
+        "Independent of --enable-chip-swimlane; not implied by any chip-swimlane level.",
+    )
+    parser.addoption(
         "--dump-args",
         nargs="?",
         const="partial",
@@ -1123,6 +1130,7 @@ _RESOURCE_CHILD_FLAG_OPTIONS = (
     "--enable-dep-gen",
     "--enable-scope-stats",
     "--enable-swimlane-overhead",
+    "--enable-l0-swimlane",
 )
 
 

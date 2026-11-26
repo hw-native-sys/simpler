@@ -392,14 +392,14 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
-# 6 int32 (aicpu_thread_num, enable_chip_swimlane, enable_dump_args,
-# enable_pmu, enable_dep_gen, enable_scope_stats) + uint64
+# 7 int32 (aicpu_thread_num, enable_chip_swimlane, enable_l0_swimlane,
+# enable_dump_args, enable_pmu, enable_dep_gen, enable_scope_stats) + 4-byte padding + uint64
 # ring sizing overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT:
 # ring_task_window, ring_heap, ring_dep_pool) + 1024-byte NUL-terminated
 # output_prefix. Log config travels separately via ChipWorker.init(log_level) —
 # not on per-task wire.
 _RUNTIME_ENV_UINT64_FIELD_COUNT = 3 * RUNTIME_ENV_RING_COUNT
-_CFG_FMT = struct.Struct("=iiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
+_CFG_FMT = struct.Struct("=iiiiiii4x" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
 # The generation-safe pipeline lease follows CONFIG. Args start after the
 # lease, rounded up to 8 bytes so the first
 # Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
@@ -420,7 +420,7 @@ _DISPOSITION_NONE = 0
 _VALIDATED_ONLY = 1
 _NATIVE_PREPARED = 2
 _TASK_ACCEPTED = 1
-_TASK_PROTOCOL_VERSION = 7
+_TASK_PROTOCOL_VERSION = 8
 
 # A request frame's own header: which run-state entry this payload belongs to,
 # that entry's generation, and this frame's generation — which the child echoes
@@ -2463,6 +2463,7 @@ def _config_diagnostics_any(cfg: CallConfig) -> bool:
     """Mirror of `CallConfig::diagnostics_any()`, which nanobind does not bind."""
     return bool(
         cfg.enable_chip_swimlane
+        or cfg.enable_l0_swimlane
         or cfg.enable_dump_args
         or cfg.enable_pmu
         or cfg.enable_dep_gen
@@ -4911,6 +4912,7 @@ def _read_config_from_mailbox(
     (
         aicpu_tn,
         swl,
+        l0_swl,
         dt,
         pmu,
         dep_gen,
@@ -4924,6 +4926,7 @@ def _read_config_from_mailbox(
     cfg = CallConfig()
     cfg.aicpu_thread_num = aicpu_tn
     cfg.enable_chip_swimlane = swl
+    cfg.enable_l0_swimlane = bool(l0_swl)
     cfg.enable_dump_args = int(dt)
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)

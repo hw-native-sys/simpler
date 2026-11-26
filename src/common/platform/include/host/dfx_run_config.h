@@ -65,6 +65,7 @@ struct RunLocalDfxMetadata {
  */
 struct DfxRunConfig {
     ChipSwimlaneLevel chip_swimlane_level{ChipSwimlaneLevel::DISABLED};
+    bool enable_l0_swimlane{false};
     DumpArgsLevel dump_args_level{DumpArgsLevel::OFF};
     PmuEventType pmu_event_type{};
     bool pmu_enabled{false};
@@ -73,16 +74,19 @@ struct DfxRunConfig {
     std::string output_prefix;
 
     bool chip_swimlane_enabled() const { return chip_swimlane_level != ChipSwimlaneLevel::DISABLED; }
+    bool l0_swimlane_enabled() const { return enable_l0_swimlane; }
     bool dump_args_enabled() const { return dump_args_level != DumpArgsLevel::OFF; }
 
     /** Mirrors CallConfig::diagnostics_any(). */
     bool diagnostics_any() const {
-        return chip_swimlane_enabled() || dump_args_enabled() || pmu_enabled || dep_gen_enabled || scope_stats_enabled;
+        return chip_swimlane_enabled() || l0_swimlane_enabled() || dump_args_enabled() || pmu_enabled ||
+               dep_gen_enabled || scope_stats_enabled;
     }
 
     static DfxRunConfig from(const CallConfig &config) {
         DfxRunConfig resolved;
         resolved.chip_swimlane_level = static_cast<ChipSwimlaneLevel>(config.enable_chip_swimlane);
+        resolved.enable_l0_swimlane = config.enable_l0_swimlane != 0;
         resolved.dump_args_level = static_cast<DumpArgsLevel>(config.enable_dump_args);
         resolved.pmu_enabled = config.enable_pmu > 0;
         resolved.pmu_event_type = resolve_pmu_event_type(config.enable_pmu);

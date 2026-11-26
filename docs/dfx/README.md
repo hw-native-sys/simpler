@@ -43,6 +43,36 @@ Analysis CLIs that consume these outputs are documented in
 | [dep_gen](dep-gen.md) | Complete per-submit dependency graph, tensor-annotated |
 | [Scope Stats](scope-stats.md) | Per-scope resource-usage peaks (ring fill, dep pool) |
 
+## A5 L0 hardware capture
+
+The basic L0 capture supports the onboard A5 `tensormap_and_ringbuffer` runtime.
+Pass `--enable-l0-swimlane` to a scene test, or set
+`CallConfig.enable_l0_swimlane = True`. After execution, the collector copies
+the hardware GM ring into `l0_dfx_capture/l0_raw/run_<epoch>/core_*.bin` and
+writes `manifest.json` under the run's output prefix.
+
+Decode the ordered raw records and generate a Chrome Trace Event JSON file:
+
+```bash
+python -m simpler_setup.tools.l0_swimlane_converter <run-directory> \
+    --decoder-library build/lib/a5/onboard/tensormap_and_ringbuffer/libhost_runtime.so
+```
+
+Open the generated `l0_swimlane_trace.json` in Perfetto or a compatible trace
+viewer. `core_*.events.json` archives can also be converted without the decoder
+library. Cached events use the system counter frequency and per-core AIC or AIV
+frequency from the capture manifest. Rerun with `--decoder-library` after changing
+a clock or replacing raw files. When raw files are present, the converter also
+checks their SHA-256 against the cached events.
+
+Capture copies data only after execution and is intended for small kernels.
+Long runs can overwrite the ring and lose samples; inspect the manifest and
+trace completeness metadata. A failed core does not discard the other cores:
+valid streams are retained and missing cores are reported with an incomplete
+capture marker. AICores keep producing samples while polling
+their idle loops, even when they have no task. Hardware sleep produces only
+a small amount of data. Incremental copying and HBG capture are unsupported.
+
 ## Related, outside this directory
 
 | Document | What it covers |

@@ -66,10 +66,12 @@ class _CallConfig(ctypes.Structure):
     _fields_ = [
         ("aicpu_thread_num", ctypes.c_int32),
         ("enable_chip_swimlane", ctypes.c_int32),
+        ("enable_l0_swimlane", ctypes.c_int32),
         ("enable_dump_args", ctypes.c_int32),
         ("enable_pmu", ctypes.c_int32),
         ("enable_dep_gen", ctypes.c_int32),
         ("enable_scope_stats", ctypes.c_int32),
+        ("reserved", ctypes.c_uint32),
         ("runtime_env", ctypes.c_uint64 * _RUNTIME_ENV_UINT64_FIELDS),
         ("output_prefix", ctypes.c_char * _OUTPUT_PREFIX_BYTES),
     ]

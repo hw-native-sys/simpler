@@ -72,7 +72,8 @@ int DeviceRunner::prepare_launch_shape(Runtime &runtime, const CallConfig &confi
         LOG_ERROR("WSE requires aicpu_thread_num=0 (got %d)", config.aicpu_thread_num);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (config.enable_chip_swimlane || config.enable_dump_args || config.enable_pmu || config.enable_scope_stats) {
+    if (config.enable_chip_swimlane || config.enable_dump_args || config.enable_pmu || config.enable_scope_stats ||
+        config.enable_l0_swimlane) {
         LOG_ERROR("WSE exposes PE events through output_prefix; legacy device diagnostic collectors are unsupported");
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     }

@@ -58,6 +58,7 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "runtime.h"
 #include "aicpu_topology_probe.h"
+#include "host/l0_capture_collector.h"
 
 // KernelArgsHelper is defined in
 // src/common/platform/onboard/host/device_runner_helpers.h (included above).
@@ -123,7 +124,12 @@ public:
      * the boundary events such an edge would name are exactly the resources a
      * poisoned runner has quarantined rather than proved retired.
      */
-    bool ready_to_join_launch() const override { return !device_unusable_.load(std::memory_order_acquire); }
+    bool ready_to_join_launch() const override {
+        // The L0 register table has one GM destination per card, so a successor
+        // may not reconfigure it while this run's L0 capture is still producing.
+        // Runs that do not arm L0 keep the ordinary joined-launch path.
+        return can_accept_run() && !l0_capture_active_.load(std::memory_order_acquire);
+    }
 
     // `set_chip_swimlane_enabled`, `set_dump_args_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
@@ -149,11 +155,6 @@ public:
     void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
     bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
     void dep_gen_finish_retained() override;
-
-    /**
-     * a5 fills the per-core register table only: it has no ffts_base_addr
-     * field. The table is allocated on `mem_alloc_`.
-     */
 
     // `upload_chip_callable_buffer`, `register_callable`,
     // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
@@ -210,6 +211,10 @@ private:
     int prepare_kernel_arch_context(rtStream_t control_stream) override;
     int release_arch_context_resources(bool abandon_device_resources) override;
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
+    int start_l0_capture(PreparedExecution &prepared);
+    int launch_l0_config(PreparedExecution &prepared, LaunchProgressSink &sink);
+    void cleanup_l0_capture(PreparedExecution &prepared, bool device_execution_complete = false) noexcept;
+    int teardown_collectors_after_run(PreparedExecution &prepared, bool device_execution_complete);
 
     int finalize_impl() override;
 
@@ -231,6 +236,9 @@ private:
     // dep_gen collector — captures orchestrator submit_task inputs for
     // offline replay. a5-specific (the base keeps dep_gen as a virtual hook).
     DepGenCollector dep_gen_collector_;
+    std::unique_ptr<L0CaptureCollector> l0_capture_collector_;
+    // The launch gate reads this without accessing the optional collector.
+    std::atomic<bool> l0_capture_active_{false};
 
     // `query_max_block_dim`, `validate_block_dim`, `ensure_aicpu_runtime_registered`,
     // `configure_aicore_op_timeout`, and `validate_active_callable` are inherited

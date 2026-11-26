@@ -23,10 +23,11 @@
 
 namespace remote_l3 {
 
+// 5: CallConfig includes enable_l0_swimlane before enable_dump_args.
 // 4: `BufferDescriptor.nbytes` is the whole backing extent and a `Tensor` may carry a non-zero
 // `byte_offset`. Version 3 interprets those fields differently even though the wire layout is
 // identical, so the frame header rejects a peer that would decode the wrong semantics.
-static constexpr uint32_t PROTOCOL_VERSION = 4;
+static constexpr uint32_t PROTOCOL_VERSION = 5;
 inline constexpr size_t FRAME_HEADER_BYTES = 40;
 static constexpr uint32_t MAX_FRAME_PAYLOAD_BYTES = 16U * 1024U * 1024U;
 static constexpr uint32_t MAX_STRING_BYTES = 1024U;

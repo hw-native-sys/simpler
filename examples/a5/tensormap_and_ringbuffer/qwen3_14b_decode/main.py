@@ -510,6 +510,7 @@ def _build_config(
     runtime_env: dict,
     *,
     enable_chip_swimlane: int,
+    enable_l0_swimlane: bool,
     dump_args: int,
     enable_pmu: int,
     enable_dep_gen: bool,
@@ -521,6 +522,7 @@ def _build_config(
     config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
     config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
     config.enable_chip_swimlane = enable_chip_swimlane
+    config.enable_l0_swimlane = enable_l0_swimlane
     config.enable_dump_args = dump_args
     config.enable_pmu = enable_pmu
     config.enable_dep_gen = enable_dep_gen
@@ -567,6 +569,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     seed: int = 1234,
     seq_len: int = 3500,
     enable_chip_swimlane: int = 0,
+    enable_l0_swimlane: bool = False,
     dump_args: int = 0,
     enable_pmu: int = 0,
     enable_dep_gen: bool = False,
@@ -603,14 +606,18 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     diagnostics = effective_diagnostic_options(
         rounds,
         chip_swimlane=enable_chip_swimlane,
+        l0_swimlane=enable_l0_swimlane,
         dump_args=dump_args,
         pmu=enable_pmu,
         dep_gen=enable_dep_gen,
         scope_stats=enable_scope_stats,
         swimlane_overhead=enable_swimlane_overhead,
     )
+    if enable_l0_swimlane:
+        enable_l0_swimlane = diagnostics.l0_swimlane
     diagnostics_on = bool(
         diagnostics.chip_swimlane
+        or enable_l0_swimlane
         or diagnostics.dump_args
         or diagnostics.pmu
         or diagnostics.dep_gen
@@ -654,6 +661,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         config = _build_config(
             runtime_env,
             enable_chip_swimlane=diagnostics.chip_swimlane,
+            enable_l0_swimlane=enable_l0_swimlane,
             dump_args=diagnostics.dump_args,
             enable_pmu=diagnostics.pmu,
             enable_dep_gen=diagnostics.dep_gen,
@@ -693,6 +701,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--seq-len", type=int, default=3500)
     parser.add_argument("--enable-chip-swimlane", nargs="?", const=4, type=int, default=0)
+    parser.add_argument("--enable-l0-swimlane", action="store_true")
     parser.add_argument("--dump-args", nargs="?", const=1, type=int, default=0)
     parser.add_argument("--enable-pmu", nargs="?", const=2, type=int, default=0)
     parser.add_argument("--enable-dep-gen", action="store_true")
@@ -720,6 +729,7 @@ def main(argv=None, *, case_name: str | None = None, **overrides) -> int:
         seed=cli.seed,
         seq_len=cli.seq_len,
         enable_chip_swimlane=cli.enable_chip_swimlane,
+        enable_l0_swimlane=cli.enable_l0_swimlane,
         dump_args=cli.dump_args,
         enable_pmu=cli.enable_pmu,
         enable_dep_gen=cli.enable_dep_gen,

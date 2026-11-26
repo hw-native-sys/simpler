@@ -15,10 +15,8 @@
 /**
  * Fault injection for the test-local `profiling_copy` implementation.
  *
- * A test arms one device-to-host copy to fail, identified by its transfer size:
- * the collector's two reads are a bank-sized one and a region-sized one, and no
- * other transfer in these tests shares either size. Everything else copies for
- * real between the separate host shadow and device allocation.
+ * A test selects a transfer direction and size to fail. Everything else copies
+ * for real between the separate host shadow and device allocation.
  */
 namespace copy_fault {
 
@@ -26,11 +24,15 @@ struct Plan {
     // Transfer size, in bytes, whose device-to-host copy must fail. 0 disables.
     size_t fail_from_device_size{0};
     int fail_rc{-1};
+    // Transfer size, in bytes, whose host-to-device copy must fail. 0 disables.
+    size_t fail_to_device_size{0};
 };
 
 struct Counts {
     int from_device_calls{0};
     int from_device_failures{0};
+    int to_device_calls{0};
+    int to_device_failures{0};
 };
 
 void arm(const Plan &plan);

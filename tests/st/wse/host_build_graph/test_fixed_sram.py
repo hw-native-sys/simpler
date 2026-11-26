@@ -39,6 +39,30 @@ def fixed_layout():
     return capacities, sizes, offsets
 
 
+def test_l0_diagnostic_is_rejected_before_execution(tmp_path, st_platform):
+    compiler = KernelCompiler(st_platform)
+    source = Path(__file__).parent / "direct_launch/kernels/empty_orch.cpp"
+    callable_ = ChipCallable.build(
+        signature=[],
+        func_name="aicpu_orchestration_entry",
+        binary=compiler.compile_orchestration("host_build_graph", str(source)),
+        children=[],
+    )
+    worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
+    worker.init()
+    try:
+        handle = worker.register(callable_)
+        config = CallConfig()
+        config.enable_l0_swimlane = True
+        config.output_prefix = str(tmp_path / "l0")
+        with pytest.raises(_task_interface.RunPreparationRefused, match="code -1001"):
+            worker.submit(handle, TaskArgs(), config).result()
+        worker.submit(handle, TaskArgs(), CallConfig()).result()
+        assert not (tmp_path / "l0" / "l0_dfx_capture").exists()
+    finally:
+        worker.close()
+
+
 def test_standard_worker_fixed_sram_and_empty_run(st_platform):
     assert not any(
         hasattr(_task_interface, name) for name in ("_wse_malloc", "_wse_submit", "_wse_query", "_wse_configure")

@@ -22,6 +22,9 @@ macro(a5_platform_case src)
         LABEL no_hardware ${ARGN})
 endmacro()
 
+a5_platform_case(test_l0_trace_decoder.cpp
+    SOURCES ${SIMPLER_SRC}/a5/platform/shared/host/l0_trace_records.cpp)
+
 # Host logger silent/off behavior — no runtime deps, just compile the same
 # self-contained host logger sources used by production consumers. It carries no
 # arch token: the logger is arch-agnostic and this is where the case happens to
@@ -53,6 +56,28 @@ a5_platform_case(test_aicore_retirement.cpp
         ${HOST_LOG_TEST_SOURCES}
     INCLUDES ${SIMPLER_SRC}/common/platform/sim/aicpu)
 set_tests_properties(test_a5_aicore_retirement PROPERTIES TIMEOUT 20)
+
+a5_platform_case(test_l0_aicpu_lifecycle.cpp
+    SOURCES ${SIMPLER_SRC}/a5/platform/shared/aicpu/l0_collector_aicpu.cpp)
+add_library(l0_test_hal SHARED support/l0_capture/hal_fixture.cpp)
+set_target_properties(l0_test_hal PROPERTIES OUTPUT_NAME ascend_hal SUFFIX ".so"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/l0_test_driver")
+a5_platform_case(test_l0_capture_collector.cpp
+    SOURCES
+        ${SIMPLER_SRC}/a5/platform/shared/host/l0_capture_collector.cpp
+        ${CMAKE_SOURCE_DIR}/common/platform/support/profiling_copy_fault.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${HOST_LOG_TEST_SOURCES}
+    INCLUDES_BEFORE ${CMAKE_SOURCE_DIR}/support/kernel_args
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/support/l0_capture
+    LINK l0_test_hal ${CMAKE_DL_LIBS})
+if(APPLE)
+    set(l0_test_library_path DYLD_LIBRARY_PATH)
+else()
+    set(l0_test_library_path LD_LIBRARY_PATH)
+endif()
+set_tests_properties(test_a5_l0_capture_collector PROPERTIES ENVIRONMENT
+    "${l0_test_library_path}=$<TARGET_FILE_DIR:l0_test_hal>:$ENV{${l0_test_library_path}}")
 
 # The AICore half of the return gate: it compiles the real a5sim
 # aicore/inner_kernel.h (so the sim include directory is on the path) and the

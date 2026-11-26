@@ -27,10 +27,11 @@ from .buffer import (
 from .remote_l3_limits import FRAME_HEADER_BYTES, MAX_FRAME_PAYLOAD_BYTES
 from .task_interface import MAX_TENSOR_DIMS, CallConfig, DataType
 
+# 5: ``CallConfig`` includes ``enable_l0_swimlane`` before ``enable_dump_args``.
 # 4: ``BufferDescriptor.nbytes`` is the whole backing extent and a ``Tensor`` may carry a
 # non-zero ``byte_offset``. Version 3 interprets those fields differently even though the wire
 # layout is identical, so the frame header rejects a peer that would decode the wrong semantics.
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAX_STRING_BYTES = 1024
 MAX_ERROR_BYTES = 4096
 MAX_TENSORS = 4096
@@ -440,6 +441,7 @@ def decode_call_config(reader: _Reader) -> CallConfig:
     cfg = CallConfig()
     cfg.aicpu_thread_num = reader.i32()
     cfg.enable_chip_swimlane = reader.i32()
+    cfg.enable_l0_swimlane = bool(reader.i32())
     cfg.enable_dump_args = reader.i32()
     cfg.enable_pmu = reader.i32()
     cfg.enable_dep_gen = bool(reader.i32())
