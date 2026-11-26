@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +47,20 @@ def _l3_child(sub_fn=None, num_sub_workers=1):
     l3 = Worker(level=3, num_sub_workers=num_sub_workers)
     l3.register(sub_fn if sub_fn is not None else (lambda args: None))
     return l3
+
+
+def _comm_marker_owner(monkeypatch, tmp_path, nested):
+    l3 = Worker(level=3, num_sub_workers=0)
+    owner = Worker(level=4, num_sub_workers=0) if nested else l3
+    if nested:
+        owner.add_worker(l3)
+    owner._assign_shm_namespace()
+    monkeypatch.setattr(worker_mod, "_COMM_ROOTINFO_DIR", str(tmp_path))
+    group = os.getpgrp() + int(nested)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "getpgrp", lambda: group)
+        rootinfo = Path(l3._comm_plan_rootinfo_path())
+    return owner, rootinfo, group
 
 
 def _trivial_orch(orch, args, config):
@@ -370,11 +385,12 @@ class TestJournalRetryOnClose:
         assert "shutdown" in events[:-1]
         assert w._cleanup_journal.empty
 
-    def test_journal_retry_on_close(self):
-        """A journal entry that fails on first close stays in the journal
-        and is retried by a second close()."""
+    def test_comm_marker_cleanup_retries_after_child_exit(self, monkeypatch, tmp_path):
         w = Worker(level=3, num_sub_workers=1)
         w.register(lambda args: None)
+        monkeypatch.setattr(worker_mod, "_COMM_ROOTINFO_DIR", str(tmp_path))
+        w._assign_shm_namespace()
+        namespace = Path(w._comm_plan_rootinfo_path()).parent.parent
         attempts = []
 
         def fail_then_ok():
@@ -389,11 +405,13 @@ class TestJournalRetryOnClose:
         assert "transient failure" in str(err1)
         assert not w._cleanup_journal.empty
         assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+        assert namespace.is_dir()
         # Second close: retries the journal entry, succeeds.
         err2 = _run_catch(w.close)
         assert err2 is None
         assert w._cleanup_journal.empty
         assert attempts == [1, 1]
+        assert not list(tmp_path.iterdir())
 
     @pytest.mark.parametrize("startup_abort", [False, True])
     @pytest.mark.parametrize(
@@ -494,9 +512,14 @@ class TestShmNames:
             if probe_error is not None:
                 raise probe_error
 
+        scandir = os.scandir
         with monkeypatch.context() as patch:
             patch.setattr(os.path, "isdir", lambda path: path == "/dev/shm")
-            patch.setattr(os, "scandir", lambda _path: [SimpleNamespace(name=name) for name in names])
+            patch.setattr(
+                os,
+                "scandir",
+                lambda path: [SimpleNamespace(name=name) for name in names] if path == "/dev/shm" else scandir(path),
+            )
             patch.setattr(os, "killpg", probe)
             patch.setattr(posixshmem, "shm_unlink", unlinked.append)
             with pytest.raises(RuntimeError, match="still alive"):
@@ -532,7 +555,10 @@ class TestShmNames:
                 raise PermissionError("injected Host unlink failure")
 
         monkeypatch.setattr(os.path, "isdir", lambda _path: True)
-        monkeypatch.setattr(os, "scandir", lambda _path: [SimpleNamespace(name=backing)])
+        scandir = os.scandir
+        monkeypatch.setattr(
+            os, "scandir", lambda path: [SimpleNamespace(name=backing)] if path == "/dev/shm" else scandir(path)
+        )
         monkeypatch.setattr(posixshmem, "shm_unlink", unlink)
         worker._cleanup_journal.add("child", "chip survivor", reap_l2)
         with pytest.raises(RuntimeError, match="unconfirmed L2 child exit"):
@@ -552,29 +578,23 @@ class TestShmNames:
 
     @pytest.mark.parametrize("nested", [False, True], ids=["local", "nested"])
     def test_comm_marker_sweep_waits_for_l2_and_retries_unlink(self, monkeypatch, tmp_path, nested):
-        l3 = Worker(level=3, num_sub_workers=0)
-        owner = Worker(level=4, num_sub_workers=0) if nested else l3
-        if nested:
-            owner.add_worker(l3)
-        owner._assign_shm_namespace()
-        monkeypatch.setattr(worker_mod, "_COMM_ROOTINFO_DIR", str(tmp_path))
-
-        group = os.getpgrp() + int(nested)
-        with monkeypatch.context() as patch:
-            patch.setattr(os, "getpgrp", lambda: group)
-            rootinfo = os.path.basename(l3._comm_plan_rootinfo_path())
-        marker = tmp_path / f"{rootinfo}.destroy_failed.1"
+        owner, rootinfo_path, group = _comm_marker_owner(monkeypatch, tmp_path, nested)
+        directory, rootinfo = rootinfo_path.parent, rootinfo_path.name
+        marker = directory / f"{rootinfo}.destroy_failed.1"
         other_rootinfo = f"pto_multi_comm_{uuid.uuid4().hex}_{group:x}.bin"
         unrelated = tmp_path / f"{other_rootinfo}.destroy_released.1.2"
         unrelated_ready = tmp_path / f"barrier_{other_rootinfo}_alloc_1_host_ready_1_1.ready"
         unrelated_pending = tmp_path / f"barrier_{other_rootinfo}_alloc_2_host_ready_1_1.ready.tmp"
-        blocked = tmp_path / f"{rootinfo}.destroy_released.1.1"
+        blocked = directory / f"{rootinfo}.destroy_released.1.1"
         blocked.mkdir()
-        release = tmp_path / f"{rootinfo}.destroy_released.1.2"
-        ready = tmp_path / f"barrier_{rootinfo}_alloc_1_host_ready_1_1.ready"
-        pending = tmp_path / f"barrier_{rootinfo}_alloc_2_host_ready_1_1.ready.tmp"
-        failed = tmp_path / f"barrier_{rootinfo}_alloc_1_host_failed_1_0.ready"
-        owned = (marker, release, ready, pending, failed)
+        release = directory / f"{rootinfo}.destroy_released.1.2"
+        ready = directory / f"barrier_{rootinfo}_alloc_1_host_ready_1_1.ready"
+        pending = directory / f"barrier_{rootinfo}_alloc_2_host_ready_1_1.ready.tmp"
+        failed = directory / f"barrier_{rootinfo}_alloc_1_host_failed_1_0.ready"
+        rootinfo_file = directory / rootinfo
+        init_pending = directory / f"{rootinfo}.tmp.123"
+        init_ready = directory / f"barrier_{rootinfo}_rootinfo_ready_1_0.ready"
+        owned = (marker, release, ready, pending, failed, rootinfo_file, init_pending, init_ready)
         for path in (*owned, unrelated, unrelated_ready, unrelated_pending):
             path.touch()
 
@@ -594,8 +614,12 @@ class TestShmNames:
             monkeypatch.setattr(os, "killpg", probe_group)
         else:
             owner._cleanup_journal.add("child", "chip survivor", reap_l2)
-        with pytest.raises(RuntimeError, match="(still alive|unconfirmed L2 child exit)"):
+        if nested:
+            with pytest.raises(RuntimeError, match="still alive"):
+                owner._reclaim_child_groups(time.monotonic())
+        else:
             owner._reclaim_child_groups(time.monotonic())
+            assert isinstance(owner._cleanup_journal.drive_kinds({"shm"}), RuntimeError)
         assert all(path.exists() for path in owned)
 
         child_alive = False
@@ -616,6 +640,86 @@ class TestShmNames:
         assert owner._cleanup_journal.empty
         assert all(not path.exists() for path in owned)
         assert unrelated.exists() and unrelated_ready.exists() and unrelated_pending.exists() and blocked.is_dir()
+
+    @pytest.mark.parametrize("nested", [False, True], ids=["local", "nested"])
+    def test_failed_comm_init_reclaims_owned_files(self, monkeypatch, tmp_path, nested):
+        owner, rootinfo, group = _comm_marker_owner(monkeypatch, tmp_path, nested)
+        names = (
+            rootinfo.name,
+            f"{rootinfo.name}.tmp.123",
+            f"{rootinfo.name}.destroy_failed.1",
+            f"{rootinfo.name}.destroy_released.1.0",
+            f"{rootinfo.name}.destroy_released.1.0.tmp",
+            f"barrier_{rootinfo.name}_rootinfo_ready_1_0.ready",
+            f"barrier_{rootinfo.name}_rootinfo_ready_1_0.ready.tmp",
+            f"barrier_{rootinfo.name}_destroy_1_0.ready",
+            f"barrier_{rootinfo.name}_destroy_departed_1_0.ready.tmp",
+            f"barrier_{rootinfo.name}_fabric_announce_1_0.ready.tmp.123",
+            f"barrier_{rootinfo.name}_alloc_2_ipc_announce_1_0.ready.tmp.123",
+            f"barrier_{rootinfo.name}_alloc_2_host_ready_1_0.ready.tmp",
+        )
+        for name in names:
+            (rootinfo.parent / name).touch()
+        sibling = Worker(level=3, num_sub_workers=0)
+        sibling._assign_shm_namespace()
+        sibling_rootinfo = Path(sibling._comm_plan_rootinfo_path())
+        sibling_rootinfo.touch()
+        sibling_marker = sibling_rootinfo.with_name(f"barrier_{sibling_rootinfo.name}_rootinfo_ready_1_0.ready")
+        sibling_marker.touch()
+        if nested:
+
+            def owner_exited(pgid, sig):
+                assert (pgid, sig) == (group, 0)
+                raise ProcessLookupError
+
+            monkeypatch.setattr(os, "killpg", owner_exited)
+
+        owner._reclaim_child_groups(time.monotonic())
+
+        assert owner._cleanup_journal.empty
+        assert not rootinfo.parent.exists() and not rootinfo.parent.parent.exists()
+        assert sibling_rootinfo.is_file() and sibling_marker.is_file()
+
+    def test_missing_comm_marker_namespace_has_no_cleanup_debt(self, monkeypatch, tmp_path):
+        worker = Worker(level=3, num_sub_workers=0)
+        worker._assign_shm_namespace()
+        monkeypatch.setattr(worker_mod, "_COMM_ROOTINFO_DIR", str(tmp_path))
+        worker._cleanup_journal.add("child", "unreaped startup child", lambda: None)
+
+        worker._unlink_comm_markers()
+
+        assert not list(tmp_path.iterdir())
+
+    def test_empty_comm_marker_directory_waits_for_owner_and_retries_removal(self, monkeypatch, tmp_path):
+        owner, rootinfo, group = _comm_marker_owner(monkeypatch, tmp_path, nested=True)
+        directory = rootinfo.parent
+        child_alive = True
+
+        def probe_group(pgid, sig):
+            assert (pgid, sig) == (group, 0)
+            if not child_alive:
+                raise ProcessLookupError
+
+        monkeypatch.setattr(os, "killpg", probe_group)
+        with pytest.raises(RuntimeError, match="still alive"):
+            owner._reclaim_child_groups(time.monotonic())
+        assert directory.is_dir() and not list(directory.iterdir())
+
+        child_alive = False
+        rmdir = os.rmdir
+
+        def fail_namespace_removal(path, *args, **kwargs):
+            if os.fspath(path) == str(directory.parent):
+                raise PermissionError("injected namespace removal failure")
+            return rmdir(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rmdir", fail_namespace_removal)
+            assert isinstance(owner._cleanup_journal.drive_kinds({"shm"}), PermissionError)
+        assert directory.parent.is_dir() and not directory.exists()
+
+        assert owner._cleanup_journal.drive_kinds({"shm"}) is None
+        assert owner._cleanup_journal.empty and not directory.parent.exists()
 
 
 class TestNewWorkerClose:
