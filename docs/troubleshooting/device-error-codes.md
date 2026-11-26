@@ -1,12 +1,15 @@
 # Device Error Codes
 
-The runtime names, describes and hints every code it latches, at the moment it
-fails. This page is what those lines cannot carry: which field to read, who the
-code usually blames, and how to chase each family down.
+## Find the status for the failing run
 
-## Start by reading the two lines you already have
+Search the Host log for the failure, its source fields and any diagnostic detail:
 
-The `error hint:` line that sent you here is the second of a pair:
+```bash
+grep -E "Observed runtime status:|orch_error_code=|sched_error_code=|sub_class=|error detail:" run.log
+```
+
+When the reporting path has the orchestration or scheduler code, it can name
+the error and suggest the next action:
 
 ```text
 [ERROR] simpler runtime failed: orch_error_code=1 sched_error_code=0 runtime_status=-1
@@ -14,34 +17,38 @@ The `error hint:` line that sent you here is the second of a pair:
 [ERROR] error hint: raise runtime_env.ring_task_window or split the scope ...
 ```
 
-`error detail:` gives the **name** and a full description of the mechanism.
-`error hint:` gives the **next action**, including the knob to turn. Host-side
-CANN failures print the same pair as `ACL error detail:` / `ACL error hint:`.
+A2/A3 `host_build_graph` can instead receive a signed status from the native
+run observer. On copy-back, that path logs only the observed status:
 
-So the code's meaning and its first remedy are already on your screen. Come here
-for the parts that are not: the triage columns below, and the chase procedures.
-
-**First move, always:**
-
-```bash
-grep -E "orch_error_code=|sched_error_code=|sub_class=|error detail:" <run log>
+```text
+[ERROR] Observed runtime status: -104 (shared scheduler header not read)
 ```
+
+A valid terminal record belongs to the run identified by its epoch. Its
+completion code and source identify the selected result. The shared scheduler
+header can already belong to a later run, so this path does not read it to
+reconstruct source fields. A missing or mismatched terminal record leaves the
+device verdict undecided. Use the platform error and device logs for further
+evidence. Host-side CANN diagnostics can also include `ACL error detail:` and
+`ACL error hint:`.
 
 ## How an error reaches you
 
 The `host_build_graph` runtime runs orchestration on the host, transfers the
 prepared image to the AICPU, and runs scheduling there. The
 `tensormap_and_ringbuffer` runtime runs both orchestration and scheduling on the
-AICPU. On a fatal condition the runtime **latches** a code, which the host reads
-back in `copy_back_run_outputs_impl` to print the lines above. Where it is latched
+AICPU. On a fatal condition the runtime **latches** a code. Where it is latched
 follows where the reporter runs: a scheduler code goes into the shared-memory
 header, and so does an orchestrator code under `tensormap_and_ringbuffer`, whose
 orchestrator is on the AICPU. `host_build_graph`'s orchestrator is host-side, so
 its code stays in host memory (`OrchestratorState::fatal_code`) and never crosses
 to the device — a refused bind reports it without the device having run at all.
 
-At most one of `orch_error_code` (1-11) and `sched_error_code` (100+) is ever
-non-zero. `runtime_status` is just the latched code negated.
+Both `orch_error_code` and `sched_error_code` can be non-zero. The failure log
+retains both values. To compute `runtime_status`, the runtime selects the
+non-zero orchestration code first, otherwise the scheduler code. A positive
+selected code becomes negative, a negative code keeps its sign, and two zero
+fields give status zero.
 
 The native-run exception normally has the form
 `RuntimeError: <phase>_native_run failed with code <rc>`, where `<phase>` is
@@ -52,36 +59,22 @@ same number:
 
 | Environment | `<rc>` |
 | ----------- | ------ |
-| **sim** (`a5sim` / `a2a3sim`) | `-N`, where `N` is the latched code. `-1` is SCOPE_DEADLOCK, `-100` is SCHEDULER_TIMEOUT. |
-| **onboard** | Usually a CANN watchdog fires first and masks the code as a generic `507018`. **Do not read `<rc>` as the error code here.** |
+| **sim** (`a5sim` / `a2a3sim`) | A selected positive runtime code reaches the caller as `-N`. The AICPU executor can also return its own failure code. |
+| **onboard** | A platform error such as `507018` may reach the caller first. Correlate it with this run's status and device logs. |
 
-### A code at or below -1000 is not a device code at all
+### Host runtime errors and an ambiguous -1
 
-The tables on this page cover the codes the *device* latches, which reach you as
-`-1..-999`. A failure raised by the **host runtime** — a null argument, an
-allocation that failed, an H2D that did not complete, a `dlopen` that found
-nothing — never borrows a number from that range: it reports
-`PTO_RUNTIME_ERR_INTERNAL` (`-1000`) or another `PTO_RUNTIME_ERR_*` code below it
-(`src/common/worker/runtime_c_api.h`).
+The Host runtime has its own range beginning at `PTO_RUNTIME_ERR_INTERNAL`
+(`-1000`). For a `PTO_RUNTIME_ERR_*` failure, check the preceding Host log and
+which operation failed, such as allocation, transfer or module loading. The
+public values are defined in `src/common/runtime_status/error_codes.h`.
 
-So `failed with code -1000` means **look for the preceding host log line**, not
-for a mechanism on this page — nothing was latched on the device, and no
-`error detail:` line accompanies it. Conversely `-1` really is SCOPE_DEADLOCK,
-and `-3` really is FLOW_CONTROL_DEADLOCK; neither doubles as "something in the
-host runtime went wrong."
-
-**One exception, and it is the reverse direction.** The AICPU executor still uses
-`-1` as its own generic failure, and that value travels out as the run's `rc`
-(most visibly the sim deinit-timeout cascade in
-[sim-oversubscription-hang.md](sim-oversubscription-hang.md)). So a `-1` on
-screen is *either* a latched SCOPE_DEADLOCK *or* an unlatched AICPU-executor
-failure. Tell them apart by the pair: a latched code always brings its
-`orch_error_code=` / `error detail:` lines with it; the executor's `-1` arrives
-bare. The `-1000`-and-below rule above is unaffected either way — it is about
-which numbers the host band uses, and no device-side code ever enters it.
-
-So on hardware the exception code is the *least* informative thing on screen. The
-`error detail:` / `error hint:` pair is printed either way — start there.
+A latched `orch_error_code=1` selects `-1` for `SCOPE_DEADLOCK`. The AICPU
+executor can independently return `-1` (an example is the
+[sim deinit-timeout cascade](sim-oversubscription-hang.md)). On a native run,
+check the terminal source and any orchestration diagnostics from that run.
+A signed `-1` alone, even without an `error detail:` line, leaves its origin
+ambiguous.
 
 ## Triage: who the code usually blames
 
@@ -133,8 +126,16 @@ Code 104 can be reported before or after device execution starts:
   during bind and never reach the device. Split the graph or reduce the number
   of tasks routed to that queue.
 - **Device scheduler:** a queue push found no free slot after bind accepted the
-  graph. Use the reported queue and occupancy details to investigate a runtime
-  accounting error or an incompatible configuration.
+  graph. A concurrent consumer may have claimed the target slot without having
+  released it. Check which queue and enqueue path failed using the available
+  scheduler diagnostics. The execution status alone cannot establish graph size.
+  On A2/A3 HBG an AICore that cannot retire by the deadline also produces
+  `AICore retirement failed: retirement_rc=-1` when the host can read this
+  run's terminal record. The primary scheduler status remains `-104`. The
+  device retirement log identifies each unreleased core. Retirement
+  closes the target to new task tokens and doorbells. EXIT waits until that
+  core's admitted register writers finish. Other cores receive EXIT independently.
+  A pending writer or missing acknowledgement at the deadline keeps the return gate closed.
 
 ### SCHEDULER_TIMEOUT sub-classes
 
@@ -250,8 +251,8 @@ time, so there is nothing to drift out of sync.
 
 ## References
 
-- Code definitions: `src/common/host_build_graph/runtime_status.h`,
-  `src/{arch}/runtime/tensormap_and_ringbuffer/common/runtime_status.h`
+- Public runtime and Host status values: `src/common/runtime_status/error_codes.h`
+- A2/A3 HBG ready queue overflow (104): a Host bind capacity rejection returns -104 before dispatch. During execution a failed enqueue records 104 and the active scheduler coordinates shutdown.
 - Host print site: `.../host/runtime_maker.cpp` (`copy_back_run_outputs_impl`)
 - Sub-class logic: `.../runtime/scheduler/scheduler_cold_path.cpp` (`classify_stall_reason`)
 - End-to-end negative tests: `tests/st/runtime_fatal_codes/`

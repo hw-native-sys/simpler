@@ -39,13 +39,9 @@ struct RuntimeContext;
 // thread to the dedicated resolution (P) thread. Whole-graph-resident hbg never
 // reclaims a slot, so the queued ChipTaskSlotState* stays valid until P reads it.
 // Single producer (the owning S thread) / single consumer (P): plain
-// acquire/release on head/tail, no CAS. Capacity is a power of two sized to the
-// run's task count, which bounds the completed-but-unresolved tasks in flight
-// exactly, so a producer does not spin on a full queue in practice; the spin is a
-// correctness backstop only
-// (P drains independently, so it always makes progress). The std::atomic cursors
-// make this type non-copyable / non-movable, so `buf` cannot be double-freed
-// through an accidental copy.
+// acquire/release on head/tail, no CAS. Graph body completions can outnumber
+// the submitted outer tasks used to size the queue. On a full ring the
+// producer waits for a free cell or for the resolution thread to stop.
 struct CompletedTaskQueue {
     ChipTaskSlotState **buf{nullptr};
     uint64_t cap{0};
@@ -65,14 +61,16 @@ struct CompletedTaskQueue {
         delete[] buf;
         buf = nullptr;
     }
-    // Producer (S). Spins only if the ring is full — sized so this never fires.
-    void push(ChipTaskSlotState *s) {
+    // Producer (S). On a full queue, P may have stopped consuming after a fatal error.
+    bool push(ChipTaskSlotState *s, const std::atomic<bool> &stopped) {
         uint64_t t = tail.load(std::memory_order_relaxed);
         while (t - head.load(std::memory_order_acquire) >= cap) {
+            if (stopped.load(std::memory_order_acquire)) return false;
             SPIN_WAIT_HINT();
         }
         buf[t & mask] = s;
         tail.store(t + 1, std::memory_order_release);
+        return true;
     }
     // Consumer (P). Returns nullptr when empty.
     ChipTaskSlotState *pop() {
@@ -129,6 +127,7 @@ public:
     // Reset all SchedulerContext-owned state to its post-construction defaults.
     // Called by AicpuExecutor::deinit() during per-run teardown.
     void deinit();
+    int32_t retirement_error() const { return retirement_error_.load(std::memory_order_acquire); }
 
     // =========================================================================
     // Per-thread execution entry points (called by AicpuExecutor::run)
@@ -138,7 +137,7 @@ public:
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
 
     // Dedicated resolution (P) thread entry (3S+1P). Owns no cores: drains the
-    // per-S CompletedTaskQueues and runs on_task_complete for each finished task
+    // per-S CompletedTaskQueues and runs complete_task for each finished task
     // (task_states publish + wake-list drain), making P
     // the sole producer of the ready queues. Owns completed_tasks_ / termination.
     int32_t run_resolution_thread(Runtime *runtime, int32_t thread_idx);
@@ -242,6 +241,7 @@ private:
     static constexpr uint8_t RETIREMENT_READY = 1;
     static constexpr uint8_t RETIREMENT_REQUESTED = 2;
     uint8_t retirement_state_[PLATFORM_MAX_CORES]{};
+    std::atomic<int32_t> retirement_error_{0};
     // The active callable's registration-owned object-address table and the
     // number of entries it holds, both bound from the descriptor in the cold
     // path. The table is in the callable's registration block, not in the
@@ -308,6 +308,7 @@ private:
     int32_t retire_claimed_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
     int32_t retire_all_cores(Runtime *runtime);
 
+    void stop_failed_scheduler(Runtime *runtime);
     __attribute__((noinline, cold)) void fail_scheduler(Runtime *runtime, int32_t thread_idx, int32_t error_code);
 
     // =========================================================================
@@ -352,7 +353,7 @@ private:
     struct PublishHandle {
         uint64_t reg_addr;
         uint32_t reg_task_id;
-        int32_t core_offset;
+        int32_t core_id;
         uint64_t *dispatch_timestamp_slot;
         int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
     };
@@ -361,6 +362,18 @@ private:
         int32_t thread_idx, int32_t core_offset, ChipTaskSlotState &slot_state, SubtaskSlot subslot, bool to_pending,
         int32_t block_idx, bool force_gate
     );
+
+    template <typename Publish>
+    bool publish_task_batch(
+        int32_t thread_idx, const PublishHandle *handles, int count, RegisterPublications::CoreMask &cores,
+        Publish publish
+    ) {
+        for (int i = 0; i < count; ++i) {
+            const int core = handles[i].core_id;
+            cores[core / 64] |= 1ULL << (core % 64);
+        }
+        return sched_->register_publications.publish(thread_idx, cores, publish);
+    }
 
     // `thread_idx` is the publishing Scheduler thread's index, used to select the
     // per-thread task-timing record; every call site already has it in scope.
@@ -462,7 +475,8 @@ private:
 
     // Ready sync_start precedes regular ready work. Each pure placement samples
     // the applicable MIX priority prefix and retains observed demand for this pass.
-    void dispatch_ready_tasks(
+    // Returns true when a sync-start drain or a failed requeue interrupts this pass.
+    bool dispatch_ready_tasks(
         int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
     );
 
@@ -485,7 +499,7 @@ private:
         int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated = false
     );
 
-    void complete_slot_task(
+    [[nodiscard]] bool complete_slot_task(
         ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, SubtaskSlot subslot, int32_t thread_idx,
         int32_t core_id, Handshake *hank, int32_t &completed_this_turn
 #if SIMPLER_DFX
@@ -497,7 +511,7 @@ private:
     static void promote_pending_to_running(CoreExecState &core);
     static void clear_running_slot(CoreExecState &core);
 
-    void check_running_cores_for_completion(
+    [[nodiscard]] LoopAction check_running_cores_for_completion(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
         bool &made_progress
     );

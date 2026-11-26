@@ -91,7 +91,7 @@ TEST_F(GraphActivationTest, WakeRoutesConsumerWhenProducerCompletedBeforeRegiste
     exec.fanin_offsets = fanin_offsets.data();
     exec.fanin_indices = fanin_indices.data();
 
-    sched.register_graph_wake(exec, &tasks[0].slot, &tasks[1].slot);
+    sched.register_graph_wake(exec, &tasks[0].slot, &tasks[1].slot, 0);
 
     ChipTaskSlotState *out[2];
     ASSERT_EQ(sched.get_ready_tasks_batch(sched.ready_queues, ResourceShape::AIC, out, 2), 1)
@@ -118,7 +118,7 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
     exec.fanin_offsets = fanin_offsets.data();
     exec.fanin_indices = fanin_indices.data();
 
-    sched.graph_incremental_publish(exec, 0, 4);
+    sched.graph_incremental_publish(exec, 0, 4, 0);
     EXPECT_EQ(exec.published_tasks.load(), 4);
 
     ChipTaskSlotState *out[4];
@@ -127,7 +127,7 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
     EXPECT_EQ(out[0], &tasks[2].slot);
 
     states[1].store(CHIP_TASK_COMPLETED);
-    sched.drain_graph_wake_list(exec, tasks[1].slot);
+    sched.drain_graph_wake_list(exec, tasks[1].slot, 0);
     ASSERT_EQ(sched.get_ready_tasks_batch(sched.ready_queues, ResourceShape::AIC, out, 4), 1)
         << "the wake-chained consumer must route once its pending producer completes";
     EXPECT_EQ(out[0], &tasks[3].slot);
@@ -154,11 +154,7 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeMaterialized) {
         exec.outer_slot = nullptr;
         graph_execution_set_phase(exec, state);
         task[0].slot.graph_context = &exec;
-#if SIMPLER_SCHED_PROFILING
         return sched.complete_task(task[0].slot, 0).error_code;
-#else
-        return sched.complete_task(task[0].slot).error_code;
-#endif
     };
 
     EXPECT_EQ(complete_in_state(GraphExecutionPhase::SUBMITTED), SIMPLER_ERROR_NONE);
@@ -189,11 +185,7 @@ TEST_F(GraphActivationTest, CompleteTaskTakesTheOrdinaryPathForTheOuterGraphTask
     slot.task_kind = TaskKind::GRAPH;
     slot.graph_context = &execution;
 
-#if SIMPLER_SCHED_PROFILING
     const SchedulerState::TaskCompletionOutcome outcome = sched.complete_task(slot, 0);
-#else
-    const SchedulerState::TaskCompletionOutcome outcome = sched.complete_task(slot);
-#endif
 
     EXPECT_EQ(outcome.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(outcome.stream_tasks_completed, 1) << "the outer Graph task is one completed task of the run";
@@ -241,39 +233,51 @@ protected:
 };
 
 TEST_F(GraphRootRoutingTest, ExternalReadyFirstRoutesEachPublishedSlice) {
-    EXPECT_EQ(sched.signal_graph_external_ready(shell), 0);
-    sched.graph_incremental_publish(execution, 0, 2);
+    EXPECT_EQ(sched.signal_graph_external_ready(shell, 0), 0);
+    sched.graph_incremental_publish(execution, 0, 2, 0);
     EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::SUBMITTED);
     EXPECT_EQ(execution.route_cursor.load(), 2);
     expect_routed_range(0, 2);
 
     graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
-    sched.graph_incremental_publish(execution, 2, TASK_COUNT);
+    sched.graph_incremental_publish(execution, 2, TASK_COUNT, 0);
     expect_routed_range(2, TASK_COUNT);
-    EXPECT_EQ(sched.signal_graph_external_ready(shell), 0);
+    EXPECT_EQ(sched.signal_graph_external_ready(shell, 0), 0);
     expect_routed_range(0, 0);
 }
 
 TEST_F(GraphRootRoutingTest, PublishedRootsReleaseBeforeFullMaterialization) {
-    sched.graph_incremental_publish(execution, 0, 2);
+    sched.graph_incremental_publish(execution, 0, 2, 0);
     expect_routed_range(0, 0);
-    EXPECT_EQ(sched.signal_graph_external_ready(shell), 2);
+    EXPECT_EQ(sched.signal_graph_external_ready(shell, 0), 2);
     EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::SUBMITTED);
     expect_routed_range(0, 2);
 
-    sched.graph_incremental_publish(execution, 2, TASK_COUNT);
+    sched.graph_incremental_publish(execution, 2, TASK_COUNT, 0);
     expect_routed_range(2, TASK_COUNT);
+}
+
+TEST_F(GraphRootRoutingTest, FailedRootEnqueueLeavesLaterRootsUnclaimed) {
+    auto &queue = sched.ready_queues[static_cast<int>(ResourceShape::AIC)];
+    queue.capacity = 2;
+    queue.mask = 1;
+    sched.graph_incremental_publish(execution, 0, TASK_COUNT, 1);
+    EXPECT_EQ(sched.signal_graph_external_ready(shell, 1), -SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    EXPECT_EQ(execution.route_cursor.load(), 3);  // Two enqueued and one failed.
+    EXPECT_EQ(sched.sm_header->sched_error_code.load(), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    EXPECT_EQ(sched.sm_header->sched_error_thread.load(), 1);
+    expect_routed_range(0, 2);
 }
 
 TEST_F(GraphRootRoutingTest, MaterializedFirstWaitsForExternalReady) {
     graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
-    sched.graph_incremental_publish(execution, 0, TASK_COUNT);
+    sched.graph_incremental_publish(execution, 0, TASK_COUNT, 0);
     EXPECT_EQ(execution.route_cursor.load(), 0);
     expect_routed_range(0, 0);
 
-    EXPECT_EQ(sched.signal_graph_external_ready(shell), TASK_COUNT);
+    EXPECT_EQ(sched.signal_graph_external_ready(shell, 0), TASK_COUNT);
     EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::MATERIALIZED);
     expect_routed_range(0, TASK_COUNT);
-    EXPECT_EQ(sched.signal_graph_external_ready(shell), 0);
+    EXPECT_EQ(sched.signal_graph_external_ready(shell, 0), 0);
     expect_routed_range(0, 0);
 }

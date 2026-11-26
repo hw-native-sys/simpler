@@ -17,38 +17,11 @@
 
 #pragma once
 
-#include <stdint.h>
+#include "../../../../common/runtime_status/error_codes.h"
 
-// A latched code reaches the host as its own value negated, so the two families
-// below land in -1..-99 and -100..-PTO_RUNTIME_LATCHED_CODE_MAX there. That
-// ceiling lives in src/common/worker/runtime_c_api.h, and the host-side C
-// API band begins below its negation — so the latched range is bounded, not
-// open-ended downwards.
-
-// Orchestrator errors (1-99): detected in orchestrator thread
-#define SIMPLER_ERROR_NONE 0  // Explicitly means "no error"; it is not an "unknown/unspecified" error code.
-#define SIMPLER_ERROR_SCOPE_DEADLOCK 1
-#define SIMPLER_ERROR_HEAP_RING_DEADLOCK 2
-#define SIMPLER_ERROR_FLOW_CONTROL_DEADLOCK 3
-#define SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED 4
-#define SIMPLER_ERROR_INVALID_ARGS 5  // Arg construction error (invalid args)
-// 6 retired: per-task fanin overflow is reported as FANIN_CAPACITY_EXCEEDED (4).
-#define SIMPLER_ERROR_REQUIRE_SYNC_START_INVALID 7
-#define SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT 8
-#define SIMPLER_ERROR_EXPLICIT_ORCH_FATAL 9
-#define SIMPLER_ERROR_SCOPE_TASKS_OVERFLOW 10      // scope_tasks buffer saturated (all rings full)
-#define SIMPLER_ERROR_TENSORMAP_OVERFLOW 11        // tensormap entry pool wedged (last_task_alive not advancing)
-#define SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED 12  // Not raised here; the number stays reserved across runtimes
-
-// Scheduler errors (100+): detected in scheduler threads
-#define SIMPLER_ERROR_SCHEDULER_TIMEOUT 100
-#define SIMPLER_ERROR_ASYNC_COMPLETION_INVALID 101
-#define SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW 102
-#define SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED 103
-#define SIMPLER_ERROR_READY_QUEUE_OVERFLOW 104
-#define SIMPLER_ERROR_KERNEL_INVALID_OUTPUT 105
-#define SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE 106
-#define SIMPLER_ERROR_KERNEL_NON_FINITE_VALUE 107
+#define SIMPLER_ERROR_KERNEL_INVALID_OUTPUT SIMPLER_A2A3_TMR_KERNEL_INVALID_OUTPUT
+#define SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE SIMPLER_A2A3_TMR_KERNEL_INDEX_OUT_OF_RANGE
+#define SIMPLER_ERROR_KERNEL_NON_FINITE_VALUE SIMPLER_A2A3_TMR_KERNEL_NON_FINITE_VALUE
 
 // These failures can leave a valid registered prefix and an untracked request.
 // Draining that prefix does not prove complete retirement of the failed run.
@@ -102,14 +75,4 @@ static inline const char *stall_detail_name(int32_t detail) {
     default:
         return "invalid";
     }
-}
-
-static inline int32_t runtime_status_from_error_codes(int32_t orch_error_code, int32_t sched_error_code) {
-    if (orch_error_code != SIMPLER_ERROR_NONE) {
-        return orch_error_code < 0 ? orch_error_code : -orch_error_code;
-    }
-    if (sched_error_code != SIMPLER_ERROR_NONE) {
-        return sched_error_code < 0 ? sched_error_code : -sched_error_code;
-    }
-    return 0;
 }

@@ -608,14 +608,54 @@ void ready_queue_init_data_from_layout(ChipReadyQueue *queue, uint64_t capacity)
 void ready_queue_wire_arena_pointers(ChipReadyQueue *queue, DeviceArena &arena, size_t slots_off);
 void ready_queue_destroy(ChipReadyQueue *queue);
 
-/**
- * Statistics returned by mixed-task completion processing
- */
-struct CompletionStats {
-    int32_t fanout_edges;       // Number of fanout edges traversed (notify consumers)
-    int32_t tasks_enqueued;     // Number of consumers that became READY
-    int32_t fanin_edges;        // Number of fanin edges traversed (release producers)
-    bool mixed_task_completed;  // True only when this callback completed a mixed task
+// One writer per AICPU thread. Retirement closes each target to new batches,
+// then waits only for writers that already announced that core. Sequential
+// consistency prevents the closer and a new writer from both seeing zero.
+struct RegisterPublications {
+    using CoreMask = uint64_t[EARLY_DISPATCH_CORE_MASK_WORDS];
+    static_assert(EARLY_DISPATCH_CORE_MASK_WORDS * 64 >= PLATFORM_MAX_CORES);
+    struct alignas(64) Mask {
+        std::atomic<uint64_t> words[EARLY_DISPATCH_CORE_MASK_WORDS]{};
+    };
+    Mask closed;
+    Mask writers[PLATFORM_MAX_AICPU_THREADS];
+
+    bool close_and_check_writers(const CoreMask &cores) {
+        for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; ++w)
+            if (cores[w]) closed.words[w].fetch_or(cores[w]);
+        // A closed core with no announced writer cannot acquire one later.
+        // Normal shutdown usually retires its entire group in this first scan.
+        for (const auto &writer : writers)
+            for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; ++w)
+                if (cores[w] && (writer.words[w].load() & cores[w])) return true;
+        return false;
+    }
+
+    bool idle(int core) const {
+        for (const auto &writer : writers)
+            if (writer.words[core / 64].load() & (1ULL << (core % 64))) return false;
+        return true;
+    }
+
+    // The callback only publishes register writes to these cores. Its stores
+    // must drain before the retirement claimant can observe an idle writer.
+    template <typename Publish>
+    bool publish(int thread, const CoreMask &cores, Publish action) {
+        auto &writer = writers[thread];
+        bool open = true;
+        for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; ++w) {
+            if (!cores[w]) continue;
+            writer.words[w].store(cores[w]);
+            if (closed.words[w].load() & cores[w]) open = false;
+        }
+        if (open) {
+            action();
+            wmb();
+        }
+        for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; ++w)
+            if (cores[w]) writer.words[w].store(0, std::memory_order_release);
+        return open;
+    }
 };
 
 /**
@@ -632,6 +672,8 @@ struct CompletionStats {
  * Hot-path methods are defined inline (implicitly inline as member functions).
  */
 struct SchedulerState {
+    RegisterPublications register_publications{};
+
     // Shared memory access
     SharedMemoryHeader *sm_header;
 
@@ -684,17 +726,8 @@ struct SchedulerState {
     // dummy_ready_queue and are retired inline; a ready sync_start cohort goes to
     // the per-shape ready_sync_queues[] (drained as Tier-0); everything else to
     // ready_queues[].
-    void latch_ready_queue_overflow(int32_t thread_idx = -1) {
-        int32_t expected = SIMPLER_ERROR_NONE;
-        const bool latched = sm_header->sched_error_code.compare_exchange_strong(
-            expected, SIMPLER_ERROR_READY_QUEUE_OVERFLOW, std::memory_order_acq_rel, std::memory_order_acquire
-        );
-        if (latched && thread_idx >= 0) {
-            sm_header->sched_error_thread.store(thread_idx, std::memory_order_release);
-        }
-        if (thread_idx >= 0 && thread_idx < 32) {
-            sm_header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
-        }
+    void latch_ready_queue_overflow(int32_t thread_idx) {
+        report_scheduler_error(*sm_header, thread_idx, SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
     }
 
     bool push_graph_prepare(ChipTaskSlotState *slot_state, TaskId task_id, int32_t thread_idx) {
@@ -703,7 +736,7 @@ struct SchedulerState {
         return false;
     }
 
-    void push_ready_routed(ChipTaskSlotState *slot_state) {
+    bool push_ready_routed(ChipTaskSlotState *slot_state, int32_t thread_idx) {
         // Early-dispatch release: a pre-staged candidate launches by doorbell
         // right here — the moment its readiness is decided — and skips the
         // queue round-trip. Only a candidate can hold a staging claim, so every
@@ -714,14 +747,18 @@ struct SchedulerState {
         // publishes to its drain owner, which may already hold it for an
         // all-or-nothing stage.
         if ((slot_state->ed_flags & ED_FLAG_CANDIDATE) != 0) {
-            const bool early_handled = try_early_dispatch_release(*slot_state);
+            const bool early_handled = try_early_dispatch_release(*slot_state, thread_idx);
             if (slot_state->task_attrs.requires_sync_start()) {
                 const bool drain_owned = publish_ready_to_early_sync_drain(slot_state->to_payload());
-                if (early_handled || drain_owned) return;
+                if (early_handled || drain_owned) return true;
             } else if (early_handled) {
-                return;
+                return true;
             }
         }
+        return enqueue_ready(slot_state, thread_idx);
+    }
+
+    bool enqueue_ready(ChipTaskSlotState *slot_state, int32_t thread_idx) {
         // A GRAPH shell occupies no core, so its readiness is not a dispatch:
         // what it releases is the body roots the shell staged. They ring here,
         // on the completion path, exactly as an ordinary candidate's producer
@@ -731,8 +768,7 @@ struct SchedulerState {
         // pending, and a cohort in that drain waits on cores that only these
         // doorbells free.
         if (slot_state->task_kind == TaskKind::GRAPH) {
-            (void)signal_graph_external_ready(*slot_state);
-            return;
+            return signal_graph_external_ready(*slot_state, thread_idx) >= 0;
         }
         ResourceShape shape = slot_state->active_mask.to_shape();
         bool pushed;
@@ -744,15 +780,10 @@ struct SchedulerState {
         } else {
             pushed = ready_queues[static_cast<int32_t>(shape)].push_shaped(slot_state, shape);
         }
-        // Every ready / sync / dummy task routes to exactly one queue. A false
-        // push means that queue's peak concurrent occupancy exceeded its
-        // bind-time capacity — a capacity mis-sizing, not a normal condition.
-        // Silently dropping the task would stall the run, so latch a named error
-        // (surfaces as READY_QUEUE_OVERFLOW rather than an anonymous
-        // forward-progress timeout).
-        if (!pushed) {
-            latch_ready_queue_overflow();
-        }
+        // A failed enqueue would lose the task. Record its reporter even when
+        // a concurrent dequeue has claimed the target cell but has not released it yet.
+        if (!pushed) latch_ready_queue_overflow(thread_idx);
+        return pushed;
     }
 
     // ---- Polling completion primitives ---------------------------------------
@@ -794,7 +825,7 @@ struct SchedulerState {
     // completed (head == SENTINEL), re-classify against ALL fanins: route to
     // ready only when every fanin is met, else re-target the next unmet producer
     // and retry. The monotone task_states bytes guarantee termination.
-    void register_wake(ChipTaskSlotState *producer, ChipTaskSlotState *consumer) {
+    bool register_wake(ChipTaskSlotState *producer, ChipTaskSlotState *consumer, int32_t thread_idx) {
         SharedMemoryTaskHeader &tasks = *task_view.tasks;
         while (true) {
             ChipTaskSlotState *expected = producer->wake_list_head.load(std::memory_order_relaxed);
@@ -803,13 +834,12 @@ struct SchedulerState {
                 if (producer->wake_list_head.compare_exchange_weak(
                         expected, consumer, std::memory_order_acq_rel, std::memory_order_relaxed
                     )) {
-                    return;
+                    return true;
                 }
             }
             int32_t state = classify_fanin_state(consumer);
             if (state < 0) {
-                push_ready_routed(consumer);
-                return;
+                return push_ready_routed(consumer, thread_idx);
             }
             producer = &tasks.get_slot_state_by_task_id(consumer->to_payload().fanin_data()[state]);
         }
@@ -819,7 +849,7 @@ struct SchedulerState {
     // byte, then drain the wake list
     // (route/re-register each waiter). Whole-graph-resident hbg
     // has no device slot reclaim, so nothing advances a reclaim cursor here.
-    void on_mixed_task_complete(ChipTaskSlotState &slot_state) {
+    bool on_mixed_task_complete(ChipTaskSlotState &slot_state, int32_t thread_idx) {
         const int32_t task_id = slot_state.to_descriptor().task_id.local_id();
         SharedMemoryTaskHeader &tasks = *task_view.tasks;
 
@@ -832,19 +862,16 @@ struct SchedulerState {
         ChipTaskSlotState *waiter = slot_state.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
         while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
             ChipTaskSlotState *next = waiter->next_in_wake_list;
-            if (waiter->to_payload().fanin_count == 1) {
-                push_ready_routed(waiter);  // single-fanin waiter was waiting only on us
-                waiter = next;
-                continue;
-            }
-            int state = classify_fanin_state(waiter);
-            if (state < 0) {
-                push_ready_routed(waiter);
+            const int unmet = waiter->to_payload().fanin_count == 1 ? -1 : classify_fanin_state(waiter);
+            if (unmet < 0) {
+                if (!push_ready_routed(waiter, thread_idx)) return false;
             } else {
-                register_wake(&tasks.get_slot_state_by_task_id(waiter->to_payload().fanin_data()[state]), waiter);
+                auto &producer = tasks.get_slot_state_by_task_id(waiter->to_payload().fanin_data()[unmet]);
+                if (!register_wake(&producer, waiter, thread_idx)) return false;
             }
             waiter = next;
         }
+        return true;
     }
 
     // Polling: there is no ready-claim CAS (a producer routes each waiter exactly
@@ -940,14 +967,16 @@ struct SchedulerState {
         *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
     }
 
-    inline void ring_staged_doorbell_bits(int word, uint64_t bits) {
-        while (bits != 0) {
-            int core_id = word * 64 + __builtin_ctzll(bits);
-            bits &= bits - 1;
-            ring_one_doorbell(
-                early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
-            );
-        }
+    bool ring_staged_doorbells(const RegisterPublications::CoreMask &cores, int32_t thread_idx) {
+        return register_publications.publish(thread_idx, cores, [&] {
+            for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; ++w) {
+                for (uint64_t bits = cores[w]; bits; bits &= bits - 1) {
+                    int core = w * 64 + __builtin_ctzll(bits);
+                    const auto &entry = early_dispatch_doorbell_table[core];
+                    ring_one_doorbell(entry.addr, entry.token);
+                }
+            }
+        });
     }
 
     static inline uint64_t claim_all_staged_doorbell_bits(std::atomic<uint64_t> &mask) {
@@ -1055,7 +1084,7 @@ struct SchedulerState {
     // destructively claim the published doorbell bits — a late stager rings
     // only the bits this pass did not take, so each gated core has exactly
     // one doorbell writer.
-    inline bool try_early_dispatch_release(ChipTaskSlotState &slot_state) {
+    inline bool try_early_dispatch_release(ChipTaskSlotState &slot_state, int32_t thread_idx) {
         TaskPayload &payload = slot_state.to_payload();
         uint8_t expect = EARLY_DISPATCH_NONE;
         if (payload.early_dispatch_state.compare_exchange_strong(
@@ -1076,13 +1105,12 @@ struct SchedulerState {
             // The flip to DISPATCHED is only the producer-released half of the
             // rendezvous; the ring fires once every gated core also occupies a
             // running slot, from whichever half completes second.
-            try_launch_sync_start_cohort(slot_state);
+            try_launch_sync_start_cohort(slot_state, thread_idx);
         } else {
-            for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
-                uint64_t owned = claim_all_staged_doorbell_bits(payload.staged_core_mask[w]);
-                ring_staged_doorbell_bits(w, owned);
-            }
-            wmb();
+            RegisterPublications::CoreMask owned{};
+            for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++)
+                owned[w] = claim_all_staged_doorbell_bits(payload.staged_core_mask[w]);
+            if (!ring_staged_doorbells(owned, thread_idx)) return true;
             payload.early_dispatch_launch_state.store(EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_seq_cst);
         }
         // A still-queued early-dispatch entry for this consumer is now
@@ -1252,22 +1280,6 @@ struct SchedulerState {
         return all_published;
     }
 
-    // Ring one sync_start cohort from its stable staged_core_mask. The caller owns
-    // the NONE->RINGING launch latch and invokes this exactly once after local or
-    // global staging completes, while the corresponding per-core table entries are live.
-    inline void ring_all_staged_doorbells(ChipTaskSlotState &slot_state) {
-        for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
-            uint64_t bits = slot_state.to_payload().staged_core_mask[w].load(std::memory_order_seq_cst);
-            while (bits != 0) {
-                int core_id = w * 64 + __builtin_ctzll(bits);
-                bits &= bits - 1;
-                ring_one_doorbell(
-                    early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
-                );
-            }
-        }
-    }
-
     static inline bool try_claim_early_sync_drain(TaskPayload &payload) {
         uint8_t expected = EARLY_SYNC_DRAIN_NONE;
         return payload.early_sync_drain_state.compare_exchange_strong(
@@ -1288,17 +1300,21 @@ struct SchedulerState {
         return (previous & EARLY_SYNC_DRAIN_OWNER) != 0;
     }
 
-    inline void cancel_early_sync_drain(ChipTaskSlotState &slot_state, CapturedReadySlot captured, TaskId task_id) {
+    inline bool cancel_early_sync_drain(
+        ChipTaskSlotState &slot_state, CapturedReadySlot captured, TaskId task_id, int32_t thread_idx
+    ) {
         uint8_t previous =
             slot_state.to_payload().early_sync_drain_state.exchange(EARLY_SYNC_DRAIN_NONE, std::memory_order_seq_cst);
-        if ((previous & EARLY_SYNC_DRAIN_OWNER) == 0) return;
+        if ((previous & EARLY_SYNC_DRAIN_OWNER) == 0) return true;
         if ((previous & EARLY_SYNC_DRAIN_READY) != 0) {
-            push_ready_routed(&slot_state);
-            return;
+            // The producer already handled readiness while we owned the drain.
+            // Classifying it a second time would discard an unstaged cohort as a duplicate.
+            return enqueue_ready(&slot_state, thread_idx);
         }
         if (slot_state.to_payload().early_dispatch_state.load(std::memory_order_seq_cst) == EARLY_DISPATCH_STAGING) {
             early_sync_start_queue.push_sync_start(captured, task_id);
         }
+        return true;
     }
 
     static inline void finish_early_sync_drain(TaskPayload &payload) {
@@ -1321,7 +1337,7 @@ struct SchedulerState {
     // release and each pending->running promotion); whichever observes the second half
     // wins the launch latch and rings exactly once. Returns true only to that winner,
     // which may then expose the cohort to its fanout.
-    inline bool try_launch_sync_start_cohort(ChipTaskSlotState &slot_state) {
+    inline bool try_launch_sync_start_cohort(ChipTaskSlotState &slot_state, int32_t thread_idx) {
         // running_slot_count is the publication seed: every staged_core_mask OR
         // happens-before its final store. Read the seed first, then the mask, so
         // observing the final count cannot be paired with a partially published
@@ -1336,8 +1352,10 @@ struct SchedulerState {
         if (slot_state.to_payload().early_dispatch_state.load(std::memory_order_seq_cst) != EARLY_DISPATCH_DISPATCHED)
             return false;
         if (!try_claim_early_dispatch_launch(slot_state.to_payload())) return false;
-        ring_all_staged_doorbells(slot_state);
-        wmb();
+        RegisterPublications::CoreMask owned{};
+        for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; ++w)
+            owned[w] = slot_state.to_payload().staged_core_mask[w].load(std::memory_order_seq_cst);
+        if (!ring_staged_doorbells(owned, thread_idx)) return false;
         slot_state.to_payload().early_dispatch_launch_state.store(
             EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_release
         );
@@ -1405,7 +1423,9 @@ struct SchedulerState {
         return execution.task_at(execution.fanin_indices[begin + row]).slot;
     }
 
-    void register_graph_wake(GraphExecution &execution, ChipTaskSlotState *producer, ChipTaskSlotState *consumer) {
+    bool register_graph_wake(
+        GraphExecution &execution, ChipTaskSlotState *producer, ChipTaskSlotState *consumer, int32_t thread_idx
+    ) {
         while (true) {
             ChipTaskSlotState *expected = producer->wake_list_head.load(std::memory_order_relaxed);
             while (expected != WAKE_LIST_SENTINEL) {
@@ -1413,7 +1433,7 @@ struct SchedulerState {
                 if (producer->wake_list_head.compare_exchange_weak(
                         expected, consumer, std::memory_order_acq_rel, std::memory_order_relaxed
                     )) {
-                    return;
+                    return true;
                 }
             }
 
@@ -1422,30 +1442,26 @@ struct SchedulerState {
             // exposes the completed producer, then route or retarget the waiter.
             const int32_t unmet_producer = graph_first_unmet_producer(execution, *consumer);
             if (unmet_producer < 0) {
-                push_ready_routed(consumer);
-                return;
+                return push_ready_routed(consumer, thread_idx);
             }
             producer = &graph_producer_at(execution, *consumer, unmet_producer);
         }
     }
 
-    uint32_t drain_graph_wake_list(GraphExecution &execution, ChipTaskSlotState &producer) {
-        uint32_t consumers_resolved = 0;
+    int32_t drain_graph_wake_list(GraphExecution &execution, ChipTaskSlotState &producer, int32_t thread_idx) {
+        int32_t consumers_resolved = 0;
         ChipTaskSlotState *waiter = producer.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
         while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
             ChipTaskSlotState *next = waiter->next_in_wake_list;
             const int32_t local_id = waiter->sub_task_local_id;
-            if (execution.fanin_offsets[local_id + 1] - execution.fanin_offsets[local_id] == 1) {
-                push_ready_routed(waiter);  // single-producer waiter was waiting only on us
-                consumers_resolved++;
-                waiter = next;
-                continue;
-            }
-            const int32_t unmet_producer = graph_first_unmet_producer(execution, *waiter);
-            if (unmet_producer < 0) {
-                push_ready_routed(waiter);
+            const bool single_fanin = execution.fanin_offsets[local_id + 1] - execution.fanin_offsets[local_id] == 1;
+            const int32_t unmet = single_fanin ? -1 : graph_first_unmet_producer(execution, *waiter);
+            if (unmet < 0) {
+                if (!push_ready_routed(waiter, thread_idx)) return -SIMPLER_ERROR_READY_QUEUE_OVERFLOW;
             } else {
-                register_graph_wake(execution, &graph_producer_at(execution, *waiter, unmet_producer), waiter);
+                auto &next_producer = graph_producer_at(execution, *waiter, unmet);
+                if (!register_graph_wake(execution, &next_producer, waiter, thread_idx))
+                    return -SIMPLER_ERROR_READY_QUEUE_OVERFLOW;
             }
             consumers_resolved++;
             waiter = next;
@@ -1459,7 +1475,8 @@ struct SchedulerState {
     // publication calls and the external-readiness notification;
     // each root reaches the ready queue exactly once. Non-roots are never pushed
     // here — they reach the ready queue through their producers' wake list.
-    int32_t graph_route_ready_roots(GraphExecution &execution) {
+    // Return the routed count, or the negative status from a failed enqueue.
+    int32_t graph_route_ready_roots(GraphExecution &execution, int32_t thread_idx) {
         if (execution.outer_slot == nullptr || !graph_execution_external_ready(execution)) return 0;
         const int32_t published = execution.published_tasks.load(std::memory_order_acquire);
         int32_t routed = 0;
@@ -1472,7 +1489,8 @@ struct SchedulerState {
                 continue;
             }
             if (execution.fanin_offsets[i] == execution.fanin_offsets[i + 1]) {
-                push_ready_routed(&execution.task_at(i).slot);
+                if (!push_ready_routed(&execution.task_at(i).slot, thread_idx))
+                    return -SIMPLER_ERROR_READY_QUEUE_OVERFLOW;
                 routed++;
             }
         }
@@ -1487,15 +1505,16 @@ struct SchedulerState {
     // graph_first_unmet_producer are safe against a producer completing
     // concurrently, which is what lets a task dispatch before the whole graph is
     // materialized.
-    void graph_incremental_publish(GraphExecution &execution, int32_t first, int32_t last) {
+    void graph_incremental_publish(GraphExecution &execution, int32_t first, int32_t last, int32_t thread_idx) {
         for (int32_t i = first; i < last; ++i) {
             if (execution.fanin_offsets[i] == execution.fanin_offsets[i + 1]) continue;  // root
             ChipTaskSlotState &task = execution.task_at(i).slot;
             const int32_t unmet = graph_first_unmet_producer(execution, task);
             if (unmet < 0) {
-                push_ready_routed(&task);
+                if (!push_ready_routed(&task, thread_idx)) return;
             } else {
-                register_graph_wake(execution, &graph_producer_at(execution, task, unmet), &task);
+                if (!register_graph_wake(execution, &graph_producer_at(execution, task, unmet), &task, thread_idx))
+                    return;
                 // Same rule the global intake applies, against this body's CSR:
                 // a not-yet-ready candidate also enters the publish list, and
                 // one whose producers are all published already goes straight to
@@ -1510,7 +1529,7 @@ struct SchedulerState {
         // The later RMW acquires the earlier one: either this publisher sees READY,
         // or the readiness caller sees the new range before claiming roots.
         if (execution.control.fetch_or(0, std::memory_order_acq_rel) & GRAPH_EXECUTION_EXTERNAL_READY) {
-            graph_route_ready_roots(execution);
+            graph_route_ready_roots(execution, thread_idx);
         }
     }
 
@@ -1518,8 +1537,8 @@ struct SchedulerState {
     // it is passed down rather than held here, because a view names the launch
     // arguments of one thread and this context is shared by all of them.
     GraphMaterializeResult prepare_graph_task(
-        ChipTaskSlotState &outer_slot, const GraphImageView &image, int32_t max_tasks = GRAPH_MATERIALIZE_SLICE_TASKS,
-        int32_t *tasks_materialized = nullptr
+        ChipTaskSlotState &outer_slot, const GraphImageView &image, int32_t thread_idx,
+        int32_t max_tasks = GRAPH_MATERIALIZE_SLICE_TASKS, int32_t *tasks_materialized = nullptr
     ) {
         GraphExecution *execution = graph_execution_from_outer_slot(outer_slot);
         if (execution == nullptr) return GraphMaterializeResult::INVALID;
@@ -1527,7 +1546,7 @@ struct SchedulerState {
         const GraphMaterializeResult result =
             graph_execution_materialize_slice(outer_slot, *execution, image, max_tasks, tasks_materialized);
         if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::MATERIALIZED) {
-            graph_incremental_publish(*execution, before, execution->materialized_tasks);
+            graph_incremental_publish(*execution, before, execution->materialized_tasks, thread_idx);
         }
         return result;
     }
@@ -1542,11 +1561,11 @@ struct SchedulerState {
     // Every staged root is covered: staging claims roots below published_tasks at
     // claim time, published_tasks only grows, and route_cursor starts at 0, so the
     // range this routes is a superset of what was staged.
-    int32_t signal_graph_external_ready(ChipTaskSlotState &outer_slot) {
+    int32_t signal_graph_external_ready(ChipTaskSlotState &outer_slot, int32_t thread_idx) {
         GraphExecution *execution = graph_execution_from_outer_slot(outer_slot);
         if (execution == nullptr) return 0;
         graph_execution_signal_external_ready(*execution);
-        return graph_route_ready_roots(*execution);
+        return graph_route_ready_roots(*execution, thread_idx);
     }
 
     struct TaskCompletionOutcome {
@@ -1555,25 +1574,17 @@ struct SchedulerState {
         int32_t error_code{SIMPLER_ERROR_NONE};
     };
 
-    TaskCompletionOutcome complete_task(
-        ChipTaskSlotState &slot_state
-#if SIMPLER_SCHED_PROFILING
-        ,
-        int thread_idx
-#endif
-    ) {
+    TaskCompletionOutcome complete_task(ChipTaskSlotState &slot_state, int32_t thread_idx) {
         TaskCompletionOutcome outcome;
         // A task in a Graph body retires into its execution's counters; everything else
         // — including the outer GRAPH shell — is a task of the run and releases its
         // fanout. graph_context is null for the common case, so this short-circuits
         // before the kind is read.
         if (slot_state.graph_context == nullptr || slot_state.task_kind == TaskKind::GRAPH) {
-#if SIMPLER_SCHED_PROFILING
-            CompletionStats stats = on_task_complete(slot_state, thread_idx);
-            outcome.fanout_edges = static_cast<uint32_t>(stats.fanout_edges);
-#else
-            outcome.fanout_edges = on_task_complete(slot_state);
-#endif
+            if (!on_mixed_task_complete(slot_state, thread_idx)) {
+                outcome.error_code = SIMPLER_ERROR_READY_QUEUE_OVERFLOW;
+                return outcome;
+            }
             outcome.stream_tasks_completed = 1;
             return outcome;
         }
@@ -1605,7 +1616,12 @@ struct SchedulerState {
         // (DUMMY, predicate-retired) releases its publish-list waiters here.
         // Idempotent after a publish-time seal, exactly as on the global path.
         if ((slot_state.ed_flags & ED_FLAG_TRACKED) != 0) seal_ed_publish_list(slot_state);
-        outcome.fanout_edges = drain_graph_wake_list(*execution, slot_state);
+        const int32_t resolved = drain_graph_wake_list(*execution, slot_state, thread_idx);
+        if (resolved < 0) {
+            outcome.error_code = -resolved;
+            return outcome;
+        }
+        outcome.fanout_edges = static_cast<uint32_t>(resolved);
 
         const bool graph_completed = graph_execution_complete_sub_task(*execution);
         graph_execution_retire_sub_task(*execution);
@@ -1615,7 +1631,10 @@ struct SchedulerState {
         // the outer task exactly once, waking external consumers and
         // contributing the one task the host actually submitted.
         if (execution->outer_slot != nullptr) {
-            on_mixed_task_complete(*execution->outer_slot);
+            if (!on_mixed_task_complete(*execution->outer_slot, thread_idx)) {
+                outcome.error_code = SIMPLER_ERROR_READY_QUEUE_OVERFLOW;
+                return outcome;
+            }
             outcome.stream_tasks_completed = 1;
         }
         graph_execution_mark_completed(*execution);
@@ -1633,45 +1652,6 @@ struct SchedulerState {
     bool on_subtask_complete(ChipTaskSlotState &slot_state) {
         int16_t prev = slot_state.completed_subtasks.fetch_add(1, std::memory_order_acq_rel);
         return (prev + 1) == slot_state.total_required_subtasks;
-    }
-
-    /**
-     * Two-stage completion: second stage.
-     * Called exactly once when all subtasks of a task are done (i.e.,
-     * on_subtask_complete returned true). Walks the consumer (fanout) list,
-     * decrements each consumer's fanin, pushes newly-ready ones, and rings
-     * doorbells for early-dispatch hits.
-     *
-     * Non-PROFILING returns the consumer-walk count (= edges traversed). The
-     * Resolve swimlane bar reads it to label the bar with how many successors
-     * actually got resolved. PROFILING returns the richer CompletionStats
-     * whose `fanout_edges` carries the same number.
-     */
-#if SIMPLER_SCHED_PROFILING
-    CompletionStats
-#else
-    uint32_t
-#endif
-    on_task_complete(
-        ChipTaskSlotState &slot_state
-#if SIMPLER_SCHED_PROFILING
-        ,
-        int thread_idx
-#endif
-    ) {
-        // Polling completion: publish the device-visible task_states
-        // byte and drain the wake list (route or
-        // re-register each waiter). Replaces the
-        // fanout-list walk + fanin_refcount decrements of the wiring model.
-        on_mixed_task_complete(slot_state);
-#if SIMPLER_SCHED_PROFILING
-        (void)thread_idx;
-        // Resolved-successor accounting is not tracked on the polling path (the
-        // producer no longer enumerates its consumers); report 0 for the DFX bar.
-        return CompletionStats{0, 0, 0, true};
-#else
-        return 0;
-#endif
     }
 
     // on_task_release is gone under polling. It existed to bump each producer's
@@ -1724,20 +1704,16 @@ struct SchedulerState {
 
 // try_inline_complete_locked: short-circuit NotDeferred completions seen during
 // drain so they don't grow entries[]. Defined here (not in async_wait.h)
-// because SchedulerState's on_task_complete signature is only known
+// because SchedulerState's complete_task signature is only known
 // after its full definition above.
 //
-// Polling: on_task_complete publishes completion + drains the wake list inline,
+// Polling: complete_task publishes completion + drains the wake list inline,
 // so the async-drain path no longer buffers producer releases.
 inline bool
 AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, ChipTaskSlotState &slot_state) {
-    // Return value (CompletionStats / consumer-walk count) discarded:
+    // Fanout count is unused here:
     // async-wait drain path has no Resolve swimlane bar attached.
-#if SIMPLER_SCHED_PROFILING
     SchedulerState::TaskCompletionOutcome outcome = sink.sched->complete_task(slot_state, sink.thread_idx);
-#else
-    SchedulerState::TaskCompletionOutcome outcome = sink.sched->complete_task(slot_state);
-#endif
     if (outcome.error_code != SIMPLER_ERROR_NONE) {
         sink.error_code = outcome.error_code;
         return false;
@@ -1748,21 +1724,14 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
 }
 
 template <bool Profiling>
-inline AsyncPollResult AsyncWaitList::poll_and_complete(
-    AICoreCompletionMailbox *aicore_mailbox, SchedulerState *sched
-#if SIMPLER_SCHED_PROFILING
-    ,
-    int thread_idx
-#endif
-) {
+inline AsyncPollResult
+AsyncWaitList::poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, SchedulerState *sched, int32_t thread_idx) {
     AsyncPollResult result;
     if (!try_lock()) return result;
 
     AsyncWaitList::DrainCompletionSink sink{};
     sink.sched = sched;
-#if SIMPLER_SCHED_PROFILING
     sink.thread_idx = thread_idx;
-#endif
 
     int32_t drain_err = SIMPLER_ERROR_NONE;
     drain_aicore_completion_mailbox_locked(aicore_mailbox, sink, drain_err);
@@ -1802,13 +1771,9 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
         }
 
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
-            // Return value (CompletionStats / consumer-walk count) discarded:
+            // Fanout count is unused here:
             // deferred-completion drain has no Resolve swimlane bar attached.
-#if SIMPLER_SCHED_PROFILING
             SchedulerState::TaskCompletionOutcome outcome = sched->complete_task(*entry.slot_state, thread_idx);
-#else
-            SchedulerState::TaskCompletionOutcome outcome = sched->complete_task(*entry.slot_state);
-#endif
             if (outcome.error_code != SIMPLER_ERROR_NONE) {
                 result.error_code = outcome.error_code;
                 result.failed_slot_state = entry.slot_state;
@@ -1835,7 +1800,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 
 #if SIMPLER_SCHED_PROFILING
 struct SchedProfilingData {
-    // Sub-phase cycle breakdown within on_task_complete
+    // Sub-phase cycle breakdown within complete_task
     uint64_t lock_cycle;           // lock_fanout + state store + unlock
     uint64_t fanout_cycle;         // fanout traversal
     uint64_t fanin_cycle;          // fanin traversal

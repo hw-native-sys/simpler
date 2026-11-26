@@ -59,8 +59,7 @@
  * copied, or used for overlapping runs while it contains a prepared run. The
  * caller must serialize phase functions for a given context/storage pair;
  * poll/wait/finalize are not concurrent operations on the same run.
- * Error codes: 0 = success, negative = error — see the two disjoint negative
- * bands documented on the PTO_RUNTIME_ERR_* enum below.
+ * Status codes and the meaning of nonterminal wait results are defined in runtime_status/error_codes.h.
  */
 
 #pragma once
@@ -69,6 +68,7 @@
 #include <stdint.h>
 
 #include "device_memory_info.h"
+#include "../runtime_status/error_codes.h"
 
 // simpler_run takes a pointer to the C++ CallConfig POD (task_interface/
 // call_config.h). Forward-declared so this C-linkage header needn't pull the
@@ -85,83 +85,6 @@ extern "C" {
 typedef void *RuntimeHandle;
 /** Opaque simpler runner handle, not an ACL/RTS current-context handle. */
 typedef void *DeviceContextHandle;
-
-/**
- * Host-side status codes, and the band they are confined to.
- *
- * A negative return from any entry point below names one of two mechanisms, and
- * a caller must be able to tell which from the number alone:
- *
- *   - a **device-latched** runtime code, reported as its own value negated.
- *     Orchestration codes occupy 1..99 and scheduler codes 100 upwards, so the
- *     latched band is -1..-PTO_RUNTIME_LATCHED_CODE_MAX (the codes themselves
- *     are SIMPLER_ERROR_* in src/{arch}/runtime/{runtime}/common/runtime_status.h;
- *     the per-code triage tables are in
- *     docs/troubleshooting/device-error-codes.md).
- *   - a **host-side** code from this enum, at or below PTO_RUNTIME_ERR_BASE.
- *
- * The two bands are disjoint, and a static_assert in each runtime's
- * runtime_maker.cpp holds them apart. So a host-side failure never reports -1
- * (which is SCOPE_DEADLOCK) or -3 (FLOW_CONTROL_DEADLOCK): it reports
- * PTO_RUNTIME_ERR_INTERNAL, or a more specific code from this band.
- */
-enum {
-    /* Ceiling on a device-latched code, and therefore the floor of the latched
-       band once negated. */
-    PTO_RUNTIME_LATCHED_CODE_MAX = 999,
-    /* Highest host-side code; the band descends from here. */
-    PTO_RUNTIME_ERR_BASE = -(PTO_RUNTIME_LATCHED_CODE_MAX + 1),
-    /* A host-side failure whose diagnosis is the log line that preceded it. */
-    PTO_RUNTIME_ERR_INTERNAL = PTO_RUNTIME_ERR_BASE,
-    /* The request names a capability this platform/runtime does not implement. */
-    PTO_RUNTIME_ERR_UNSUPPORTED = PTO_RUNTIME_ERR_BASE - 1,
-    PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE = PTO_RUNTIME_ERR_BASE - 2,
-    /* The call is structurally valid but conflicts with the context's
-       execution mode or lifecycle (e.g. launch before kernel initialization). */
-    PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
-    /* A caller supplied an invalid pointer, id, size, or other argument. */
-    PTO_RUNTIME_ERR_INVALID_ARGUMENT = PTO_RUNTIME_ERR_BASE - 4,
-    /* BASE - 5 is reserved for diagnostic collector capacity refusal. */
-    /* A prepare could not take the device resources it needs now, and a
-       consumer that still holds some of them has a retirement this context will
-       reach. The plan is kept and retried once that consumer finishes, so this
-       is a wait rather than a failure and the caller must not discard the run. */
-    SIMPLER_RUNTIME_ERR_RESOURCE_WAIT = PTO_RUNTIME_ERR_BASE - 6,
-    /* A prepare could not take the device resources it needs and no consumer
-       remains whose retirement could supply them: either none ever held any, or
-       this plan has already waited for every one that did. Terminal. */
-    SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE = PTO_RUNTIME_ERR_BASE - 7,
-    /* Reserved for simpler_wait_run: this wait did not observe the result.
-       The run remains live and may be waited/finalized again. Never store this
-       operation result as the execution's terminal error. */
-    SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE = PTO_RUNTIME_ERR_BASE - 8,
-    /* Host register/unregister succeeded, but restoring the caller context failed. */
-    SIMPLER_HOST_DDR_CONTEXT_RESTORE_FAILED = PTO_RUNTIME_ERR_BASE - 9,
-};
-
-/**
- * A launch result that is not a failure of the run.
- *
- * Every diagnostic output slot or terminal bank some enabled owner needs is
- * still held by a run ahead. Nothing was submitted and nothing was admitted:
- * the run keeps its prepared state and may be launched again, unchanged, once
- * `simpler_diagnostic_credit_generation_ctx` advances. A caller that treats it
- * as a failure turns a run that is merely waiting into one that is lost.
- *
- * It takes a value in the host-side band so it cannot collide with a latched
- * device code, and sits in its own enum because the band's other members are
- * externally-contracted legacy names this one does not join.
- */
-enum {
-    SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL = PTO_RUNTIME_ERR_BASE - 5,
-};
-
-/** Return values from simpler_poll_run(). */
-enum {
-    SIMPLER_NATIVE_RUN_POLL_ERROR = PTO_RUNTIME_ERR_INTERNAL,
-    SIMPLER_NATIVE_RUN_POLL_NOT_READY = 0,
-    SIMPLER_NATIVE_RUN_POLL_COMPLETE = 1,
-};
 
 enum {
     PTO_PIPELINE_CONTRACT_ABI_VERSION = 2,

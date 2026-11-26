@@ -357,7 +357,7 @@ TEST_F(HbgEdQualificationTest, ReleaseClaimsNeverStagedTaskForNormalRoute) {
     TaskId c = submit_consumer(deps, 1);
     ChipTaskSlotState &c_slot = sm_handle->header->tasks.get_slot_state_by_task_id(c.local_id());
     // Never staged: release wins NONE->DISPATCHED and reports "route normally".
-    EXPECT_FALSE(sched.try_early_dispatch_release(c_slot));
+    EXPECT_FALSE(sched.try_early_dispatch_release(c_slot, 0));
     EXPECT_EQ(c_slot.to_payload().early_dispatch_state.load(std::memory_order_relaxed), EARLY_DISPATCH_DISPATCHED);
     // A later enqueue attempt (stale drain verdict) is dropped by the claim.
     sched.enqueue_early_dispatch_candidate(c_slot);

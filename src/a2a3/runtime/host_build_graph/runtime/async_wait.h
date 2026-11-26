@@ -22,7 +22,6 @@
 #include "host_build_graph/runtime_types.h"
 
 struct SchedulerState;
-struct CompletionStats;
 
 inline constexpr int32_t MAX_ASYNC_WAITS = 64;
 
@@ -186,9 +185,7 @@ struct AsyncWaitList {
         int32_t inline_completed{0};
         int32_t inline_resolved{0};
         int32_t error_code{SIMPLER_ERROR_NONE};
-#if SIMPLER_SCHED_PROFILING
-        int32_t thread_idx{0};
-#endif
+        int32_t thread_idx;
 
         bool can_inline_complete() const { return sched != nullptr; }
     };
@@ -302,11 +299,6 @@ struct AsyncWaitList {
     }
 
     template <bool Profiling>
-    AsyncPollResult poll_and_complete(
-        AICoreCompletionMailbox *aicore_mailbox, SchedulerState *sched
-#if SIMPLER_SCHED_PROFILING
-        ,
-        int thread_idx
-#endif
-    );
+    AsyncPollResult
+    poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, SchedulerState *sched, int32_t thread_idx);
 };

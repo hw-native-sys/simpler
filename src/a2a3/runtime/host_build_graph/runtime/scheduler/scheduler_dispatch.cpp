@@ -254,7 +254,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 #endif
 
     return PublishHandle{
-        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task_attrs.timing_slot()
+        core_exec_state.reg_addr, reg_task_id, core_id, dispatch_timestamp_slot, slot_state.task_attrs.timing_slot()
     };
 }
 
@@ -333,8 +333,8 @@ bool SchedulerContext::requeue_ready_tasks(
     const bool pushed =
         count == 1 ? queue.push_shaped(entries[0], shape) : queue.push_shaped_batch(entries, nullptr, count, shape);
     if (pushed) return true;
+    // Leave completed_ to the shared shutdown election when this dispatch pass stops.
     sched_->latch_ready_queue_overflow(thread_idx);
-    completed_.store(true, std::memory_order_release);
     return false;
 }
 
@@ -428,13 +428,14 @@ void SchedulerContext::dispatch_shape(
         // are out.
         auto flush_publish = [&]() {
             int seal_n = 0;
-            for (int i = 0; i < published_n; i++) {
-                if (sched_->account_published_blocks(*published_list[i], published_counts[i])) {
-                    published_list[seal_n++] = published_list[i];
+            if (handle_count == 0) return;
+            RegisterPublications::CoreMask cores{};
+            publish_task_batch(thread_idx, handles, handle_count, cores, [&] {
+                for (int i = 0; i < published_n; i++) {
+                    if (sched_->account_published_blocks(*published_list[i], published_counts[i])) {
+                        published_list[seal_n++] = published_list[i];
+                    }
                 }
-            }
-            published_n = 0;
-            if (handle_count != 0) {
                 wmb();
                 uint64_t dispatch_ts = 0;
 #if SIMPLER_DFX
@@ -445,9 +446,10 @@ void SchedulerContext::dispatch_shape(
                 for (int i = 0; i < handle_count; i++) {
                     publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
                 }
-                handle_count = 0;
                 made_progress = true;
-            }
+            });
+            published_n = 0;
+            handle_count = 0;
             for (int i = 0; i < seal_n; i++) {
                 sched_->seal_ed_publish_list(*published_list[i]);
             }
@@ -632,11 +634,11 @@ void SchedulerContext::run_staging_order(
     }
 }
 
-void SchedulerContext::dispatch_ready_tasks(
+bool SchedulerContext::dispatch_ready_tasks(
     int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
 ) {
     // Normal ready dispatch (is_ready): dispatch_shape places each block on pickup and
-    // signals a stop by setting stop_dispatch when it enters a sync_start drain.
+    // interrupts this pass on sync_start drain or a failed requeue.
     bool stop_dispatch = false;
     LaneMask observed = LaneMask::none();
 
@@ -657,7 +659,7 @@ void SchedulerContext::dispatch_ready_tasks(
             return unreserved_mix_lanes(MixPriority::ReadySync, observed);
         }
     );
-    if (stop_dispatch) return;
+    if (stop_dispatch) return true;
 
     // Tier 1: regular ready work.
     run_staging_order(
@@ -673,6 +675,7 @@ void SchedulerContext::dispatch_ready_tasks(
             return unreserved_mix_lanes(MixPriority::Ready, observed);
         }
     );
+    return stop_dispatch;
 }
 
 // Stage the ALREADY-CLAIMED range [start, start+count) of consumer `c` onto
@@ -698,7 +701,6 @@ int32_t SchedulerContext::stage_consumer_blocks(
     int32_t thread_idx, ChipTaskSlotState *c, ResourceShape shape, int32_t start, int32_t count,
     CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
 ) {
-    CoreTracker &tracker = core_trackers_[thread_idx];
     // Stamp the real pre-stage time (NOT 0) so the swimlane shows these blocks
     // dispatched during the producer's run, not at trace start.
     uint64_t early_dispatch_ts = get_sys_cnt_aicpu();
@@ -728,17 +730,18 @@ int32_t SchedulerContext::stage_consumer_blocks(
     if (idle.has_value()) prepare_from(idle, /*to_pending=*/false);
     if (pend.has_value()) prepare_from(pend, /*to_pending=*/true);
     // Account before the tokens, seal after them (see account_published_blocks).
-    const bool owns_seal = sched_->account_published_blocks(*c, staged);
-    if (n > 0) {
-        wmb();
-        for (int i = 0; i < n; i++) {
-            publish_subtask_to_core(handles[i], early_dispatch_ts, thread_idx);
-            int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
-            sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
-            sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
-            my_cores[cid >> 6] |= (1ULL << (cid & 63));
-        }
-    }
+    bool owns_seal = false;
+    if (!publish_task_batch(thread_idx, handles, n, my_cores, [&] {
+            owns_seal = sched_->account_published_blocks(*c, staged);
+            wmb();
+            for (int i = 0; i < n; i++) {
+                publish_subtask_to_core(handles[i], early_dispatch_ts, thread_idx);
+                int32_t cid = handles[i].core_id;
+                sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
+                sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
+            }
+        }))
+        return 0;
     // Publish all this thread's gated cores into the shared mask in one OR per word
     // (vs one per subtask) so release sees them; seq_cst keeps the self-ring order.
     for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++)
@@ -767,13 +770,14 @@ int32_t SchedulerContext::stage_consumer_blocks(
                     SchedulerState::claim_late_staged_doorbell_bits(c->to_payload().staged_core_mask[w], my_cores[w]);
             }
         }
-        for (int i = 0; i < n; i++) {
-            int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
-            SchedulerState::ring_claimed_local_doorbell(
-                owned[cid >> 6], cid, handles[i].reg_addr, handles[i].reg_task_id
-            );
-        }
-        wmb();
+        sched_->register_publications.publish(thread_idx, owned, [&] {
+            for (int i = 0; i < n; i++) {
+                int32_t cid = handles[i].core_id;
+                SchedulerState::ring_claimed_local_doorbell(
+                    owned[cid >> 6], cid, handles[i].reg_addr, handles[i].reg_task_id
+                );
+            }
+        });
     }
     if (owns_seal) sched_->seal_ed_publish_list(*c);
     return staged;
@@ -940,7 +944,8 @@ int32_t SchedulerContext::try_early_dispatch(
             c->to_descriptor().task_id == sync_task_id_snapshot && c->task_attrs.requires_sync_start();
         if (current_sync_task && SchedulerState::try_claim_early_sync_drain(c->to_payload())) {
             if (c->to_payload().early_dispatch_state.load(std::memory_order_seq_cst) != EARLY_DISPATCH_STAGING) {
-                sched_->cancel_early_sync_drain(*c, captured, sync_task_id_snapshot);
+                if (!sched_->cancel_early_sync_drain(*c, captured, sync_task_id_snapshot, thread_idx))
+                    return -SIMPLER_ERROR_READY_QUEUE_OVERFLOW;
             } else if (drain_state_.sync_start_pending.load(std::memory_order_acquire) == 0 &&
                        tracker.count_available_blocks(
                            c->active_mask.to_shape(), c->active_mask, /*include_pending=*/true
@@ -957,13 +962,14 @@ int32_t SchedulerContext::try_early_dispatch(
                 c->to_payload().running_slot_count.store(
                     static_cast<int16_t>(staged.running_cores), std::memory_order_seq_cst
                 );
-                sched_->try_launch_sync_start_cohort(*c);
+                sched_->try_launch_sync_start_cohort(*c, thread_idx);
                 SchedulerState::finish_early_sync_drain(c->to_payload());
                 total_staged += staged.staged_blocks;
             } else if (enter_drain_mode(c, c->logical_block_num)) {
                 SchedulerState::mark_early_sync_drain_armed(c->to_payload());
             } else {
-                sched_->cancel_early_sync_drain(*c, captured, sync_task_id_snapshot);
+                if (!sched_->cancel_early_sync_drain(*c, captured, sync_task_id_snapshot, thread_idx))
+                    return -SIMPLER_ERROR_READY_QUEUE_OVERFLOW;
             }
         }
     }
@@ -997,7 +1003,7 @@ int32_t SchedulerContext::try_early_dispatch(
 // =============================================================================
 
 // P owns no AICore cores. It drains the per-S CompletedTaskQueues and runs
-// on_task_complete for every finished task: publish task_states, drain the
+// complete_task for every finished task: publish task_states, drain the
 // wake list (route/re-register waiters into the ready queues). As the sole
 // producer of the ready queues its enqueues never contend. P owns
 // completed_tasks_ and the terminal completed_ flip, so the S threads keep
@@ -1077,11 +1083,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
                     capture_shared_ready_depth(sched_, resolve_shared_at_start);
                 }
 #endif
-#if SIMPLER_SCHED_PROFILING
                 SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot, thread_idx);
-#else
-                SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot);
-#endif
                 if (outcome.error_code != SIMPLER_ERROR_NONE) {
                     fail_scheduler(runtime, thread_idx, outcome.error_code);
                     break;
@@ -1104,7 +1106,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
         if (completed_.load(std::memory_order_acquire)) break;
 
         // Async deferred completions, moved off the scheduler threads. Every
-        // condition that fires resolves via on_task_complete inside
+        // condition that fires resolves via complete_task inside
         // poll_and_complete, so async ready tasks also enter the ready queues
         // through P alone.
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
@@ -1119,13 +1121,8 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
                 async_poll_t0 = get_sys_cnt_aicpu();
             }
 #endif
-            AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->aicore_mailbox, sched_
-#if SIMPLER_SCHED_PROFILING
-                ,
-                thread_idx
-#endif
-            );
+            AsyncPollResult poll_result =
+                sched_->async_wait_list.poll_and_complete<false>(rt_->aicore_mailbox, sched_, thread_idx);
 #if SIMPLER_DFX
             if (async_poll_t0 != 0) {
                 const uint64_t async_poll_t1 = get_sys_cnt_aicpu();
@@ -1168,11 +1165,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
                 }
 #endif
                 for (int di = 0; di < dummy_got; di++) {
-#if SIMPLER_SCHED_PROFILING
                     SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di], thread_idx);
-#else
-                    SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di]);
-#endif
                     if (outcome.error_code != SIMPLER_ERROR_NONE) {
                         fail_scheduler(runtime, thread_idx, outcome.error_code);
                         break;
@@ -1224,13 +1217,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
                     "Thread %d: P resolution stall (%d/%d resolved)", thread_idx,
                     completed_tasks_.load(std::memory_order_relaxed), total
                 );
-                int32_t expected = SIMPLER_ERROR_NONE;
-                header->sched_error_code.compare_exchange_strong(
-                    expected, SIMPLER_ERROR_SCHEDULER_TIMEOUT, std::memory_order_acq_rel, std::memory_order_acquire
-                );
-                if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-                    emergency_shutdown(runtime);
-                }
+                fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_SCHEDULER_TIMEOUT);
                 break;
             }
             last_progress_ts = now;  // a task is still running (or none outstanding): not a stall
@@ -1413,8 +1400,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
+        LoopAction completion_action = LoopAction::NONE;
         if (try_completed) {
-            check_running_cores_for_completion(
+            completion_action = check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress
             );
         }
@@ -1434,6 +1422,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     );
                 }
             }
+        }
+
+        if (completion_action == LoopAction::BREAK_LOOP) {
+            stop_failed_scheduler(runtime);
+            break;
         }
 
         // Async deferred-completion polling and dependency-only (dummy /
@@ -1527,9 +1520,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
                 int32_t tasks_materialized = 0;
                 GraphMaterializeResult result = sched_->prepare_graph_task(
-                    *prepare_slot, graph_image_view_for_reader(*runtime), GRAPH_MATERIALIZE_SLICE_TASKS,
+                    *prepare_slot, graph_image_view_for_reader(*runtime), thread_idx, GRAPH_MATERIALIZE_SLICE_TASKS,
                     &tasks_materialized
                 );
+                // Materialization can succeed while publishing its newly ready tasks fails.
+                if (check_latched_sched_error(thread_idx, header, runtime) == LoopAction::BREAK_LOOP) break;
                 if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::BUSY) {
                     if (!sched_->push_graph_prepare(prepare_slot, prepare_task_id, thread_idx)) {
                         fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
@@ -1563,7 +1558,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if SIMPLER_DFX
         uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
-        dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+        if (dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed) &&
+            check_latched_sched_error(thread_idx, header, runtime) == LoopAction::BREAK_LOOP) {
+            break;
+        }
 #if SIMPLER_DFX
         // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
         // covers the actual publish work — not the trailing second-poll /
@@ -1603,8 +1601,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool early_dispatch_record = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
         uint64_t early_dispatch_t0 = early_dispatch_record ? get_sys_cnt_aicpu() : 0;
 #endif
-        [[maybe_unused]] int32_t staged_count =
-            try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+        const int32_t staged_count = try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+        if (staged_count < 0) {
+            stop_failed_scheduler(runtime);
+            break;
+        }
 #if SIMPLER_DFX
         // Emit an EarlyDispatch bar so a staging-dominated iteration is attributed
         // to early-dispatch rather than disappearing into a blank gap.

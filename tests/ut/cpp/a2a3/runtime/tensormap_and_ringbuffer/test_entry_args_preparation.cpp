@@ -126,7 +126,7 @@ uint64_t read_reg(uint64_t, RegId) {
 }
 void platform_init_aicore_regs(uint64_t) { ADD_FAILURE() << "Orch init handshook an AICore"; }
 void platform_signal_aicore_exit(uint64_t) { ADD_FAILURE() << "Orch init signaled an AICore"; }
-int32_t platform_retire_aicore_group(const AicoreExitTarget *, size_t, uint64_t, bool *) {
+int32_t platform_retire_aicore_group(const AicoreExitTarget *, size_t, uint64_t, bool *, AicoreExitReadiness) {
     ADD_FAILURE() << "Orch init retired an AICore";
     return -1;
 }

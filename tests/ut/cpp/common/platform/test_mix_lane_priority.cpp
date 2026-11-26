@@ -76,7 +76,7 @@ TEST_P(LanePriority, LaterComplementaryDemandClosesRemainingLane) {
     EXPECT_EQ(pure.slot.next_block_idx.load(), 0);
 }
 
-TEST_P(LanePriority, FullRequeueReportsOverflowAndStopsInsteadOfSpinning) {
+TEST_P(LanePriority, FullRequeueReportsOverflowAndPreservesFirstReporter) {
     auto &q = sched->ready_queues[1];
     pure.init(2, 1, 1);
     for (int i = 0; i < capacity; ++i)
@@ -84,7 +84,11 @@ TEST_P(LanePriority, FullRequeueReportsOverflowAndStopsInsteadOfSpinning) {
     const auto value = CapturedReadySlot(&pure.slot, LaneMask::none());
     EXPECT_FALSE(SchedulerContextTestPeer::requeue(*context, q, &value, 1, ResourceShape::AIV));
     EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+#ifdef PTO_ASYNC_WAIT_H
     EXPECT_TRUE(SchedulerContextTestPeer::stopped(*context));
+#else
+    EXPECT_FALSE(SchedulerContextTestPeer::stopped(*context));  // The dispatch loop elects the EXIT owner.
+#endif
     EXPECT_EQ(header.sched_error_thread.load(), 0);
     EXPECT_EQ(header.sched_error_bitmap.load(), 1u);
     EXPECT_FALSE(SchedulerContextTestPeer::requeue(*context, q, &value, 1, ResourceShape::AIV, 3));
@@ -211,7 +215,11 @@ TEST_P(LanePriority, CancelledEarlySyncRequeuesOriginalTagAndIdentity) {
     const auto original_id = mixed.descriptor.task_id;
     ASSERT_TRUE(SchedulerState::try_claim_early_sync_drain(mixed.payload));
     mixed.init(7, 1, 7);
+#ifdef PTO_ASYNC_WAIT_H
     sched->cancel_early_sync_drain(mixed.slot, captured, original_id);
+#else
+    sched->cancel_early_sync_drain(mixed.slot, captured, original_id, 0);
+#endif
     EXPECT_EQ(sched->early_sync_start_queue.mix_demand(), captured.tag());
     TaskId id;
     const auto popped = sched->early_sync_start_queue.pop_sync_start(&id);

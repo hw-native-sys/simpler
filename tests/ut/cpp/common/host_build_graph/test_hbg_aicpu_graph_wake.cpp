@@ -177,11 +177,11 @@ TEST_F(HbgGraphWakeScanTest, SingleProducerWaiterIsRoutedByTheDrain) {
     ChipTaskSlotState &producer = slot(0);
     ChipTaskSlotState &consumer = slot(1);
 
-    sched.register_graph_wake(execution, &producer, &consumer);
+    sched.register_graph_wake(execution, &producer, &consumer, 0);
     ASSERT_EQ(producer.wake_list_head.load(std::memory_order_relaxed), &consumer);
 
     execution.store_completed(0);
-    EXPECT_EQ(sched.drain_graph_wake_list(execution, producer), 1u);
+    EXPECT_EQ(sched.drain_graph_wake_list(execution, producer, 0), 1u);
     EXPECT_EQ(pop_ready(), &consumer);
     // Decided from the row's length alone, so the never-hung sentinel stands.
     EXPECT_EQ(consumer.wake_scan_cursor, 0xFFFF);
@@ -193,9 +193,9 @@ TEST_F(HbgGraphWakeScanTest, MultiProducerWaiterReRegistersUntilItsRowClears) {
     build({{}, {}, {0, 1}});
     ChipTaskSlotState &consumer = slot(2);
 
-    sched.register_graph_wake(execution, &slot(1), &consumer);
+    sched.register_graph_wake(execution, &slot(1), &consumer, 0);
     execution.store_completed(1);
-    EXPECT_EQ(sched.drain_graph_wake_list(execution, slot(1)), 1u);
+    EXPECT_EQ(sched.drain_graph_wake_list(execution, slot(1), 0), 1u);
 
     // Producer 0 is still pending, so the waiter moved rather than became ready.
     EXPECT_EQ(pop_ready(), nullptr);
@@ -203,6 +203,6 @@ TEST_F(HbgGraphWakeScanTest, MultiProducerWaiterReRegistersUntilItsRowClears) {
     EXPECT_EQ(consumer.wake_scan_cursor, 0);
 
     execution.store_completed(0);
-    EXPECT_EQ(sched.drain_graph_wake_list(execution, slot(0)), 1u);
+    EXPECT_EQ(sched.drain_graph_wake_list(execution, slot(0), 0), 1u);
     EXPECT_EQ(pop_ready(), &consumer);
 }

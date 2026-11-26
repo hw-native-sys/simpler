@@ -11,7 +11,10 @@
 
 #include "host_build_graph/host/ready_queue_sizing.h"
 
+#include <cinttypes>
+
 #include "host_build_graph/runtime_status.h"
+#include "runtime_status/error_log.h"
 
 namespace {
 
@@ -66,5 +69,12 @@ bool ReadyQueuePopulations::derive_capacities(ReadyQueueCapacities *capacities) 
 int32_t derive_ready_queue_capacities(const ReadyQueuePopulations &populations, ReadyQueueCapacities *capacities) {
     if (populations.derive_capacities(capacities)) return 0;
 
-    return runtime_status_from_error_code(SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    LOG_ERROR(
+        "host-orch: ready queue reachable population exceeds %" PRIu64 " (ready=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+        ", sync=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", dummy=%" PRIu64 ", graph_prepare=%" PRIu64 ")",
+        READY_QUEUE_CAPACITY_LIMIT, populations.ready[0], populations.ready[1], populations.ready[2],
+        populations.ready_sync[0], populations.ready_sync[1], populations.ready_sync[2], populations.dummy,
+        populations.graph_prepare
+    );
+    return report_scheduler_error(SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
 }

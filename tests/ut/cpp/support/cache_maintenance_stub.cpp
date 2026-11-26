@@ -25,4 +25,6 @@ void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
 
 void flush_range_impl(const void * /* addr */, size_t /* size */) {}
 
+void flush_ranges_impl(const void *const *, size_t, size_t) {}
+
 }  // namespace aicpu_cache_maintenance

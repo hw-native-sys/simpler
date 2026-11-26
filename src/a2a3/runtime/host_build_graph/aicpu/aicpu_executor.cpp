@@ -93,8 +93,8 @@ struct AicpuExecutor {
     // positively reached the end of their audited path, so a run is a success
     // only when every one of them did rather than when none of them complained;
     // `terminal_publisher_` carries the finalizer's decision across teardown to
-    // the sole cleanup owner that publishes it. This runtime attaches no
-    // diagnostic payload: it keeps no shared error scene to preserve.
+    // the sole cleanup owner that publishes it, including any independent
+    // AICore retirement failure.
     RunTerminalAccumulator terminal_;
     std::atomic<int32_t> normal_path_claims_{0};
     RunTerminalPublisher terminal_publisher_;
@@ -386,7 +386,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // failure.
             normal_path = false;
         } else {
-            sched_ctx_.bind_runtime(rt);
             // 3S+1P: the last thread is the core-less resolution (P) thread; the
             // rest are core-owning schedulers (S).
             int32_t completed = (thread_idx == sched_ctx_.p_thread_idx()) ?
@@ -453,7 +452,14 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     // would call that run a success.
     const int32_t header_status = read_runtime_status(runtime);
     const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
-    terminal_publisher_.take(run_terminal_select(normal_path, header_status, terminal_), nullptr, 0);
+    // The thread that claimed a core may finish waiting for its ACK after a
+    // peer has already returned from shutdown. All claimants have arrived here.
+    const int32_t retirement_rc = sched_ctx_.retirement_error();
+    terminal_.record_participant(0, retirement_rc);
+    terminal_publisher_.take(
+        run_terminal_select(normal_path, header_status, terminal_), &retirement_rc,
+        retirement_rc ? sizeof(retirement_rc) : 0
+    );
 }
 
 void AicpuExecutor::handoff_run_terminal() {

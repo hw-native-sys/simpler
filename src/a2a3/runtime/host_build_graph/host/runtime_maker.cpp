@@ -1026,18 +1026,7 @@ int32_t run_host_orchestration(
 
     ReadyQueueCapacities ready_queue_capacities{};
     const int32_t ready_queue_status = derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities);
-    if (ready_queue_status != 0) {
-        LOG_ERROR(
-            "host-orch: ready queue reachable population exceeds %" PRIu64 " (ready=%" PRIu64 "/%" PRIu64 "/%" PRIu64
-            ", sync=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", dummy=%" PRIu64 ", graph_prepare=%" PRIu64 ")",
-            READY_QUEUE_CAPACITY_LIMIT, ready_queue_populations.ready[0], ready_queue_populations.ready[1],
-            ready_queue_populations.ready[2], ready_queue_populations.ready_sync[0],
-            ready_queue_populations.ready_sync[1], ready_queue_populations.ready_sync[2], ready_queue_populations.dummy,
-            ready_queue_populations.graph_prepare
-        );
-        LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, SIMPLER_ERROR_READY_QUEUE_OVERFLOW, ready_queue_status);
-        return ready_queue_status;
-    }
+    if (ready_queue_status != 0) return ready_queue_status;
     plan.layout.sched.capacities = ready_queue_capacities;
     host_phase_trace_note_submitted(static_cast<uint64_t>(total_tasks));
 
@@ -1762,6 +1751,13 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     // Only the legacy fallback reads the shared header of a launched run.
     if (execution_rc != 0 && launched != 0) {
         runtime_status = read_runtime_status(runtime, api, &host_header);
+        size_t bytes = 0;
+        const void *payload = api->run_result(&bytes);
+        if (payload != nullptr && bytes == sizeof(int32_t)) {
+            int32_t retirement_rc = 0;
+            memcpy(&retirement_rc, payload, sizeof(retirement_rc));
+            LOG_ERROR("AICore retirement failed: retirement_rc=%d", retirement_rc);
+        }
     }
     if (runtime_status != 0) {
         if (api->observed_run_status().has_value()) {
