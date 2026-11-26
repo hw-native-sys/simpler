@@ -66,7 +66,7 @@ std::shared_ptr<RunState> Orchestrator::current_building_run() const {
     return it->second;
 }
 
-RunId Orchestrator::begin_run() {
+RunId Orchestrator::begin_run(bool hold_activation) {
     RunId run_id = INVALID_RUN_ID;
     {
         std::unique_lock<std::mutex> lk(runs_mu_);
@@ -100,6 +100,7 @@ RunId Orchestrator::begin_run() {
         try {
             // Generation zero is the reserved "no slot held" lease encoding.
             auto run = std::make_shared<RunState>(run_id, PipelineSlotLease{});
+            run->activation_held = hold_activation;
             bool inserted = runs_.emplace(run_id, run).second;
             if (!inserted) throw std::logic_error("Orchestrator::begin_run: duplicate run id");
             map_published = true;
@@ -322,6 +323,7 @@ void Orchestrator::activate_fifo_head() {
         auto it = runs_.find(run_fifo_.front());
         if (it == runs_.end()) return;
         run = it->second;
+        if (run->activation_held) return;
         RunPhase phase = run->phase.load(std::memory_order_acquire);
         if (phase != RunPhase::BUILDING && phase != RunPhase::PREPARED) return;
         // A head with no slot is not dispatchable, so promoting it to
@@ -346,6 +348,39 @@ void Orchestrator::activate_fifo_head() {
     // missing condition; no later END event is owed for those members.
     retire_execution_if_ready(run);
     finish_run_if_ready(run);
+}
+
+void Orchestrator::resolve_held_run(RunId run_id, bool success) {
+    if (!success) {
+        // Serializes the cancelling snapshot with scheduler claim and endpoint
+        // publication. A prepared task owns its slot until its endpoint ACK.
+        std::unique_lock<std::mutex> scheduler_lk;
+        if (sched_loop_mu_ != nullptr) scheduler_lk = std::unique_lock<std::mutex>(*sched_loop_mu_);
+        {
+            std::lock_guard<std::mutex> lk(runs_mu_);
+            const auto it = runs_.find(run_id);
+            if (it == runs_.end() || !it->second->activation_held ||
+                is_terminal(it->second->phase.load(std::memory_order_acquire))) return;
+        }
+        manager_->cancel_staged_run(run_id);
+        fail_run_submission(run_id, std::make_exception_ptr(std::runtime_error("predecessor failed")));
+        return;
+    }
+    bool stage_failed = false;
+    {
+        std::lock_guard<std::mutex> lk(runs_mu_);
+        const auto it = runs_.find(run_id);
+        if (it == runs_.end() || !it->second->activation_held) return;
+        std::lock_guard<std::mutex> run_lk(it->second->completion_mu);
+        if (it->second->submission_failed) return;
+        stage_failed = static_cast<bool>(it->second->first_error);
+        if (!stage_failed) it->second->activation_held = false;
+    }
+    if (stage_failed) {
+        resolve_held_run(run_id, false);
+    } else {
+        activate_fifo_head();
+    }
 }
 
 void Orchestrator::close_run_submission(RunId run_id) {
@@ -680,7 +715,7 @@ RunId Orchestrator::early_launch_successor_locked(size_t predecessor_index) cons
     auto candidate = runs_.find(run_fifo_[predecessor_index + 1]);
     if (candidate == runs_.end()) return INVALID_RUN_ID;
     const std::shared_ptr<RunState> &successor = candidate->second;
-    if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
+    if (successor->activation_held || successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
         !run_resources_.owns(successor->lease)) {
         return INVALID_RUN_ID;
     }
@@ -699,7 +734,8 @@ void Orchestrator::compact_if_quiescent() {
     if (quiescent_locked() && allocator_->active_count() == 0) allocator_->reset_to_empty();
 }
 
-void Orchestrator::release_run(RunId run_id) {
+void Orchestrator::release_run(RunId run_id, bool skip_busy_compaction) {
+    bool try_compact = true;
     int64_t terminal_ns = 0;
     PipelineSlotLease lease{};
     {
@@ -712,9 +748,12 @@ void Orchestrator::release_run(RunId run_id) {
         terminal_ns = it->second->trace_terminal_ns;
         lease = it->second->lease;
         runs_.erase(it);
+        // A retained successor means there is nothing quiescent to compact.
+        // A possible compaction still rechecks under both locks.
+        try_compact = !skip_busy_compaction || quiescent_locked();
     }
 
-    compact_if_quiescent();
+    if (try_compact) compact_if_quiescent();
 #if SIMPLER_HOST_STRACE
     if (terminal_ns != 0 && simpler::host_trace::enabled()) {
         std::ostringstream retire_attrs;

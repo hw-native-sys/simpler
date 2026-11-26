@@ -493,7 +493,10 @@ inline void bind_worker(nb::module_ &m) {
         .def("scope_end", &Orchestrator::scope_end, "Close the innermost scope. Non-blocking.")
         .def("_scope_begin", &Orchestrator::scope_begin)
         .def("_scope_end", &Orchestrator::scope_end)
-        .def("_begin_run", &Orchestrator::begin_run, nb::call_guard<nb::gil_scoped_release>())
+        .def("_begin_run", &Orchestrator::begin_run, nb::arg("hold_activation") = false,
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("_resolve_held_run", &Orchestrator::resolve_held_run, nb::arg("run_id"), nb::arg("success"),
+             nb::call_guard<nb::gil_scoped_release>())
         .def("_close_run_submission", &Orchestrator::close_run_submission, nb::arg("run_id"))
         .def(
             "_fail_run_submission",
@@ -529,7 +532,7 @@ inline void bind_worker(nb::module_ &m) {
             "_begin_run_waiter_count_for_test", &Orchestrator::begin_run_waiter_count_for_test,
             "Return the number of begin_run calls currently waiting for a pipeline slot."
         )
-        .def("_release_run", &Orchestrator::release_run, nb::arg("run_id"));
+        .def("_release_run", &Orchestrator::release_run, nb::arg("run_id"), nb::arg("skip_busy_compaction") = false);
 
     // --- Worker ---
     // Bound as `_Worker` because the Python user-facing `Worker` factory
@@ -1132,6 +1135,7 @@ inline void bind_worker(nb::module_ &m) {
     mailbox_states["FRAME_STAGED"] = static_cast<int32_t>(MailboxState::FRAME_STAGED);
     mailbox_states["TASK_LAUNCHED"] = static_cast<int32_t>(MailboxState::TASK_LAUNCHED);
     mailbox_states["TASK_ENDED"] = static_cast<int32_t>(MailboxState::TASK_ENDED);
+    mailbox_states["CANCEL_STAGED"] = static_cast<int32_t>(MailboxState::CANCEL_STAGED);
     mailbox_states["TASK_FAILED"] = static_cast<int32_t>(MailboxState::TASK_FAILED);
     mailbox_states["ACTIVATE"] = static_cast<int32_t>(MailboxState::ACTIVATE);
     mailbox_states["PREPARE_READY"] = static_cast<int32_t>(MailboxState::PREPARE_READY);

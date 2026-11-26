@@ -154,7 +154,8 @@ public:
     SubmitResult submit_sub_group(const CallableIdentity &callable, const std::vector<TaskArgs> &args_list);
 
     // Only the calling orchestration thread builds a run at a time.
-    RunId begin_run();
+    RunId begin_run(bool hold_activation = false);
+    void resolve_held_run(RunId run_id, bool success);
 
     /**
      * Set how many runs may hold a native pipeline-slot lease at once
@@ -308,7 +309,7 @@ public:
      * contract — it is reached from the worker progress driver.
      */
     void notify_run_staged(RunId run_id);
-    void release_run(RunId run_id);
+    void release_run(RunId run_id, bool skip_busy_compaction = false);
 
     // Open a nested scope. Every task submitted between this call and the
     // matching `scope_end()` picks a heap ring based on the current scope

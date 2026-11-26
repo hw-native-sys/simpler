@@ -84,6 +84,7 @@ enum class MailboxState : int32_t {
     ACTIVATE = 11,
     PREPARE_READY = 12,
     TASK_ENDED = 13,
+    CANCEL_STAGED = 14,
 };
 
 enum class MailboxPreparationDisposition : int32_t {
@@ -570,6 +571,7 @@ public:
     virtual size_t available_request_transport();
     virtual bool poll_progress(WorkerEndpointProgress &progress);
     virtual bool activate_progress(RunId run_id);
+    virtual void cancel_staged_progress(RunId run_id);
     virtual void request_progress_stop() noexcept;
     virtual void request_observation(RunId) {}
     virtual void progress_observations() {}
@@ -669,6 +671,7 @@ public:
     size_t available_request_transport() override;
     bool poll_progress(WorkerEndpointProgress &progress) override;
     bool activate_progress(RunId run_id) override;
+    void cancel_staged_progress(RunId run_id) override;
     void request_progress_stop() noexcept override;
     void request_observation(RunId run_id) override;
     void progress_observations() override;
@@ -786,6 +789,7 @@ private:
         bool ended_reported{false};
         bool activation_requested{false};
         bool activation_published{false};
+        bool cancellation_requested{false};
         // The disposition this run was last reported with. A staged run may be
         // prepared later than it was staged — its own predecessor had not
         // launched yet when it arrived — and that promotion is published by the
@@ -906,6 +910,7 @@ public:
      * whether this call is the one that requested it.
      */
     bool authorize_staged_launch(RunId run_id);
+    void cancel_staged_run(RunId run_id);
     void progress();
 
     // The active lane and staged-successor lane are intentionally distinct.
@@ -1181,6 +1186,7 @@ public:
     bool any_busy() const;
     bool has_staged_run(RunId run_id) const;
     bool activate_prepared_run(RunId run_id);
+    void cancel_staged_run(RunId run_id);
     /** @see WorkerThread::authorize_staged_launch. */
     bool authorize_staged_launch(RunId run_id);
 
