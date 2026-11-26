@@ -17,6 +17,8 @@ namespace aicpu_cache_maintenance {
 
 void invalidate_range_impl(const void *addr, size_t size);
 void flush_range_impl(const void *addr, size_t size);
+void clean_line_impl(const void *addr);
+void complete_clean_impl();
 
 }  // namespace aicpu_cache_maintenance
 
@@ -27,3 +29,27 @@ inline void cache_invalidate_range(const void *addr, size_t size) {
 }
 
 inline void cache_flush_range(const void *addr, size_t size) { aicpu_cache_maintenance::flush_range_impl(addr, size); }
+
+// The calling thread must own each line. Leave the scope before publishing
+// that the cleaned data is visible to other agents.
+class CacheLineCleanBatch {
+public:
+    static constexpr size_t kLineSize = 64;
+
+    CacheLineCleanBatch() = default;
+    CacheLineCleanBatch(const CacheLineCleanBatch &) = delete;
+    CacheLineCleanBatch &operator=(const CacheLineCleanBatch &) = delete;
+    ~CacheLineCleanBatch() {
+        if (pending_) aicpu_cache_maintenance::complete_clean_impl();
+    }
+
+    template <typename Line>
+    void clean(const Line &line) {
+        static_assert(sizeof(Line) == kLineSize && alignof(Line) == kLineSize);
+        aicpu_cache_maintenance::clean_line_impl(&line);
+        pending_ = true;
+    }
+
+private:
+    bool pending_{false};
+};

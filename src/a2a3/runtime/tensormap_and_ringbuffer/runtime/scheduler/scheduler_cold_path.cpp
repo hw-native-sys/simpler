@@ -785,12 +785,23 @@ int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *
     // metadata before a unique retirement claimant can enter this helper.
     const uint64_t deadline = platform_aicore_exit_deadline();
     const int32_t rc = platform_retire_aicore_group(targets, count, deadline, released);
+    {
+        CacheLineCleanBatch reports;
+        for (size_t i = 0; i < count; ++i) {
+            if (!released[i]) continue;
+            Handshake &report = runtime->get_workers()[claimed_ids[i]];
+            aicore_invalidate_retired_report(&report);
+            reports.clean(report);
+        }
+    }
+    // Cancellation drain treats RELEASED as proof that the report is retired.
     for (size_t i = 0; i < count; ++i) {
         if (!released[i]) continue;
-        Handshake *report = &runtime->get_workers()[claimed_ids[i]];
-        aicore_invalidate_retired_report(report);
-        cache_flush_range(report, sizeof(*report));
-        __atomic_fetch_or(&retirement_state_[claimed_ids[i]], RETIREMENT_RELEASED, __ATOMIC_RELEASE);
+        // The unique claimant owns a state with both claim bits already set.
+        __atomic_store_n(
+            &retirement_state_[claimed_ids[i]], RETIREMENT_READY | RETIREMENT_REQUESTED | RETIREMENT_RELEASED,
+            __ATOMIC_RELEASE
+        );
     }
     wmb();
     if (rc != 0) {

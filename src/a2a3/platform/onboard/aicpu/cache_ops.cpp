@@ -31,6 +31,13 @@ namespace aicpu_cache_maintenance __attribute__((visibility("hidden"))) {
         __asm__ __volatile__("isb" ::: "memory");
     }
 
+    void clean_line_impl(const void *addr) { __asm__ __volatile__("dc cvac, %0" ::"r"(addr) : "memory"); }
+
+    void complete_clean_impl() {
+        __asm__ __volatile__("dsb sy" ::: "memory");
+        __asm__ __volatile__("isb" ::: "memory");
+    }
+
     void flush_range_impl(const void *addr, size_t size) {
         if (size == 0) {
             return;
@@ -39,10 +46,9 @@ namespace aicpu_cache_maintenance __attribute__((visibility("hidden"))) {
         uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~(kCacheLineSize - 1);
         uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + size + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
         for (uintptr_t p = start; p < end; p += kCacheLineSize) {
-            __asm__ __volatile__("dc cvac, %0" ::"r"(p) : "memory");
+            clean_line_impl(reinterpret_cast<const void *>(p));
         }
-        __asm__ __volatile__("dsb sy" ::: "memory");
-        __asm__ __volatile__("isb" ::: "memory");
+        complete_clean_impl();
     }
 
 #else
@@ -54,6 +60,8 @@ namespace aicpu_cache_maintenance __attribute__((visibility("hidden"))) {
     void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
 
     void flush_range_impl(const void * /* addr */, size_t /* size */) {}
+    void clean_line_impl(const void * /* addr */) {}
+    void complete_clean_impl() {}
 
 #endif
 
