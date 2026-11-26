@@ -191,6 +191,7 @@ from .comm_endpoints import (
     at,
     parse_endpoint_path,
 )
+from .comm_generation import CommGeneration
 from .comm_provider import (
     DeviceAllocationTarget,
     ProviderRegionStore,
@@ -989,6 +990,7 @@ assert _DOMAIN_REPLY_HEADER.size == 40
 # throwing; it does not imply the window is usable. The parent's shm is
 # zero-filled, so an unwritten slot records no reported ownership.
 _OFF_DOMAIN_REPLY_COMMITTED = 0
+_DOMAIN_REPLY_REJECTED = 2
 
 # Control args layout (reuses task mailbox fields when state == _CONTROL_*):
 #   offset  8 (_OFF_CALLABLE):  uint64  sub-command
@@ -1418,12 +1420,14 @@ def _domain_reply_committed(reply_shm: SharedMemory | None) -> bool:
     The parent creates the shm zero-filled, so a chip that never ran, never
     allocated, or died before reporting ownership reads as not committed.
     """
-    if reply_shm is None:
-        return False
-    buf = reply_shm.buf
+    return _domain_reply_ownership(reply_shm) == 1
+
+
+def _domain_reply_ownership(reply_shm: SharedMemory | None) -> int:
+    buf = reply_shm.buf if reply_shm is not None else None
     if buf is None:
-        return False
-    return struct.unpack_from("<Q", buf, _OFF_DOMAIN_REPLY_COMMITTED)[0] != 0
+        return 0
+    return struct.unpack_from("<Q", buf, _OFF_DOMAIN_REPLY_COMMITTED)[0]
 
 
 def _raise_first(step, items) -> None:
@@ -6489,7 +6493,10 @@ class Worker:
         # ``orch.allocate_domain`` call (see ``_ensure_comm_base``).  We
         # keep ``Worker.init()`` cheap — it only forks chip children and
         # starts the C++ scheduler; no comm work happens there.
+        self._comm_domain_error: BaseException | None = None
+        self._comm_domain_alloc_errors: dict[int, BaseException] = {}
         self._comm_base_ready: bool = False
+        self._comm_generation: CommGeneration | None = None
 
         self._endpoint_registry: EndpointRegistry | None = None
         self._endpoint_registry_epoch: int = 0
@@ -6558,13 +6565,18 @@ class Worker:
         return self._lifecycle is _Lifecycle.READY and self.level >= 3
 
     def _comm_plan_rootinfo_path(self) -> str:
-        """Per-Worker rootinfo path used by HCCL/sim base comm_init.
+        """Private generation shared by the local Worker and its native ranks."""
+        if self._config.get("platform") not in ("a2a3", "a5"):
+            tag = f"pto_multi_comm_{self._shm_token}_{os.getpgrp():x}.bin"
+            return os.path.join(_COMM_ROOTINFO_DIR, tag)
+        if self._comm_generation is None:
+            self._comm_generation = CommGeneration()
+        return self._comm_generation.rootinfo_path
 
-        The startup-tree token and process group identify the owner to an
-        ancestor even if the L3 exits before its chip children.
-        """
-        tag = f"pto_multi_comm_{self._shm_token}_{os.getpgrp():x}.bin"
-        return os.path.join(_COMM_ROOTINFO_DIR, tag)
+    def _close_comm_generation(self) -> None:
+        if self._comm_generation is not None:
+            self._comm_generation.close()
+            self._comm_generation = None
 
     def _allocate_next_level_worker_id(self) -> int:
         worker_id = self._next_level_worker_id_count
@@ -10738,6 +10750,10 @@ class Worker:
 
         with contextlib.suppress(BaseException):
             self._teardown_worker_tree(startup_abort=True, deadline=deadline)
+        if self._comm_generation is not None:
+            key = ("comm-generation", "local handshake generation")
+            self._cleanup_journal.add_once(*key, self._close_comm_generation)
+            self._cleanup_journal.drive({key})
         self._comm_base_ready = False
 
     @property
@@ -11192,12 +11208,18 @@ class Worker:
                     f"first error chip={first[0]}: {first[1]}"
                 )
 
-        _run_with_owned_shared_memory(
-            len(device_ids),
-            initialize,
-            name_prefix="shm-comm-init-lifecycle-",
-            after_success=lambda: setattr(self, "_comm_base_ready", True),
-        )
+        try:
+            _run_with_owned_shared_memory(
+                len(device_ids),
+                initialize,
+                name_prefix="shm-comm-init-lifecycle-",
+                after_success=lambda: setattr(self, "_comm_base_ready", True),
+            )
+        except BaseException as error:
+            with self._alloc_id_lock:
+                if self._comm_domain_error is None:
+                    self._comm_domain_error = error
+            raise
 
     def _domain_config(  # noqa: PLR0912 -- validate domain topology and platform-specific engines
         self, members, window_size, buffers, retain_after_run, workspace_engines=(), memory_source=AddressSpace.DEVICE
@@ -11705,7 +11727,7 @@ class Worker:
             self._use_domain(handle)
             return handle
 
-    def _allocate_domain(  # noqa: PLR0912 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering
+    def _allocate_domain(  # noqa: PLR0912, PLR0915 -- input validation, admission and publication share one ordered transaction
         self,
         *,
         name: str,
@@ -11728,6 +11750,10 @@ class Worker:
         # triggers HCCL RootInfo handshake + EnablePeerAccess on every chip.
         # Cheap enough to do once per Worker; defers cost from init() (which
         # used to pre-bootstrap) to the first DAG that actually needs comm.
+        with self._alloc_id_lock:
+            error = self._comm_domain_error or next(iter(self._comm_domain_alloc_errors.values()), None)
+            if error is not None:
+                raise RuntimeError("communication domain admission stopped after backend failure") from error
         self._ensure_comm_base()
 
         with self._alloc_id_lock:
@@ -11841,7 +11867,7 @@ class Worker:
                         (committed, device_ctx, local_window_base, actual_window_size, reply_buffer_count) = (
                             _DOMAIN_REPLY_HEADER.unpack_from(reply_buf, 0)
                         )
-                        if not committed:
+                        if committed != 1:
                             raise RuntimeError(f"allocate_domain: chip {chip_idx} reported success without committing")
                         if reply_buffer_count != buffer_count or actual_window_size < window_size:
                             raise RuntimeError(
@@ -11880,9 +11906,16 @@ class Worker:
                         )
                     handle.contexts = contexts
                 finally:
+                    if any(_domain_reply_ownership(reply_shms[w]) == 0 for w in workers):
+                        with self._alloc_id_lock:
+                            if self._comm_domain_error is None:
+                                self._comm_domain_error = RuntimeError("allocation ownership reply is unconfirmed")
                     committed = tuple(w for w in workers if _domain_reply_committed(reply_shms.get(w)))
                     handle.workers = committed
                     if not committed:
+                        if all(_domain_reply_ownership(reply_shms[w]) == _DOMAIN_REPLY_REJECTED for w in workers):
+                            with self._alloc_id_lock:
+                                self._comm_domain_alloc_errors.pop(allocation_id, None)
                         if self._live_domains.get(name) is handle:
                             self._live_domains.pop(name)
                         if resources.live_domains.get(name) is handle:
@@ -12192,6 +12225,9 @@ class Worker:
             )
 
         def retire_live_handle() -> None:
+            if handle._allocation_pending:
+                with self._alloc_id_lock:
+                    self._comm_domain_alloc_errors.pop(handle.allocation_id, None)
             if self._live_domains.get(handle.name) is handle:
                 self._live_domains.pop(handle.name)
             for key in tuple(self._ccu_run_registrations):
@@ -12246,10 +12282,16 @@ class Worker:
 
         if errors:
             first = next(iter(errors.items()))
-            raise RuntimeError(
+            error = RuntimeError(
                 f"{op}_domain(allocation_id={allocation_id}) failed on "
                 f"{len(errors)}/{len(workers)} chips; first error chip={first[0]}: {first[1]}"
             )
+            with self._alloc_id_lock:
+                if op == "alloc":
+                    self._comm_domain_alloc_errors[allocation_id] = error
+                elif self._comm_domain_error is None:
+                    self._comm_domain_error = error
+            raise error
 
     @staticmethod
     def _global_domain_command_identity(command: GlobalDomainCommand) -> tuple[Any, ...]:
@@ -15981,6 +16023,7 @@ class Worker:
         pending remote frees/import-releases."""
         return (
             self._has_native_tree()
+            or self._comm_generation is not None
             or bool(self._sub_pids or self._chip_pids or self._next_level_pids)
             or bool(self._sub_shms or self._chip_shms or self._next_level_shms)
             or any(group.process is not None or group.ready_dir is not None for group in self._mpi_l3_groups)
@@ -16911,6 +16954,13 @@ class Worker:
 
         if errors and self._has_native_tree():
             raise errors[0]
+
+        if self._comm_generation is not None:
+            generation_key = ("comm-generation", "local handshake generation")
+            self._cleanup_journal.add_once(*generation_key, self._close_comm_generation)
+            generation_error = self._cleanup_journal.drive({generation_key})
+            if generation_error is not None:
+                errors.append(generation_error)
 
         # Domain retirement reads the recorded release verdict. A failed child
         # exit must not hide that debt after the native owner has closed.

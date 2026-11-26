@@ -110,12 +110,20 @@ def test_each_upload_observes_the_current_decoder(monkeypatch, tmp_path):
     monkeypatch.setenv("ASCEND_HOME_PATH", str(tmp_path))
     tool = tmp_path / "bin/llvm-objdump"
     tool.parent.mkdir()
-    assert worker_module._chip_callable_for_upload(target, "a5", "host_build_graph") is target
+    deadline = worker_module._monotonic() + 5.0
+    assert (
+        worker_module._chip_callable_for_upload(target, "a5", "host_build_graph", analysis_deadline=deadline) is target
+    )
     tool.write_text("#!/bin/sh\nprintf '%s\\n' '0: 4061f000 RET'\n")
     tool.chmod(0o755)
-    assert worker_module._chip_callable_for_upload(target, "a5", "host_build_graph") is not target
+    assert (
+        worker_module._chip_callable_for_upload(target, "a5", "host_build_graph", analysis_deadline=deadline)
+        is not target
+    )
     tool.write_text("#!/bin/sh\nexit 1\n")
-    assert worker_module._chip_callable_for_upload(target, "a5", "host_build_graph") is target
+    assert (
+        worker_module._chip_callable_for_upload(target, "a5", "host_build_graph", analysis_deadline=deadline) is target
+    )
 
 
 def test_late_prepare_falls_back_when_its_short_analysis_budget_is_spent(monkeypatch):

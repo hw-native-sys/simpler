@@ -2897,14 +2897,20 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
                 window_size, workspace_mask, host_shm_name.c_str(), &device_ctx, &local_window_base,
                 &actual_window_size, workspace_config
             );
-    if (ownership_flag != nullptr &&
-        (rc == 0 || rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED)) {
-        __atomic_store_n(ownership_flag, uint64_t{1}, __ATOMIC_RELEASE);
+    if (ownership_flag != nullptr) {
+        const uint64_t ownership =
+            rc == 0 || rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED ?
+                COMM_DOMAIN_OWNED :
+                COMM_DOMAIN_REJECTED;
+        __atomic_store_n(ownership_flag, ownership, __ATOMIC_RELEASE);
     }
     if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
     if (rc != 0) {
         const char *reason = "domain allocation failed";
         switch (rc) {
+        case COMM_DOMAIN_ADMISSION_STOPPED:
+            reason = "communication domain admission stopped after an earlier failure";
+            break;
         case COMM_INITIALIZATION_ABORT_REQUIRED:
             reason = "initialization failed with retained resources; join all allocation requests before local abort; "
                      "check host logs";

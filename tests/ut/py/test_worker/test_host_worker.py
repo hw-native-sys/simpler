@@ -1558,7 +1558,7 @@ class _TwoFrameLoopHarness:
         staged = SharedMemory(create=True, size=len(payload))
         self._control_payloads.append(staged)
         assert staged.buf is not None
-        staged.buf[:] = payload
+        staged.buf[: len(payload)] = payload
         struct.pack_into("Q", self.buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_CCU_DOMAIN)
         struct.pack_into("Q", self.buf, worker_mod._CTRL_OFF_ARG0, len(payload))
         name = staged.name.encode().ljust(worker_mod._CTRL_SHM_NAME_BYTES, b"\0")
@@ -6882,7 +6882,10 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
     @pytest.mark.parametrize("failed_rank_owns", [False, True])
     @pytest.mark.parametrize("members", [(0, 1, 2), (1, 2), (2, 1)])
-    def test_a_partial_domain_allocation_keeps_its_original_release_ranks(self, monkeypatch, failed_rank_owns, members):
+    @pytest.mark.parametrize("unknown_reply", [False, True])
+    def test_a_partial_domain_allocation_keeps_its_original_release_ranks(
+        self, monkeypatch, failed_rank_owns, members, unknown_reply
+    ):
         """Abort every reported owner after all allocation requests finish.
 
         A failed rank may retain an unpublished allocation for late import.
@@ -6911,6 +6914,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 reply_buf = reply_shms[chip_idx].buf
                 assert reply_buf is not None
                 struct.pack_into("<Q", reply_buf, worker_mod._OFF_DOMAIN_REPLY_COMMITTED, 1)
+            if not failed_rank_owns and not unknown_reply:
+                struct.pack_into("<Q", reply_shms[members[1]].buf, 0, worker_mod._DOMAIN_REPLY_REJECTED)
+            worker._comm_domain_alloc_errors[_kwargs["allocation_id"]] = RuntimeError("rank 1 failed")
             raise RuntimeError("rank 1 failed")
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", partial_failure)
@@ -6939,6 +6945,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", capture_release)
         worker._release_domain_claimed(handle)
+        assert not worker._comm_domain_alloc_errors
+        assert (worker._comm_domain_error is not None) is (unknown_reply and not failed_rank_owns)
 
         assert release_headers == {
             chip: (handle.allocation_id, len(members), members.index(chip), 1) for chip in owners
@@ -7042,17 +7050,25 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 shm.close()
                 shm.unlink()
 
-    def test_a_fully_failed_domain_allocation_owes_nothing(self, monkeypatch):
+    @pytest.mark.parametrize("acknowledged", [False, True])
+    def test_a_fully_failed_domain_allocation_owes_nothing(self, monkeypatch, acknowledged):
         worker = self._worker()
         worker._config = {"device_ids": [0, 1, 2]}
         resources = worker_mod._RunResources()
         worker._building_run_resources = resources
         monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
-        monkeypatch.setattr(
-            worker,
-            "_dispatch_control_domain",
-            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("no rank committed")),
-        )
+        attempted = []
+
+        def reject_without_ownership(*, allocation_id, reply_shms, **_kwargs):
+            attempted.append(allocation_id)
+            if acknowledged:
+                for reply in reply_shms.values():
+                    struct.pack_into("<Q", reply.buf, 0, worker_mod._DOMAIN_REPLY_REJECTED)
+            error = RuntimeError("no rank committed")
+            worker._comm_domain_alloc_errors[allocation_id] = error
+            raise error
+
+        monkeypatch.setattr(worker, "_dispatch_control_domain", reject_without_ownership)
 
         with pytest.raises(RuntimeError, match="no rank committed"):
             worker._allocate_domain(name="d", workers=(0, 1, 2), window_size=64, buffers=[])
@@ -7060,6 +7076,10 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         assert "d" not in resources.live_domains
         assert "d" not in worker._live_domains
         assert not resources.requires_ordered_cleanup
+        assert bool(worker._comm_domain_alloc_errors) is not acknowledged
+        with pytest.raises(RuntimeError, match="no rank committed" if acknowledged else "admission stopped"):
+            worker._allocate_domain(name="retry", workers=(0, 1, 2), window_size=64, buffers=[])
+        assert len(attempted) == (2 if acknowledged else 1)
 
     def test_domain_fanout_launches_later_ranks_after_a_start_boundary_interrupt(self, monkeypatch):
         worker = self._worker()

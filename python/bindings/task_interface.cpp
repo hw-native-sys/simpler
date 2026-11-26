@@ -4419,8 +4419,9 @@ NB_MODULE(_task_interface, m) {
             nb::arg("host_shm_name") = "", nb::arg("urma_jetties_per_aiv") = 1, nb::arg("urma_sq_depth") = 0,
             nb::arg("ccu_mode") = uint32_t{COMM_CCU_MODE_SCHED},
             "Collectively allocate a fresh per-rank pool for a subset; returns "
-            "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
-            "responsibility before result conversion or an allocation error; it does not imply a usable context."
+            "(device_ctx, local_window_base, actual_window_size) for this rank. The ownership reply is 1 for retained "
+            "resources or 2 for a confirmed rejection without resources; zero means no reply. Ownership does not "
+            "imply a usable context."
         )
         .def("communication_cleanup_confirmed", &ChipWorker::communication_cleanup_confirmed)
         .def(

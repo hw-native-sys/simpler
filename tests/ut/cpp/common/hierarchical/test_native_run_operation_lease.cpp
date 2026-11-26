@@ -1307,6 +1307,7 @@ TEST(NativeRunOperationLeaseTest, DomainAllocationFailurePublishesCleanupOwnersh
         COMM_DOMAIN_URMA_CONFIG_INVALID,
         COMM_DOMAIN_URMA_INIT_FAILED,
         COMM_DOMAIN_URMA_WORKSPACE_INVALID,
+        COMM_DOMAIN_ADMISSION_STOPPED,
         COMM_INITIALIZATION_ABORT_REQUIRED,
         COMM_RECLAMATION_UNCONFIRMED
     };
@@ -1325,7 +1326,8 @@ TEST(NativeRunOperationLeaseTest, DomainAllocationFailurePublishesCleanupOwnersh
         EXPECT_THROW(worker.comm_alloc_domain_windows(comm, 1, {0, 1}, 0, 4096, 2, &ownership), std::runtime_error);
         EXPECT_EQ(
             __atomic_load_n(&ownership, __ATOMIC_ACQUIRE),
-            (rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED) ? 1u : 0u
+            (rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED) ? COMM_DOMAIN_OWNED :
+                                                                                               COMM_DOMAIN_REJECTED
         );
         ASSERT_NE(worker.find_comm_session(comm), nullptr);
         EXPECT_EQ(worker.comm_cleanup_unconfirmed_, rc == COMM_RECLAMATION_UNCONFIRMED);
