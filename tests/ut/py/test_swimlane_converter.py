@@ -100,9 +100,15 @@ def _task_row(
 
 
 @pytest.mark.parametrize("recorded_window", [False, True])
-def test_hbg_l1_worker_order_counts_idle_cores(tmp_path, recorded_window):
-    capture = Capture(runtime=HBG_RUNTIME, level=1, core_types=["aiv", "aic", "aiv", "aic", "aiv"])
-    for worker in (4, 3, 0):
+@pytest.mark.parametrize("runtime", [HBG_RUNTIME, "percounter", TMR_RUNTIME])
+def test_l1_worker_order_counts_idle_cores(tmp_path, runtime, recorded_window):
+    core_types = ["aic"] * 32 + ["aiv"] * 64
+    workers = (2, 10, 31, 32, 42, 95)
+    if runtime == HBG_RUNTIME:
+        core_types = ["aiv", "aic", "aiv"] * 32
+        workers = (7, 31, 94, 0, 15, 95)
+    capture = Capture(runtime=runtime, level=1, core_types=core_types)
+    for worker in reversed(workers):
         capture.aicore_task(task_id=worker, core_id=worker, start=10, end=20)
     if recorded_window:
         capture.metadata(collection={"recorded_window": True})
@@ -110,7 +116,7 @@ def test_hbg_l1_worker_order_counts_idle_cores(tmp_path, recorded_window):
     trace = _trace(
         data["tasks"],
         tmp_path / "trace.json",
-        runtime_name=HBG_RUNTIME,
+        runtime_name=runtime,
         chip_swimlane_level=1,
         timeline_metadata=data.get("timeline_metadata"),
     )
@@ -118,7 +124,17 @@ def test_hbg_l1_worker_order_counts_idle_cores(tmp_path, recorded_window):
     order = sorted(
         (e["args"]["sort_index"], e["tid"]) for e in trace["traceEvents"] if e["name"] == "thread_sort_index"
     )
-    assert [names[tid] for _, tid in order] == ["AIC1", "AIV0", "AIV2"]
+    assert [(rank, names[tid]) for rank, tid in order] == [
+        (2, "AIC2"),
+        (10, "AIC10"),
+        (31, "AIC31"),
+        (32, "AIV0"),
+        (42, "AIV10"),
+        (95, "AIV63"),
+    ]
+    task_key = "task_id" if recorded_window else "taskId"
+    drawn = {e["tid"]: e["args"][task_key] for e in trace["traceEvents"] if e["ph"] == "X"}
+    assert tuple(drawn[tid] for _, tid in order) == workers
 
 
 @pytest.mark.parametrize("runtime", [HBG_RUNTIME, "percounter"])
