@@ -532,6 +532,25 @@ def test_incore_artifact_key_includes_search_paths_used_by_has_include(tmp_path)
     assert without_key != with_key
 
 
+@pytest.mark.parametrize("quoted", [True, False])
+def test_optional_header_presence_changes_key_in_same_search_path(tmp_path, quoted):
+    source = tmp_path / "kernel.cpp"
+    include_dir = tmp_path / "include"
+    include_dir.mkdir()
+    probe = '"optional.h"' if quoted else "<optional.h>"
+    source.write_text(f"#if __has_include({probe})\n#define ENABLED 1\n#endif\n")
+    header = (tmp_path if quoted else include_dir) / "optional.h"
+
+    def key():
+        return scene_test_cache.compile_incore_artifact_key({}, source, [include_dir])
+
+    absent = key()
+    header.touch()
+    assert key() != absent
+    header.unlink()
+    assert key() == absent
+
+
 def test_incore_artifact_key_normalizes_relative_source_path(monkeypatch, tmp_path):
     source = tmp_path / "kernel.cpp"
     source.write_text('extern "C" const char *source_path() { return __FILE__; }\n')

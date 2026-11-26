@@ -41,6 +41,7 @@ _INCORE_BINARY_FILE = "artifact.bin"
 _MANIFEST_FILE = "manifest.json"
 _LOCK_DIR = ".locks"
 _INCLUDE_RE = re.compile(rb"^\s*#\s*include\s*([<\"])([^>\"]+)[>\"]", re.MULTILINE)
+_HAS_INCLUDE_RE = re.compile(rb'\b__has_include\s*\(\s*(?:"([^"\n]+)"|<([^>\n]+)>)\s*\)')
 
 # Entries are content-addressed, so a source change strands the old entry
 # forever. Every hit refreshes its mtime, so this window is time-since-last-use
@@ -92,11 +93,12 @@ def _resolve_include(name: str, quoted: bool, including_file: Path, include_dirs
     return None
 
 
-_scan_cache: dict[tuple[Path, int, int], tuple[bytes, tuple[tuple[str, bool], ...]]] = {}
+_HeaderNames = tuple[tuple[str, bool], ...]
+_scan_cache: dict[tuple[Path, int, int], tuple[bytes, _HeaderNames, _HeaderNames]] = {}
 
 
-def _scan_source(path: Path) -> tuple[bytes, tuple[tuple[str, bool], ...]]:
-    """Return one file's digest and its ``#include`` directives as ``(name, quoted)``.
+def _scan_source(path: Path) -> tuple[bytes, _HeaderNames, _HeaderNames]:
+    """Return a source digest, included headers, and literal header-presence probes.
 
     Memoized on ``(path, mtime_ns, size)`` because the compilation units of one
     scene test share most of their include closure — the pto-isa headers alone
@@ -122,7 +124,10 @@ def _scan_source(path: Path) -> tuple[bytes, tuple[tuple[str, bool], ...]]:
         except UnicodeDecodeError:
             continue
         directives.append((name, delimiter == b'"'))
-    scanned = (hashlib.sha256(data).digest(), tuple(directives))
+    probes = tuple(
+        (os.fsdecode(quoted or angled), bool(quoted)) for quoted, angled in _HAS_INCLUDE_RE.findall(data)
+    )
+    scanned = (hashlib.sha256(data).digest(), tuple(directives), probes)
     if token is not None:
         _scan_cache[token] = scanned
     return scanned
@@ -153,7 +158,10 @@ def _source_closure(
         path = pending.pop()
         if path in files:
             continue
-        file_digest, directives = _scan_source(path)
+        file_digest, directives, probes = _scan_source(path)
+        if probes:
+            presence = bytes(_resolve_include(name, quoted, path, roots) is not None for name, quoted in probes)
+            file_digest = hashlib.sha256(file_digest + presence).digest()
         files[path] = file_digest
         for name, quoted in directives:
             dependency = _resolve_include(name, quoted, path, roots)
