@@ -78,7 +78,7 @@ CI terms: the harvested distributed program compiles, both ranks' graphs
 dispatch, the cross-die window protocol (TPUT/TNOTIFY arrivals, LM-head
 all-gather) drains, and the run terminates cleanly.
 
-The case is manual: Per-PR CI runs it in the dedicated `st-deepseek-onboard-a2a3`
+The case is manual: Per-PR CI runs it in the dedicated `st-model-onboard-a2a3`
 job instead of the main sweep; compiling its 368 incore kernels plus the 7.8k-line
 chip orchestration takes several minutes.
 
@@ -132,8 +132,7 @@ on the repository pin `cd4a3d3f7a1a27fcfe536f617e9bca3008929664`. The device
 verification in #1939 passed both the TMR and HBG variants on two A2A3 dies. The
 Per-PR run for #1949 then exercised both full device bodies in the ordinary
 scene-test sweep: TMR passed in 299.25 seconds and HBG in 303.09 seconds.
-Since the split into `st-deepseek-onboard-a2a3`, that Per-PR coverage runs in a
-dedicated job parallel to the main sweep.
+The `st-model-onboard-a2a3` job runs that Per-PR coverage parallel to the main sweep.
 
 ## Running
 

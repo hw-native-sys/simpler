@@ -190,6 +190,11 @@ computes the torch golden in place, then reads back `out`, `k_cache`, and
 `v_cache` one at a time after the last round. The freshly allocated `out` buffer
 is not uploaded because the final `copy_out` task overwrites every element.
 
+Per-PR runs the manual Qwen wrappers for both runtimes in
+`st-model-onboard-a2a3` with golden verification enabled, alongside both
+DeepSeek smokes. Daily retains these cases in its full onboard sweep through
+`--manual include` without a separate model job.
+
 ## Historical cost
 
 Before the device-resident migration, it ran in the daily full scene-test sweep

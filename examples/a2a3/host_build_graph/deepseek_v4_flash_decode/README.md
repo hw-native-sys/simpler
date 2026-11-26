@@ -179,7 +179,7 @@ pytest examples/a2a3/host_build_graph/deepseek_v4_flash_decode \
     --platform a2a3 --manual only --device <d0>,<d1>
 ```
 
-The case is manual: Per-PR CI runs it in the dedicated `st-deepseek-onboard-a2a3`
+The case is manual: Per-PR CI runs it in the dedicated `st-model-onboard-a2a3`
 job, in parallel with the main sweep rather than at its tail. It has no golden
 because no full-network torch reference exists upstream, which is why every
 invocation here carries `--skip-golden`: without it the driver first streams the
