@@ -650,6 +650,7 @@ def test_publish_prunes_entries_past_the_retention_window(monkeypatch, tmp_path)
     stale_lock = cache_dir / ".locks" / "old.lock"
     stale_lock.parent.mkdir(parents=True)
     stale_lock.write_text("")
+    lock_inode = stale_lock.stat().st_ino
     expired = time.time() - scene_test_cache._ENTRY_RETENTION_S - 60
     for path in (stale, stale_incore, stale_lock):
         os.utime(path, (expired, expired))
@@ -658,7 +659,7 @@ def test_publish_prunes_entries_past_the_retention_window(monkeypatch, tmp_path)
 
     assert not stale.exists()
     assert not stale_incore.exists()
-    assert not stale_lock.exists()
+    assert stale_lock.stat().st_ino == lock_inode
     assert (cache_dir / ("c" * 64) / "callable.bin").is_file()
 
 
