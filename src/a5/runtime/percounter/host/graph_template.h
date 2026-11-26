@@ -13,6 +13,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -31,6 +32,7 @@ struct BodyTaskShape {
     bool has_predicate;
     int32_t block_num;
     int32_t total_required_subtasks;
+    std::array<int32_t, PLATFORM_CORES_PER_BLOCKDIM> kernel_ids{};
 };
 
 enum class TemplateStatus : uint8_t {
@@ -114,6 +116,7 @@ inline TemplateResult build_graph_template(
         task.block_num = static_cast<uint32_t>(shape.block_num);
         task.sync_start = shape.sync_start;
         task.has_predicate = shape.has_predicate;
+        task.kernel_ids = shape.kernel_ids;
         task.sink = !has_consumer[static_cast<size_t>(i)];
         if (task.sink) next.sink_subtask_total += task.subtask_total;
         if (!dummy) next.defer_rows += task.subtask_total;
@@ -130,11 +133,9 @@ inline TemplateResult build_graph_template(
  * Every read goes through upstream's bounded decoders, so a Definition the
  * device would refuse to localize is refused here too, as MALFORMED.
  */
-inline TemplateResult
-read_graph_template(const GraphImageView &view, uint32_t image_offset, uint64_t worker_count, HostGraphTemplate *out) {
-    GraphImageValue object{};
-    if (!graph_definition_decode_framed(view, image_offset, &object))
-        return TemplateResult{TemplateStatus::MALFORMED, "the Definition does not decode", -1};
+inline TemplateResult read_graph_template(
+    const GraphImageView &view, const GraphImageValue &object, uint64_t worker_count, HostGraphTemplate *out
+) {
     const Graph &definition = object.definition;
     if (definition.task_count <= 0 || definition.task_count > SUB_TASK_MAX_NUM || definition.edge_count < 0)
         return TemplateResult{TemplateStatus::MALFORMED, "the Definition's counts are out of range", -1};
@@ -148,10 +149,12 @@ read_graph_template(const GraphImageView &view, uint32_t image_offset, uint64_t 
             ))
             return TemplateResult{TemplateStatus::MALFORMED, "a body task does not decode", i};
         const TaskAttrs attrs(source.task_attrs);
-        shapes[static_cast<size_t>(i)] = BodyTaskShape{
+        auto &shape = shapes[static_cast<size_t>(i)];
+        shape = BodyTaskShape{
             source.active_mask.raw(), attrs.requires_sync_start(), attrs.has_predicate(), source.logical_block_num,
             source.total_required_subtasks
         };
+        std::copy_n(source.kernel_id, shape.kernel_ids.size(), shape.kernel_ids.begin());
     }
     std::vector<int32_t> rows(n + 1, 0);
     std::vector<uint16_t> wire_indices(static_cast<size_t>(definition.edge_count), 0);

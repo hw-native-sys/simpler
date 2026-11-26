@@ -19,6 +19,7 @@
 #include <memory>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <vector>
@@ -59,6 +60,7 @@ struct FakeRuntime {
     int four_prepare_overlaps{0};
     int prepare_overlaps{0};
     int begin_calls{0};
+    std::optional<simpler::hbg::GraphCalendarHint> begin_calendar_hint;
     uint32_t begin_explicit_dep_count{0};
     TaskId begin_first_explicit_dep{TaskId::invalid()};
     int prepare_calls{0};
@@ -123,10 +125,14 @@ void fake_report_fatal(OrchContext *ctx, int32_t error_code, const char * /*func
     fake.fatal.store(true, std::memory_order_release);
 }
 
-GraphScopeResult fake_graph_begin(OrchContext *ctx, uint64_t, const GraphTaskArgs &args) {
+GraphScopeResult fake_graph_begin(
+    OrchContext *ctx, uint64_t, const GraphTaskArgs &args,
+    const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint
+) {
     FakeRuntime &fake = *as_fake(ctx);
     std::lock_guard<std::mutex> lock(fake.mutex);
     fake.begin_calls++;
+    fake.begin_calendar_hint = calendar_hint;
     fake.begin_explicit_dep_count = args.explicit_dep_count();
     fake.begin_first_explicit_dep = args.explicit_dep_count() == 0 ? TaskId::invalid() : args.explicit_dep(0);
     GraphScopeResult result;
@@ -641,6 +647,7 @@ struct SubmitConfig : simpler::hbg::ConfigBase {
 };
 
 void config_graph_body(const GraphTaskArgs & /*args*/, const SubmitConfig & /*config*/) {}
+void default_graph_body(const GraphTaskArgs & /*args*/) {}
 
 }  // namespace
 
@@ -681,6 +688,47 @@ TEST(HbgGraphAsyncSubmit, SubmittingWithAConfigRetainsItUntilTheBindFinishes) {
     framework_finish_orch();
     EXPECT_TRUE(simpler::hbg::config_registry().empty()) << "the bind's teardown must release every retained Config";
 
+    framework_bind_orch_context(nullptr);
+}
+
+TEST(HbgGraphAsyncSubmit, CalendarOptionsCarryThePublicGraphIdentityAndPreserveZero) {
+    FakeBoundary boundary;
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    fake.boundaries = &boundary;
+    fake.boundary_capacity = 1;
+    fake.later_submit_entered = true;
+    framework_bind_orch_context(reinterpret_cast<OrchContext *>(&fake));
+
+    const GraphTaskArgs args{};
+    const simpler::hbg::GraphSubmitOptions zero{uint64_t{0}};
+    const simpler::hbg::GraphSubmitOptions other{uint64_t{31}};
+    const uint64_t explicit_id = 0xA1C310;
+    const SubmitConfig config{1};
+    const auto expect_hint = [&](uint64_t graph_id, uint64_t calendar_hash) {
+        ASSERT_TRUE(fake.begin_calendar_hint.has_value());
+        EXPECT_EQ(fake.begin_calendar_hint->graph_id, graph_id);
+        EXPECT_EQ(fake.begin_calendar_hint->calendar_hash, calendar_hash);
+    };
+    {
+        ScopeGuard scope;
+        EXPECT_FALSE(rt_submit_graph(&default_graph_body, args, zero).has_error);
+        expect_hint(rt_graph_function_id(&default_graph_body), 0);
+        EXPECT_FALSE(rt_submit_graph(explicit_id, &default_graph_body, args, other).has_error);
+        expect_hint(explicit_id, 31);
+        EXPECT_FALSE(rt_submit_graph(&default_graph_body, args, config, zero).has_error);
+        expect_hint(rt_graph_function_id(&default_graph_body), 0);
+        EXPECT_FALSE(rt_submit_graph(explicit_id, &default_graph_body, args, config, other).has_error);
+        expect_hint(explicit_id, 31);
+        EXPECT_FALSE(rt_submit_graph(&config_graph_body, args, config, other).has_error);
+        expect_hint(rt_graph_function_id(&config_graph_body), 31);
+        EXPECT_FALSE(rt_submit_graph(explicit_id, &config_graph_body, args, config, zero).has_error);
+        expect_hint(explicit_id, 0);
+        EXPECT_FALSE(rt_submit_graph(&default_graph_body, args).has_error);
+        EXPECT_FALSE(fake.begin_calendar_hint.has_value());
+    }
+    rt_graph_commit();
+    framework_finish_orch();
     framework_bind_orch_context(nullptr);
 }
 

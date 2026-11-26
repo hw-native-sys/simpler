@@ -19,6 +19,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -81,6 +82,7 @@ struct HostBodyTask {
     bool sync_start;
     bool sink;
     bool has_predicate;
+    std::array<int32_t, PLATFORM_CORES_PER_BLOCKDIM> kernel_ids{};
 };
 
 struct HostGraphTemplate {

@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -175,14 +176,20 @@ struct OrchestratorState final {
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);
     TaskOutputTensors alloc_tensors(const CoreTaskArgs &args);
-    GraphScopeResult graph_begin(uint64_t graph_key, const GraphTaskArgs &args);
+    GraphScopeResult graph_begin(
+        uint64_t graph_key, const GraphTaskArgs &args,
+        const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint = {}
+    );
     bool graph_prepare(void *recording_handle, const GraphTaskArgs &args);
     void graph_abort(void *recording_handle);
     bool graph_end();
     void graph_commit();
     // Bodies of the two above. Both have several early returns, so the phase
     // record that measures them wraps the call instead of every exit.
-    GraphScopeResult graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &args);
+    GraphScopeResult graph_begin_inner(
+        uint64_t graph_key, const GraphTaskArgs &args,
+        const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint
+    );
     void graph_commit_inner();
     void mark_done();
 };
@@ -242,6 +249,7 @@ struct OrchContext {
     // caller registered none, which makes get_tensor_data / set_tensor_data fail
     // closed rather than dereference one.
     HostTensorAccessor *tensor_access;
+    bool retain_graph_config_id{false};
 };
 
 // The .so compiles against the ops-pointer partial definition in orchestration_api.h

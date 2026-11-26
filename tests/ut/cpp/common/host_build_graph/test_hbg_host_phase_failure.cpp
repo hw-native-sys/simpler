@@ -160,7 +160,8 @@ void check_orchestration_budget() {
     ops.is_fatal = [](OrchContext *) {
         return false;
     };
-    ops.graph_begin = [](OrchContext *, uint64_t, const GraphTaskArgs &) {
+    ops.graph_begin = [](OrchContext *, uint64_t, const GraphTaskArgs &,
+                         const std::optional<simpler::hbg::GraphCalendarHint> &) {
         return GraphScopeResult{};
     };
     ops.orchestration_done = [](OrchContext *) {};

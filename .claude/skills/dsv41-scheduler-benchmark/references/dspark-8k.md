@@ -84,6 +84,76 @@ same lowest-median rank aggregation, with its own metric name. The summary
 also reports the median of the per-round slowest-rank sum. This uses rank
 durations and does not require synchronized device clocks.
 
+## Graph Calendar key comparison on EP2
+
+Use [dspark_calendar_hash.py](../scripts/dspark_calendar_hash.py) with the frozen
+8K EP2 Percounter fixture. Its checked source transformation wraps the local
+drafter Markov normalization and LM-head row selection in a Graph immediately
+before the existing TP push. The workload still executes the complete target
+and drafter on both ranks. Replays cycle through prefixes of 1, 6, 11 and 12
+active requests per rank. The Markov normalization kernel normalizes 5, 30,
+55 and 60 rows respectively and zeroes normalized padding. Physical tensor
+shapes, task dependencies, kernel registrations and the 30/64-block launch
+specifications stay fixed inside the Graph. Both arms use the same business
+kernels.
+
+Run `prepare` outside the device allocation for each arm, passing `--lib`,
+`--fixture` (the directory with `prepared.json` and frozen inputs), `--scratch`,
+`--mode exact` or `--mode bucket`, and a distinct `--output` directory. The
+adapter checks the generated prologue before wrapping it and primes the binary
+cache for each arm. Each replay starts a fresh Worker and restores the frozen
+InOuts and active prefix before every dispatch. Set `--first-active-requests`
+to rotate the first input used to train the bucket. A replay creates a fresh
+`first-N` directory under its prepared arm and records the input sequence,
+integer outputs per input and raw timings there. Keep any failed replay for
+diagnosis by archiving its `first-N` directory before retrying.
+
+After releasing the two devices, run `compare` with `--exact EXACT/first-N`,
+`--bucket BUCKET/first-N` and `--output REPORT.json`. It checks that both ranks
+executed every round with matching input sequences and outputs. The exact arm
+publishes four Graph calendars per rank and the bucket arm publishes one.
+Whole-decode AICore wall P50 and P95 use the slower rank in each measured
+round and are also reported per input. `--reference-outputs` checks the
+12-request boundary against the integer outputs of an unwrapped replay of
+the full-B12 frozen fixture.
+
+Both arms report the host AICPU enqueue skew. Large skew can dominate the
+slower rank's wall time while it waits for its peer. For an aligned timing
+comparison, prepare the repository's test-only device-start gate around the
+same runtime binaries outside the device allocation. The gate build manifest
+records unchanged runtime executable sections.
+[Device start gate build and validation](../../../../tests/fdwic/dsv41_scheduler/README.md#prepare-and-run)
+
+```bash
+GATE_TOOL="$SIMPLER_ROOT/tests/fdwic/dsv41_scheduler/production/device_start_gate.py"
+"$PYTHON" "$GATE_TOOL" --runtime-dir "$SIMPLER_ROOT/build/lib/a5/onboard" --output-dir "$GATE_DIR"
+GATE_RUNTIME="$GATE_DIR/runtime/a5/onboard"
+"$PYTHON" "$GATE_TOOL" validate "$GATE_RUNTIME" percounter
+```
+
+With `ADAPTER` pointing to `dspark_calendar_hash.py`, submit each arm and
+first input as a separate device job on the same physical pair. Alternate
+exact-first and bucket-first across the four pairs. Use first inputs 1, 6,
+11 and 12, and retain the recorded run order, commands, raw samples and reports.
+The gate option selects the validated runtime snapshot for execution. The
+compiler keeps the original runtime source and cache identity.
+
+```bash
+# Set ARM to EXACT or BUCKET for this job, FIRST to the first request count,
+# and DEVICE_IDS to the physical pair used for the entire comparison.
+printf -v replay '%q ' "$PYTHON" "$ADAPTER" run --lib "$LIB" --output "$ARM" \
+  --gate-runtime "$GATE_RUNTIME" --first-active-requests "$FIRST"
+task-submit --device "$DEVICE_IDS" --timeout 3600 --max-time 1800 \
+  "${env_args[@]}" --run "$replay"
+```
+
+After releasing the devices, use `compare --require-start-gate` to verify both
+ranks' matching peer epochs for every dispatch and require identical runtime
+and gate binaries between the arms. Each report includes the spread in local
+gate-to-AICore-start offsets. `within_performance_limits` requires the bucket
+relative to exact change to stay within +5% P50 and +10% P95 for every input.
+Check this field for every first-input rotation.
+
 ## Capture and export Perfetto
 
 Reuse the prepared output for the same runtime, fixture and topology. Set

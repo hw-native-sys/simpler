@@ -140,19 +140,28 @@ inline void assert_config() {
     );
 }
 
-// One exact Graph identity retained for the bind. Config stays in the orchestration
-// library; only graph_key crosses the RuntimeOps boundary.
+// Config stays in the orchestration library. Only its numeric identities cross
+// the RuntimeOps boundary.
 struct RetainedGraphConfig {
     uint64_t graph_id;
-    uint64_t graph_key;
+    uint64_t id;
     std::unique_ptr<ConfigBase> config;
 };
+
+using GraphConfigRegistry = std::unordered_multimap<uint64_t, RetainedGraphConfig>;
 
 // Digest buckets may contain different Graph ids, Config types, or Config values.
 // Entries are only inserted during a bind and cleared together after recorder jobs
 // finish, matching the lifetime of the host Definition cache.
-inline std::unordered_multimap<uint64_t, RetainedGraphConfig> &config_registry() {
-    static std::unordered_multimap<uint64_t, RetainedGraphConfig> registry;
+inline GraphConfigRegistry &config_registry() {
+    static GraphConfigRegistry registry;
+    return registry;
+}
+
+// The loader materializes a separate orchestration library for each Callable
+// registration. Keep the Config copies and their destructors in that library.
+__attribute__((visibility("hidden"))) inline GraphConfigRegistry &callable_config_registry() {
+    static GraphConfigRegistry registry;
     return registry;
 }
 
@@ -168,26 +177,29 @@ inline void clear_config_registry() {
     config_registry().clear();
 }
 
-// Return the same key for an equal identity, or retain a copy with a fresh key.
-// Keys are insertion ordinals, independent of digest values. With no per-entry erase,
-// size() + 1 is unique until the bind ends; clearing the registry resets that namespace.
-// The host Definition cache uses this key directly within the same bind.
-// RTTI and operator== remain local to the orchestration library that owns the Config.
 template <typename ConfigT>
-[[nodiscard]] inline uint64_t retain_config(uint64_t graph_id, const ConfigT &config) {
-    assert_config<ConfigT>();
-    const uint64_t digest = rt_graph_make_key(graph_id, config.hash());
-    const std::lock_guard<std::mutex> lock(config_registry_mutex());
-    auto &registry = config_registry();
+inline uint64_t
+intern_graph_config(GraphConfigRegistry &registry, uint64_t digest, uint64_t graph_id, const ConfigT &config) {
     const auto range = registry.equal_range(digest);
     for (auto it = range.first; it != range.second; ++it) {
         const auto &entry = it->second;
         if (entry.graph_id != graph_id || typeid(*entry.config) != typeid(ConfigT)) continue;
-        if (dynamic_cast<const ConfigT &>(*entry.config) == config) return entry.graph_key;
+        if (dynamic_cast<const ConfigT &>(*entry.config) == config) return entry.id;
     }
-    const uint64_t graph_key = registry.size() + 1;
-    registry.emplace(digest, RetainedGraphConfig{graph_id, graph_key, std::make_unique<ConfigT>(config)});
-    return graph_key;
+    const uint64_t id = registry.size() + 1;
+    registry.emplace(digest, RetainedGraphConfig{graph_id, id, std::make_unique<ConfigT>(config)});
+    return id;
+}
+
+// The Definition key is a bind-local ordinal. When requested, also return an
+// independently interned identity in the Callable's library.
+template <typename ConfigT>
+[[nodiscard]] inline uint64_t retain_config(uint64_t graph_id, const ConfigT &config, uint64_t *config_id = nullptr) {
+    assert_config<ConfigT>();
+    const uint64_t digest = rt_graph_make_key(graph_id, config.hash());
+    const std::lock_guard<std::mutex> lock(config_registry_mutex());
+    if (config_id != nullptr) *config_id = intern_graph_config(callable_config_registry(), digest, graph_id, config);
+    return intern_graph_config(config_registry(), digest, graph_id, config);
 }
 
 }  // namespace simpler::hbg

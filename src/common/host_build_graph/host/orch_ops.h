@@ -33,6 +33,8 @@
 
 #include <stdint.h>
 
+#include <optional>
+
 #include "host_build_graph/host/graph_cache.h"  // GraphScopeResult
 #include "host_build_graph/submit_types.h"      // MixedKernels
 #include "host_build_graph/tensor.h"            // simpler::hbg::Tensor
@@ -76,7 +78,10 @@ struct OrchOps {
     // (one AIC each) and standalone AIV cores.
     int32_t (*available_cluster_count)(OrchContext *ctx);
     int32_t (*available_aiv_count)(OrchContext *ctx);
-    GraphScopeResult (*graph_begin)(OrchContext *ctx, uint64_t graph_key, const GraphTaskArgs &args);
+    GraphScopeResult (*graph_begin)(
+        OrchContext *ctx, uint64_t graph_key, const GraphTaskArgs &args,
+        const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint
+    );
     bool (*graph_prepare)(OrchContext *ctx, void *recording_handle, const GraphTaskArgs &args);
     void (*graph_abort)(OrchContext *ctx, void *recording_handle);
     bool (*graph_end)(OrchContext *ctx);
@@ -98,4 +103,6 @@ struct OrchOps {
     // caller record the body inline instead.
     bool (*graph_record_start)(OrchContext *ctx, const GraphTaskArgs &args, void *job);
     void (*graph_record_wait)(OrchContext *ctx);
+    // Set for schedulers that validate Graph structure across binds.
+    bool (*retain_graph_config_id)(OrchContext *ctx){nullptr};
 };

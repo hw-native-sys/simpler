@@ -133,6 +133,27 @@ hazard is silent: an explicit `GRAPH_KEY` must be unique for every distinct Grap
 function in an orchestration callable, or one of them replays the other's
 recorded topology.
 
+For A5 Calendar online PGO, a caller can group invocations with similar
+execution costs by passing `simpler::hbg::GraphSubmitOptions` as the last
+argument to `rt_submit_graph`. The same option follows a Config when present.
+
+```cpp
+rt_submit_graph(&layer, args, config, simpler::hbg::GraphSubmitOptions{bucket});
+```
+
+`calendar_hash` is an optional `uint64_t` bucket ID, including zero. With no
+bucket the Calendar cache uses its argument-derived key. With a bucket the
+Worker can reuse a plan across separate runs of the same registered Callable
+and Graph after checking the current task structure and available cores. Each
+invocation binds its own Definition and arguments. The Definition cache uses
+the Graph identity and Config independently of the Calendar bucket.
+
+A5 Percounter also checks the recorded body structure across binds of the
+same Callable. Equal Configs for a Graph ID must produce the same task layout.
+If a tensor shape controls a construction choice such as the block count,
+include that choice in the Config. A mismatch fails bind before Calendar
+lookup or training, including submissions with no bucket or a different bucket.
+
 An invocation may declare explicit predecessors with
 `GraphTaskArgs::set_dependencies`. They order that invocation's outer `GRAPH`
 shell, including its first recording and an in-flight or cached reuse. Their

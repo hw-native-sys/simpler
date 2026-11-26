@@ -13,9 +13,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
+#include "host_build_graph/host/graph_cache.h"
 #include "host_build_graph/submit_types.h"
 #include "scheduler/scheduler_native_graph.h"
 
@@ -43,6 +45,7 @@ struct NativeGraphHostPlan {
     std::vector<SchedulerNodeBinding> bindings;
     std::vector<int64_t> completion_refs;
     std::vector<SchedulerGraphInstance> instances;
+    std::map<int32_t, simpler::hbg::GraphCalendarHint> calendar_hints;
 };
 
 // definition_indices uses UINT32_MAX for a non-Graph top-level task. The

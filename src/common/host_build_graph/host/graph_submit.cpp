@@ -236,7 +236,7 @@ void graph_reset_outer_payload(TaskPayload &payload) {
 
 bool graph_submit_outer(
     OrchestratorState *orch, GraphHostState *state, uint64_t graph_key, int32_t owned_heap, bool defer_heap,
-    const GraphTaskArgs &args, TaskId *submitted_id
+    const GraphTaskArgs &args, const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint, TaskId *submitted_id
 ) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit Graph outside a scope");
     auto &allocator = orch->task_allocator;
@@ -430,6 +430,7 @@ bool graph_submit_outer(
     }
 
     pending.outer_slot = &slot;
+    pending.calendar_hint = calendar_hint;
     state->pending_uploads.push_back(pending);
     if (submitted_id != nullptr) *submitted_id = task_id;
 #if SIMPLER_DFX
@@ -440,7 +441,7 @@ bool graph_submit_outer(
 
 bool graph_submit_definition(
     OrchestratorState *orch, GraphHostState *state, const Graph *definition, const GraphCacheRecord &record,
-    const GraphTaskArgs &args, TaskId *submitted_id
+    const GraphTaskArgs &args, const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint, TaskId *submitted_id
 ) {
     // A published Definition is immutable and has a cached runtime-owned
     // invocation budget. Native argument backing can legitimately be empty.
@@ -466,14 +467,15 @@ bool graph_submit_definition(
         return false;
     }
     return graph_submit_outer(
-        orch, state, definition->graph_key, static_cast<int32_t>(owned_heap), false, args, submitted_id
+        orch, state, definition->graph_key, static_cast<int32_t>(owned_heap), false, args, calendar_hint, submitted_id
     );
 }
 
 bool graph_submit_pending_definition(
-    OrchestratorState *orch, GraphHostState *state, uint64_t graph_key, const GraphTaskArgs &args, TaskId *submitted_id
+    OrchestratorState *orch, GraphHostState *state, uint64_t graph_key, const GraphTaskArgs &args,
+    const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint, TaskId *submitted_id
 ) {
-    return graph_submit_outer(orch, state, graph_key, 0, true, args, submitted_id);
+    return graph_submit_outer(orch, state, graph_key, 0, true, args, calendar_hint, submitted_id);
 }
 
 bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState *state, uint64_t *failed_key) {
@@ -807,19 +809,23 @@ TaskOutputTensors graph_record_submit_sub_task(
     return result;
 }
 
-GraphScopeResult OrchestratorState::graph_begin(uint64_t graph_key, const GraphTaskArgs &args) {
+GraphScopeResult OrchestratorState::graph_begin(
+    uint64_t graph_key, const GraphTaskArgs &args, const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint
+) {
     if (!require_device_arguments(this, args)) {
         GraphScopeResult rejected;
         rejected.has_error = true;
         return rejected;
     }
     ORCH_PHASE_START_SPANNING(active_graph().entry != nullptr ? active_graph().entry->submit_idx : g_orch_submit_idx);
-    const GraphScopeResult result = graph_begin_inner(graph_key, args);
+    const GraphScopeResult result = graph_begin_inner(graph_key, args, calendar_hint);
     ORCH_PHASE_END_SPANNING(HostPhaseKind::OrchGraphBegin, graph_key);
     return result;
 }
 
-GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &args) {
+GraphScopeResult OrchestratorState::graph_begin_inner(
+    uint64_t graph_key, const GraphTaskArgs &args, const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint
+) {
     auto *orch = this;
     GraphScopeResult result;
     GraphHostState *state = graph_state_from(orch);
@@ -855,7 +861,7 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
         ORCH_PHASE_START();
         if (graph_submit_definition(
                 orch, state, graph_record_definition(*state, definition_it->second), definition_it->second, args,
-                &submitted
+                calendar_hint, &submitted
             )) {
             result.task_id = submitted;
             ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, TaskId::to_uint64(submitted));
@@ -897,7 +903,7 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
         }
         TaskId submitted = TaskId::invalid();
         ORCH_PHASE_START();
-        if (graph_submit_pending_definition(orch, state, graph_key, args, &submitted)) {
+        if (graph_submit_pending_definition(orch, state, graph_key, args, calendar_hint, &submitted)) {
             result.task_id = submitted;
             ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, TaskId::to_uint64(submitted));
 #if SIMPLER_DFX
@@ -1002,7 +1008,7 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
 
     TaskId submitted = TaskId::invalid();
     ORCH_PHASE_START();
-    if (graph_submit_pending_definition(orch, state, graph_key, args, &submitted)) {
+    if (graph_submit_pending_definition(orch, state, graph_key, args, calendar_hint, &submitted)) {
         result.recording = true;
         result.recording_handle = entry_ptr;
         result.params = &entry_ptr->boundary.params;

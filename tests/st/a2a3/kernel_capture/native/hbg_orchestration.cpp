@@ -75,7 +75,7 @@ extern "C" void hbg_capture_orchestration(const ChipTaskArgs &args) {
     GraphTaskArgs boundary;
     boundary.add_input(input);
     boundary.add_output(output);
-    const auto graph = rt_graph_begin(0xCADD, boundary);
+    const auto graph = rt_graph_begin(0xCADD, boundary, {});
     if (graph.recording) {
         always_assert(rt_graph_prepare(graph.recording_handle, boundary));
         chain(graph.params->tensor(0).ref(), graph.params->tensor(1).ref(), false);
@@ -99,7 +99,7 @@ extern "C" void hbg_shared_heap_orchestration(const ChipTaskArgs &args) {
     const int32_t increment = args.scalar<int32_t>(0);
     GraphTaskArgs boundary;
     boundary.add_inout(args.tensor(0).ref());
-    const auto graph = rt_graph_begin(0xCAEE, boundary);
+    const auto graph = rt_graph_begin(0xCAEE, boundary, {});
     if (graph.recording) {
         always_assert(rt_graph_prepare(graph.recording_handle, boundary));
         // Models share a 64 KiB intermediate. The 256 KiB eager request must

@@ -140,6 +140,26 @@ with the smallest estimated end time in memory.
 
 A repeated Graph in the same submission samples its last matching invocation.
 
+A Graph submission can supply `GraphSubmitOptions::calendar_hash` to share an
+online PGO plan across argument values. The Worker scopes each bucket to a
+registered Callable and a Graph ID. Each distinct scheduling structure and
+core topology in the bucket trains its own plan. A later bind can reuse a
+published plan and binds its current arguments and counter addresses. Without
+the option, Graphs use the exact argument-derived key. The caller controls
+which arguments share a bucket and should compare warm timings for its
+representative members.
+
+Within a registered Callable, a Graph ID and equal Config must record the same
+body structure in each bind. Put construction choices such as a shape-derived
+block count in Config equality. Before any Calendar lookup or training, bind
+reports the first structural difference against the previously recorded body.
+The check applies to both explicit buckets and the exact argument path.
+
+Calendar cache diagnostics label each `MISS`, `REUSE`, `HIT` and `STORE`
+as `kind=graph_bucket`, `kind=graph_args` or `kind=outer`. The `key` field
+identifies the lookup key in logs. A successful `STORE` records one trained
+plan, and `REUSE` denotes an in-flight initial plan.
+
 Chip Swimlane is a separate diagnostic stream. It can display actual kernel runs
 and scheduler events for all invocations, including the rows for which online
 PGO did not request samples.

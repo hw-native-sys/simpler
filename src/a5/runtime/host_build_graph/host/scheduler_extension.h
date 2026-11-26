@@ -25,8 +25,10 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <vector>
 
+#include "host_build_graph/host/graph_cache.h"
 #include "host_build_graph/shared_memory.h"
 #include "scheduler/scheduler_types.h"
 
@@ -57,8 +59,10 @@ enum class SchedulerExtensionResult : uint8_t {
 __attribute__((visibility("hidden"))) SchedulerExtensionResult scheduler_extension_select(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
+    const std::map<int32_t, simpler::hbg::GraphCalendarHint> &calendar_hints,
     const sm_layout::SegmentOffsets &device_segments, const void *uploaded_sm
 );
 
 __attribute__((visibility("hidden"))) bool scheduler_extension_publish_profiling(Runtime *runtime);
 __attribute__((visibility("hidden"))) void scheduler_extension_release(Runtime *runtime);
+__attribute__((visibility("hidden"))) bool scheduler_extension_retains_graph_config_id();
