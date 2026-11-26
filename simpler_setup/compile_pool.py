@@ -31,26 +31,20 @@ def default_compile_workers() -> int:
     return min(_MAX_AUTO_COMPILE_WORKERS, max(1, cpu_count - 2))
 
 
-@dataclass(frozen=True)
-class _CompileBudget:
-    workers: int
-    semaphore: threading.BoundedSemaphore
-
-
 @dataclass
 class _CompilePoolState:
-    budget: _CompileBudget
+    workers: int
+    active: int = 0
     override_active: bool = False
 
 
-_budget_guard = threading.Lock()
-_initial_workers = default_compile_workers()
-_state = _CompilePoolState(_CompileBudget(_initial_workers, threading.BoundedSemaphore(_initial_workers)))
+_budget_guard = threading.Condition()
+_state = _CompilePoolState(default_compile_workers())
 
 
 def current_compile_workers() -> int:
     with _budget_guard:
-        return _state.budget.workers
+        return _state.workers
 
 
 @contextlib.contextmanager
@@ -61,14 +55,16 @@ def compile_worker_budget(max_workers: int):
     with _budget_guard:
         if _state.override_active:
             raise RuntimeError("only one process-wide compile worker budget override may be active")
-        previous = _state.budget
-        _state.budget = _CompileBudget(max_workers, threading.BoundedSemaphore(max_workers))
+        previous = _state.workers
+        _state.workers = max_workers
+        _budget_guard.notify_all()
         _state.override_active = True
     try:
         yield
     finally:
         with _budget_guard:
-            _state.budget = previous
+            _state.workers = previous
+            _budget_guard.notify_all()
             _state.override_active = False
 
 
@@ -76,6 +72,11 @@ def compile_worker_budget(max_workers: int):
 def compile_slot():
     """Hold one process-wide compiler token."""
     with _budget_guard:
-        budget = _state.budget
-    with budget.semaphore:
+        _budget_guard.wait_for(lambda: _state.active < _state.workers)
+        _state.active += 1
+    try:
         yield
+    finally:
+        with _budget_guard:
+            _state.active -= 1
+            _budget_guard.notify_all()
