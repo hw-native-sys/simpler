@@ -821,7 +821,9 @@ TEST(ChipRunLaneJoinedLaunchTest, ADiagnosticSuccessorWithNoTerminalBankStaysPre
     // A run ahead reports and releases its bank. The decline was about this round only, so the
     // same successor — same run, same slot — is asked again.
     g_bank_of.erase(9002);
-    second.activate();
+    // The worker retries through progress, without a second activation.
+    EXPECT_FALSE(second.done());
+    EXPECT_FALSE(g_complete[0]) << "the predecessor must remain incomplete at the successful join";
 
     EXPECT_TRUE(second.launched()) << "a freed bank did not resume the successor that was waiting for one";
     EXPECT_GT(g_diagnostic_queries, asked_once) << "the decline was remembered rather than re-asked";

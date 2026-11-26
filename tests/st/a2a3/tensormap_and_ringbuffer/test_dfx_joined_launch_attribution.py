@@ -10,18 +10,30 @@
 """Continuous collecting runs through ``Worker.submit``, each owning their diagnostic artifacts.
 
 The agreeing case offers six public submissions through a two-run execution front,
-without intermediate semantic waits or flushes. It requires actual slot/generation
-reuse and a later joined receipt after reuse;
+without intermediate result waits or collector flushes. The first two predecessors
+acknowledge SDK Notify gates and remain incomplete until their exact successors'
+native receipts establish early enqueue. The second handshake covers slot/generation reuse;
 the first pair alone cannot qualify refill. The mixed pair remains a serial
-fallback control. Buffer initialization is outside the submission window, but
-host scheduling can still miss overlap: that is a failure, never a retry-to-pass.
+fallback control. The SDK gate is a stream wait before the AICore worker launch:
+it establishes an incomplete predecessor and an unfired operator boundary, not
+that an AICore kernel has started. Kernel-already-running overlap is outside
+this test's coverage. Activation may defer a collecting successor for retained
+DFX capacity; its actual launch is acknowledged from activation or a later
+progress checkpoint, with the native receipt log flushed before notification.
+Release runs on an independent SDK stream, without a Worker mailbox command,
+completion fence or admission credit.
+
+Hardware scenarios own their Worker, SDK notifications and submission threads in
+an isolated process group. Normal completion closes them explicitly. A failed
+or unresponsive backend is stopped before the supervisor reclaims its private
+shared memory, without treating a terminal error as proof of safe device retirement.
 
 Early enqueue already carried pairs that collect nothing. The case this suite is about is the one
 that used to be refused outright — two runs with every diagnostic owner on, offered to the device
 together — and it asserts the two things that capability has to be:
 
   joined        on hardware, the successor's submission completed while its predecessor was still
-                executing. The witness is the receipt the runner publishes on
+                incomplete. The witness is the receipt the runner publishes on
                 ``chip.run.joined_launch`` for a join that succeeded, read in the direction it was
                 published and only where it says so: the query answered (``observed=1``,
                 ``rc=0``) and found the predecessor's whole-operator boundary **unfired**. A
@@ -60,7 +72,10 @@ execution claim at prepare and never holds two runs. So the sim rows assert the 
 pair serializes, no join is published, and every attribution claim above still holds. The joined
 receipt is asserted on the onboard rows, where a join is reachable.
 
-The mixed-mode case is a requirement rather than a degradation. A pair whose settings disagree —
+The mixed-mode case is a requirement rather than a degradation. On hardware the predecessor
+acknowledges its gate and stays held while the successor becomes native-prepared and receives
+activation authorization. A completed child activation call must leave that exact
+successor unaccepted before the predecessor is released. A pair whose settings disagree —
 a different swimlane level, a different PMU event mode — cannot join, because each is one word in
 a device header the device latches once. The runs then go in queue order, publish no joined
 receipt, and *both* keep a complete diagnostic. Nothing is turned off to make them fit. That
@@ -76,24 +91,33 @@ import contextlib
 import json
 import os
 import struct
-import time
 from collections import Counter
 from pathlib import Path
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import DataType, TaskArgs, TensorArgType
 
 from simpler_setup import SceneTestCase, scene_test
 from simpler_setup.tools.strace_timing import parse_spans
+from tests.st.a2a3.tensormap_and_ringbuffer.dfx_joined_launch.control import (
+    UnsettledSubmission,
+    gated_refill,
+    wait_serial_fallback,
+)
+from tests.st.a2a3.tensormap_and_ringbuffer.dfx_joined_launch.notify import build_notify_helper
+from tests.st.a2a3.tensormap_and_ringbuffer.dfx_joined_launch.process import run_native_scene
 
-#: The payload that keeps a run on the device long enough for its successor to be offered beside
-#: it, with the chain and the spin this tree's own early-enqueue suite uses.
-KERNELS_BASE = "early_enqueue/kernels"
+KERNELS_BASE = "dfx_joined_launch/kernels"
 _CHAIN_LENGTH = 64
-#: Bounded so a regression fails on an assertion rather than on the op-execute timeout. Zero in
-#: simulation, where the kernel runs on a host thread and no pair can be joined anyway.
-_SPIN_ITERS = 200_000_000
+
+
+@pytest.fixture(scope="class", autouse=True)
+def _native_notify_adapter(st_platform):
+    if not st_platform.endswith("sim"):
+        build_notify_helper()
+
 
 #: What each run of a pair fills its two inputs with — `value` and `value + 1`. No two runs share
 #: one, so a record holding the other run's value is the two collections crossing in one artifact.
@@ -139,10 +163,6 @@ _JOIN_SPAN = "chip.run.joined_launch"
 #: record that run published. Seeing both runs' is therefore the observation boundary: any joined
 #: record for the pair is already in the window, so an absence is an absence.
 _RUN_SPAN = "chip.run"
-#: How long to wait for that boundary. The writers are asynchronous, so this covers the lag
-#: between a record being accepted and written — not the runs, which have been waited for.
-#: Exhausting it is a failed observation, which is reported as one rather than as an absence.
-_EVIDENCE_BUDGET_S = 10.0
 
 _DIR_TAGS = {
     D.IN: TensorArgType.INPUT,
@@ -381,12 +401,13 @@ class _ChildTrace:
 
     Opened at the files' current size, so the window begins where this object was created — which
     is what keeps an earlier pair's records, and an earlier session that happened to reuse a pid,
-    out of a later pair's evidence. The offsets are never advanced: a caller polls the same window
+    out of a later pair's evidence. The offsets are never advanced: a caller reads the same window
     until the records it needs are in it.
     """
 
     def __init__(self, worker):
         directory = Path(_child_log_directory())
+        self._notifications = getattr(worker, "_dfx_notify", None)
         self._paths = {pid: directory / f"host.{pid}.log" for pid in worker._chip_pids}  # noqa: SLF001
         self._offsets = {pid: self._size(path) for pid, path in self._paths.items()}
 
@@ -408,6 +429,14 @@ class _ChildTrace:
                     for span in parse_spans([line.decode("utf-8", errors="replace")]):
                         if span.pid == pid:
                             yield span
+
+    def await_activation(self, run_id, timeout):
+        assert self._notifications is not None, "native activation observer is missing"
+        return self._notifications.await_activation(run_id, timeout)
+
+    def await_launch(self, run_id, timeout):
+        assert self._notifications is not None, "native launch observer is missing"
+        return self._notifications.await_launch(run_id, timeout)
 
     def spans(self) -> list:
         """Every whole-line span this worker's own children appended since the window opened."""
@@ -495,7 +524,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
     #: Every owner this runtime has a device producer for. host_build_graph builds its graph on
     #: the host, so dep_gen and scope_stats have none there and its copy names a different set.
     #: Which argument of each marked task carries the handoff, by the index it holds in its own
-    #: task's argument list. Every task here is `kSpinAdd(a, b, out)` over the same three tensors
+    #: task's argument list. Every task here is `kAdd(a, b, out)` over the same three tensors
     #: and `out` is the chained buffer, so the first task's output and the second task's input are
     #: the same argument of two different tasks, read at two different stages.
     PRODUCER_OUTPUT_ARG = 2
@@ -509,14 +538,14 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             {
                 "name": "vector",
                 "orchestration": {
-                    "source": f"{KERNELS_BASE}/orchestration/pipelined_vector_orch.cpp",
+                    "source": f"{KERNELS_BASE}/orchestration/gated_vector_orch.cpp",
                     "function_name": "aicpu_orchestration_entry",
                     "signature": [D.IN, D.IN, D.OUT],
                 },
                 "incores": [
                     {
                         "func_id": 0,
-                        "source": f"{KERNELS_BASE}/aiv/spin_add.cpp",
+                        "source": f"{KERNELS_BASE}/aiv/gated_add.cpp",
                         "core_type": "aiv",
                         # The kernel reads its third argument whenever the accumulate scalar is
                         # set — every task of this chain but the first — and writes it always, so
@@ -546,7 +575,19 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         },
     ]
 
+    @classmethod
+    def _compile_l3_callables(cls, platform):
+        if not platform.endswith("sim"):
+            build_notify_helper()
+        return super()._compile_l3_callables(platform)
+
     def test_run(self, st_platform, st_worker, tmp_path):
+        if not st_platform.endswith("sim"):
+            run_native_scene(st_worker, type(self)._st_chip_handles["vector"], tmp_path)
+            return
+        self._run_scenarios(st_platform, st_worker, tmp_path)
+
+    def _run_scenarios(self, st_platform, st_worker, tmp_path):
         worker = st_worker
         simulated = st_platform.endswith("sim")
 
@@ -591,20 +632,19 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
 
     # -- submission ------------------------------------------------------
 
-    def _chip_args(self, buffers, spin_iters):
+    def _chip_args(self, buffers):
         """One chip task's args: this run's three tensors, tagged by the orch signature."""
         signature = type(self)._st_chip_handles["vector_sig"]
         args = TaskArgs()
         for buffer, direction in zip(buffers, signature):
             args.add_tensor(buffer.tensor((SIZE,), _F32), _DIR_TAGS[direction])
-        args.add_scalar(spin_iters)
         return args
 
-    def _submit(self, worker, buffers, chip_config, spin_iters):
+    def _submit(self, worker, buffers, chip_config):
         handle = type(self)._st_chip_handles["vector"]
 
         def graph(orch, _args, _cfg):
-            orch.submit_next_level(handle, self._chip_args(buffers, spin_iters), chip_config, worker=0)
+            orch.submit_next_level(handle, self._chip_args(buffers), chip_config, worker=0)
 
         return worker.submit(graph)
 
@@ -620,9 +660,11 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         its buffers held for the worker's life.
         """
         root.mkdir(parents=True, exist_ok=True)
-        spin_iters = 0 if simulated else _SPIN_ITERS
         handles = []
         views = []
+        prepared = []
+        controller = None
+        witnesses = []
         try:
             for index, value in enumerate(_PAIR_INPUT_VALUES):
                 nbytes = SIZE * DTYPE.itemsize
@@ -635,17 +677,41 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
                 # Only the second run's settings move, so the pair agrees or disagrees by exactly
                 # one word.
                 chip_config = self._diagnostic_config(prefix, shifted=disagree and index == 1)
-                handles.append(self._submit(worker, buffers, chip_config, spin_iters))
+                prepared.append((buffers, chip_config))
                 views.append((tensors, prefix))
+            if simulated:
+                for buffers, chip_config in prepared:
+                    handles.append(self._submit(worker, buffers, chip_config))
+            else:
+                gate = self._notify.gate(views[0][1])
+                controller = gate
+                trace = _ChildTrace(worker)
+
+                def submit(index):
+                    buffers, config = prepared[index]
+                    return self._submit(worker, buffers, config)
+
+                options = {}
+                if disagree:
+                    options["verify_pair"] = lambda *args: wait_serial_fallback(worker, gate, *args)
+                witnesses = gated_refill([gate], submit, [entry[1] for entry in views], trace, handles, **options)
+        except UnsettledSubmission:
+            # A still-running callback may enter after release. Keep its lists,
+            # tensors and gates intact until the isolated owner is stopped.
+            raise
         except BaseException:
             # Whatever was accepted still has to retire, and its views have to go before anything
             # can unlink the memory behind them. The drain's own failure must not replace the one
             # being unwound, so it is suppressed here and the first cause is re-raised.
             with contextlib.suppress(BaseException):
                 self._drain(handles)
+            # A failed submit/wait is not a device-retirement proof. Hardware
+            # errors leave SDK resource ownership to the scene supervisor.
+            for tensors, _prefix in views:
+                tensors.clear()
             views.clear()
             raise
-        return handles, views
+        return handles, views, controller, witnesses
 
     @staticmethod
     def _drain(handles):
@@ -666,16 +732,19 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
 
     # -- the cases -------------------------------------------------------
 
-    def _refill_owns_its_records(self, worker, root: Path, simulated: bool, trace):
+    def _refill_owns_its_records(self, worker, root: Path, simulated: bool, trace):  # noqa: PLR0912 -- one lifetime scope owns submissions, gates and tensor exports
         """Refill a two-run front without draining the pair or flushing its writers."""
         what = "six continuously refilled diagnostic runs"
         root.mkdir(parents=True, exist_ok=True)
         prepared = []
         tensors = []
         handles = []
+        gates = []
+        receipts = []
+        drained = False
+        unsettled = False
         try:
-            # Allocation and tensor initialization must not consume the overlap window between
-            # execution-credit reuse and the next submit. Each run keeps its own buffers alive.
+            # All six runs own independent inputs, outputs and diagnostic destinations.
             for index, value in enumerate(_REFILL_INPUT_VALUES):
                 buffers = [worker.create_buffer(SIZE * DTYPE.itemsize) for _ in range(3)]
                 tensors = [torch.frombuffer(buffer.shm.buf, dtype=DTYPE, count=SIZE) for buffer in buffers]
@@ -685,16 +754,31 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
                 prefix = root / f"run{index}"
                 prepared.append((buffers, tensors, prefix, self._diagnostic_config(prefix, shifted=False)))
 
-            # Submission uses physical execution credit. A strong wait here would also
-            # observe already queued successors on their shared streams and serialize refill.
-            for buffers, _tensors, _prefix, config in prepared:
-                handles.append(self._submit(worker, buffers, config, 0 if simulated else _SPIN_ITERS))
+            if simulated:
+                for buffers, _tensors, _prefix, config in prepared:
+                    handles.append(self._submit(worker, buffers, config))
+            else:
+                # With two native slots, run 3 reuses run 1's slot. Later runs
+                # carry no gate: result-entry pressure may strongly observe all
+                # queued streams, which must then be able to finish unaided.
+                for _entry in prepared[:2]:
+                    gates.append(self._notify.gate(_entry[2]))
+
+                def submit(index):
+                    buffers, _tensors, _prefix, config = prepared[index]
+                    return self._submit(worker, buffers, config)
+
+                receipts = gated_refill(gates, submit, [entry[2] for entry in prepared], trace, handles)
             self._drain(handles)
+            drained = True
             for index, (_buffers, tensors, _prefix, _config) in enumerate(prepared):
                 assert torch.allclose(tensors[2], _golden(tensors[0], tensors[1]), rtol=self.RTOL, atol=self.ATOL), (
                     f"{what}: run {index} did not produce its own golden result"
                 )
             prefixes = [prefix for _buffers, _tensors, prefix, _config in prepared]
+        except UnsettledSubmission:
+            unsettled = True
+            raise
         except BaseException:
             # A later submit/wait failure must not abandon an already accepted successor or
             # replace the original failure with a subsequent cleanup error.
@@ -703,12 +787,16 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             raise
         finally:
             # Tracebacks retain loop locals; empty the view lists themselves.
-            for entry in prepared:
-                entry[1].clear()
-            tensors.clear()
-            prepared.clear()
+            if not unsettled:
+                for entry in prepared:
+                    entry[1].clear()
+                tensors.clear()
+                prepared.clear()
+            if drained:
+                for gate in gates:
+                    gate.close()
 
-        # This is the first flush in the sequence. It observes background publication rather
+        # This is the first collector flush in the sequence. It observes background publication rather
         # than granting credit between submissions.
         worker.flush_diagnostics()
         runs = []
@@ -742,6 +830,16 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             previous_slots[slot] = (index, generation)
         assert reused_slots, f"{what}: no execution-resource slot was reused: {runs}"
 
+        for index, receipt in enumerate(receipts):
+            pair = runs[index : index + 2]
+            assert tuple(run["epoch"] for run in pair) == receipt["epochs"], (
+                f"{what}: released a different native pair: {receipt}; artifacts: {pair}"
+            )
+            for run, side in zip(pair, ("predecessor", "successor")):
+                assert all(run[key] == receipt[side][key] for key in run if key != "epoch"), (
+                    f"{what}: released a different dispatch: {receipt[side]}; artifact: {run}"
+                )
+
         # Pipeline slots are not collector banks. Early enqueue is proved by the runner's
         # existing receipt, not by a repeated slot, the number of submissions or wall time.
         spans = self._wait_for_both_runs(trace, runs[0]["host_pid"], what, minimum_runs=len(runs))
@@ -759,6 +857,9 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
                 f"{what}: no successor joined after execution-resource reuse; wanted {sorted(after_reuse)}, "
                 f"observed {records}. An initial joined pair followed by serial refills is insufficient."
             )
+            assert after_reuse & {receipt["epochs"] for receipt in receipts}, (
+                f"{what}: no handshake covered actual execution-resource reuse: {receipts}; runs: {runs}"
+            )
 
     def _assert_pair_owns_its_records(self, worker, root: Path, simulated: bool, *, disagree: bool, trace):
         """Submit a pair, check both results and every artifact, and return what each run is.
@@ -775,9 +876,11 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
 
     def _pair_owns_its_records(self, worker, root: Path, simulated: bool, *, disagree: bool, what: str):
         """The pair case itself, with its failures carried by the caller above."""
-        handles, views = self._submit_pair(worker, root, simulated, disagree=disagree)
+        handles, views, controller, witnesses = self._submit_pair(worker, root, simulated, disagree=disagree)
+        drained = False
         try:
             self._drain(handles)
+            drained = True
             results = [
                 torch.allclose(tensors[2], _golden(tensors[0], tensors[1]), rtol=self.RTOL, atol=self.ATOL)
                 for tensors, _prefix in views
@@ -785,7 +888,11 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             prefixes = [prefix for _tensors, prefix in views]
         finally:
             # Dropped before the framework-driven close can unlink the shm.
+            for tensors, _prefix in views:
+                tensors.clear()
             views.clear()
+            if drained and controller is not None:
+                controller.close()
 
         for index, ok in enumerate(results):
             assert ok, f"{what}: run {index} did not produce its own golden result"
@@ -809,6 +916,11 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         assert runs[0]["run_id"] != runs[1]["run_id"], (
             f"{what}: both runs reported dispatch identity {runs[0]['run_id']}"
         )
+        for witness in witnesses:
+            for run, side in zip(runs, ("predecessor", "successor")):
+                assert all(run[key] == witness[side][key] for key in run if key != "epoch"), (
+                    f"{what}: fallback witness belongs to another dispatch: {witness}; artifacts: {runs}"
+                )
         return runs
 
     def _assert_one_run_owns_this_namespace(
@@ -1027,7 +1139,14 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             "epoch": epoch,
             **{
                 key: sidecar.get(key)
-                for key in ("run_id", "host_pid", "owner_instance_id", "pipeline_slot", "pipeline_generation")
+                for key in (
+                    "run_id",
+                    "host_pid",
+                    "owner_instance_id",
+                    "pipeline_slot",
+                    "pipeline_generation",
+                    "endpoint_dispatch_id",
+                )
             },
         }
 
@@ -1041,18 +1160,14 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         joined record this pair produced is already in it too, which is what lets an absence be
         read as an absence rather than as a read taken too early.
         """
-        deadline = time.monotonic() + _EVIDENCE_BUDGET_S
-        while True:
-            spans = trace.spans()
-            published = sum(1 for span in spans if span.pid == pid and span.name == _RUN_SPAN)
-            if published >= minimum_runs:
-                return spans
-            assert time.monotonic() < deadline, (
-                f"{what}: only {published} of {minimum_runs} runs had published their own {_RUN_SPAN} span on "
-                f"child {pid} within {_EVIDENCE_BUDGET_S:.0f}s, so nothing can be concluded from the joined "
-                f"records in that window"
-            )
-            time.sleep(0.05)
+        # Chip children flush their host log before publishing TASK_DONE for
+        # swimlane-enabled runs. Every caller has already waited its handles.
+        spans = trace.spans()
+        published = sum(1 for span in spans if span.pid == pid and span.name == _RUN_SPAN)
+        assert published >= minimum_runs, (
+            f"{what}: only {published} of {minimum_runs} runs published {_RUN_SPAN} after the completion barrier"
+        )
+        return spans
 
     def _assert_join_evidence(self, trace, runs, *, expect_joined: bool, what: str):
         """Whether the device held these two runs together, by the runner's own receipt.
@@ -1115,7 +1230,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         quiet = self._build_config(self.CASES[0]["config"], output_prefix=str(root))
         ok = False
         try:
-            self._submit(worker, buffers, quiet, 0).wait()
+            self._submit(worker, buffers, quiet).wait()
             ok = torch.allclose(tensors[2], _golden(tensors[0], tensors[1]), rtol=self.RTOL, atol=self.ATOL)
         finally:
             tensors.clear()

@@ -31,6 +31,7 @@ import ast
 import contextlib
 import importlib.util
 import inspect
+import json
 import mmap
 import os
 import sys
@@ -43,6 +44,7 @@ import pytest
 from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
 
 from simpler_setup.tools.strace_timing import parse_spans
+from tests.st.a2a3.tensormap_and_ringbuffer.dfx_joined_launch.control import UnsettledSubmission, gated_refill
 
 #: The suites carrying this reader. Both are loaded, because they hold separate copies of it and a
 #: repair applied to one would otherwise go missing from the other.
@@ -121,6 +123,7 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path, 
     scene = _refill_scene_body(relative_path)
     torch = scene["torch"]
     jobs, events, spans, tiles = [], [], [], []
+    gates = []
     generations = [0, 0]
     tensor_refs = []
 
@@ -142,6 +145,27 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path, 
         job.ended = True
         events.append(("physical_end", job.epoch))
 
+    class Gate:
+        def __init__(self, _prefix):
+            self.index = len(gates)
+            self.address = self.index + 1
+            gates.append(self)
+
+        def wait_entered(self, _timeout):
+            assert self.index < len(jobs) and not jobs[self.index].ended
+            events.append(("entered", self.index + 1))
+
+        def verify(self, identity):
+            assert identity["run_id"] == self.index + 1
+
+        def release(self):
+            if self.index < len(jobs) and not jobs[self.index].ended:
+                retire(jobs[self.index])
+            events.append(("release", self.index + 1))
+
+        def close(self):
+            assert self.index >= len(jobs) or jobs[self.index].ended
+
     def observe(job):
         events.append(("wait", job.epoch))
         if job.observed:
@@ -157,8 +181,11 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path, 
         output.fill_(value + additions * (value + 1))
         job.observed = True
 
-    def submit(_worker, buffers, prefix, spin_iters):
-        assert spin_iters == scene["_SPIN_ITERS"]
+    def submit(_worker, buffers, prefix, *scalars):
+        if name == "a2a3_tmr":
+            assert not scalars
+        else:
+            assert scalars == (scene["_SPIN_ITERS"],)
         live = [job for job in jobs if not job.ended]
         if len(live) == 2:
             retire(live.pop(0))
@@ -178,12 +205,31 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path, 
                 SimpleNamespace(
                     name=scene["_JOIN_SPAN"],
                     pid=4242,
-                    attrs=f"p_epoch={live[-1].epoch} s_epoch={job.epoch} observed=1 unfired=1 rc=0",
+                    attrs=(
+                        f"p_epoch={live[-1].epoch} p_disp={live[-1].epoch} p_slot={live[-1].slot} "
+                        f"s_epoch={job.epoch} s_disp={job.epoch} s_slot={job.slot} observed=1 unfired=1 rc=0"
+                    ),
                 )
             )
         jobs.append(job)
+        prefix.mkdir(parents=True, exist_ok=True)
+        (prefix / "dispatch_identity.json").write_text(
+            json.dumps(
+                {
+                    "run_id": job.epoch,
+                    "host_pid": 4242,
+                    "owner_instance_id": "controlled-owner",
+                    "endpoint_dispatch_id": job.epoch,
+                    "pipeline_slot": job.slot,
+                    "pipeline_generation": job.generation,
+                    "task_slot": job.epoch - 1,
+                    "group_index": 0,
+                    "group_size": 1,
+                }
+            )
+        )
         events.append(("submit", job.epoch))
-        return SimpleNamespace(wait=lambda: observe(job))
+        return SimpleNamespace(_run_id=job.epoch, wait=lambda: observe(job))
 
     def flush():
         assert len(jobs) == 6 and all(job.observed for job in jobs)
@@ -206,6 +252,7 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path, 
             "host_pid": 4242,
             "pipeline_slot": job.slot,
             "pipeline_generation": job.generation,
+            "endpoint_dispatch_id": job.epoch,
         }
 
     def allclose(actual, expected, **kwargs):
@@ -213,8 +260,27 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path, 
         tiles.append(actual.numel())
         return torch.allclose(actual, expected, **kwargs)
 
-    scene["torch"] = SimpleNamespace(frombuffer=tracked_frombuffer, allclose=allclose)
+    scene.update(
+        torch=SimpleNamespace(frombuffer=tracked_frombuffer, allclose=allclose),
+        gated_refill=gated_refill,
+        UnsettledSubmission=UnsettledSubmission,
+    )
+    from simpler.worker import _TASK_PROTOCOL_VERSION  # noqa: PLC0415
+
+    def activated(run_id, _timeout):
+        job = jobs[run_id - 1]
+        return {
+            "pid": 4242,
+            "identity": [_TASK_PROTOCOL_VERSION, run_id, job.slot, job.generation, run_id, run_id - 1, 0, 1],
+            "activated": 1,
+            "launched": 1,
+        }
+
+    trace = SimpleNamespace(
+        _paths={4242: None}, spans=lambda: spans, await_activation=activated, await_launch=activated
+    )
     case = SimpleNamespace(
+        _notify=SimpleNamespace(gate=Gate),
         RTOL=0,
         ATOL=0,
         _diagnostic_config=lambda prefix, **_kwargs: prefix,
@@ -225,22 +291,27 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path, 
         _wait_for_both_runs=lambda *_args, **_kwargs: spans,
     )
     worker = SimpleNamespace(
+        _config={"device_ids": [0]},
         create_buffer=lambda nbytes: SimpleNamespace(shm=SimpleNamespace(buf=bytearray(nbytes))),
         flush_diagnostics=flush,
     )
     if fail_at_flush:
         with pytest.raises(RuntimeError, match="injected diagnostic failure") as failure:
-            scene["_refill_owns_its_records"](case, worker, tmp_path / name, False, None)
+            scene["_refill_owns_its_records"](case, worker, tmp_path / name, False, trace)
         assert failure.value.__traceback__ is not None
         assert not any(ref() is not None for ref in tensor_refs), "traceback retained CPU tensor exports"
         return
     try:
-        scene["_refill_owns_its_records"](case, worker, tmp_path / name, False, None)
+        scene["_refill_owns_its_records"](case, worker, tmp_path / name, False, trace)
     except AssertionError as error:
         pytest.fail(f"{error}\ncontrolled two-credit/strong-observer events: {events}")
     assert tiles == [16384] * 6
     assert events.index(("submit", 6)) < events.index(("wait", 1))
     assert [epoch for event, epoch in events if event == "wait"] == list(range(1, 7))
+    if gates:
+        for epoch in range(1, len(gates) + 1):
+            assert events.index(("submit", epoch + 1)) < events.index(("release", epoch))
+            assert events.index(("release", epoch)) < events.index(("wait", 1))
 
 
 def _load_suite(name, relative_path, monkeypatch):
