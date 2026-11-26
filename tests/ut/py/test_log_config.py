@@ -44,6 +44,27 @@ def test_choices_are_single_axis():
         assert f"v{v}" not in LOG_LEVEL_CHOICES
 
 
+def test_concurrent_root_configuration_emits_one_line():
+    code = """
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from simpler_setup.log_config import configure_logging
+
+gate = Barrier(8)
+def configure(_):
+    gate.wait(timeout=5)
+    configure_logging("info")
+
+with ThreadPoolExecutor(8) as pool:
+    list(pool.map(configure, range(8)))
+assert len(logging.getLogger().handlers) == 1
+logging.getLogger("application").warning("once")
+"""
+    run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=15)
+    assert run.stderr.splitlines() == ["[WARNING] once"]
+
+
 def test_null_mutes_severity():
     configure_logging("null")
     sim = logging.getLogger("simpler")

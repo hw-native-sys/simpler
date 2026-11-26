@@ -63,8 +63,4 @@ def configure_logging(log_level: str | int = DEFAULT_LOG_LEVEL) -> None:
     simpler_logger.setLevel(level)
     # Ensure root has at least one handler so the message reaches stderr;
     # this matches the prior behaviour for first-time CLI invocations.
-    root = logging.getLogger()
-    if not root.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-        root.addHandler(handler)
+    logging.basicConfig(format="[%(levelname)s] %(message)s")
