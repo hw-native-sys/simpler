@@ -48,12 +48,19 @@ def test_task_payload_decode_preserves_scope_stats_config():
     assert payload.config.output_prefix == prefix.decode()
 
 
-def test_register_callable_command_round_trips_python_import_target():
+@pytest.mark.parametrize(
+    "registry, kind",
+    [
+        (RemoteRegistryTarget.REMOTE_TASK_DISPATCHER, CallableKind.PYTHON_IMPORT),
+        (RemoteRegistryTarget.REMOTE_CHIP_WORKER, CallableKind.CHIP_CALLABLE),
+    ],
+)
+def test_register_callable_command_round_trips_target(registry, kind):
     digest = b"\x12" * 32
     target = b"pkg.mod:remote_entry"
     encoded = encode_register_callable_command(
-        RemoteRegistryTarget.REMOTE_TASK_DISPATCHER,
-        CallableKind.PYTHON_IMPORT,
+        registry,
+        kind,
         digest,
         1,
         target,
@@ -61,8 +68,8 @@ def test_register_callable_command_round_trips_python_import_target():
 
     decoded = decode_register_callable_command(encoded)
 
-    assert decoded.target_registry == RemoteRegistryTarget.REMOTE_TASK_DISPATCHER
-    assert decoded.callable_kind == CallableKind.PYTHON_IMPORT
+    assert decoded.target_registry == registry
+    assert decoded.callable_kind == kind
     assert decoded.digest == digest
     assert decoded.payload_version == 1
     assert decoded.payload == target

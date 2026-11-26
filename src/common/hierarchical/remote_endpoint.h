@@ -48,7 +48,9 @@ public:
     );
     ~RemoteL3SocketTransport() override;
 
-    void expect_hello_ready(uint64_t session_id, int32_t worker_id, const std::string &comm_profile);
+    void expect_hello_ready(
+        uint64_t session_id, int32_t worker_id, const std::string &comm_profile, int32_t remote_worker_level = 3
+    );
     void submit_frame(const std::vector<uint8_t> &frame) override;
     std::vector<uint8_t> wait_for_reply(remote_l3::FrameType frame_type, uint64_t sequence) override;
     void submit_progress_frame(const std::vector<uint8_t> &frame) override;

@@ -155,6 +155,44 @@ On real hardware (`-p a2a3 -d 0-1`) device memory is a separate address space
 from host memory, but the runtime handles DMA transparently based on the
 `TensorArgType` tags — the user-side code is identical to sim.
 
+### Remote chips
+
+With `--remote-endpoint`, the same L3 dispatches to its local chips and to
+single-card L2 runners on another host. Add each remote chip with
+`worker.add_remote_chip(RemoteChipSpec(...))` before `init()`; its returned
+worker ID is the target passed to `orch.submit_next_level(...)`.
+
+Each remote chip has its own session, command TCP connection and health TCP
+connection. Inputs are sent inline; outputs use the remote-buffer copy API.
+The CHIP runtime handles the device uploads and output copies.
+
+Use the same source and built runtimes on both Linux hosts and a controlled
+internal network. The deployment must allocate two exclusive devices per
+host through its job queue or a dedicated device assignment. Use the device
+IDs from each host's allocation. Run the Host A example and the Host B
+daemon within their respective reservations and keep them active through
+shutdown. Replace `B_IP` with Host B's reachable numeric IPv4 address.
+
+On Host B, start the daemon:
+
+```bash
+python -m simpler.remote_l3_worker --host B_IP --port 19073
+```
+
+On Host A, dispatch to two local and two remote chips:
+
+```bash
+python examples/workers/l3/multi_chip_dispatch/main.py \
+  -p a2a3 -d 0-1 --remote-endpoint B_IP:19073 --remote-device 0-1
+```
+
+The example registers the same CHIP callable twice before `init()` and
+once after it. It releases one reference before each subsequent epoch and
+checks fresh vector-add results. Expect one
+`[remote_chip_dispatch] ... PASS` line per worker in each epoch.
+
+After the Host A command returns, stop the idle daemon on Host B.
+
 ## Common pitfalls
 
 - **Not using `share_memory_()`** → chip child sees zeros where it expects

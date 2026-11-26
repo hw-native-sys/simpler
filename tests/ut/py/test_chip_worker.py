@@ -239,6 +239,7 @@ def kernel_symbol_runtime(tmp_path_factory):
         progress=False,
         shared_storage=False,
         comm_admission=False,
+        startup_peer_gate=False,
     ):
         nonlocal next_library_id
         key = (
@@ -257,6 +258,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             progress,
             shared_storage,
             comm_admission,
+            startup_peer_gate,
         )
         # Fault scripts retain their consumed failure budget in the loaded DSO.
         if finalize_failures == 0 and not init_gate and key in cache:
@@ -309,7 +311,8 @@ def kernel_symbol_runtime(tmp_path_factory):
             "    gate_init = false; init_entered = true; init_changed.notify_all();\n"
             "    init_changed.wait(lock, [] { return init_released; });\n"
             "}\n"
-            "static int destroys = 0, closes = 0, borrowed_inits = 0, validation = 0;\n"
+            + ('extern "C" int test_startup_enter(int);\n' if startup_peer_gate else "")
+            + "static int destroys = 0, closes = 0, borrowed_inits = 0, validation = 0;\n"
             'extern "C" int test_destroys() { return destroys; }\n'
             'extern "C" int test_closes() { return closes; }\n'
             'extern "C" int test_borrowed_inits() { return borrowed_inits; }\n'
@@ -365,14 +368,15 @@ def kernel_symbol_runtime(tmp_path_factory):
             "        {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0}}};\n"
             "    return &contract;\n"
             "}\n"
-            "int simpler_init(DeviceContextHandle ctx, int, const uint8_t *, size_t, const uint8_t *, size_t,\n"
+            "int simpler_init(DeviceContextHandle ctx, int device_id, const uint8_t *, size_t,\n"
+            "                 const uint8_t *, size_t,\n"
             "                 const uint8_t *, size_t, const CallConfig *, int, const void *, uint64_t) {\n"
             "    auto *context = static_cast<Context *>(ctx);\n"
             "    ++program_inits; enter_init();\n"
             "    context->initialized = 1;\n"
             "    context->scratch = std::make_shared<Scratch>();\n"
-            f"    return {init_result};\n"
-            "}\n"
+            + ("    return test_startup_enter(device_id);\n" if startup_peer_gate else f"    return {init_result};\n")
+            + "}\n"
             + (
                 "int simpler_kernel_mode_supported(DeviceContextHandle ctx) {\n"
                 "    if (ctx == nullptr || static_cast<Context *>(ctx)->initialized != 0) std::abort();\n"
@@ -529,6 +533,11 @@ def kernel_symbol_runtime(tmp_path_factory):
                             std::this_thread::yield();
                         }
                         return 1;
+                    }
+                    extern "C" int test_startup_enter(int device_id) {
+                        if (device_id == 0) return test_progress_wait(38, 1, 10000) ? -71 : -72;
+                        test_progress_set(38, static_cast<int>(getpid()));
+                        return test_progress_wait(39, 1, 10000) ? 0 : -72;
                     }
                     struct ProgressRun {
                         uint64_t magic;
@@ -1773,6 +1782,100 @@ class TestWorkerNativeChip:
             assert len(captured) == 1
             assert not captured[0].initialized
             assert captured[0]._execution_environment is None
+
+    def test_chip_startup_shutdown_skips_callable_upload(self, kernel_symbol_runtime):
+        import simpler.worker as worker_module  # noqa: PLC0415
+
+        runtime = kernel_symbol_runtime(borrowed=True, memory=True)
+        observer = ctypes.CDLL(str(runtime))
+        registered, closed = observer.test_registrations(), observer.test_closes()
+        bins = SimpleNamespace(host_path=runtime, aicpu_path=os.devnull, aicore_path=os.devnull)
+        target = ChipCallable.build(signature=[], func_name="cancelled_startup", binary=b"\0", children=[])
+        mailbox = memoryview(bytearray(worker_module.mailbox_size(2)))
+        worker_module._request_child_shutdown(mailbox)
+        worker_module._chip_process_loop(
+            mailbox,
+            bins,
+            0,
+            {7: target},
+            {},
+            {},
+            worker_module.mint_owner_instance_id(),
+            worker_module.mint_owner_instance_id(),
+            worker_module.mint_owner_instance_id(),
+            platform="a2a3sim",
+            runtime="tensormap_and_ringbuffer",
+        )
+        assert observer.test_registrations() == registered
+        assert observer.test_closes() == closed + 1
+
+    def test_startup_abort_retains_initializing_device_child_until_cleanup(
+        self, monkeypatch, kernel_symbol_runtime, tmp_path
+    ):
+        import simpler.worker as worker_module  # noqa: PLC0415
+
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        events = tmp_path / "startup-events.log"
+        runtime = kernel_symbol_runtime(
+            borrowed=True, memory=True, progress=True, startup_peer_gate=True, lifecycle_log=events
+        )
+        control = ctypes.CDLL(str(runtime))
+        control.test_progress_set.argtypes = [ctypes.c_int, ctypes.c_int]
+        control.test_progress_get.argtypes = [ctypes.c_int]
+        assert control.test_progress_init() == 0
+        bins = SimpleNamespace(host_path=runtime, aicpu_path=os.devnull, aicore_path=os.devnull)
+        monkeypatch.setattr(RuntimeBuilder, "__init__", lambda *_: None)
+        monkeypatch.setattr(RuntimeBuilder, "get_binaries", lambda *_: bins)
+        monkeypatch.setattr(worker_module, "_ROLLBACK_GRACEFUL_TIMEOUT_S", 0.2)
+        owner = Worker(
+            level=3,
+            device_ids=[0, 1],
+            num_sub_workers=0,
+            platform="a2a3",
+            runtime="host_build_graph",
+            startup_timeout_s=20,
+        )
+        child_pid = None
+        try:
+            with pytest.raises(RuntimeError, match="failed with code -71"):
+                owner.init()
+            child_pid = control.test_progress_get(38)
+            assert child_pid > 0
+            os.kill(child_pid, 0)
+            assert owner._cleanup_journal.has_kind("child")
+            control.test_progress_set(39, 1)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if events.exists() and events.read_text().splitlines().count("context-destroyed") == 2:
+                    break
+                time.sleep(0.01)
+            assert events.read_text().splitlines().count("context-destroyed") == 2
+            while True:
+                try:
+                    owner.close()
+                except RuntimeError as exc:
+                    assert "still alive" in str(exc)
+                    assert time.monotonic() < deadline
+                    time.sleep(0.01)
+                else:
+                    break
+            assert owner._cleanup_journal.empty
+        finally:
+            control.test_progress_set(39, 1)
+            try:
+                owner.close()
+            finally:
+                # The fixture's CPU-only native context owns no physical device.
+                if child_pid:
+                    try:
+                        waited, _status = os.waitpid(child_pid, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+                    else:
+                        if waited == 0:
+                            os.kill(child_pid, signal.SIGKILL)
+                            os.waitpid(child_pid, 0)
 
     def test_direct_worker_owns_native_chip_without_public_wrapper(self, monkeypatch, kernel_symbol_runtime):
         import simpler.worker as worker_module  # noqa: PLC0415

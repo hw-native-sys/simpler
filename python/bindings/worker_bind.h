@@ -111,6 +111,7 @@ inline TargetNamespace parse_target_namespace(const std::string &target_namespac
 inline remote_l3::RemoteRegistryTarget parse_remote_registry_target(const std::string &target_registry) {
     if (target_registry == "REMOTE_TASK_DISPATCHER") return remote_l3::RemoteRegistryTarget::REMOTE_TASK_DISPATCHER;
     if (target_registry == "INNER_L3_WORKER") return remote_l3::RemoteRegistryTarget::INNER_L3_WORKER;
+    if (target_registry == "REMOTE_CHIP_WORKER") return remote_l3::RemoteRegistryTarget::REMOTE_CHIP_WORKER;
     throw std::invalid_argument("unsupported remote registry target: " + target_registry);
 }
 
@@ -647,16 +648,17 @@ inline void bind_worker(nb::module_ &m) {
             "add_remote_l3_socket",
             [](Worker &self, int32_t worker_id, uint64_t session_id, const std::string &transport_name,
                const std::string &host, uint16_t port, const std::string &health_host, uint16_t health_port,
-               double attach_timeout_s, double runtime_timeout_s) {
+               double attach_timeout_s, double runtime_timeout_s, int32_t remote_worker_level) {
                 nb::gil_scoped_release release;
                 self.add_remote_l3_socket(
                     worker_id, session_id, transport_name, host, port, health_host, health_port, attach_timeout_s,
-                    runtime_timeout_s
+                    runtime_timeout_s, remote_worker_level
                 );
             },
             nb::arg("worker_id"), nb::arg("session_id"), nb::arg("transport_name"), nb::arg("host"), nb::arg("port"),
             nb::arg("health_host"), nb::arg("health_port"), nb::arg("attach_timeout_s") = 30.0,
-            nb::arg("runtime_timeout_s") = 30.0, "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
+            nb::arg("runtime_timeout_s") = 30.0, nb::arg("remote_worker_level") = 3,
+            "Register a remote endpoint after the session reports HELLO READY."
         )
         .def(
             "add_mpi_group_mailbox",

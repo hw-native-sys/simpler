@@ -1525,6 +1525,14 @@ void Orchestrator::validate_remote_sidecars(
         const TaskArgs &args = args_list[g];
         const RemoteTaskArgsSidecar &sidecar = remote_sidecars[g];
         if (sidecar.empty() && args.tensor_count() == 0) continue;
+        if (sidecar.empty() && manager_ != nullptr && !eligible_worker_ids[g].empty()) {
+            const bool local_only =
+                std::all_of(eligible_worker_ids[g].begin(), eligible_worker_ids[g].end(), [this](int32_t worker_id) {
+                    const auto *worker = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+                    return worker != nullptr && !worker->caps().remote;
+                });
+            if (local_only) continue;
+        }
         if (sidecar.tensors.size() != static_cast<size_t>(args.tensor_count())) {
             throw std::invalid_argument("Orchestrator: remote sidecar tensor count does not match TaskArgs");
         }

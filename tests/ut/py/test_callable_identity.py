@@ -18,6 +18,8 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from multiprocessing.shared_memory import SharedMemory
 from typing import cast
 
@@ -68,6 +70,7 @@ from simpler.task_interface import (
 )
 from simpler.worker import (
     RemoteCallable,
+    RemoteChipSpec,
     RemoteWorkerSpec,
     Worker,
     _pack_py_callable_payload,
@@ -2856,6 +2859,86 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
         assert fake.calls.count(("free", worker_id, 7, 1)) == free_count + 1
     finally:
         worker.close()
+
+
+@pytest.mark.parametrize("operation", ["register", "unregister"])
+def test_remote_chip_registry_serializes_same_digest(operation):
+    prepared_event = threading.Event()
+    allow_commit = threading.Event()
+    contender_started = threading.Event()
+
+    class FakeRemoteChip:
+        def __init__(self):
+            self.prepared = set()
+            self.ref_count = 0
+            self.pause_prepare = False
+
+        def remote_prepare_register(self, worker_id, _registry, _kind, _payload, digest):
+            assert digest not in self.prepared, "overlapping prepares for the same digest"
+            self.prepared.add(digest)
+            if self.pause_prepare:
+                self.pause_prepare = False
+                prepared_event.set()
+                assert allow_commit.wait(5)
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_commit_register(self, worker_id, _registry, _kind, digest):
+            self.prepared.remove(digest)
+            self.ref_count += 1
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_unregister(self, worker_id, _registry, _kind, digest):
+            self.prepared.discard(digest)
+            self.ref_count -= 1
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_abort_register(self, worker_id, _registry, _kind, digest):
+            self.prepared.discard(digest)
+            return _FakeRemoteControlResult(worker_id)
+
+        def broadcast_register_all(self, *_args):
+            return []
+
+        def broadcast_unregister_all(self, *_args):
+            return []
+
+    worker = Worker(level=3, device_ids=[0], num_sub_workers=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
+    worker.add_remote_chip(RemoteChipSpec(endpoint="127.0.0.1:19073", platform="a2a3sim", device_id=1))
+    fake = FakeRemoteChip()
+    worker._worker = fake  # type: ignore[assignment]
+    worker._lifecycle = worker_mod._Lifecycle.READY
+    chip = ChipCallable.build(signature=[], func_name="x", binary=b"\x01", children=[])
+    previous = worker.register(chip) if operation == "unregister" else None
+
+    def compete():
+        contender_started.set()
+        if previous is not None:
+            worker.unregister(previous)
+            return None
+        return worker.register(chip)
+
+    fake.pause_prepare = True
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(worker.register, chip)
+        try:
+            assert prepared_event.wait(5)
+            second = executor.submit(compete)
+            assert contender_started.wait(5)
+            with pytest.raises(FutureTimeoutError):
+                second.result(timeout=0.2)
+        finally:
+            allow_commit.set()
+        registered = first.result(timeout=5)
+        other = second.result(timeout=5)
+
+    assert not fake.prepared
+    assert registered.digest not in worker._uncertain_hashids
+    assert fake.ref_count == (2 if operation == "register" else 1)
+    worker.unregister(registered)
+    if other is not None:
+        assert other.digest == registered.digest
+        worker.unregister(other)
+    assert fake.ref_count == 0
 
 
 def test_remote_register_prepare_exception_marks_hash_uncertain():
