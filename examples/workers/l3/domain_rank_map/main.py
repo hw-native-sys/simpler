@@ -240,7 +240,7 @@ def run(platform: str, device_ids: list[int]) -> int:
                 got = outputs[domain_name][worker_idx]
                 max_diff = float(torch.max(torch.abs(got - expected_tensor)))
                 print(f"[domain_rank_map] {domain_name} worker {worker_idx}: max_diff={max_diff:.3e}")
-                if max_diff > 1e-3:
+                if not max_diff <= 1e-3:
                     ok = False
 
         if not ok:

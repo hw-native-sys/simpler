@@ -42,6 +42,7 @@ import argparse
 import contextlib
 import struct
 
+from simpler_setup.goldens import max_abs_error
 from simpler.task_interface import (
     CallConfig,
     CommBufferSpec,
@@ -188,7 +189,7 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
         expected = _expected_values(member_count)
         failed_ranks: list[int] = []
         for domain_rank, result in enumerate(observed):
-            max_diff = max(abs(actual - wanted) for actual, wanted in zip(result, expected))
+            max_diff = max_abs_error(actual - wanted for actual, wanted in zip(result, expected))
             node_id, local_index = members[domain_rank]
             print(
                 f"[global-tload-mpirun-l3] domain_rank={domain_rank} "

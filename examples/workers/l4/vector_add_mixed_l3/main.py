@@ -33,6 +33,7 @@ from simpler.task_interface import (
 )
 from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
 
+from simpler_setup.goldens import max_abs_error
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
@@ -227,7 +228,7 @@ def _check_outputs(worker_label: str, output_map: dict[str, tuple[Any, float]]) 
     a name still holding one when ``worker.close()`` runs blocks the shm release.
     """
     for name, (output_array, expected) in output_map.items():
-        max_diff = max(abs(float(output_array[index]) - expected) for index in range(ELEMENTS))
+        max_diff = max_abs_error(float(output_array[index]) - expected for index in range(ELEMENTS))
         print(f"[vector-add-mixed-l3] {worker_label} output={name} max_diff={max_diff:.3e}")
         if max_diff > 1e-4:
             raise AssertionError(f"{worker_label} {name} golden mismatch: max_diff={max_diff}")

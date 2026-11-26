@@ -35,6 +35,7 @@ from simpler.task_interface import (
 )
 from simpler.worker import RemoteCallable
 
+from simpler_setup.goldens import max_abs_error
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
@@ -169,7 +170,7 @@ def controller(context) -> None:
         for worker_id, handles in task_inputs.items():
             output, wanted = expected[worker_id]
             worker.remote_copy_from(handles[2], output, NBYTES)
-            max_diff = max(abs(float(output[index]) - wanted) for index in range(ELEMENTS))
+            max_diff = max_abs_error(float(output[index]) - wanted for index in range(ELEMENTS))
             if max_diff > 1e-5:
                 raise AssertionError(f"worker {worker_id} vector result mismatch: max_diff={max_diff}")
         print("vector_add_mpi_direct_l3 passed")

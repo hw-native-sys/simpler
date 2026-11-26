@@ -32,6 +32,7 @@ from simpler.task_interface import (
 )
 from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
 
+from simpler_setup.goldens import max_abs_error
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
@@ -260,7 +261,7 @@ def run(
         expected = _expected_values(len(RANK_LABELS))
         failed_ranks: list[int] = []
         for rank, result in enumerate(observed):
-            max_diff = max(abs(actual - wanted) for actual, wanted in zip(result, expected))
+            max_diff = max_abs_error(actual - wanted for actual, wanted in zip(result, expected))
             print(f"[global-tload-mixed-l3] {RANK_LABELS[rank]} rank={rank} max_diff={max_diff:.3e}")
             if max_diff > 1e-3:
                 failed_ranks.append(rank)

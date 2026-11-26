@@ -7,3 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """Shared golden reference compute modules for scene tests and examples."""
+
+import math
+from collections.abc import Iterable
+
+
+def max_abs_error(differences: Iterable[float]) -> float:
+    """Return the worst absolute error against finite golden values."""
+    return max(abs(delta) if math.isfinite(delta) else math.inf for delta in differences)
