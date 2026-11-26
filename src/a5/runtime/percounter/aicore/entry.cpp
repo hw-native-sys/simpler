@@ -17,16 +17,18 @@
  * into this runtime at all — neither it nor the legacy executor beside it has
  * a path this runtime can reach.
  *
- * Weak like the one it stands in for: every AICore source is compiled once for
- * AIC and once for AIV, and the two objects are combined, so a strong
- * definition here would collide with its own other half.
+ * The device linker keeps one copy of this weak entry for both core types.
+ * Each executor has a distinct instantiation so dispatch reaches code
+ * compiled for the caller's core.
  */
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
-#include "lane_loop.h"
 #include "runtime.h"
 #include "scheduler/gm.h"
+
+template <CoreType Architecture>
+__aicore__ void percounter_execute_unprofiled(__gm__ Runtime *runtime, int block_idx);
 
 template <CoreType Architecture>
 __aicore__ void percounter_execute_profiled(__gm__ Runtime *runtime, int block_idx);
@@ -50,5 +52,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     } else if (runtime->dev.chip_swimlane_level == 2) {
         if (core_type == CoreType::AIC) percounter_execute_task_profiled<CoreType::AIC>(runtime, block_idx);
         else percounter_execute_task_profiled<CoreType::AIV>(runtime, block_idx);
-    } else simpler::percounter::percounter_aicore_execute(runtime, block_idx, core_type);
+    } else {
+        if (core_type == CoreType::AIC) percounter_execute_unprofiled<CoreType::AIC>(runtime, block_idx);
+        else percounter_execute_unprofiled<CoreType::AIV>(runtime, block_idx);
+    }
 }

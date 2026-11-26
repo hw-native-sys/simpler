@@ -8,7 +8,21 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for the runtime pre-build entry point."""
 
+import subprocess
+
 import pytest
+
+
+def test_a5_percounter_image_keeps_separate_unprofiled_executors():
+    from simpler_setup.environment import PROJECT_ROOT  # noqa: PLC0415
+
+    image = PROJECT_ROOT / "build/lib/a5/onboard/percounter/aicore_kernel.o"
+    if not image.is_file():
+        pytest.skip("requires the A5 onboard Percounter image")
+
+    symbols = subprocess.check_output(["nm", "-C", "--defined-only", image], text=True)
+    entries = {line.split()[0] for line in symbols.splitlines() if " percounter_execute_unprofiled<" in line}
+    assert len(entries) == 2, "AIC and AIV must have distinct L0/L1 executor addresses in the linked image"
 
 
 def test_build_all_prebuilds_sim_context_once(monkeypatch, tmp_path):
