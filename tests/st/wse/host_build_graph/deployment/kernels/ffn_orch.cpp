@@ -44,6 +44,8 @@ void layer(const GraphTaskArgs &a, const Deployment &deployment) {
                 if (deployment.mode == 3) placement.core_id = 40;
                 if (deployment.mode == 4) placement.thread_pes[3] = placement.thread_pes[0];
                 launch.placement.push_back(std::move(placement));
+            } else {
+                launch.placement.emplace_back(core);
             }
             auto &v = views[b];
             if (stage == 1) {

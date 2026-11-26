@@ -13,7 +13,7 @@
 #include "launch_spec.h"
 
 static inline TaskOutputTensors
-rt_submit_wse_task(int32_t kernel_id, const CoreTaskArgs &args, const WseLaunchSpec &launch = {}) {
+rt_submit_wse_task(int32_t kernel_id, const CoreTaskArgs &args, const WseLaunchSpec &launch) {
     auto *ctx = current_orch_context();
     if (ctx->ops->is_fatal(ctx)) return {};
     return static_cast<const WseOrchOps *>(ctx->ops)->submit_wse(ctx, kernel_id, args, launch);

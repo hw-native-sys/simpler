@@ -37,7 +37,7 @@ def build_graph(platform, *, independent=False):
     )
 
 
-def run_graph(worker, handle, path, instances, *, independent=False, first_core=0):
+def run_graph(worker, handle, path, instances, *, graph_variant=None, first_core=0):
     args = TaskArgs()
     views = []
     outputs = []
@@ -54,7 +54,8 @@ def run_graph(worker, handle, path, instances, *, independent=False, first_core=
                 )
                 if index >= len(inputs):
                     outputs.append((tensor, view, golden[index - len(inputs)]))
-        args.add_scalar(int(independent))
+        if graph_variant is not None:
+            args.add_scalar(graph_variant)
         config = CallConfig()
         config.output_prefix = str(path)
         config.enable_dep_gen = True
@@ -66,7 +67,6 @@ def run_graph(worker, handle, path, instances, *, independent=False, first_core=
         for view in views:
             release_view(worker, view)
     header, *events = [json.loads(line) for line in (path / "wse_events.jsonl").read_text().splitlines()]
-    assert header["expected_tasks"] == 5 * len(instances)  # Enter, three kernel tasks, exit per Graph.
     return header, events
 
 
@@ -74,31 +74,32 @@ def assert_calendar_matches_dispatch(path, header, events):
     calendar = json.loads((path / "calendar.json").read_text())
     assert calendar["epoch"] == header["epoch"]
     assert len(calendar["cores"]) == header["core_count"]
-    starts = sorted((e for e in events if e["kind"] == BLOCK_BEGIN), key=lambda e: e["seq"])
+    block_events = sorted((e for e in events if e["kind"] in (BLOCK_BEGIN, BLOCK_END)), key=lambda e: e["seq"])
     for core, rows in enumerate(calendar["cores"]):
-        order = [(e["task"], e["block"]) for e in starts if e["core"] == core]
-        assert [(row["task"], row["block"]) for row in rows] == order
+        actual = [(e["kind"], e["task"], e["block"]) for e in block_events if e["core"] == core]
+        expected = [(kind, row["task"], row["block"]) for row in rows for kind in (BLOCK_BEGIN, BLOCK_END)]
+        assert actual == expected
         ticks = [row["tick"] for row in rows]
         assert all(before < after for before, after in zip(ticks, ticks[1:]))
     return calendar["waits"]
 
 
-def assert_fan_out_and_join(events, branches, first_task):
+def assert_fan_out_and_join(events, first_task):
     # Compare events using IDs local to this invocation. Independent Graphs can interleave.
     events = [dict(e, task=e["task"] - first_task) for e in events if first_task <= e["task"] < first_task + 5]
     begins = {(e["task"], e["block"]): e for e in events if e["kind"] == BLOCK_BEGIN}
     ends = {(e["task"], e["block"]): e for e in events if e["kind"] == BLOCK_END}
     done = {e["task"]: e["seq"] for e in events if e["kind"] == TASK_DONE}
-    expected = {(1, 0), (3, 0)} | {(2, b) for b in range(branches)}
-    assert begins.keys() == ends.keys() == expected
-    assert sum(e["kind"] == BLOCK_BEGIN for e in events) == sum(e["kind"] == BLOCK_END for e in events) == len(expected)
+    expected_cores = {(1, 0): 7, (2, 0): 6, (2, 1): 2, (2, 2): 6, (2, 3): 1, (3, 0): 3}
+    assert begins.keys() == ends.keys() == expected_cores.keys()
+    for kind in (BLOCK_BEGIN, BLOCK_END):
+        assert sum(e["kind"] == kind for e in events) == len(expected_cores)
     assert sum(e["kind"] == TASK_DONE for e in events) == len(done) == 5
-    assert done[0] < begins[1, 0]["seq"] < ends[1, 0]["seq"] < done[1]
-    for block in range(branches):
-        begin, end = begins[2, block], ends[2, block]
-        assert begin["core"] == end["core"] == block
-        assert done[1] < begin["seq"] < end["seq"] < done[2]
-    assert done[2] < begins[3, 0]["seq"] < ends[3, 0]["seq"] < done[3] < done[4]
+    for (task, block), core in expected_cores.items():
+        begin, end = begins[task, block], ends[task, block]
+        assert begin["core"] == end["core"] == core
+        assert done[task - 1] < begin["seq"] < end["seq"] < done[task]
+    assert done[3] < done[4]
 
 
 def test_native_graph_one_to_many_to_one(tmp_path, st_platform):
@@ -117,10 +118,11 @@ def test_native_graph_one_to_many_to_one(tmp_path, st_platform):
                 joined = torch.relu((branches @ weights).sum(dim=0))
                 instances.append(([x, weights], [seed, branches, joined]))
             path = tmp_path / str(repeat)
-            header, events = run_graph(worker, handle, path, instances, first_core=repeat)
+            header, events = run_graph(worker, handle, path, instances, graph_variant=0, first_core=repeat)
+            assert header["expected_tasks"] == 5 * len(instances)
             waits = assert_calendar_matches_dispatch(path, header, events)
             for first_task in (0, 5):
-                assert_fan_out_and_join(events, len(weights), first_task)
+                assert_fan_out_and_join(events, first_task)
                 assert first_task + 1 in waits[first_task + 2] and first_task + 2 in waits[first_task + 3]
             shells = json.loads((path / "deps.json").read_text())["tasks"]
             assert len(shells) == 2
@@ -142,12 +144,42 @@ def test_ready_critical_path_precedes_independent_leaf(tmp_path, st_platform):
         weight = torch.tensor([[[2, 1], [-1, 3]]]).float()
         first = torch.relu(x @ weight[0])
         golden = [first, first, torch.relu(first @ weight[0])]
-        header, events = run_graph(worker, handle, tmp_path, [([x, weight], golden)], independent=True)
-        starts = sorted((e["seq"], e["task"], e["core"]) for e in events if e["kind"] == BLOCK_BEGIN)
-        assert len(starts) == 3 and all(core == 0 for _, _, core in starts)
-        assert starts[0][1] == 2  # Task 1 is the leaf. Task 2 unlocks task 3 on the same Core.
+        header, events = run_graph(worker, handle, tmp_path, [([x, weight], golden)], graph_variant=1)
+        assert header["expected_tasks"] == 5
+        starts = sorted((e for e in events if e["kind"] == BLOCK_BEGIN), key=lambda e: e["seq"])
+        assert sorted((e["task"], e["block"], e["core"]) for e in starts) == [(1, 0, 0), (2, 0, 0), (3, 0, 0)]
+        assert starts[0]["task"] == 2  # Task 1 is the leaf. Task 2 unlocks task 3 on the same Core.
         waits = assert_calendar_matches_dispatch(tmp_path, header, events)
         assert 2 in waits[3]
+        worker.unregister(handle)
+    finally:
+        worker.close()
+
+
+def test_native_graph_and_top_level_dependency_only_tasks(tmp_path, st_platform):
+    worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
+    try:
+        worker.init()
+        handle = worker.register(
+            build_callable(
+                st_platform,
+                Path(__file__).parent / "kernels",
+                "control_graph.cpp",
+                [D.IN, D.IN, D.OUT],
+                [("fused.cpp", [D.IN, D.IN, D.OUT, D.IN])],
+            )
+        )
+        x = torch.tensor([[1, -3], [2, 1]]).float()
+        weight = torch.tensor([[2, 1], [-1, 2]]).float()
+        header, events = run_graph(worker, handle, tmp_path, [([x, weight], [torch.relu(x @ weight)])])
+        # Enter → SS → inner dummy → exit → top-level dummy.
+        assert header["expected_tasks"] == 5
+        waits = assert_calendar_matches_dispatch(tmp_path, header, events)
+        assert waits == [[], [0], [1], [2], [3]]
+        starts = [(e["task"], e["block"], e["core"]) for e in events if e["kind"] == BLOCK_BEGIN]
+        assert starts == [(1, 0, 7)]
+        done = sorted((e["seq"], e["task"]) for e in events if e["kind"] == TASK_DONE)
+        assert [task for _, task in done] == [0, 1, 2, 3, 4]
         worker.unregister(handle)
     finally:
         worker.close()

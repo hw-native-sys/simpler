@@ -26,7 +26,9 @@ void graph(const GraphTaskArgs &a, const Config &config) {
         task.add_scalar(stage);
         task.launch_spec.set_block_num(a.tensor(0).ref().shapes[0]);
         WseLaunchSpec launch;
-        if (config.skew) launch.placement.assign(task.launch_spec.block_num(), WseBlockPlacement{1, {0}});
+        const uint32_t cores = rt_available_core_count();
+        for (int32_t block = 0; block < task.launch_spec.block_num(); ++block)
+            launch.placement.emplace_back(config.skew ? 1U : block % cores);
         rt_submit_wse_task(0, task, launch);
     }
 }

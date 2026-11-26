@@ -1,0 +1,64 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#include <cstdio>
+#include "launch.h"
+
+namespace {
+struct Wire {
+    WseGraphDescriptor descriptor{};
+    WseNodePlan node{};
+    WseBlockPlan placement{};
+    uint32_t indices[3]{0, 1, 1};
+    wse::CalendarRow row{0, 0, 0};
+};
+
+void kernel(int64_t *) {}
+}  // namespace
+
+int main() {
+    alignas(128) std::byte tasks[SCHEDULER_GRAPH_TASK_STORAGE_STRIDE]{};
+    alignas(128) std::byte sram[2][16384]{};
+    wse::SramRegion regions[2];
+    for (size_t c = 0; c < 2; ++c) {
+        const auto base = reinterpret_cast<uintptr_t>(sram[c]);
+        regions[c] = {base, sizeof(sram[c]), sizeof(sram[c]) / 2, base + sizeof(sram[c]) / 2};
+    }
+
+    Wire wire;
+    auto &descriptor = wire.descriptor;
+    descriptor.graph = scheduler_ordinary_graph_view(reinterpret_cast<uintptr_t>(tasks), 1, 0);
+    descriptor.nodes_address = reinterpret_cast<uintptr_t>(&wire.node);
+    descriptor.descriptor_bytes = sizeof(wire);
+    descriptor.expected_tasks = descriptor.calendar_row_count = 1;
+    descriptor.calendar_core_count = 2;
+    descriptor.calendar_indices_offset = offsetof(Wire, indices);
+    descriptor.calendar_rows_offset = offsetof(Wire, row);
+    wire.node.entry = reinterpret_cast<uintptr_t>(kernel);
+    wire.node.blocks = wire.node.block_plan_count = 1;
+    wire.node.block_plans_offset = offsetof(Wire, placement);
+    wire.placement.core_id = 0;
+    wire.placement.thread_num = 1;
+
+    const auto admit = [&](const char *name) {
+        char error[256]{};
+        auto *run = wse_create_run(&descriptor, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
+        std::printf("%s %s\n", name, run ? "accepted" : "rejected");
+        if (!run) std::fprintf(stderr, "%s\n", error);
+        wse_destroy_run(run);
+    };
+    admit("explicit_core_0");
+    wire.indices[1] = 0;  // Move the calendar row to Core 1, keeping its explicit Core 0 placement.
+    admit("wrong_calendar_core");
+    wire.indices[1] = 1;
+    wire.node.block_plan_count = 0;
+    wire.node.block_plans_offset = 0;
+    admit("missing_placement");
+}

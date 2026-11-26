@@ -176,3 +176,32 @@ def test_executor_rejects_missing_memory_sections_before_create(tmp_path, st_pla
         assert not marker.exists(), "an incomplete PE executor reached run creation"
     finally:
         worker.close()
+
+
+def test_pe_requires_explicit_core_matching_calendar_row(tmp_path, st_platform):
+    compiler = KernelCompiler(st_platform)
+    binaries = RuntimeBuilder(st_platform).get_binaries("host_build_graph")
+    assert binaries.sim_context_path is not None
+    libraries = [binaries.aicore_path, binaries.sim_context_path]
+    probe = tmp_path / "pe-admission"
+    subprocess.run(
+        [
+            compiler.gxx15.cxx_path,
+            "-std=c++17",
+            "-D__CPU_SIM",
+            *(f"-I{path}" for path in compiler.get_orchestration_include_dirs("host_build_graph")),
+            str(Path(__file__).parent / "calendar/pe_admission.cpp"),
+            *(str(path) for path in libraries),
+            *(f"-Wl,-rpath,{path.parent}" for path in libraries),
+            "-o",
+            str(probe),
+        ],
+        check=True,
+        timeout=60,
+    )
+    result = subprocess.run([str(probe)], capture_output=True, text=True, timeout=60, check=True)
+    assert result.stdout.splitlines() == [
+        "explicit_core_0 accepted",
+        "wrong_calendar_core rejected",
+        "missing_placement rejected",
+    ], result.stderr

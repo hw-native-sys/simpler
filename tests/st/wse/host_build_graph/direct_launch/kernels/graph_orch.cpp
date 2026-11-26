@@ -13,8 +13,12 @@ namespace {
 void layer(const GraphTaskArgs &args) {
     CoreTaskArgs task;
     task.add_inout(args.tensor(0).ref());
-    task.launch_spec.set_block_num(rt_available_core_count());
-    rt_submit_wse_task(0, task);
+    const uint32_t cores = rt_available_core_count();
+    task.launch_spec.set_block_num(cores);
+    WseLaunchSpec launch;
+    for (uint32_t core = 0; core < cores; ++core)
+        launch.placement.emplace_back(core);
+    rt_submit_wse_task(0, task, launch);
 }
 }  // namespace
 extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {

@@ -29,6 +29,7 @@ void protocol(const GraphTaskArgs &args) {
         launch.thread_num = 2;
         task.launch_spec.set_block_num(split ? 1 : 2);
         if (split) launch.placement = {{static_cast<uint32_t>(child), {0, 1}}};
+        else launch.placement = {{0}, {1}};
         rt_submit_wse_task(split ? child + 1 : 0, task, launch);
     }
 }

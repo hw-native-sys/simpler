@@ -8,30 +8,37 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include <cstdint>
+#include <initializer_list>
 #include "orchestration_api.h"
 
 namespace {
-void submit_ss(const GraphTaskArgs &args, int input, int output, int block_count = 1, int tiles_per_block = 1) {
+void submit_ss(
+    const GraphTaskArgs &args, int input, int output, std::initializer_list<uint32_t> core_ids, int tiles_per_block = 1
+) {
     CoreTaskArgs task;
     task.add_input(args.tensor(input).ref());
     task.add_input(args.tensor(1).ref());
     task.add_output(args.tensor(output).ref());
     task.add_scalar(tiles_per_block);
-    task.launch_spec.set_block_num(block_count);
-    rt_submit_wse_task(0, task);
+    task.launch_spec.set_block_num(core_ids.size());
+    WseLaunchSpec launch;
+    for (uint32_t core : core_ids)
+        launch.placement.push_back({core});
+    rt_submit_wse_task(0, task, launch);
 }
 
 void fan_out_and_join(const GraphTaskArgs &args) {
-    constexpr int branches = 4;
-    submit_ss(args, 0, 2);
-    submit_ss(args, 2, 3, branches);
-    submit_ss(args, 3, 4, 1, branches);
+    const std::initializer_list<uint32_t> branch_cores{6, 2, 6, 1};
+    submit_ss(args, 0, 2, {7});
+    submit_ss(args, 2, 3, branch_cores);
+    submit_ss(args, 3, 4, {3}, branch_cores.size());
 }
 
 void independent_leaf_and_chain(const GraphTaskArgs &args) {
-    submit_ss(args, 0, 2);  // Independent leaf, submitted first.
-    submit_ss(args, 0, 3);  // The other ready node feeds the final SS.
-    submit_ss(args, 3, 4);
+    submit_ss(args, 0, 2, {0});  // Independent leaf, submitted first.
+    submit_ss(args, 0, 3, {0});  // The other ready node feeds the final SS.
+    submit_ss(args, 3, 4, {0});
 }
 }  // namespace
 

@@ -712,73 +712,25 @@ static TaskOutputTensors submit_task_common(
     return result;
 }
 
-TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
-    return wse::submit_task_with_dependencies(this, mixed_kernels, args, nullptr);
+TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &, const CoreTaskArgs &) {
+    if (!is_fatal())
+        report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+            "WSE SS/SPMD requires rt_submit_wse_task with one explicit Core ID per Block"
+        );
+    return {};
 }
 
-TaskOutputTensors wse::submit_task_with_dependencies(
-    OrchestratorState *orch, const MixedKernels &mixed_kernels, const CoreTaskArgs &args, const DepInputs *dependencies
+TaskOutputTensors wse::submit_placed_task(
+    OrchestratorState *orch, int32_t kernel, const CoreTaskArgs &args, const DepInputs &dependencies
 ) {
-    if (!require_device_arguments(orch, args)) return {};
+    if (orch->is_fatal() || !require_device_arguments(orch, args)) return {};
 
-    // Orchestration API should short-circuit after fatal, but keep this entry
-    // robust as a no-op in case a caller reaches it directly.
-    if (orch->is_fatal()) {
-        return TaskOutputTensors{};
-    }
-
-    // Validate Arg construction (errors recorded by add_input/add_output/etc.)
-    if (args.has_error()) {
-        LOG_ERROR("========================================");
-        LOG_ERROR("FATAL: Invalid Arg Detected!");
-        LOG_ERROR("========================================");
-        LOG_ERROR("Error: %s", args.error_msg() ? args.error_msg() : "(unknown)");
-        LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
-        LOG_ERROR("This is a bug in the orchestration code.");
-        LOG_ERROR("========================================");
-        orch_mark_fatal(orch, SIMPLER_ERROR_INVALID_ARGS);
-        return TaskOutputTensors{};
-    }
-    // === Validate submit inputs ===
-    LaneMask active_mask = mixed_kernels.to_lanes();
-    if (active_mask.is_empty()) {
-        orch->report_fatal(SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "WSE submission requires an SS kernel entry");
-        return TaskOutputTensors{};
-    }
-
-    int16_t block_num = args.launch_spec.block_num();
-
-    // The shared Graph format uses AIV0 for a lone vector entry. WSE bind
-    // resolves the occupied slot to the SS entry for the Block.
-    MixedKernels normalized = mixed_kernels;
-    bool has_aic = active_mask.has_aic();
-    bool has_aiv0 = active_mask.has_aiv0();
-    bool has_aiv1 = active_mask.has_aiv1();
-    if (!has_aic && has_aiv1 && !has_aiv0) {
-        normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
-        normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
-        active_mask = normalized.to_lanes();
-    }
-
+    // The shared Graph image carries the single SS kernel entry in its first slot.
+    const auto active_mask = LaneMask::aic();
     TaskAttrs task_attrs;
     task_attrs.set_early_resolve(args.allow_early_resolve());
     task_attrs.set_timing_slot(args.task_timing_slot());
-
-    // sync_start is only meaningful for tasks with block_num > 1.
-    if (block_num > 1 && args.launch_spec.require_sync_start()) {
-        // Validate the shared launch description before WSE bind.
-        ResourceShape shape = active_mask.to_shape();
-        int32_t limit = (shape == ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
-        if (limit > 0 && block_num > limit) {
-            orch->report_fatal(
-                SIMPLER_ERROR_REQUIRE_SYNC_START_INVALID, __FUNCTION__,
-                "require_sync_start block_num=%d > limit=%d (deadlock guaranteed)", block_num, limit
-            );
-            return TaskOutputTensors{};
-        }
-        task_attrs.set_sync_start();
-    }
-
     if (args.predicate().op != PredicateOp::NONE) {
         const auto *operand = args.predicate().operand.tensor;
         if (operand != nullptr && operand->address_space != AddressSpace::DEVICE) {
@@ -790,14 +742,12 @@ TaskOutputTensors wse::submit_task_with_dependencies(
 
     if (active_graph_recording(orch) != nullptr) {
         return wse::graph_record_submit_with_dependencies(
-            orch, args, active_mask, task_attrs, normalized.aic_kernel_id, normalized.aiv0_kernel_id,
-            normalized.aiv1_kernel_id, dependencies
+            orch, args, active_mask, task_attrs, kernel, INVALID_KERNEL_ID, INVALID_KERNEL_ID, &dependencies
         );
     }
 
     return submit_task_common(
-        orch, args, active_mask, task_attrs, normalized.aic_kernel_id, normalized.aiv0_kernel_id,
-        normalized.aiv1_kernel_id, dependencies
+        orch, args, active_mask, task_attrs, kernel, INVALID_KERNEL_ID, INVALID_KERNEL_ID, &dependencies
     );
 }
 
