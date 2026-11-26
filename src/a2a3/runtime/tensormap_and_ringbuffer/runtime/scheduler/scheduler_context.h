@@ -475,6 +475,24 @@ private:
         bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
     );
 
+    enum class FirstQueueState { Open, Inspecting, Local };
+    enum class WaveState { WaitForIdle, Publish, Fallback };
+    // Positive block counts select the capacity drain. A logical block count fits in int16_t.
+    static constexpr int32_t WAVE_GATE = INT32_MAX;
+    std::atomic<FirstQueueState> wave_first_{FirstQueueState::Open};
+    std::atomic<WaveState> wave_state_{WaveState::WaitForIdle};
+    std::atomic<unsigned> wave_arrived_{0};
+    struct alignas(64) WaveLocal {
+        uint64_t seen{}, ready{}, sent{};  // Drain generation last observed, acknowledged idle, and published.
+        CoreTracker::BitStates waiting{};
+    };
+    WaveLocal wave_local_[MAX_AICPU_THREADS]{};
+    bool allow_first_queue(int owner, bool &past_first);
+    bool start_queued_wave(ChipTaskSlotState *slot, bool first);
+    bool plan_local_predecessors(int owner, CoreTracker::BitStates busy);
+    int publish_wave_slice(int owner, ChipTaskSlotState &slot);
+    int service_queued_wave(int owner);
+    bool enter_ready_drain(ChipTaskSlotState *slot_state, int32_t block_num);
     bool enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num);
     int32_t count_global_available(ResourceShape shape, LaneMask lanes, bool include_pending = false);
     struct SyncStartStageResult {

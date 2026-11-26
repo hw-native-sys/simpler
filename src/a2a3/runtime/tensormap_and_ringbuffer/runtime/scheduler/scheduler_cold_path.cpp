@@ -1656,6 +1656,9 @@ void SchedulerContext::deinit() {
     // Thus no FIN for an undispatched slot is processed, and
     // the count-gated consumer never reads entries[] past the fresh count.
 
+    wave_first_.store(FirstQueueState::Open, std::memory_order_relaxed);
+    for (auto &local : wave_local_)
+        local = {};
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/ack state for the next reuse.
     drain_state_.sync_start_pending.store(0, std::memory_order_release);

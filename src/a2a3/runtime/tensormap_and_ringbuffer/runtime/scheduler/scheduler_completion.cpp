@@ -527,13 +527,228 @@ void SchedulerContext::check_running_cores_for_completion(
 // sync_start drain protocol
 // =============================================================================
 
-// Take ownership of slot_state and signal all threads to enter drain mode.
-// Returns true if this thread won the CAS and owns the drain slot.
-// Returns false if another thread already holds drain; caller must re-push slot_state.
-//
-// Two-phase protocol: CAS 0 -> -1 (sentinel) to claim ownership, store task and
-// reset staging state, then release-store block_num. Other threads acquire-load
-// sync_start_pending; seeing block_num > 0 ensures all relaxed stores are visible.
+// One owner inspects the first hardware queue while all other consumers stay out.
+// After ordinary dispatch starts, retirement readiness alone no longer proves that lanes are idle.
+bool SchedulerContext::allow_first_queue(int owner, bool &past_first) {
+    const auto state = wave_first_.load(std::memory_order_acquire);
+    if (state == FirstQueueState::Local) {
+        past_first = true;
+        return true;
+    }
+    if (state != FirstQueueState::Open) return false;
+    const int m = static_cast<int>(ResourceShape::MIX);
+    const bool sync_mix = sched_->ready_sync_queues[m].size() != 0;
+    const bool normal_mix = sched_->ready_queues[m].size() != 0;
+    bool other = sched_->early_sync_start_queue.size() != 0;
+    for (int i = 0; i < NUM_RESOURCE_SHAPES && !other; ++i) {
+        other = sched_->early_dispatch_queues[i].size() ||
+                (i != m && (sched_->ready_queues[i].size() || sched_->ready_sync_queues[i].size()));
+    }
+    if (!other && !sync_mix && !normal_mix) return false;
+    auto expected = FirstQueueState::Open;
+    if (!wave_first_.compare_exchange_strong(expected, FirstQueueState::Inspecting, std::memory_order_acq_rel))
+        return false;
+    if (!other && (sync_mix || normal_mix)) {
+        ChipReadyQueue &queue = sync_mix ? sched_->ready_sync_queues[m] : sched_->ready_queues[m];
+        auto pos = queue.dequeue_pos.load(std::memory_order_relaxed);
+        auto &cell = queue.slots[pos & queue.mask];
+        // All other hardware consumers are excluded. A producer
+        // can still own a reserved but not yet published ring cell.
+        if (cell.sequence.load(std::memory_order_acquire) != static_cast<int64_t>(pos + 1)) {
+            // The normal dispatcher can try SS again and then pop ordinary MIX
+            // while the SS producer is still filling its reserved cell.
+            past_first = sync_mix && normal_mix;
+            wave_first_.store(past_first ? FirstQueueState::Local : FirstQueueState::Open, std::memory_order_release);
+            return past_first;
+        }
+        auto *slot = cell.slot_value.ptr();
+        const int clusters = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
+        const int local_max = (clusters + active_sched_threads_ - 1) / active_sched_threads_;
+        bool fits = slot && slot->active_mask.to_shape() == ResourceShape::MIX && slot->logical_block_num > local_max &&
+                    slot->logical_block_num <= clusters && slot->next_block_idx.load(std::memory_order_acquire) == 0 &&
+                    slot->payload->early_dispatch_state.load(std::memory_order_acquire) == EARLY_DISPATCH_NONE;
+        for (int i = 0; fits && i < cores_total_num_; ++i) {
+            fits = __atomic_load_n(&retirement_state_[i], __ATOMIC_ACQUIRE) == RETIREMENT_READY;
+        }
+        if (fits && !handshake_failed_.load(std::memory_order_acquire) && !is_completed() &&
+            !sched_->sm_header->orch_error_code.load(std::memory_order_acquire) &&
+            !sched_->sm_header->sched_error_code.load(std::memory_order_acquire)) {
+            CapturedReadySlot item;
+            if (queue.pop_shaped_batch(&item, nullptr, 1, ResourceShape::MIX) != 1 || item.ptr() != slot) {
+                latch_scheduler_error(sched_->sm_header, owner, SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+                completed_.store(true, std::memory_order_release);
+                return false;
+            }
+            if (start_queued_wave(slot, true)) return false;
+            if (!requeue_ready_tasks(owner, queue, &item, 1, ResourceShape::MIX)) return false;
+        }
+    }
+    wave_first_.store(FirstQueueState::Local, std::memory_order_release);
+    past_first = true;
+    return true;
+}
+
+bool SchedulerContext::start_queued_wave(ChipTaskSlotState *slot, bool first) {
+    int idle = 0;
+    if (!drain_state_.sync_start_pending.compare_exchange_strong(idle, -1, std::memory_order_acq_rel)) return false;
+    const auto generation = sync_start_drain_next_attempt(drain_state_.drain_attempt.load(std::memory_order_relaxed));
+    drain_state_.drain_attempt.store(generation, std::memory_order_release);
+    drain_state_.pending_task.store(slot, std::memory_order_relaxed);
+    drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
+    drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
+    drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
+    wave_arrived_.store(0, std::memory_order_relaxed);
+    wave_state_.store(first ? WaveState::Publish : WaveState::WaitForIdle, std::memory_order_relaxed);
+    if (first) {
+        int start;
+        int got = slot->claim_block_range(slot->logical_block_num, slot->logical_block_num, start);
+        always_assert(start == 0 && got == slot->logical_block_num);
+    }
+    drain_state_.sync_start_pending.store(WAVE_GATE, std::memory_order_release);
+    return true;
+}
+
+// A new entry may be scheduled after an already-running, independent task.
+// Existing pending/gated or multi-wave work stays with the original protocol.
+bool SchedulerContext::plan_local_predecessors(int owner, CoreTracker::BitStates busy) {
+    auto &tracker = core_trackers_[owner];
+    while (busy.has_value()) {
+        int offset = busy.pop_first();
+        auto &core = core_exec_states_[tracker.get_core_id_by_offset(offset)];
+        auto *running = core.running_slot_state;
+        if (core.pending_slot_state || !running || running->logical_block_num != 1 ||
+            running->task_attrs.requires_sync_start() ||
+            running->payload->early_dispatch_state.load(std::memory_order_acquire) == EARLY_DISPATCH_STAGING)
+            return false;
+    }
+    return true;
+}
+
+int SchedulerContext::publish_wave_slice(int owner, ChipTaskSlotState &slot) {
+    const int blocks = slot.logical_block_num;
+    const int base = blocks / active_sched_threads_;
+    const int extra = blocks % active_sched_threads_;
+    const int count = base + (owner < extra);
+    const int first = owner * base + (owner < extra ? owner : extra);
+    if (!count) return 0;
+    always_assert(count <= core_trackers_[owner].get_cluster_count());
+#if SIMPLER_DFX
+    const bool phases = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
+    const uint64_t start = phases ? get_sys_cnt_aicpu() : 0;
+#endif
+    PublishHandle handles[CoreTracker::MAX_CORE_PER_THREAD];
+    int n = 0;
+    for (int i = 0; i < count; ++i) {
+        n += prepare_block_for_dispatch(
+            owner, i * PLATFORM_CORES_PER_BLOCKDIM, slot, ResourceShape::MIX, false, first + i, handles + n
+        );
+    }
+#if SIMPLER_DFX
+    if (phases)
+        chip_swimlane_aicpu_record_sched_phase(
+            owner, SchedPhaseKind::DrainPrepare, start, get_sys_cnt_aicpu(),
+            sched_chip_swimlane_[owner].sched_loop_count, n
+        );
+#endif
+    wmb();
+    uint64_t issue = 0;
+#if SIMPLER_DFX
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) issue = get_sys_cnt_aicpu();
+#endif
+    for (int i = 0; i < n; ++i)
+        publish_subtask_to_core(handles[i], issue, owner);
+#if SIMPLER_DFX
+    if (phases) {
+        chip_swimlane_aicpu_record_sched_phase(
+            owner, SchedPhaseKind::DrainPublish, issue, get_sys_cnt_aicpu(),
+            sched_chip_swimlane_[owner].sched_loop_count, n
+        );
+        // The wave already recorded these subtasks. A later ordinary dispatch only owns its own count.
+        sched_chip_swimlane_[owner].phase_dispatch_count -= n;
+    }
+#endif
+    sched_->record_published_blocks(slot, count);
+    return count;
+}
+
+// Only blocks actually published by this owner count as scheduler progress.
+int SchedulerContext::service_queued_wave(int owner) {
+    const auto gen = drain_state_.drain_attempt.load(std::memory_order_acquire);
+    if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != WAVE_GATE || is_completed()) return 0;
+    auto &local = wave_local_[owner];
+    // A late reader that already published this generation may no longer
+    // dereference the task. Another owner may have just reopened the gate.
+    if (local.sent == gen) return 0;
+    auto *slot = drain_state_.pending_task.load(std::memory_order_acquire);
+    auto phase = wave_state_.load(std::memory_order_acquire);
+    const unsigned bit = 1u << owner;
+    const unsigned all = (1u << active_sched_threads_) - 1;
+    if (phase == WaveState::WaitForIdle) {
+        if (local.seen != gen) {
+#if SIMPLER_DFX
+            const bool profile = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
+            const uint64_t take = profile ? get_sys_cnt_aicpu() : 0;
+#endif
+            local.seen = gen;
+            local.waiting = core_trackers_[owner].get_all_running_cores();
+            if (!plan_local_predecessors(owner, local.waiting)) {
+                auto expected = WaveState::WaitForIdle;
+                if (wave_state_.compare_exchange_strong(expected, WaveState::Fallback, std::memory_order_acq_rel)) {
+                    drain_state_.sync_start_pending.store(slot->logical_block_num, std::memory_order_release);
+                }
+                return 0;
+            }
+#if SIMPLER_DFX
+            if (profile)
+                chip_swimlane_aicpu_record_sched_phase(
+                    owner, SchedPhaseKind::Drain, take, get_sys_cnt_aicpu(),
+                    sched_chip_swimlane_[owner].sched_loop_count, 0
+                );
+#endif
+        }
+        if (local.ready == gen || (local.waiting & core_trackers_[owner].get_all_running_cores()).has_value()) return 0;
+        local.ready = gen;
+        if ((wave_arrived_.fetch_or(bit, std::memory_order_acq_rel) | bit) != all) return 0;
+        int start = 0;
+        const int blocks = slot->logical_block_num;
+        const int got = slot->claim_block_range(blocks, blocks, start);
+        always_assert(start == 0 && got == blocks);
+        wave_state_.store(WaveState::Publish, std::memory_order_release);
+        phase = WaveState::Publish;
+    }
+    if (phase != WaveState::Publish || is_completed()) return 0;
+    local.sent = gen;
+    const int published = publish_wave_slice(owner, *slot);
+    const auto done = drain_state_.drain_stage_done_mask.fetch_or(bit, std::memory_order_acq_rel) | bit;
+    if (done != all) {
+        // Keep participating owners from retiring/recycling this task while
+        // the last publisher still has to expose its dispatch fanout.
+        while (!is_completed() && drain_state_.drain_attempt.load(std::memory_order_acquire) == gen &&
+               drain_state_.sync_start_pending.load(std::memory_order_acquire) == WAVE_GATE)
+            SPIN_WAIT_HINT();
+        return published;
+    }
+    if (!is_completed()) sched_->propagate_dispatch_fanin(*slot);
+    drain_state_.pending_task.store(nullptr, std::memory_order_relaxed);
+    drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
+    wave_first_.store(FirstQueueState::Local, std::memory_order_release);
+    drain_state_.sync_start_pending.store(0, std::memory_order_release);
+    return published;
+}
+
+bool SchedulerContext::enter_ready_drain(ChipTaskSlotState *slot_state, int32_t block_num) {
+    if (slot_state->task_attrs.requires_sync_start() && slot_state->active_mask.raw() == LaneMask::all().raw() &&
+        block_num == cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM &&
+        slot_state->payload->early_dispatch_state.load(std::memory_order_acquire) != EARLY_DISPATCH_STAGING &&
+        !SchedulerState::owns_early_sync_drain(*slot_state->payload) &&
+        slot_state->next_block_idx.load(std::memory_order_acquire) == 0) {
+        return start_queued_wave(slot_state, false);
+    }
+    return enter_drain_mode(slot_state, block_num);
+}
+
+// Claim the drain slot with 0 -> -1, initialize its task, then publish the positive block count.
+// A caller that loses the CAS still owns its queue entry and must return it.
 bool SchedulerContext::enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num) {
     int32_t expected = 0;
     if (!drain_state_.sync_start_pending.compare_exchange_strong(
@@ -734,7 +949,7 @@ void SchedulerContext::handle_drain_mode(
         if (is_completed()) return;
         block_num = drain_state_.sync_start_pending.load(std::memory_order_acquire);
     } while (block_num < 0);
-    if (block_num == 0) return;
+    if (block_num == 0 || block_num == WAVE_GATE) return;
 
     uint32_t all_acked = (1u << active_sched_threads_) - 1;
     uint64_t drain_attempt = drain_state_.drain_attempt.load(std::memory_order_acquire);

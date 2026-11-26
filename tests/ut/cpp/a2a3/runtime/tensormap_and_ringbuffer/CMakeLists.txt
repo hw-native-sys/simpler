@@ -109,6 +109,22 @@ a2a3_tmr_case(test_scalar_access_deps.cpp NO_OBJS
     LINK_OPTIONS ${_scalar_gc_link_option}
     TIMEOUT 20)
 
+a2a3_tmr_case(test_queued_mix_wave.cpp NO_OBJS
+    SOURCES
+        ${A2A3_RUNTIME_DIR}/ring_buffer.cpp
+        ${A2A3_RUNTIME_DIR}/shared/shared_memory.cpp
+        ${A2A3_RUNTIME_DIR}/shared/runtime_init.cpp
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler.cpp
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler_dispatch.cpp
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+    DEFINES SIMPLER_DFX=0
+    LINK a2a3_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_entry_preparation_gc}
+    TIMEOUT 30)
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it
