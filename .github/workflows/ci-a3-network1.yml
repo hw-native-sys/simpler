@@ -1,0 +1,114 @@
+name: CI A3 Network1
+run-name: >-
+  ${{ format('CI a3-network1 PR #{0} @{1} base:{2}{3}', inputs.pr_number, inputs.head_sha, inputs.base_sha,
+      inputs.request_id && format(' request:{0}', inputs.request_id) || '') }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number supplied by the A3 Network1 comment command
+        type: string
+        required: true
+      head_sha:
+        description: Authorized PR head SHA
+        type: string
+        required: true
+      base_sha:
+        description: Authorized base SHA
+        type: string
+        required: true
+      merge_sha:
+        description: Pinned test merge with the authorized base and head parents
+        type: string
+        required: true
+      request_id:
+        description: Command workflow run ID and attempt
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  CI_COMMAND: a3-network1
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      checkout_sha: ${{ steps.target.outputs.checkout_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: |
+            .github/scripts
+            .github/ci-commands.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Authorize A3 Network1 dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/ci_control.py authorize-dispatch
+      - name: Validate and pin the authorized A3 Network1 merge
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/ci_control.py prepare
+
+  st-network1-onboard-a2a3:
+    needs: prepare
+    concurrency:
+      group: ci-a3-network1-${{ inputs.pr_number }}
+      queue: max
+      cancel-in-progress: false
+    uses: ./.github/workflows/_st-network1.yml
+    with:
+      repository: ${{ github.repository }}
+      ref: ${{ needs.prepare.outputs.checkout_sha }}
+      platform: a2a3
+      runs_on: '["self-hosted","Linux","ARM64","a2a3pod"]'
+
+  network1-result:
+    if: always()
+    needs: [prepare, st-network1-onboard-a2a3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: |
+            .github/scripts
+            .github/ci-commands.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Require the A3 Network1 suite
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python .github/scripts/ci_control.py aggregate
+      - name: Request final status publication
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh workflow run ci-command-status.yml --repo "$GITHUB_REPOSITORY" --ref main
+          -f command=a3-network1 -f run_id="$GITHUB_RUN_ID" -f wait_for_completion=true
+      - name: Reconcile A3 Network1 job checks
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh workflow run ci-command-progress.yml --repo "$GITHUB_REPOSITORY" --ref main
+          -f command=a3-network1 -f run_id="$GITHUB_RUN_ID"

@@ -237,6 +237,7 @@ nav:
           - Adding a C++ unit test: testing/adding-a-cpp-unit-test.md
           - Scene-test device-memory fixtures: testing/child-memory.md
       - CI Pipeline: ci.md
+      - PR hardware test commands: ci/pr-commands.md
       - Python Packaging: python-packaging.md
       - Sanitizers: sanitizers.md
       - Sim Multi-Device Isolation: sim-multi-device-isolation.md

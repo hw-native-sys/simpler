@@ -1,0 +1,35 @@
+{
+  "a5": {
+    "aliases": [
+      "/run-a5",
+      "/run a5"
+    ],
+    "workflow": "ci-a5-comment.yml",
+    "jobs": {
+      "ut-a5": "ut-a5 / ut-a5",
+      "st-onboard-a5": "st-onboard-a5 / st-onboard-a5"
+    },
+    "status_context": "ci/run/a5",
+    "status_workflow": "ci-command-status.yml",
+    "progress_workflow": "ci-command-progress.yml",
+    "command_workflow": "ci-command.yml",
+    "result_job": "a5-result",
+    "label": "A5"
+  },
+  "a3-network1": {
+    "aliases": [
+      "/run-a3-network1",
+      "/run a3-network1"
+    ],
+    "workflow": "ci-a3-network1.yml",
+    "jobs": {
+      "st-network1-onboard-a2a3": "st-network1-onboard-a2a3 / st-network1-onboard-a2a3"
+    },
+    "status_context": "ci/run/a3-network1",
+    "status_workflow": "ci-command-status.yml",
+    "progress_workflow": "ci-command-progress.yml",
+    "command_workflow": "ci-command.yml",
+    "result_job": "network1-result",
+    "label": "A3 Network1"
+  }
+}

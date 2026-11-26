@@ -1,153 +1,127 @@
 name: CI A5 Comment
-run-name: /run-a5 PR ${{ github.event.issue.number }}
+run-name: >-
+  ${{ format('CI a5 PR #{0} @{1} base:{2}{3}', inputs.pr_number, inputs.head_sha, inputs.base_sha,
+      inputs.request_id && format(' request:{0}', inputs.request_id) || '') }}
 
 on:
-  issue_comment:
-    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number supplied by the A5 comment command
+        type: string
+        required: true
+      head_sha:
+        description: Authorized PR head SHA
+        type: string
+        required: true
+      base_sha:
+        description: Authorized base SHA
+        type: string
+        required: true
+      merge_sha:
+        description: Pinned test merge with the authorized base and head parents
+        type: string
+        required: true
+      request_id:
+        description: Command workflow run ID and attempt
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
+env:
+  CI_COMMAND: a5
+
 jobs:
-  gate-and-resolve:
-    if: github.event.issue.pull_request && contains(github.event.comment.body, '/run-a5')
-    runs-on: ubuntu-24.04
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
+      actions: read
       pull-requests: read
     outputs:
-      ready: ${{ steps.resolve.outputs.ready }}
-      repository: ${{ steps.resolve.outputs.repository }}
-      ref: ${{ steps.resolve.outputs.ref }}
-      head_sha: ${{ steps.resolve.outputs.head_sha }}
-      base_sha: ${{ steps.resolve.outputs.base_sha }}
-      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      checkout_sha: ${{ steps.target.outputs.checkout_sha }}
     steps:
-      - name: Authorize command and resolve PR head
-        id: resolve
-        uses: actions/github-script@v7
+      - uses: actions/checkout@v5
         with:
-          script: |
-            core.setOutput('ready', 'false');
-            if (!context.payload.issue.pull_request ||
-                context.payload.comment.body.trim() !== '/run-a5') return;
-            // A re-executed gate would resolve the PR's current head, not the head the comment admitted.
-            if (process.env.GITHUB_RUN_ATTEMPT !== '1') {
-              core.setFailed('/run-a5 admits one head per comment; comment /run-a5 again instead of re-running the gate');
-              return;
-            }
-            const user = context.payload.comment.user.login;
-            let access = null;
-            try {
-              const response = await github.rest.repos.getCollaboratorPermissionLevel({
-                ...context.repo, username: user,
-              });
-              access = response.data;
-            } catch (error) {
-              core.info(`cannot verify repo permission for ${user}`);
-            }
-            if (access?.permission !== 'admin' && access?.role_name !== 'maintain') {
-              core.setFailed(`denied: ${user} requires maintain or admin repo permission to trigger /run-a5`);
-              return;
-            }
-            // PR metadata and its test merge can describe different snapshots
-            // while GitHub refreshes a merge after a push or base update.
-            const MERGEABILITY_RETRY_MS = 5000;
-            const MERGEABILITY_ATTEMPTS = 12;
-            const repository = `${context.repo.owner}/${context.repo.repo}`;
-            let pr, mergeSha;
-            for (let attempt = 0; attempt <= MERGEABILITY_ATTEMPTS; attempt += 1) {
-              ({ data: pr } = await github.rest.pulls.get({
-                ...context.repo, pull_number: context.payload.issue.number,
-              }));
-              if (pr.state !== 'open' || pr.number !== context.payload.issue.number ||
-                  pr.base.ref !== 'main' ||
-                  pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase() ||
-                  !pr.head.repo || !/^[\w.-]+\/[\w.-]+$/.test(pr.head.repo.full_name) ||
-                  !/^[0-9a-f]{40}$/i.test(pr.head.sha)) {
-                core.setFailed('/run-a5 requires an open PR targeting this repo main with an available head');
-                return;
-              }
-              if (pr.mergeable === false) {
-                core.setFailed('PR merge snapshot unavailable or conflicting; update the PR and issue a new command');
-                return;
-              }
-              mergeSha = pr.merge_commit_sha;
-              let reason = 'PR merge snapshot unavailable or conflicting; update the PR and issue a new command';
-              if (pr.mergeable === true && /^[0-9a-f]{40}$/i.test(mergeSha || '')) {
-                const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: mergeSha });
-                if (commit.sha === mergeSha && commit.parents.length === 2 &&
-                    commit.parents[0].sha === pr.base.sha && commit.parents[1].sha === pr.head.sha) break;
-                reason = 'PR merge snapshot is stale; issue a new command after GitHub refreshes it';
-              }
-              if (attempt === MERGEABILITY_ATTEMPTS) {
-                core.setFailed(reason);
-                return;
-              }
-              core.info(`PR merge snapshot is pending or stale; retrying in ${MERGEABILITY_RETRY_MS} ms (attempt ${attempt + 1}/${MERGEABILITY_ATTEMPTS})`);
-              await new Promise(resolve => setTimeout(resolve, MERGEABILITY_RETRY_MS));
-            }
-            core.setOutput('head_sha', pr.head.sha);
-            core.setOutput('base_sha', pr.base.sha);
-            core.setOutput('repository', `${context.repo.owner}/${context.repo.repo}`);
-            core.setOutput('ref', mergeSha);
-            core.setOutput('pr_number', String(pr.number));
-            core.summary.addRaw(`Tested merge: ${mergeSha}\n\nPR head: ${pr.head.sha}\n\nBase: ${pr.base.sha}\n`);
-            await core.summary.write();
-            core.setOutput('ready', 'true');
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: |
+            .github/scripts
+            .github/ci-commands.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Authorize A5 dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/ci_control.py authorize-dispatch
+      - name: Validate and pin the authorized A5 merge
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/ci_control.py prepare
 
   ut-a5:
-    needs: [gate-and-resolve]
-    if: needs.gate-and-resolve.outputs.ready == 'true'
+    needs: prepare
     concurrency:
-      group: ci-a5-ut-${{ needs.gate-and-resolve.outputs.pr_number }}
-      cancel-in-progress: true
+      group: ci-a5-ut-${{ inputs.pr_number }}
+      queue: max
+      cancel-in-progress: false
     uses: ./.github/workflows/_ut-npu-a5.yml
     with:
-      repository: ${{ needs.gate-and-resolve.outputs.repository }}
-      ref: ${{ needs.gate-and-resolve.outputs.ref }}
+      repository: ${{ github.repository }}
+      ref: ${{ needs.prepare.outputs.checkout_sha }}
       runs_on: '["self-hosted","a5"]'
       include_cann_examples: true
 
   st-onboard-a5:
-    needs: [gate-and-resolve]
-    if: needs.gate-and-resolve.outputs.ready == 'true'
+    needs: prepare
     concurrency:
-      group: ci-a5-st-${{ needs.gate-and-resolve.outputs.pr_number }}
-      cancel-in-progress: true
+      group: ci-a5-st-${{ inputs.pr_number }}
+      queue: max
+      cancel-in-progress: false
     uses: ./.github/workflows/_st-npu-a5.yml
     with:
-      repository: ${{ needs.gate-and-resolve.outputs.repository }}
-      ref: ${{ needs.gate-and-resolve.outputs.ref }}
+      repository: ${{ github.repository }}
+      ref: ${{ needs.prepare.outputs.checkout_sha }}
       runs_on: '["self-hosted","a5"]'
       include_dfx_smokes: true
 
-  report:
-    needs: [gate-and-resolve, ut-a5, st-onboard-a5]
-    if: always() && needs.gate-and-resolve.result == 'success' && needs.gate-and-resolve.outputs.ready == 'true'
-    runs-on: ubuntu-24.04
+  a5-result:
+    if: always()
+    needs: [prepare, ut-a5, st-onboard-a5]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
-      pull-requests: write
+      actions: write
     steps:
-      - name: Report the tested head and suite results
-        uses: actions/github-script@v7
-        env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
+      - uses: actions/checkout@v5
         with:
-          script: |
-            const needs = JSON.parse(process.env.NEEDS_JSON);
-            const gate = needs['gate-and-resolve'];
-            if (gate.result !== 'success' || gate.outputs.ready !== 'true') return;
-            const { repository, ref, head_sha, base_sha, pr_number: number } = gate.outputs;
-            const suites = ['ut-a5', 'st-onboard-a5'];
-            const results = suites.map(name => ({ name, result: needs[name]?.result || 'unknown' }));
-            const passed = results.every(job => job.result === 'success');
-            const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const lines = results.map(job => `- ${job.name}: **${job.result}**`);
-            await github.rest.issues.createComment({
-              ...context.repo,
-              issue_number: Number(number),
-              body: `**/run-a5 ${passed ? 'passed' : 'finished without all suites passing'}**\n\n` +
-                    `Tested merge: \`${repository}@${ref}\`\nPR head: \`${head_sha}\`\nBase: \`${base_sha}\`\n[Workflow run](${url})\n\n${lines.join('\n')}`,
-            });
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: |
+            .github/scripts
+            .github/ci-commands.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Require every A5 suite
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python .github/scripts/ci_control.py aggregate
+      - name: Request final status publication
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh workflow run ci-command-status.yml --repo "$GITHUB_REPOSITORY" --ref main
+          -f run_id="$GITHUB_RUN_ID" -f wait_for_completion=true
+      - name: Reconcile A5 job checks
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh workflow run ci-command-progress.yml --repo "$GITHUB_REPOSITORY" --ref main
+          -f run_id="$GITHUB_RUN_ID"

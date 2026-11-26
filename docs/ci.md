@@ -19,7 +19,7 @@ validation runs under `a5_changed && st_affected`. The full A5 onboard sweep is 
 with `/run-a5`.
 A5 simulation, CPU tests and profiling remain automatic under their existing
 change gates. Daily retains its A5 jobs. A2/A3 multi-machine Network1 validation
-runs only in Daily, including manually dispatched Daily runs.
+runs in Daily and on demand with `/run a3-network1`.
 
 A5 UT allows 60 minutes overall, including setup and device-queue waits. Each
 task client waits up to 60 minutes for queueing and execution together; actual
@@ -32,12 +32,12 @@ selects it for diagnostics. A2/A3 retains automatic coverage.
 
 ## Full Job Matrix
 
-The complete test-type × hardware-tier matrix across automatic CI, the A5 comment workflow and Daily. A5 UT and framework tests run automatically on affected PRs; the full A5 onboard sweep uses `/run-a5`.
+The complete test-type × hardware-tier matrix across automatic CI, the PR comment workflows and Daily. A5 UT and framework tests run automatically on affected PRs; the full A5 onboard sweep uses `/run-a5`.
 
 | Category | CPU (no hardware) | a2a3 runner | a5 runner |
 | -------- | ----------------- | ----------- | --------- |
 | **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py + SDK cpp) |
-| **st** | `st-sim-a2a3`, `st-sim-a5`, `st-sim-wse` | `st-onboard-a2a3`, `st-network1-onboard-a2a3` (Daily only), `st-model-onboard-a2a3`, `st-framework-a2a3` | `st-onboard-a5`, `st-framework-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5`, `st-sim-wse` | `st-onboard-a2a3`, `st-network1-onboard-a2a3` (Daily or `/run a3-network1`), `st-model-onboard-a2a3`, `st-framework-a2a3` | `st-onboard-a5`, `st-framework-a5` |
 
 ## GitHub Actions Jobs
 
@@ -117,10 +117,15 @@ PullRequest
   ├── st-framework-a5   (a5 self-hosted)       — a5_changed && st_affected
   └── st-model-onboard-a2a3       (a2a3 self-hosted)      — a2a3_changed && st_affected
 
-Admin PR comment /run-a5
-  └── gate-and-resolve       (ubuntu-24.04)          — open PR to this repo main; pinned merge
-      ├── ut-a5             (a5 self-hosted)        — Python and C++ UT and CANN examples
-      └── st-onboard-a5     (a5 self-hosted)        — onboard ST and DFX smokes
+Maintainer/admin PR comment /run-a5 or /run a5
+  └── CI Command            (hosted)                — validate, bind pending, dispatch main
+      └── CI A5 Comment     (prepare pinned merge)
+          ├── ut-a5         (a5 self-hosted)        — Python and C++ UT and CANN examples
+          └── st-onboard-a5 (a5 self-hosted)        — onboard ST and DFX smokes
+Maintainer/admin PR comment /run a3-network1
+  └── CI Command → CI A3 Network1 → st-network1-onboard-a2a3 (two machines)
+
+      CI Command Status / CI Command Progress (hosted)        — aggregate and suite visibility
 ```
 
 | Job | Runner | What it runs |
@@ -135,7 +140,7 @@ Admin PR comment /run-a5
 | `ut-a5` | a5 self-hosted | SDK-only pytest and CTest run on the host. Device UT and CANN example smokes use the device queue. |
 | `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA and the active URMA regressions, then adaptive-parallel DFX feature smokes |
 | `st-framework-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 4 -p no:xdist` in one exclusive four-device task, then verify plan/JUnit |
-| `st-network1-onboard-a2a3` (Daily only) | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
+| `st-network1-onboard-a2a3` (Daily or `/run a3-network1`) | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
 | `st-model-onboard-a2a3` | a2a3 self-hosted | Qwen3-14B golden checks and DeepSeek V4 Flash smokes for both runtimes, selected with `--manual only` and scheduled across four devices, in parallel with `st-onboard-a2a3` in Per-PR |
 
 ### Job phase contract
@@ -245,8 +250,8 @@ result.
 
 ### Multi-machine network1 jobs
 
-`st-network1-onboard-a2a3` runs only in `daily.yml`, on its schedule or through
-`workflow_dispatch`, and is the only job spanning two machines. The runner it
+`st-network1-onboard-a2a3` runs in scheduled or manually dispatched Daily runs and on PRs through
+`/run a3-network1`. The runner it
 lands on becomes the L4 parent and drives its peer entirely over ssh; the peer
 runs no workflow code at all. Everything that identifies either machine —
 addresses, the device split, ports, the staging root, proxies — comes from a
@@ -315,7 +320,7 @@ re-runs through `workflow_dispatch`. It also runs packaging and no-hardware
 unit tests on macOS. A2/A3, A5 and WSE simulation runs on Ubuntu and macOS;
 onboard runs on the A2/A3 and A5 self-hosted pools. The
 same DFX smoke steps used by Per-PR run once in each Daily platform job, and
-the A2/A3 `network1` corpus runs exclusively in Daily through the existing two-machine workflow. The
+the A2/A3 `network1` corpus uses the same two-machine workflow as `/run a3-network1`. The
 main Per-PR scene-test steps keep the default `--manual exclude`, so moving an
 ordinary case to Daily does not require a second workflow exclusion list.
 
@@ -820,41 +825,20 @@ Qualification is limited to the actual platform and environment in each receipt.
 
 ### A5 hardware validation (`/run-a5`)
 
-A repo maintainer or admin can comment exactly `/run-a5` on an open PR targeting this repo's
-`main` branch. Surrounding whitespace is accepted; extra arguments or text are
-ignored. `ci-a5-comment.yml` checks the commenter's current `admin` permission
-or `maintain` role (returned as `role_name`, with `permission: write`)
-with `getCollaboratorPermissionLevel` before resolving the PR's head repository
-and base SHA, then pinning their GitHub-generated merge commit in the upstream
-repository, including fork PRs. The gate verifies that the
-merge commit has exactly the observed base and head as its two parents. Pending
-or stale snapshots are re-read for up to 60 seconds; a persistent mismatch or
-conflict fails the gate before any suite is scheduled. The gate summary records all three
-SHAs. Testing the merge includes current main's CI interfaces even for a PR whose
-head predates their introduction. This qualifies integration with that base,
-not the standalone head. Non-PR comments and unverified or
-requests without maintain or admin access cannot schedule hardware work.
+Maintainers and admins can comment `/run-a5` or `/run a5` to request the A5 UT
+and onboard sweep for an open PR to this repository's `main`. The command
+controller validates and pins the test merge, writes a pending status, and
+dispatches trusted main. Existing A5 reusable workflows retain their CANN
+examples and DFX smokes; framework validation stays in automatic PR CI.
 
-Every admitted request runs `ut-a5` with CANN examples and `st-onboard-a5` with
-DFX smokes through the existing reusable workflows. Framework validation runs
-automatically in per-PR CI and is not repeated by the comment command.
-No change detector filters an explicit request, including a documentation-only
-PR. A new admitted request cancels the previous same-PR job for each suite;
-unmatched and denied comments cannot cancel admitted jobs. Pushes do not
-retrigger this comment workflow; comment again to test a new head. The automatic
-`ut-a5` job independently follows the PR change gates. The gate refuses any
-run attempt after the first, so "Re-run all jobs" cannot admit a head the
-comment never saw; "Re-run failed jobs" keeps the original gate outputs and
-retests the admitted SHA. The gate and report jobs only call the GitHub API and
-run on GitHub-hosted `ubuntu-24.04`, so a burst of comments never queues on the
-self-hosted pools.
-
-The final A5 PR comment records the tested merge, original head and base, each suite's
-result and the workflow run link. Skipped and cancelled jobs retain those results
-and are not reported as passing. The issue-comment workflow itself uses the
-default branch's definition, so this new command cannot execute on GitHub until
-`ci-a5-comment.yml` is merged into the default branch. Local mocked-API tests
-validate its scripts and topology before that deployment.
+PR Checks show acceptance, suite progress, results and job-log links. A rejected
+command receives a reason and command-log link. Repeated requests reuse a
+matching queued or passing run; failed runs can be requested again, and native
+reruns keep the original inputs. Feedback does not change automatic PR or Daily
+coverage. For the A3 two-machine Network1 suite, post `/run a3-network1` or
+`/run-a3-network1`. Its results appear under `ci/run/a3-network1`.
+See [PR hardware test commands](ci/pr-commands.md) for the PyPTO-derived
+control flow, permissions, status ownership and manual reconciliation.
 
 ### Self-hosted CPU runner contract
 
