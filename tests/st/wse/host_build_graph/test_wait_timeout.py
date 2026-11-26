@@ -83,7 +83,7 @@ extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) 
 extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     CoreTaskArgs core;
     core.add_output(args.tensor(0).ref());
-    rt_submit_aiv_task(0, core);
+    rt_submit_wse_task(0, core, {.placement = {{0}}});
 }
 """
 

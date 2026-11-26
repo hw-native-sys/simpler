@@ -64,12 +64,12 @@ for each Block. A Graph expresses dependencies between these launches.
 
 Every run uses all configured Cores. A task's logical Block count comes from
 `CoreTaskArgs.launch_spec.block_num()`, independently of the device width.
-The default mapping is `core_id = block_id % core_count`. Cores with no work are
-idle; excess Blocks queue on their assigned Core. A Core executes one Block at a
+Host submission supplies a Core ID for every Block. Cores with no work are
+idle, and Blocks assigned to the same Core queue there. A Core executes one Block at a
 time, and the task completes once all its Blocks have finished.
 
 A Block has one to four logical Threads placed on distinct local PEs. WSE
-orchestration may specify Block placement and per-Block arguments, while the
+orchestration specifies Block placement and may provide per-Block arguments. The
 Python caller still uses ordinary `worker.submit(...)` or `worker.run(...)`.
 See [Block deployment](deployment.md).
 
@@ -134,8 +134,8 @@ Those source dependencies do not load an A5 runtime binary. Recorded source hash
 identify the reviewed revision, not a pin: normal include dependencies and the
 runtime source stamp invalidate caches when shared inputs change.
 
-WSE predicate scenes read unchanged A5 fixture sources; all WSE execution and
-assertions remain in WSE tests. Existing A3/A5 tests and CI selection are unchanged.
+WSE predicate scenes reuse four A5 kernel fixtures. The WSE orchestration supplies
+the execution Core for each task.
 A5-only changes deliberately do not select the independent WSE scene job,
 including changes to reused sources. For changes to A5 product sources,
 `packaging-matrix` and `ut` build WSE through their default installation, covering

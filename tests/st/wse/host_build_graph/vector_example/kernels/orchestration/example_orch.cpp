@@ -56,7 +56,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     p_add.add_input(a);
     p_add.add_input(b);
     p_add.add_output(c);
-    rt_submit_aiv_task(FUNC_ADD, p_add);
+    rt_submit_wse_task(FUNC_ADD, p_add, {.placement = {{3}}});
 
     // task1: d = c + 1
     CoreTaskArgs p_d;
@@ -64,7 +64,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     p_d.add_output(d);
     sconv.f32 = 1.0f;
     p_d.add_scalar(sconv.u64);
-    rt_submit_aiv_task(FUNC_ADD_SCALAR, p_d);
+    rt_submit_wse_task(FUNC_ADD_SCALAR, p_d, {.placement = {{4}}});
 
     // task2: e = c + 2
     CoreTaskArgs p_e;
@@ -72,14 +72,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     p_e.add_output(e);
     sconv.f32 = 2.0f;
     p_e.add_scalar(sconv.u64);
-    rt_submit_aiv_task(FUNC_ADD_SCALAR, p_e);
+    rt_submit_wse_task(FUNC_ADD_SCALAR, p_e, {.placement = {{5}}});
 
     // task3: f = d * e  (write into the external output tensor)
     CoreTaskArgs p_mul;
     p_mul.add_input(d);
     p_mul.add_input(e);
     p_mul.add_output(f);
-    rt_submit_aiv_task(FUNC_MUL, p_mul);
+    rt_submit_wse_task(FUNC_MUL, p_mul, {.placement = {{2}}});
 
     LOG_INFO("[example_orch] Submitted 4 tasks for f = (a + b + 1) * (a + b + 2)");
 }

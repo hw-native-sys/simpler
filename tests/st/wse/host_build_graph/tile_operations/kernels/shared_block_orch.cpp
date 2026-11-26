@@ -18,5 +18,6 @@ extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &a) {
     task.add_output(a.tensor(1).ref());
     WseLaunchSpec launch;
     launch.thread_num = 4;
+    launch.placement = {{0}};
     rt_submit_wse_task(0, task, launch);
 }

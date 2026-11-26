@@ -176,7 +176,8 @@ def test_deployment_rejects_invalid_and_recovers(tmp_path, st_platform, native):
     worker = configured_worker(st_platform, 40)
     try:
         handle = worker.register(build_probe(st_platform))
-        for mode in (4, 5, 6, 7, 8, 10, 11, *([9] if native else [])):
+        # Modes 13–15 omit all placements, supply an extra Block, or call the generic submit API.
+        for mode in (4, 5, 6, 7, 8, 10, 11, 13, 14, 15, *([9] if native else [])):
             path = tmp_path / f"invalid-{mode}"
             args, buffers, _ = probe_args(worker, 5, mode, native, 0, 3)
             with pytest.raises(RuntimeError):

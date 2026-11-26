@@ -22,5 +22,8 @@ extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &a) {
         launch.thread_num = 4;
         task.launch_spec.set_block_num(a.scalar<int64_t>(0) / 4);
     }
+    const uint32_t cores = rt_available_core_count();
+    for (int32_t block = 0; block < task.launch_spec.block_num(); ++block)
+        launch.placement.emplace_back(block % cores);
     rt_submit_wse_task(0, task, launch);
 }

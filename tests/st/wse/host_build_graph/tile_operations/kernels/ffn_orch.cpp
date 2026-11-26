@@ -14,6 +14,8 @@ namespace {
 void layer(const GraphTaskArgs &a) {
     WseLaunchSpec launch;
     launch.thread_num = 4;
+    for (uint32_t core = 0; core < 40; ++core)
+        launch.placement.emplace_back(core);
     CoreTaskArgs first;
     first.add_input(a.tensor(0).ref());
     first.add_input(a.tensor(1).ref());

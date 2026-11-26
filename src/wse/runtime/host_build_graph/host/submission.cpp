@@ -24,9 +24,12 @@ TaskOutputTensors submit(OrchContext *ctx, int32_t kernel, const CoreTaskArgs &a
         const int32_t count = args.launch_spec.block_num();
         if (orch.total_cluster_count <= 0 || kernel < 0 || args.has_error() || count <= 0 || launch.thread_num < 1 ||
             launch.thread_num > WSE_PE_PER_CORE || args.launch_spec.require_sync_start() ||
-            (!launch.placement.empty() && launch.placement.size() != static_cast<size_t>(count)) ||
             (!launch.block_args.empty() && launch.block_args.size() != static_cast<size_t>(count)))
             throw std::invalid_argument("invalid WSE Block count, Thread count or launch table length");
+        if (launch.placement.size() != static_cast<size_t>(count))
+            throw std::invalid_argument("WSE SS/SPMD requires exactly one explicit Core ID per Block");
+        if (count != 1 && args.predicate().op != PredicateOp::NONE)
+            throw std::invalid_argument("WSE predicates require a single Block");
         if (!launch.block_args.empty() && (args.tensor_count() || args.scalar_count()))
             throw std::invalid_argument("per-Block arguments require an empty common argument list");
         auto *recording = active_graph_recording(&orch);
@@ -43,25 +46,19 @@ TaskOutputTensors submit(OrchContext *ctx, int32_t kernel, const CoreTaskArgs &a
             if (input->tensor_count() != first->tensor_count() || input->scalar_count() != first->scalar_count())
                 throw std::invalid_argument("WSE Blocks must use the same Kernel argument signature");
             auto &block = captured.blocks[b];
-            block.plan.core_id = b % orch.total_cluster_count;
-            block.plan.thread_num = launch.thread_num;
-            for (uint32_t t = 0; t < launch.thread_num; ++t)
-                block.plan.thread_pes[t] = t;
-            if (!launch.placement.empty()) {
-                const auto &where = launch.placement[b];
-                if (where.core_id >= static_cast<uint32_t>(orch.total_cluster_count) || where.thread_pes.empty() ||
-                    where.thread_pes.size() > WSE_PE_PER_CORE)
-                    throw std::invalid_argument("WSE Block targets an inactive Core or invalid Thread count");
-                block.plan.core_id = where.core_id;
-                block.plan.thread_num = where.thread_pes.size();
-                uint32_t mask = 0;
-                for (uint32_t t = 0; t < block.plan.thread_num; ++t) {
-                    const auto pe = where.thread_pes[t];
-                    if (pe >= WSE_PE_PER_CORE || (mask & (1u << pe)))
-                        throw std::invalid_argument("WSE Threads require distinct PEs on their Block's Core");
-                    mask |= 1u << pe;
-                    block.plan.thread_pes[t] = pe;
-                }
+            const auto &where = launch.placement[b];
+            if (where.core_id >= static_cast<uint32_t>(orch.total_cluster_count) ||
+                where.thread_pes.size() > WSE_PE_PER_CORE)
+                throw std::invalid_argument("WSE Block targets an inactive Core or invalid Thread count");
+            block.plan.core_id = where.core_id;
+            block.plan.thread_num = where.thread_pes.empty() ? launch.thread_num : where.thread_pes.size();
+            uint32_t mask = 0;
+            for (uint32_t t = 0; t < block.plan.thread_num; ++t) {
+                const uint32_t pe = where.thread_pes.empty() ? t : where.thread_pes[t];
+                if (pe >= WSE_PE_PER_CORE || (mask & (1u << pe)))
+                    throw std::invalid_argument("WSE Threads require distinct PEs on their Block's Core");
+                mask |= 1u << pe;
+                block.plan.thread_pes[t] = pe;
             }
             block.plan.tensor_count = input->tensor_count();
             block.plan.scalar_count = input->scalar_count();
@@ -126,9 +123,7 @@ TaskOutputTensors submit(OrchContext *ctx, int32_t kernel, const CoreTaskArgs &a
             static_cast<int32_t>(tensor_count), tensors.get(), tags.data(),
             static_cast<int32_t>(args.explicit_dep_count()), args.explicit_deps_data()
         };
-        const auto result = wse::submit_task_with_dependencies(
-            &orch, {kernel, INVALID_KERNEL_ID, INVALID_KERNEL_ID}, args, &dependencies
-        );
+        const auto result = wse::submit_placed_task(&orch, kernel, args, dependencies);
         if (orch.is_fatal() || !result.task_id().is_valid() || (recording && recording->unsupported)) return result;
         std::lock_guard lock(state.launches_mutex);
         auto &dest = recording ? state.launches.definitions[recording->graph_key] : state.launches.ordinary;

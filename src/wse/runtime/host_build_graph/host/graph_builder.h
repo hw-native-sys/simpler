@@ -15,8 +15,7 @@
 #include "host_build_graph/host/dep_compute.h"
 
 namespace wse {
-TaskOutputTensors
-submit_task_with_dependencies(OrchestratorState *, const MixedKernels &, const CoreTaskArgs &, const DepInputs *);
+TaskOutputTensors submit_placed_task(OrchestratorState *, int32_t kernel, const CoreTaskArgs &, const DepInputs &);
 TaskOutputTensors graph_record_submit_with_dependencies(
     OrchestratorState *, const CoreTaskArgs &, LaneMask, TaskAttrs, int32_t, int32_t, int32_t, const DepInputs *
 );

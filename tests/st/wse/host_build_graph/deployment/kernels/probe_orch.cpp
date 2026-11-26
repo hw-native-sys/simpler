@@ -25,6 +25,7 @@ struct Deployment : simpler::hbg::ConfigBase {
         for (uint32_t stage = 0; stage < 2; ++stage) {
             for (uint32_t i = 0; i < b; ++i) {
                 WseBlockPlacement target{i % c, {0}};
+                if (m == 0) target.thread_pes.clear();
                 if (m == 2) target = {(i % c + 1) % c, {(stage + 1) % 4}};
                 if (m == 12) target = {0, {0}};
                 if (m == 3) target = {c - 1, {3 - stage}};
@@ -33,16 +34,12 @@ struct Deployment : simpler::hbg::ConfigBase {
                 tables[stage].push_back(target);
             }
             if (m == 6) tables[stage].pop_back();
-            if (m == 7) tables[stage][0].thread_pes.clear();
+            if (m == 7) tables[stage][0].thread_pes = {0, 0};
+            if (m == 13) tables[stage].clear();
+            if (m == 14) tables[stage].emplace_back(0);
         }
     }
-    uint64_t hash() const {
-        auto result = simpler::hbg::config_hash(blocks, mode, cores);
-        for (const auto &table : tables)
-            for (const auto &p : table)
-                result = simpler::hbg::config_hash(result, p.core_id, p.thread_pes[0]);
-        return result;
-    }
+    uint64_t hash() const { return simpler::hbg::config_hash(blocks, mode, cores); }
     bool operator==(const Deployment &other) const {
         return blocks == other.blocks && mode == other.mode && cores == other.cores;
     }
@@ -61,10 +58,11 @@ void body(const GraphTaskArgs &a, const Deployment &deployment) {
                                     deployment.blocks
         );
         WseLaunchSpec launch;
-        if (deployment.mode != 0) launch.placement = deployment.tables[stage];
+        launch.placement = deployment.tables[stage];
         if (deployment.mode == 9) launch.thread_num = 0;
         if (deployment.mode == 10) launch.thread_num = 5;
-        rt_submit_wse_task(0, task, launch);
+        if (deployment.mode == 15) rt_submit_aiv_task(0, task);  // Deliberately omit WSE placement.
+        else rt_submit_wse_task(0, task, launch);
     }
 }
 }  // namespace

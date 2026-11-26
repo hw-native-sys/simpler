@@ -630,11 +630,12 @@ bool create_scheduler_state(
     const uint64_t count = native ? native_plan.bindings.size() : static_cast<uint64_t>(total_tasks);
     NativeGraphReadonlyImage image;
     if (native) {
-        // Host-completed nodes remain dependency anchors but do not enter the device count.
+        auto &slots = host_sm_handle.header->tasks;
         for (auto &binding : native_plan.bindings) {
-            if (binding.instance_index == SCHEDULER_NATIVE_NO_INSTANCE &&
-                host_sm_handle.header->tasks.is_completed(binding.source_index))
-                binding.kind = SchedulerNodeKind::HOST_DONE;
+            if (binding.instance_index != SCHEDULER_NATIVE_NO_INSTANCE) continue;
+            if (slots.is_completed(binding.source_index)) binding.kind = SchedulerNodeKind::HOST_DONE;
+            else if (slots.get_slot_state_by_task_id(binding.source_index).active_mask.is_empty())
+                binding.kind = SchedulerNodeKind::CONTROL_DUMMY;
         }
         std::string error;
         if (!native_graph_plan_readonly_image(native_plan, &image, &error)) {
@@ -732,12 +733,7 @@ bool create_scheduler_state(
             plan.host_done = host_sm_handle.header->tasks.is_completed(original);
             control = host_sm_handle.header->tasks.get_slot_state_by_task_id(original).active_mask.is_empty();
         }
-        if (launches[ref]) {
-            if (plan.host_done || control) return false;
-            const auto &blocks = launches[ref]->blocks;
-            plan.block_plan_count = blocks.size();
-            plan.block_plans_offset = block_offsets[ref];
-        }
+        if ((plan.host_done || control) && launches[ref]) return false;
         plan.blocks = 1;
         if (!plan.host_done && !control) {
             SchedulerTaskShape shape{};
@@ -767,14 +763,19 @@ bool create_scheduler_state(
                 LOG_ERROR("WSE requires a registered entry, 1 to INT16_MAX Blocks and no cluster sync-start");
                 return false;
             }
+            const auto &blocks = block_plans[ref];
+            if (blocks.size() != plan.blocks) {
+                LOG_ERROR("WSE requires an explicit Core ID for every kernel Block");
+                return false;
+            }
+            plan.block_plan_count = plan.blocks;
+            plan.block_plans_offset = block_offsets[ref];
+            auto &cores = tasks[ref].block_cores;
+            cores.reserve(plan.blocks);
+            for (const auto &block : blocks)
+                cores.push_back(block.core_id);
         }
         auto &task = tasks[ref];
-        if (plan.entry) {
-            if (launches[ref] && plan.block_plan_count != plan.blocks) return false;
-            task.block_cores.reserve(plan.blocks);
-            for (uint32_t b = 0; b < plan.blocks; ++b)
-                task.block_cores.push_back(launches[ref] ? block_plans[ref][b].core_id : b % core_count);
-        }
         uint32_t fanins = 0;
         if (scheduler_node_fanin_count(access, ref, &fanins) != SchedulerGraphResult::OK) return false;
         for (uint32_t i = 0; i < fanins; ++i) {

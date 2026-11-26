@@ -195,7 +195,13 @@ struct WseRun {
         uint64_t expected_rows = 0;
         for (uint32_t ref = 0; ref < count; ++ref) {
             const auto &plan = source_plans[ref];
-            if (plan.entry && !plan.host_done) expected_rows += plan.blocks;
+            if (plan.entry) {
+                if (plan.host_done || !plan.blocks || plan.block_plan_count != plan.blocks)
+                    throw std::invalid_argument("WSE requires a placement for every kernel Block");
+                expected_rows += plan.blocks;
+            } else if (plan.block_plan_count || plan.block_plans_offset) {
+                throw std::invalid_argument("WSE control nodes cannot carry Block placements");
+            }
         }
         if (expected_rows != d->calendar_row_count) throw std::invalid_argument("WSE calendar Block count mismatch");
         ImageBuilder image(storage, region_count);
@@ -274,8 +280,8 @@ struct WseRun {
                 throw std::invalid_argument("invalid WSE task block count");
             if (source.entry && scheduler_bind_graph_arguments(graph, ref) != SchedulerGraphBindingError::NONE)
                 throw std::invalid_argument("invalid WSE graph argument binding");
-            SchedulerTaskPayloadArguments args{};
             if (source.entry) {
+                SchedulerTaskPayloadArguments args{};
                 if (scheduler_parse_task_payload_arguments(graph, ref, &args) != SchedulerGraphResult::OK)
                     throw std::invalid_argument("invalid WSE task arguments");
                 if (source.has_predicate) {
@@ -308,22 +314,13 @@ struct WseRun {
             }
             if (task_calendar.row_by_block.size() != source.blocks || task_calendar.first_tick < ready_tick)
                 throw std::invalid_argument("missing or premature WSE calendar task");
-            const WseBlockPlan *block_plans = nullptr;
-            if (source.block_plan_count) {
-                if (source.block_plan_count != source.blocks)
-                    throw std::invalid_argument("invalid WSE Block plan count");
-                block_plans = descriptor_table<WseBlockPlan>(*d, source.block_plans_offset, source.block_plan_count);
-            } else if (source.block_plans_offset) throw std::invalid_argument("unexpected WSE Block plans offset");
+            const auto *block_plans =
+                descriptor_table<WseBlockPlan>(*d, source.block_plans_offset, source.block_plan_count);
             SchedulerNativeNode native_node{};
             const bool child = graph.native_header_offset && scheduler_native_node_checked(graph, ref, &native_node) &&
                                native_node.binding->kind == SchedulerNodeKind::CHILD_KERNEL;
             for (uint32_t b = 0; b < task.blocks; ++b) {
-                WseBlockPlan placement{};
-                placement.core_id = b % cores;
-                placement.thread_num = 1;
-                placement.tensor_count = args.tensor_count;
-                placement.scalar_count = args.scalar_count;
-                if (block_plans) placement = block_plans[b];
+                const auto &placement = block_plans[b];
                 const uint32_t core = placement.core_id;
                 if (core >= cores || !placement.thread_num || placement.thread_num > WSE_PE_PER_CORE ||
                     placement.tensor_count > CORE_MAX_TENSOR_ARGS || placement.scalar_count > CORE_MAX_SCALAR_ARGS)
@@ -348,14 +345,11 @@ struct WseRun {
                 work.tensors_offset = image.allocate<Tensor>(core, work.tensor_count, 5);
                 work.scalars_offset = image.allocate<uint64_t>(core, work.scalar_count, 6);
                 const auto *tensor_bytes =
-                    block_plans ? descriptor_region(
-                                      *d, placement.tensors_offset, work.tensor_count, sizeof(Tensor), alignof(Tensor)
-                                  ) :
-                                  reinterpret_cast<const std::byte *>(args.tensors);
+                    descriptor_region(*d, placement.tensors_offset, work.tensor_count, sizeof(Tensor), alignof(Tensor));
                 for (uint32_t i = 0; i < work.tensor_count; ++i) {
                     auto &tensor = image.at<Tensor>(core, work.tensors_offset)[i];
                     std::memcpy(&tensor, tensor_bytes + i * sizeof(Tensor), sizeof(Tensor));
-                    if (block_plans && child) {
+                    if (child) {
                         SchedulerTensorBinding bound{};
                         if (!scheduler_graph_relocate_tensor(tensor, native_node, &bound))
                             throw std::invalid_argument("invalid WSE Block Tensor Graph binding");
@@ -369,14 +363,13 @@ struct WseRun {
                         throw std::invalid_argument("invalid WSE Tensor span");
                     validate_storage(tensor.buffer.addr, tensor.buffer.size);
                 }
-                const auto *values = block_plans ? reinterpret_cast<const uint64_t *>(descriptor_region(
-                                                       *d, placement.scalars_offset, work.scalar_count,
-                                                       sizeof(uint64_t) + sizeof(int32_t), alignof(uint64_t)
-                                                   )) :
-                                                   args.scalars;
+                const auto *values = reinterpret_cast<const uint64_t *>(descriptor_region(
+                    *d, placement.scalars_offset, work.scalar_count, sizeof(uint64_t) + sizeof(int32_t),
+                    alignof(uint64_t)
+                ));
                 for (uint32_t i = 0; i < work.scalar_count; ++i) {
                     uint64_t value = values[i];
-                    if (block_plans && child) {
+                    if (child) {
                         const int32_t parameter = reinterpret_cast<const int32_t *>(values + work.scalar_count)[i];
                         if (parameter >= 0) {
                             if (static_cast<uint32_t>(parameter) >= native_node.instance->boundary_scalar_count)

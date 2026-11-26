@@ -86,7 +86,7 @@
     {
       "source": "src/a5/runtime/host_build_graph/host/runtime_maker.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/runtime_maker.cpp",
-      "sha256": "272e1612d6eeef1b3ea0a52c719060487c3cd4d533886f653e031762be933afa"
+      "sha256": "2699f4a3b2fdb7023fe34b3195e2a17caf154adb923f8a1f51f80411420c1212"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
@@ -147,7 +147,7 @@
       "source": "tests/st/a5/host_build_graph/vector_example/kernels/orchestration/example_orch.cpp",
       "destination": "tests/st/wse/host_build_graph/vector_example/kernels/orchestration/example_orch.cpp",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "sha256": "b240fc91ff48a3b43868a3df7f410cc44cac9ecd81d7eaa5c48911674eee2efe"
+      "sha256": "de679f81ce2de0ed0907d3a47577e1243754c590da75b423235514b3458f3236"
     },
     {
       "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_add_scalar.cpp",
@@ -177,7 +177,13 @@
       "source": "tests/st/a5/host_build_graph/predicated_dispatch/test_predicated_dispatch.py",
       "destination": "tests/st/wse/host_build_graph/direct_launch/test_predicate.py",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "sha256": "54bfcfbb919155a6e6a0c3623c70883be05b0e0e675aa4fe8495017a3095b431"
+      "sha256": "e851497edcfa349fc3c6a264c36086231e08bd09bc8170afe2fa3a26d3584361"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/orchestration/predicated_dispatch_orch.cpp",
+      "destination": "tests/st/wse/host_build_graph/direct_launch/kernels/predicate_orch.cpp",
+      "source_commit": "df65739f3266334e21bec08a5488cd6663f9d0fa",
+      "sha256": "e72a5c84fa8cc9586e3fbc6bd85bb03e437fb5f0fd1a0115afc7c4ed754db8fa"
     }
   ],
   "derivation_baseline": "a3a951a1f9ef4dd898b254dc88f233b9cfac0b32",
@@ -227,10 +233,6 @@
     {
       "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_write_const.cpp",
       "sha256": "74abaf7aaf19db0347be56e174df0ae2166178553aa2cba0a25f0bfa7bb8370b"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/orchestration/predicated_dispatch_orch.cpp",
-      "sha256": "db2af41e502fb952fc7133d4aa8f7d850208a4b3cc3539c9c79ed13820d1efd0"
     },
     {
       "source": "src/a5/platform/include/common/kernel_args.h",
