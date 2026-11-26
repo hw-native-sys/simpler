@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "host_build_graph/host/graph_cache.h"
 #include "host_build_graph/host/graph_recording.h"
 
 struct ChipTaskSlotState;
@@ -49,6 +50,7 @@ inline constexpr size_t GRAPH_NO_OBJECT_OFFSET = static_cast<size_t>(-1);
 struct GraphHostUpload {
     ChipTaskSlotState *outer_slot;
     uint64_t graph_key;
+    std::optional<simpler::hbg::GraphCalendarHint> calendar_hint;
 };
 
 // The run's distinct Definition images (already deduplicated by the host-side
@@ -68,6 +70,7 @@ struct GraphPendingUpload {
     ChipTaskSlotState *outer_slot{nullptr};
     uint64_t graph_key{0};
     bool deferred_heap{false};
+    std::optional<simpler::hbg::GraphCalendarHint> calendar_hint;
 };
 
 enum class GraphRecordingStatus : uint8_t { RECORDING = 0, READY = 1, FAILED = 2 };

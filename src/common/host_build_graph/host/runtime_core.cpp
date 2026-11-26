@@ -49,9 +49,12 @@ static TaskOutputTensors submit_dummy_task_impl(OrchContext *ctx, const CoreTask
     return ctx->orchestrator->submit_dummy_task(args);
 }
 
-static GraphScopeResult graph_begin_impl(OrchContext *ctx, uint64_t graph_key, const GraphTaskArgs &args) {
+static GraphScopeResult graph_begin_impl(
+    OrchContext *ctx, uint64_t graph_key, const GraphTaskArgs &args,
+    const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint
+) {
     if (ctx == nullptr) return GraphScopeResult{};
-    return ctx->orchestrator->graph_begin(graph_key, args);
+    return ctx->orchestrator->graph_begin(graph_key, args, calendar_hint);
 }
 
 static bool graph_prepare_impl(OrchContext *ctx, void *recording_handle, const GraphTaskArgs &args) {
@@ -209,6 +212,9 @@ static const OrchOps s_orch_ops = {
 #endif
     .graph_record_start = graph_record_start_impl,
     .graph_record_wait = graph_record_wait_impl,
+    .retain_graph_config_id = [](OrchContext *ctx) {
+        return ctx->retain_graph_config_id;
+    },
 };
 
 // =============================================================================

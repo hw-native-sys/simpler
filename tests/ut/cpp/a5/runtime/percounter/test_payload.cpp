@@ -43,6 +43,53 @@ TaskInput task(uint32_t mask, int blocks = 1, bool sync = false) {
     return result;
 }
 
+TEST(GraphCalendarCache, BucketKeysDistinguishGraphAndSchedulingShape) {
+    HostGraphTemplate body{};
+    body.tasks = {{1, 1, 1, false, false, false, {11, 0, 0}}, {2, 2, 2, true, true, false, {0, 12, 0}}};
+    body.fanin_offsets = {0, 0, 1};
+    body.fanin_indices = {0};
+    const auto signature = make_graph_calendar_signature(body, 4);
+    const auto reference = make_bucket_graph_calendar_key(5, 0, signature);
+
+    EXPECT_EQ(reference, make_bucket_graph_calendar_key(5, 0, make_graph_calendar_signature(body, 4)));
+    EXPECT_NE(reference, make_bucket_graph_calendar_key(6, 0, signature));
+    EXPECT_NE(reference, make_bucket_graph_calendar_key(5, 1, signature));
+    EXPECT_NE(reference, make_bucket_graph_calendar_key(5, 0, make_graph_calendar_signature(body, 3)));
+
+    auto changed = body;
+    changed.tasks[1].kernel_ids[1] = 13;
+    EXPECT_NE(signature, make_graph_calendar_signature(changed, 4));
+    changed = body;
+    changed.tasks[1].block_num = 4;
+    changed.tasks[1].subtask_total = 4;
+    EXPECT_NE(signature, make_graph_calendar_signature(changed, 4));
+    changed = body;
+    changed.fanin_offsets = {0, 0, 0};
+    changed.fanin_indices.clear();
+    changed.tasks[0].sink = true;
+    EXPECT_NE(signature, make_graph_calendar_signature(changed, 4));
+}
+
+TEST(GraphCalendarCache, InterruptedTrainingReleasesItsOwnKeyForRetry) {
+    const auto cache = std::make_shared<CalendarCache>();
+    const auto plan = std::make_shared<const CalendarPlan>();
+    const auto key = make_bucket_graph_calendar_key(5, 0, {4, 1});
+    const auto other_shape = make_bucket_graph_calendar_key(5, 0, {4, 2});
+    cache->training.emplace(other_shape, plan);
+    {
+        CalendarTraining interrupted{};
+        interrupted.cache = cache;
+        interrupted.key = key;
+        interrupted.baseline = plan;
+        cache->training.emplace(key, plan);
+        interrupted.owns_training = true;
+    }
+    EXPECT_EQ(cache->plans.count(key), 0U);
+    EXPECT_EQ(cache->training.count(key), 0U);
+    EXPECT_EQ(cache->training.count(other_shape), 1U);
+    EXPECT_TRUE(cache->training.emplace(key, plan).second);
+}
+
 struct CalendarDeferTest : testing::Test {
     static constexpr uint32_t defer_bit = 1U << 24;
     alignas(32) uint32_t done{0};

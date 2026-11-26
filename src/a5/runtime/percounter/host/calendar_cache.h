@@ -35,18 +35,108 @@ namespace simpler::percounter {
 
 using CalendarKey = std::vector<uint64_t>;
 
+enum class CalendarKeyKind : uint64_t { OUTER, GRAPH_ARGS, GRAPH_BUCKET };
+
+inline const char *calendar_key_kind_name(CalendarKeyKind kind) {
+    switch (kind) {
+    case CalendarKeyKind::OUTER:
+        return "outer";
+    case CalendarKeyKind::GRAPH_ARGS:
+        return "graph_args";
+    case CalendarKeyKind::GRAPH_BUCKET:
+        return "graph_bucket";
+    }
+    return "unknown";
+}
+
+inline CalendarKey make_graph_calendar_signature(const HostGraphTemplate &body, uint32_t cluster_count) {
+    CalendarKey key{cluster_count, body.tasks.size()};
+    for (size_t i = 0; i < body.tasks.size(); ++i) {
+        const auto &task = body.tasks[i];
+        const int32_t begin = body.fanin_offsets[i];
+        const int32_t end = body.fanin_offsets[i + 1];
+        key.insert(
+            key.end(), {task.active_mask, task.block_num, task.subtask_total, task.sync_start, task.has_predicate,
+                        task.sink, static_cast<uint64_t>(end - begin)}
+        );
+        for (size_t lane = 0; lane < task.kernel_ids.size(); ++lane)
+            if (task.active_mask & (1U << lane)) key.push_back(static_cast<uint64_t>(task.kernel_ids[lane]));
+        key.insert(key.end(), body.fanin_indices.begin() + begin, body.fanin_indices.begin() + end);
+    }
+    return key;
+}
+
+inline CalendarKey
+make_bucket_graph_calendar_key(uint64_t graph_id, uint64_t calendar_hash, const CalendarKey &signature) {
+    CalendarKey key{static_cast<uint64_t>(CalendarKeyKind::GRAPH_BUCKET), graph_id, calendar_hash};
+    key.insert(key.end(), signature.begin(), signature.end());
+    return key;
+}
+
 inline uint64_t calendar_fingerprint(const void *data, size_t bytes) {
     return graph_hash_bytes(1469598103934665603ULL, data, bytes);
 }
 
+inline uint64_t calendar_key_id(const CalendarKey &key) {
+    return calendar_fingerprint(key.data(), key.size() * sizeof(key[0]));
+}
+
 struct CalendarKeyHash {
-    size_t operator()(const CalendarKey &key) const {
-        return static_cast<size_t>(calendar_fingerprint(key.data(), key.size() * sizeof(key[0])));
-    }
+    size_t operator()(const CalendarKey &key) const { return static_cast<size_t>(calendar_key_id(key)); }
 };
+
+struct GraphStructureDifference {
+    int64_t task;
+    const char *field;
+    uint64_t expected;
+    uint64_t actual;
+};
+
+inline std::optional<GraphStructureDifference>
+graph_structure_difference(const HostGraphTemplate &expected, const HostGraphTemplate &actual) {
+    if (expected.tasks.size() != actual.tasks.size())
+        return GraphStructureDifference{-1, "task_count", expected.tasks.size(), actual.tasks.size()};
+    for (size_t task = 0; task < expected.tasks.size(); ++task) {
+        const auto &before = expected.tasks[task];
+        const auto &after = actual.tasks[task];
+        const int64_t id = static_cast<int64_t>(task);
+        const auto expected_begin = expected.fanin_offsets[task];
+        const auto actual_begin = actual.fanin_offsets[task];
+        const auto expected_count = expected.fanin_offsets[task + 1] - expected_begin;
+        const auto actual_count = actual.fanin_offsets[task + 1] - actual_begin;
+        const GraphStructureDifference fields[] = {
+            {id, "block_num", before.block_num, after.block_num},
+            {id, "active_mask", before.active_mask, after.active_mask},
+            {id, "subtask_total", before.subtask_total, after.subtask_total},
+            {id, "sync_start", before.sync_start, after.sync_start},
+            {id, "has_predicate", before.has_predicate, after.has_predicate},
+            {id, "sink", before.sink, after.sink},
+            {id, "fanin_count", static_cast<uint64_t>(expected_count), static_cast<uint64_t>(actual_count)},
+        };
+        for (const auto &field : fields)
+            if (field.expected != field.actual) return field;
+        for (size_t lane = 0; lane < before.kernel_ids.size(); ++lane) {
+            if ((before.active_mask & (1U << lane)) && before.kernel_ids[lane] != after.kernel_ids[lane])
+                return GraphStructureDifference{
+                    id, "kernel_id", static_cast<uint64_t>(before.kernel_ids[lane]),
+                    static_cast<uint64_t>(after.kernel_ids[lane])
+                };
+        }
+        for (int32_t edge = 0; edge < expected_count; ++edge) {
+            const auto expected_fanin = expected.fanin_indices[expected_begin + edge];
+            const auto actual_fanin = actual.fanin_indices[actual_begin + edge];
+            if (expected_fanin != actual_fanin)
+                return GraphStructureDifference{
+                    id, "fanin", static_cast<uint64_t>(expected_fanin), static_cast<uint64_t>(actual_fanin)
+                };
+        }
+    }
+    return std::nullopt;
+}
 
 struct CalendarCache {
     std::mutex mutex;
+    std::unordered_map<uint64_t, HostGraphTemplate> graph_structures;
     std::unordered_map<CalendarKey, uint64_t, CalendarKeyHash> outer_signatures;
     std::map<CalendarKey, std::weak_ptr<const CalendarPlan>> training;
     std::unordered_map<CalendarKey, std::shared_ptr<const CalendarPlan>, CalendarKeyHash> plans;
@@ -273,9 +363,10 @@ struct CalendarTraining {
         if (cache->plans.try_emplace(key, std::move(selected)).second) {
             LOG_INFO(
                 "A5 calendar: STORE plan=%016" PRIx64 " rows=%u changed=%u pid=%d base_cycles=%" PRIu64
-                " selected_cycles=%" PRIu64 " deferred_rows=%zu variant=%s training_us=%" PRIu64,
+                " selected_cycles=%" PRIu64 " deferred_rows=%zu variant=%s training_us=%" PRIu64
+                " kind=%s key=%016" PRIx64,
                 id, rows, changed, getpid(), baseline_cycles, selected_cycles, deferred_rows, selected_variant,
-                training_us
+                training_us, calendar_key_kind_name(static_cast<CalendarKeyKind>(key.front())), calendar_key_id(key)
             );
         }
     }

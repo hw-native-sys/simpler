@@ -453,13 +453,15 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
 // the weak half of an override.
 __attribute__((weak)) SchedulerExtensionResult scheduler_extension_select(
     Runtime *, const HostApi *, SharedMemoryHandle &, int32_t, const std::vector<SchedulerTaskMetadata> &,
-    const std::vector<int64_t> &, const sm_layout::SegmentOffsets &, const void *
+    const std::vector<int64_t> &, const std::map<int32_t, simpler::hbg::GraphCalendarHint> &,
+    const sm_layout::SegmentOffsets &, const void *
 ) {
     return SchedulerExtensionResult::DECLINED;
 }
 
 __attribute__((weak)) bool scheduler_extension_publish_profiling(Runtime *) { return true; }
 __attribute__((weak)) void scheduler_extension_release(Runtime *) {}
+__attribute__((weak)) bool scheduler_extension_retains_graph_config_id() { return false; }
 
 namespace {
 
@@ -1168,9 +1170,12 @@ bool bind_graph_definitions(
             LOG_ERROR("host-orch: invalid or duplicate Graph shell identity");
             return false;
         }
-        if constexpr (task_image::native_graph_plan)
+        if constexpr (task_image::native_graph_plan) {
             invocation_definitions[static_cast<size_t>(shell_id.local_id())] = object_it->second.native_index;
-        else invocation_definitions[static_cast<size_t>(shell_id.local_id())] = 0;
+        } else {
+            invocation_definitions[static_cast<size_t>(shell_id.local_id())] = 0;
+            if (upload->calendar_hint) native_plan->calendar_hints.emplace(shell_id.local_id(), *upload->calendar_hint);
+        }
     }
     if (task_image::native_graph_plan && !invocation_definitions.empty()) {
         std::string error;
@@ -1646,8 +1651,8 @@ bool create_scheduler_state(
     // An extension receives the validated top-level graph before native Graph
     // expansion and owns the remaining bind when it accepts the graph.
     const auto extension = scheduler_extension_select(
-        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs, device_segments,
-        uploaded_sm
+        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs,
+        native_plan.calendar_hints, device_segments, uploaded_sm
     );
     if (extension != SchedulerExtensionResult::DECLINED) return extension == SchedulerExtensionResult::TAKEN;
     if (native_graph) {
@@ -2379,6 +2384,7 @@ int32_t run_host_orchestration(
     storage.swap_storage(orchestrator);
     OrchContext orch_ctx{};
     orch_ctx.orchestrator = &orchestrator;
+    orch_ctx.retain_graph_config_id = scheduler_extension_retains_graph_config_id();
     RAIIScopeGuard retained_storage_return([&storage, &orchestrator]() {
         storage.swap_storage(orchestrator);
     });

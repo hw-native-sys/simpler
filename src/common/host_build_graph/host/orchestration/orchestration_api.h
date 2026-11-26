@@ -36,6 +36,7 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <optional>
 #include <type_traits>
 
 // Type headers needed by orchestration
@@ -208,7 +209,9 @@ static inline TaskOutputTensors rt_submit_dummy_task(const CoreTaskArgs &args) {
     return ctx->ops->submit_dummy_task(ctx, args);
 }
 
-static inline GraphScopeResult rt_graph_begin(uint64_t graph_key, const GraphTaskArgs &args) {
+static inline GraphScopeResult rt_graph_begin(
+    uint64_t graph_key, const GraphTaskArgs &args, const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint
+) {
     OrchContext *ctx = current_orch_context();
     // Every runtime reaching this header implements graph_begin, so a null one means the ops
     // table is not the one this call belongs to. Asserted rather than reported: the default
@@ -224,7 +227,7 @@ static inline GraphScopeResult rt_graph_begin(uint64_t graph_key, const GraphTas
         rejected.has_error = true;
         return rejected;
     }
-    return ctx->ops->graph_begin(ctx, graph_key, args);
+    return ctx->ops->graph_begin(ctx, graph_key, args, calendar_hint);
 }
 
 // Bind the calling thread to the recording `graph_key` opened. The handle comes
@@ -449,7 +452,10 @@ static inline uint64_t rt_graph_function_id(Function function) {
 // including the boundary `args` — is a use-after-free; the recorded body receives
 // its own boundary copy as a parameter for exactly that reason.
 template <typename Invoke>
-static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const GraphTaskArgs &args, Invoke invoke) {
+static inline GraphSubmitResult rt_submit_graph_impl(
+    uint64_t graph_key, const GraphTaskArgs &args, Invoke invoke,
+    const std::optional<simpler::hbg::GraphCalendarHint> &calendar_hint = {}
+) {
     // A boundary cannot hold a runtime-allocated output: GraphTaskArgs::add_output rejects a
     // TensorCreateInfo at compile time, so this tag is reachable only by a bug.
     //
@@ -496,7 +502,7 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
     }
     const uint64_t _admitted_ns = rt_orch_phase_now_ns();
     rt_record_orch_phase(HostPhaseKind::OrchSubmitAdmit, _entry_ns, _admitted_ns, graph_key);
-    GraphScopeResult result = rt_graph_begin(graph_key, args);
+    GraphScopeResult result = rt_graph_begin(graph_key, args, calendar_hint);
     // A failed submission has latched a fatal, so there is no body to run and no phase
     // worth recording: the orchestration it belongs to will not produce a timeline.
     if (result.has_error) return result;
@@ -566,52 +572,25 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
 }
 
 template <typename ConfigT>
-static inline GraphSubmitResult
-rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args, const ConfigT &config) {
-    simpler::hbg::assert_config<ConfigT>();
-    if (function == nullptr) {
-        // Reported rather than asserted: debug_assert is a no-op in release, where a null
-        // body would otherwise drop the Graph silently and let the orchestration carry on.
-        rt_report_fatal(
-            SIMPLER_ERROR_INVALID_ARGS, "%s",
-            "[GraphExecution] a Graph was submitted with a null body, which names nothing to record"
-        );
-        GraphSubmitResult rejected;
-        rejected.has_error = true;
-        return rejected;
+static inline uint64_t rt_graph_retain_config(
+    uint64_t graph_id, const ConfigT &config, const simpler::hbg::GraphSubmitOptions &options,
+    std::optional<simpler::hbg::GraphCalendarHint> &hint
+) {
+    OrchContext *ctx = current_orch_context();
+    const auto retain_id = ctx->ops->retain_graph_config_id;
+    uint64_t config_id = 0;
+    const uint64_t graph_key =
+        simpler::hbg::retain_config(graph_id, config, retain_id && retain_id(ctx) ? &config_id : nullptr);
+    if (config_id != 0 || options.calendar_hash.has_value()) {
+        hint = simpler::hbg::GraphCalendarHint{graph_id, options.calendar_hash, config_id};
     }
-    const uint64_t graph_key = simpler::hbg::retain_config(graph_id, config);
-    return rt_submit_graph_impl(graph_key, args, [function](const GraphTaskArgs &record_args) {
-        function(record_args);
-    });
+    return graph_key;
 }
-
-// Submitting without a Config and submitting a DefaultConfig are the same submission. They
-// share this one path rather than computing a key each, so the two spellings cannot drift
-// into two keys for one Graph.
-static inline GraphSubmitResult rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args) {
-    return rt_submit_graph(graph_id, function, args, simpler::hbg::DefaultConfig{});
-}
-
-static inline GraphSubmitResult rt_submit_graph(GraphFunction function, const GraphTaskArgs &args) {
-    return rt_submit_graph(rt_graph_function_id(function), function, args, simpler::hbg::DefaultConfig{});
-}
-
-template <typename ConfigT>
-static inline GraphSubmitResult
-rt_submit_graph(GraphFunction function, const GraphTaskArgs &args, const ConfigT &config) {
-    return rt_submit_graph(rt_graph_function_id(function), function, args, config);
-}
-
-// A Graph whose body reads construction parameters. The body takes the Config by its own
-// type, so a call that pairs a body with the wrong Config fails to deduce ConfigT rather
-// than compiling into a wrong read.
-template <typename ConfigT>
-using GraphFunctionWithConfig = void (*)(const GraphTaskArgs &, const ConfigT &);
 
 template <typename ConfigT>
 static inline GraphSubmitResult rt_submit_graph(
-    uint64_t graph_id, GraphFunctionWithConfig<ConfigT> function, const GraphTaskArgs &args, const ConfigT &config
+    uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args, const ConfigT &config,
+    const simpler::hbg::GraphSubmitOptions &options = {}
 ) {
     simpler::hbg::assert_config<ConfigT>();
     if (function == nullptr) {
@@ -625,26 +604,91 @@ static inline GraphSubmitResult rt_submit_graph(
         rejected.has_error = true;
         return rejected;
     }
-    const uint64_t graph_key = simpler::hbg::retain_config(graph_id, config);
-    // The lambda captures its own copy: the recording job runs on a recorder thread that
-    // outlives this call, so it may hold nothing of the caller's frame -- `config` included.
-    return rt_submit_graph_impl(graph_key, args, [function, config](const GraphTaskArgs &record_args) {
-        function(record_args, config);
-    });
+    std::optional<simpler::hbg::GraphCalendarHint> hint;
+    const uint64_t graph_key = rt_graph_retain_config(graph_id, config, options, hint);
+    return rt_submit_graph_impl(
+        graph_key, args,
+        [function](const GraphTaskArgs &record_args) {
+            function(record_args);
+        },
+        hint
+    );
+}
+
+// Submitting without a Config and submitting a DefaultConfig are the same submission. They
+// share this one path rather than computing a key each, so the two spellings cannot drift
+// into two keys for one Graph.
+static inline GraphSubmitResult rt_submit_graph(
+    uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args,
+    const simpler::hbg::GraphSubmitOptions &options = {}
+) {
+    return rt_submit_graph(graph_id, function, args, simpler::hbg::DefaultConfig{}, options);
+}
+
+static inline GraphSubmitResult rt_submit_graph(
+    GraphFunction function, const GraphTaskArgs &args, const simpler::hbg::GraphSubmitOptions &options = {}
+) {
+    return rt_submit_graph(rt_graph_function_id(function), function, args, options);
 }
 
 template <typename ConfigT>
-static inline GraphSubmitResult
-rt_submit_graph(GraphFunctionWithConfig<ConfigT> function, const GraphTaskArgs &args, const ConfigT &config) {
-    return rt_submit_graph(rt_graph_function_id(function), function, args, config);
+static inline GraphSubmitResult rt_submit_graph(
+    GraphFunction function, const GraphTaskArgs &args, const ConfigT &config,
+    const simpler::hbg::GraphSubmitOptions &options = {}
+) {
+    return rt_submit_graph(rt_graph_function_id(function), function, args, config, options);
+}
+
+// A Graph whose body reads construction parameters. The body takes the Config by its own
+// type, so a call that pairs a body with the wrong Config fails to deduce ConfigT rather
+// than compiling into a wrong read.
+template <typename ConfigT>
+using GraphFunctionWithConfig = void (*)(const GraphTaskArgs &, const ConfigT &);
+
+template <typename ConfigT>
+static inline GraphSubmitResult rt_submit_graph(
+    uint64_t graph_id, GraphFunctionWithConfig<ConfigT> function, const GraphTaskArgs &args, const ConfigT &config,
+    const simpler::hbg::GraphSubmitOptions &options = {}
+) {
+    simpler::hbg::assert_config<ConfigT>();
+    if (function == nullptr) {
+        // Reported rather than asserted: debug_assert is a no-op in release, where a null
+        // body would otherwise drop the Graph silently and let the orchestration carry on.
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, "%s",
+            "[GraphExecution] a Graph was submitted with a null body, which names nothing to record"
+        );
+        GraphSubmitResult rejected;
+        rejected.has_error = true;
+        return rejected;
+    }
+    std::optional<simpler::hbg::GraphCalendarHint> hint;
+    const uint64_t graph_key = rt_graph_retain_config(graph_id, config, options, hint);
+    // The lambda captures its own copy: the recording job runs on a recorder thread that
+    // outlives this call, so it may hold nothing of the caller's frame -- `config` included.
+    return rt_submit_graph_impl(
+        graph_key, args,
+        [function, config](const GraphTaskArgs &record_args) {
+            function(record_args, config);
+        },
+        hint
+    );
+}
+
+template <typename ConfigT>
+static inline GraphSubmitResult rt_submit_graph(
+    GraphFunctionWithConfig<ConfigT> function, const GraphTaskArgs &args, const ConfigT &config,
+    const simpler::hbg::GraphSubmitOptions &options = {}
+) {
+    return rt_submit_graph(rt_graph_function_id(function), function, args, config, options);
 }
 
 // Release what this .so holds for the bind that just ended. The host calls it once per bind,
 // after the orchestration entry returns, so anything retained here covers the same window as
 // the host's Definition cache -- which is a local of run_host_orchestration and dies with it.
 //
-// Currently that is the Graph Config registry. Its internal keys share the lifetime of
-// the host Definition cache; clearing both lets the next bind start a fresh key namespace.
+// The bind-local Config keys share the lifetime of the host Definition cache.
+// Callable Config identities, when used, stay alive with this library.
 //
 // `used` because this is an inline definition nothing inside the .so calls: the host reaches
 // it by dlsym, so the symbol has to be emitted anyway.

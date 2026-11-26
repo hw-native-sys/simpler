@@ -323,6 +323,53 @@ TEST_F(HbgGraphRecordingBoundsTest, ExplicitPredecessorsBelongToEachOuterShell) 
     EXPECT_EQ(definition->edge_count, 0U);
 }
 
+TEST_F(HbgGraphRecordingBoundsTest, CalendarHintsBelongToIndividualInvocationsOfOneDefinition) {
+    const uint64_t definition_key = 0x2010;
+    const uint64_t graph_id = 0xA62010;
+    orch.begin_scope();
+    const GraphTaskArgs boundary{};
+
+    const auto first = orch.graph_begin(definition_key, boundary, simpler::hbg::GraphCalendarHint{graph_id, 0});
+    ASSERT_FALSE(first.has_error);
+    ASSERT_TRUE(first.recording);
+    const auto inflight = orch.graph_begin(definition_key, boundary, simpler::hbg::GraphCalendarHint{graph_id, 11});
+    ASSERT_FALSE(inflight.has_error);
+    EXPECT_FALSE(inflight.recording);
+
+    ASSERT_TRUE(orch.graph_prepare(first.recording_handle, boundary));
+    ASSERT_TRUE(orch.submit_dummy_task(CoreTaskArgs{}).task_id().is_valid());
+    ASSERT_TRUE(orch.graph_end());
+
+    const auto cached = orch.graph_begin(definition_key, boundary, simpler::hbg::GraphCalendarHint{graph_id, 22});
+    ASSERT_FALSE(cached.has_error);
+    EXPECT_FALSE(cached.recording);
+    const auto default_options = orch.graph_begin(definition_key, boundary);
+    ASSERT_FALSE(default_options.has_error);
+    EXPECT_FALSE(default_options.recording);
+    orch.end_scope();
+    orch.graph_commit();
+    ASSERT_FALSE(orch.is_fatal());
+
+    ASSERT_EQ(graph_host_definitions(*graph_state).size(), 1u);
+    const std::array<TaskId, 4> shells{first.task_id, inflight.task_id, cached.task_id, default_options.task_id};
+    const std::array<uint64_t, 3> hashes{0, 11, 22};
+    ASSERT_EQ(graph_host_upload_count(*graph_state), shells.size());
+    for (size_t i = 0; i < shells.size(); ++i) {
+        ASSERT_TRUE(shells[i].is_valid());
+        const auto upload = graph_host_upload(*graph_state, i);
+        ASSERT_TRUE(upload.has_value());
+        EXPECT_EQ(upload->graph_key, definition_key);
+        EXPECT_EQ(upload->outer_slot, &orch.sm_header->tasks.storage_at(shells[i].local_id()).slot);
+        if (i < hashes.size()) {
+            ASSERT_TRUE(upload->calendar_hint.has_value());
+            EXPECT_EQ(upload->calendar_hint->graph_id, graph_id);
+            EXPECT_EQ(upload->calendar_hint->calendar_hash, hashes[i]);
+        } else {
+            EXPECT_FALSE(upload->calendar_hint.has_value());
+        }
+    }
+}
+
 class HbgGraphExplicitDependencyRejectionTest : public HbgGraphRecordingBoundsTest,
                                                 public ::testing::WithParamInterface<int> {};
 

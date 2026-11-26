@@ -35,12 +35,14 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "common/host_api.h"
 #include "common/host_phase_kind.h"
 #include "common/unified_log.h"
+#include "host_log.h"
 #include "host_build_graph/runtime.h"
 #include "host_build_graph/shared_memory.h"
 #include "intrinsic.h"
@@ -65,10 +67,17 @@ inline void log_unsupported(int32_t total_tasks, const char *reason, int64_t tas
     );
 }
 
+struct GraphCalendarDefinition {
+    const std::byte *image;
+    uint32_t bytes;
+    CalendarKey exact{};
+    CalendarKey signature{};
+};
+
 /** The bind's Graph templates and invocations, gathered from the task table. */
 struct GraphInputs {
     std::vector<HostGraphTemplate> templates;
-    std::vector<CalendarKey> definitions;
+    std::vector<GraphCalendarDefinition> definitions;
     std::vector<GraphInvocationInput> invocations;
     GraphLayoutInput layout{};
     uint64_t body_blocks{0};
@@ -107,38 +116,27 @@ inline TemplateResult gather_graph_inputs(
         const uint32_t definition_offset = slot.to_descriptor().graph_definition_offset;
         auto found = template_of_definition.find(definition_offset);
         if (found == template_of_definition.end()) {
-            HostGraphTemplate tmpl{};
-            const TemplateResult built = read_graph_template(view, definition_offset, worker_count, &tmpl);
-            if (built.status != TemplateStatus::OK) {
-                *failed_task_id = task_id;
-                return built;
-            }
             GraphImageValue definition{};
             if (!graph_definition_decode_framed(view, definition_offset, &definition)) {
                 *failed_task_id = task_id;
                 return TemplateResult{TemplateStatus::MALFORMED, "the Definition framing is invalid", -1};
             }
-            for (int32_t i = 0; i < definition.definition.task_count; ++i) {
-                SubTaskDefinition task{};
+            HostGraphTemplate tmpl{};
+            const TemplateResult built = read_graph_template(view, definition, worker_count, &tmpl);
+            if (built.status != TemplateStatus::OK) {
                 *failed_task_id = task_id;
-                if (!graph_definition_load_element(
-                        view, definition, definition.definition.off_sub_tasks, definition.definition.task_count, i,
-                        &task
-                    ))
-                    return TemplateResult{TemplateStatus::MALFORMED, "the body task does not decode", i};
+                return built;
+            }
+            for (int32_t i = 0; i < definition.definition.task_count; ++i) {
+                const auto &task = tmpl.tasks[static_cast<size_t>(i)];
+                *failed_task_id = task_id;
                 for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-                    if ((task.active_mask.raw() & (1U << lane)) != 0 &&
-                        runtime->get_function_bin_addr(task.kernel_id[lane]) == 0)
+                    if ((task.active_mask & (1U << lane)) != 0 &&
+                        runtime->get_function_bin_addr(task.kernel_ids[lane]) == 0)
                         return TemplateResult{TemplateStatus::MALFORMED, "a body kernel is unregistered", i};
                 }
             }
-            // The recorded definition contains relative tensor and scalar
-            // records. Its bind-local graph_key is not a replay identity.
-            const auto bytes = definition.definition.total_bytes;
-            CalendarKey structure((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
-            std::memcpy(structure.data(), view.section + definition_offset, bytes);
-            structure.front() = 0;  // graph_key is the first uint64_t in Graph.
-            out->definitions.push_back(std::move(structure));
+            out->definitions.push_back({view.section + definition_offset, definition.definition.total_bytes});
             out->section = view.section;
             out->section_bytes = std::max(out->section_bytes, definition_offset + definition.definition.total_bytes);
             out->layout.templates_bytes += sizeof(PercounterGraphTemplate);
@@ -154,6 +152,50 @@ inline TemplateResult gather_graph_inputs(
     }
     out->layout.invocation_count = out->invocations.size();
     return TemplateResult{};
+}
+
+inline bool validate_graph_config_structures(
+    CalendarCache &cache, const GraphInputs &graph,
+    const std::map<int32_t, simpler::hbg::GraphCalendarHint> &calendar_hints
+) {
+    std::vector<bool> checked(graph.templates.size(), false);
+    std::unordered_map<uint64_t, const HostGraphTemplate *> pending;
+    const std::lock_guard<std::mutex> lock(cache.mutex);
+    for (const auto &invocation : graph.invocations) {
+        const auto index = invocation.template_index;
+        if (checked[index]) continue;
+        checked[index] = true;
+        const auto hint = calendar_hints.find(static_cast<int32_t>(invocation.shell_task_id));
+        if (hint == calendar_hints.end() || hint->second.config_id == 0) {
+            LOG_ERROR(
+                "A5 percounter: Graph shell=%" PRId64 " has no Callable Config identity", invocation.shell_task_id
+            );
+            return false;
+        }
+        const auto &identity = hint->second;
+        const auto &body = graph.templates[index];
+        const auto saved = cache.graph_structures.find(identity.config_id);
+        const HostGraphTemplate *expected = nullptr;
+        if (saved == cache.graph_structures.end()) {
+            const auto [entry, inserted] = pending.try_emplace(identity.config_id, &body);
+            if (inserted) continue;
+            expected = entry->second;
+        } else {
+            expected = &saved->second;
+        }
+        if (const auto difference = graph_structure_difference(*expected, body)) {
+            LOG_ERROR(
+                "A5 percounter: Graph %" PRIu64 " changed structure for the same Config (id=%" PRIu64 "): "
+                "task=%" PRId64 " field=%s expected=%" PRIu64 " actual=%" PRIu64,
+                identity.graph_id, identity.config_id, difference->task, difference->field, difference->expected,
+                difference->actual
+            );
+            return false;
+        }
+    }
+    for (const auto &[id, body] : pending)
+        cache.graph_structures.try_emplace(id, *body);
+    return true;
 }
 
 enum class StateSelection : uint8_t {
@@ -174,6 +216,7 @@ enum class StateSelection : uint8_t {
 inline StateSelection select_percounter_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
+    const std::map<int32_t, simpler::hbg::GraphCalendarHint> &calendar_hints,
     const sm_layout::SegmentOffsets &device_segments, const void *uploaded_sm
 ) {
     if (total_tasks < 0) return StateSelection::FAILED;
@@ -271,7 +314,13 @@ inline StateSelection select_percounter_state(
     std::vector<CalendarPhase> phases;
     std::vector<RangeCalendarInput> range_inputs;
     std::vector<std::shared_ptr<CalendarTraining>> training;
-    std::vector<const char *> calendar_events;
+    struct CalendarEvent {
+        const char *status{nullptr};
+        CalendarKeyKind kind{};
+        uint64_t key_id{0};
+    };
+    std::vector<CalendarEvent> calendar_events;
+    const bool log_cache_events = HostLogger::get_instance().is_enabled(simpler::log::LogLevel::INFO);
     RangeCalendarImage calendar;
     if (worker_count < static_cast<int32_t>(PLATFORM_CORES_PER_BLOCKDIM) ||
         worker_count % PLATFORM_CORES_PER_BLOCKDIM != 0 || !plan_calendar_phases(inputs, graph_plan, &phases)) {
@@ -282,6 +331,9 @@ inline StateSelection select_percounter_state(
         auto cache = std::static_pointer_cast<CalendarCache>(
             api->acquire_callable_calendar_cache(runtime->get_active_callable_id(), make_calendar_cache)
         );
+        if (cache != nullptr && !graph.invocations.empty() &&
+            !validate_graph_config_structures(*cache, graph, calendar_hints))
+            return StateSelection::FAILED;
         range_inputs.resize(phases.size());
         training.resize(phases.size());
         calendar_events.resize(phases.size());
@@ -307,7 +359,7 @@ inline StateSelection select_percounter_state(
                     auto &signatures = cache->outer_signatures;
                     outer_signature_id = signatures.try_emplace(std::move(signature), signatures.size()).first->second;
                 }
-                key = {*outer_signature_id, phase.task_ids.size()};
+                key = {static_cast<uint64_t>(CalendarKeyKind::OUTER), *outer_signature_id, phase.task_ids.size()};
                 key.insert(key.end(), phase.task_ids.begin(), phase.task_ids.end());
                 for (size_t id = 0; id < phase.tasks.size(); ++id) {
                     key.push_back(phase.fanins[id].size());
@@ -315,33 +367,52 @@ inline StateSelection select_percounter_state(
                 }
             } else {
                 const auto &invocation = graph.invocations[phase.invocation];
-                const auto &definition = graph.definitions[invocation.template_index];
-                const auto &payload =
-                    host_sm_handle.header->tasks.get_slot_state_by_task_id(invocation.shell_task_id).to_payload();
-                key = {
-                    UINT64_MAX, static_cast<uint64_t>(worker_count), definition.size(),
-                    static_cast<uint64_t>(payload.scalar_count), static_cast<uint64_t>(payload.tensor_count)
-                };
-                key.insert(key.end(), definition.begin(), definition.end());
-                append_calendar_argument_key(
-                    key, payload.scalar_count, payload.tensor_count,
-                    [&](int32_t i) {
-                        return payload.scalar_data()[i];
-                    },
-                    [&](int32_t i) -> const auto & {
-                        return payload.tensor_data()[i];
+                auto &definition = graph.definitions[invocation.template_index];
+                const auto hint = calendar_hints.find(static_cast<int32_t>(invocation.shell_task_id));
+                if (hint != calendar_hints.end() && hint->second.calendar_hash.has_value()) {
+                    const auto calendar_hash = *hint->second.calendar_hash;
+                    if (definition.signature.empty())
+                        definition.signature =
+                            make_graph_calendar_signature(graph.templates[invocation.template_index], cluster_count);
+                    key = make_bucket_graph_calendar_key(hint->second.graph_id, calendar_hash, definition.signature);
+                } else {
+                    if (definition.exact.empty()) {
+                        definition.exact.resize((definition.bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+                        std::memcpy(definition.exact.data(), definition.image, definition.bytes);
+                        definition.exact.front() = 0;  // The Definition starts with its bind-local graph_key.
                     }
-                );
+                    const auto &payload =
+                        host_sm_handle.header->tasks.get_slot_state_by_task_id(invocation.shell_task_id).to_payload();
+                    key = {
+                        static_cast<uint64_t>(CalendarKeyKind::GRAPH_ARGS), static_cast<uint64_t>(worker_count),
+                        definition.exact.size(), static_cast<uint64_t>(payload.scalar_count),
+                        static_cast<uint64_t>(payload.tensor_count)
+                    };
+                    key.insert(key.end(), definition.exact.begin(), definition.exact.end());
+                    append_calendar_argument_key(
+                        key, payload.scalar_count, payload.tensor_count,
+                        [&](int32_t i) {
+                            return payload.scalar_data()[i];
+                        },
+                        [&](int32_t i) -> const auto & {
+                            return payload.tensor_data()[i];
+                        }
+                    );
+                }
             }
+            auto &event = calendar_events[n];
+            event.kind = static_cast<CalendarKeyKind>(key.front());
+            if (log_cache_events) event.key_id = calendar_key_id(key);
             std::unique_lock<std::mutex> lock(cache->mutex);
             if (const auto found = cache->plans.find(key); found != cache->plans.end()) {
                 entry.plan = found->second;
-                calendar_events[n] = "HIT";
+                event.status = "HIT";
                 continue;
             }
             if (const auto pending = cache->training.find(key); pending != cache->training.end()) {
-                if ((entry.plan = pending->second.lock())) {
-                    calendar_events[n] = "REUSE";
+                entry.plan = pending->second.lock();
+                if (entry.plan) {
+                    event.status = "REUSE";
                     continue;
                 }
             }
@@ -359,7 +430,7 @@ inline StateSelection select_percounter_state(
             entry.plan = std::move(initial);
             entry.sample = true;
             training[n] = sample;
-            calendar_events[n] = "MISS";
+            event.status = "MISS";
         }
         if (!build_range_calendar(
                 range_inputs, graph_plan, static_cast<uint32_t>(task_count), cluster_count, &calendar
@@ -492,12 +563,14 @@ inline StateSelection select_percounter_state(
             static_cast<std::byte *>(device_state) + calendar_offset, host_calendar, calendar.bytes.size(),
             HostPhaseKind::Count, {}
         );
-        for (size_t p = 0; p < range_inputs.size(); ++p) {
-            if (calendar_events[p] == nullptr) continue;
+        for (size_t p = 0; log_cache_events && p < range_inputs.size(); ++p) {
+            const auto &event = calendar_events[p];
+            if (event.status == nullptr) continue;
             const auto &plan = *range_inputs[p].plan;
             LOG_INFO(
-                "A5 calendar: %s plan=%016" PRIx64 " rows=%zu pid=%d", calendar_events[p], calendar_plan_id(plan),
-                plan.logical_row_by_packed.size(), getpid()
+                "A5 calendar: %s plan=%016" PRIx64 " rows=%zu pid=%d kind=%s key=%016" PRIx64, event.status,
+                calendar_plan_id(plan), plan.logical_row_by_packed.size(), getpid(), calendar_key_kind_name(event.kind),
+                event.key_id
             );
         }
         std::array<size_t, CALENDAR_FUSED_FANIN_MAX_PRODUCERS + 1> fusion_counts{};

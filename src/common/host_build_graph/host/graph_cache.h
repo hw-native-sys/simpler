@@ -14,10 +14,28 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <optional>
 #include <type_traits>
 
 #include "host_build_graph/task_id.h"
 #include "host_build_graph/types.h"
+
+namespace simpler::hbg {
+
+struct GraphSubmitOptions {
+    // Explicit PGO bucket within the Worker-local Callable and Graph.
+    std::optional<uint64_t> calendar_hash;
+};
+
+// The bucket belongs to this invocation. config_id is stable for this registered
+// orchestration library and names the exact Graph and Config identity.
+struct GraphCalendarHint {
+    uint64_t graph_id;
+    std::optional<uint64_t> calendar_hash;
+    uint64_t config_id{0};
+};
+
+}  // namespace simpler::hbg
 
 struct GraphScopeResult {
     // The submission failed: no shell was published and no recording opened. Every path
