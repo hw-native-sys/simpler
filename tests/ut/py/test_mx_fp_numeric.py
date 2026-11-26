@@ -103,6 +103,13 @@ class TestFp8E8m0Numeric:
     reason="torch float8_e4m3fn + float8_e8m0fnu required",
 )
 class TestMxFp8MatmulGolden:
+    def test_case_preserves_default_rng(self):
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(1234)
+            before = torch.get_rng_state()
+            make_mx_fp8_case(seed=19)
+            assert torch.equal(torch.get_rng_state(), before)
+
     def test_make_case_shapes_and_finite(self):
         a, a_s, b, b_s, c, expected = make_mx_fp8_case(128, 64, 64)
         assert a.shape == (128, 64) and a.dtype == torch.float8_e4m3fn
@@ -136,6 +143,13 @@ class TestMxFp8MatmulGolden:
     reason="torch float4_e2m1fn_x2 + float8_e8m0fnu required",
 )
 class TestMxFp4MatmulGolden:
+    def test_case_preserves_default_rng(self):
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(1234)
+            before = torch.get_rng_state()
+            make_mx_fp4_case(seed=19)
+            assert torch.equal(torch.get_rng_state(), before)
+
     def test_pack_two_fp4_lo_hi(self):
         # [0.5=0b0001, 1.0=0b0010] → byte 0x21
         packed = pack_two_fp4(torch.tensor([[1, 2]], dtype=torch.uint8))
