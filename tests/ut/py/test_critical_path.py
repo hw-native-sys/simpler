@@ -424,3 +424,14 @@ def test_same_task_id_in_another_run_cannot_hide_a_missing_trace_bar(tmp_path, c
     assert "run 43: task 1" in capsys.readouterr().err
     assert not (trace_path.parent / critical_path.STATIC_TRACE_NAME).exists()
     assert not (trace_path.parent / critical_path.OBSERVED_TRACE_NAME).exists()
+
+
+@pytest.mark.parametrize("middle_kernels, expected", [([-1, -1, -1], ["0"]), ([4, -1, -1], [])])
+def test_project_only_dependency_only_tasks(middle_kernels, expected):
+    rows = [[0, 0, 0, 10, 20], [1, 2, 0, 25, 35]]
+    deps = {
+        "tasks": [{"task_id": 1, "kernel_ids": middle_kernels}],
+        "edges": [{"pred": 0, "succ": 1}, {"pred": 1, "succ": 2}],
+    }
+    graph = critical_path._build_run_graph(rows, deps, {}, 1_000_000, "run", None, 0)
+    assert graph.hb_pred.get("2", []) == expected

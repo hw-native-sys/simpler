@@ -199,15 +199,23 @@ def _build_run_graph(
     # under tick-level ties, and every edge is time-forward for the DP / backward walk.
     hb_pred: dict[str, list[str]] = collections.defaultdict(list)
     kept = 0
-    seen: set[tuple[str, str]] = set()
-    for e in deps["edges"]:
-        p, s = str(e["pred"]), str(e["succ"])
-        if p == s or p not in start or s not in start or (p, s) in seen:
-            continue
-        seen.add((p, s))
-        if end[p] <= start[s] + tol and start[p] < start[s]:
-            hb_pred[s].append(p)
-            kept += 1
+    parents: dict[str, list[str]] = collections.defaultdict(list)
+    for edge in deps["edges"]:
+        parents[str(edge["succ"])].append(str(edge["pred"]))
+    controls = {t for t, info in tinfo.items() if info.get("kernel_ids") == [-1, -1, -1] and t not in start}
+    for s in start:
+        pending = list(reversed(parents.get(s, ())))
+        visited: set[str] = set()
+        while pending:
+            p = pending.pop()
+            if p in visited:
+                continue
+            visited.add(p)
+            if p in controls:
+                pending.extend(reversed(parents.get(p, ())))
+            elif p in start and end[p] <= start[s] + tol and start[p] < start[s]:
+                hb_pred[s].append(p)
+                kept += 1
 
     # Same-core resource predecessor: the moment the core a task first lands on was
     # freed = max end over all earlier slices on that core (running-max handles any
