@@ -197,3 +197,61 @@ TEST(GraphExecutionProgress, SubTaskResolutionIsNotAHostCompletion) {
     EXPECT_EQ(result.resolved, 1);
     EXPECT_EQ(result.completed, 0);
 }
+
+TEST(GraphPrepareScheduling, ReadyGraphYieldsToQueuedPeerAfterFourSlices) {
+    SharedMemoryHeader header{};
+    SchedulerState scheduler{};
+    scheduler.sm_header = &header;
+    ChipReadyQueueSlot queue_slots[4]{};
+    for (int i = 0; i < 4; ++i)
+        queue_slots[i].sequence.store(i);
+    auto &queue = scheduler.graph_prepare_queue;
+    queue.slots = queue_slots;
+    queue.capacity = 4;
+    queue.mask = 3;
+    GraphExecution execution{};
+    ChipTaskSlotState ready{}, peer{};
+    ready.task_kind = TaskKind::GRAPH;
+    ready.graph_context = &execution;
+    execution.outer_slot = &ready;
+    ASSERT_EQ(scheduler.signal_graph_external_ready(ready), 0);
+    const TaskId ready_id = TaskId::make_global(10);
+    const TaskId peer_id = TaskId::make_global(11);
+    ASSERT_TRUE(scheduler.push_graph_prepare(&ready, ready_id, 0));
+    ASSERT_TRUE(scheduler.push_graph_prepare(&peer, peer_id, 0));
+    GraphPrepareBurst burst;
+    TaskId id = TaskId::invalid();
+    for (int slice = 0; slice < 4; ++slice) {
+        ASSERT_EQ(burst.next(queue, id), &ready);
+        EXPECT_EQ(id, ready_id);
+        EXPECT_EQ(burst.retain(&ready, id, GraphMaterializeResult::PENDING, 4), slice < 3);
+    }
+    ASSERT_TRUE(scheduler.push_graph_prepare(&ready, id, 0));
+    EXPECT_EQ(burst.next(queue, id), &peer);
+    EXPECT_EQ(id, peer_id);
+    EXPECT_EQ(burst.next(queue, id), &ready);
+    EXPECT_EQ(id, ready_id);
+}
+
+TEST(GraphPrepareScheduling, BusyNoProgressAndClosedGateYieldImmediately) {
+    GraphExecution execution{};
+    ChipTaskSlotState slot{};
+    slot.task_kind = TaskKind::GRAPH;
+    slot.graph_context = &execution;
+    execution.outer_slot = &slot;
+    const TaskId token = TaskId::make_global(19);
+    GraphPrepareBurst burst;
+    EXPECT_FALSE(burst.retain(&slot, token, GraphMaterializeResult::PENDING, 4));
+    SchedulerState scheduler{};
+    ASSERT_EQ(scheduler.signal_graph_external_ready(slot), 0);
+    EXPECT_FALSE(burst.retain(&slot, token, GraphMaterializeResult::BUSY, 4));
+    EXPECT_FALSE(burst.retain(&slot, token, GraphMaterializeResult::PENDING, 0));
+    EXPECT_FALSE(burst.retain(&slot, token, GraphMaterializeResult::MATERIALIZED, 4));
+    EXPECT_FALSE(burst.retain(&slot, token, GraphMaterializeResult::INVALID, 0));
+    EXPECT_TRUE(burst.retain(&slot, token, GraphMaterializeResult::PENDING, 4));
+    ChipReadyQueue queue{};
+    TaskId observed = TaskId::invalid();
+    EXPECT_EQ(burst.next(queue, observed), &slot);
+    EXPECT_EQ(observed, token);
+    EXPECT_EQ(burst.next(queue, observed), nullptr);
+}

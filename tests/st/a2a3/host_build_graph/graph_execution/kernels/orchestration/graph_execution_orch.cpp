@@ -42,6 +42,15 @@ void layer(const GraphTaskArgs &args, const LayerConfig &config) {
     const std::array<uint32_t, 1> shape{a.shapes[0]};
     TensorCreateInfo intermediate(shape.data(), static_cast<uint32_t>(shape.size()), DataType::FLOAT32);
 
+    // Two 42-node definitions surround a 6-node peer and ordinary tasks.
+    // The long bodies span multiple bounded preparation bursts.
+    if (config.variant == 0) {
+        for (int i = 0; i < 36; ++i) {
+            CoreTaskArgs task;
+            rt_submit_dummy_task(task);
+        }
+    }
+
     // A dependency-only root. Its shape is DUMMY, which indexes no per-shape
     // dispatch queue, so it must never be staged by the shell's early release —
     // this body is where that is exercised on device.

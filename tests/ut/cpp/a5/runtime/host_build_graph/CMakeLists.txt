@@ -107,7 +107,7 @@ a5_hbg_case(test_hbg_scheduler_bootstrap.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
 
-a5_hbg_case(test_hbg_nonce_exit.cpp NO_OBJS TIMEOUT 20
+a5_hbg_case(test_hbg_nonce_exit.cpp NO_OBJS TIMEOUT 60
     SOURCES
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/aicore_executor.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary.cpp

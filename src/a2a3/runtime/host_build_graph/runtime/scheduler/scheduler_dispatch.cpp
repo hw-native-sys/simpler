@@ -1293,6 +1293,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     int32_t timeout_rc = 0;
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
+    GraphPrepareBurst graph_prepare_burst;
 #if SIMPLER_DFX
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
     chip_swimlane.reset();
@@ -1509,11 +1510,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         //
         // Keep it ahead of dummy/regular dispatch so a Graph body can expose its
         // tasks without waiting for an otherwise unrelated dispatch pass. One
-        // bounded prepare slice per loop prevents a large definition from
-        // monopolizing a scheduler thread.
+        // bounded prepare slice per loop preserves completion and dispatch
+        // service. Ready Graphs retain ownership for at most four turns.
         if (thread_idx < active_sched_threads_) {
             TaskId prepare_task_id = TaskId::invalid();
-            ChipTaskSlotState *prepare_slot = sched_->graph_prepare_queue.pop_tagged(&prepare_task_id);
+            ChipTaskSlotState *prepare_slot = graph_prepare_burst.next(sched_->graph_prepare_queue, prepare_task_id);
             if (prepare_slot != nullptr) {
                 const bool valid_slot = prepare_slot->task_kind == TaskKind::GRAPH &&
                                         prepare_slot->to_descriptor().task_id == prepare_task_id;
@@ -1531,7 +1532,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     &tasks_materialized
                 );
                 if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::BUSY) {
-                    if (!sched_->push_graph_prepare(prepare_slot, prepare_task_id, thread_idx)) {
+                    if (!graph_prepare_burst.retain(prepare_slot, prepare_task_id, result, tasks_materialized) &&
+                        !sched_->push_graph_prepare(prepare_slot, prepare_task_id, thread_idx)) {
                         fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
                         break;
                     }
