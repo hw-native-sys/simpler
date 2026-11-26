@@ -116,6 +116,7 @@ simpler_ut_add_target(NAME test_a2a3_hbg_mix_lane_priority ARCH a2a3 RUNTIME hos
 
 simpler_ut_add_target(NAME test_a2a3_tmr_mix_lane_priority ARCH a2a3 RUNTIME tensormap_and_ringbuffer TIER aicpu
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_priority.cpp
+        ${SIMPLER_SRC}/common/tensormap_and_ringbuffer/aicpu/scheduler_failure.cpp
         ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
         ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
@@ -798,6 +799,7 @@ tmr_case(test_diagnostic_rollback_notification.cpp
 hbg_case(test_run_terminal_stop_settlement.cpp
     SOURCES
         ${CAPACITY_REFUSAL_SOURCES}
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
         ${HBG_COMMON_SHARED_DIR}/runtime.cpp
     INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
     DEFINES  SIMPLER_RUNTIME_NAME="host_build_graph"

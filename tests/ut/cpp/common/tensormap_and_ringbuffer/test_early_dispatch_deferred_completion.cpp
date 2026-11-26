@@ -21,6 +21,7 @@
 
 #include "callable.h"
 #include "orchestrator.h"
+#include "runtime.h"
 #include "runtime_core.h"
 #include "scheduler/scheduler_context.h"
 
@@ -108,9 +109,11 @@ public:
         return testing::internal::GetCapturedStderr();
     }
 
-    static void timeout(SchedulerContext &context, SharedMemoryHeader &header) {
+    static bool claim_shutdown(SchedulerContext &context) { return context.begin_emergency_shutdown(); }
+
+    static void timeout(SchedulerContext &context, SharedMemoryHeader &header, int32_t thread_idx = 0) {
         testing::internal::CaptureStderr();
-        EXPECT_EQ(context.handle_timeout_exit(0, &header, nullptr, 42, 0), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+        EXPECT_EQ(context.handle_timeout_exit(thread_idx, &header, nullptr, 42, 0), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
         (void)testing::internal::GetCapturedStderr();
     }
 
@@ -131,6 +134,12 @@ public:
             slab.entries[i].completion_type = COMPLETION_TYPE_COUNTER;
         }
         slab.count = count;
+    }
+
+    static void fail_slab(SchedulerContext &context, int core, int code) {
+        const int token = context.core_exec_states_[core].running_reg_task_id;
+        ASSERT_NE(token, AICPU_TASK_INVALID);
+        context.deferred_slab_per_core_[core][token & 1].error_code = code;
     }
 
     static int free_aiv_slots(SchedulerContext &context) {
@@ -347,6 +356,44 @@ protected:
     }
 };
 
+TEST_F(EarlyDispatchDeferredCompletion, FinFailureStopsBeforeIndependentReadyTaskIsDispatched) {
+    const TaskId running = submit(KernelKind::Aic);
+    dispatch();
+    ASSERT_EQ(core(0).running_slot_state, slot(running));
+    ack(0);
+    const TaskId ready = submit(KernelKind::Aiv);
+    MixAdmissionTestPeer::fail_slab(*context, 0, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    conditions[0] = MAKE_FIN_VALUE(core(0).running_reg_task_id);
+    auto device_runtime = std::make_unique<Runtime>();
+    context->resolve_and_dispatch(device_runtime.get(), 0);
+    EXPECT_EQ(shared.header->sched_error_code.load(), SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(shared.header->sched_error_thread.load(), 0);
+    EXPECT_EQ(shared.header->sched_error_bitmap.load(), 1U);
+    EXPECT_TRUE(context->is_completed());
+    EXPECT_LT(slot(running)->task_state.load(), CHIP_TASK_COMPLETED);
+    expect_no_occupancy(ready);
+}
+
+TEST_F(EarlyDispatchDeferredCompletion, MailboxFailureStopsDispatchAndPreservesFirstReporter) {
+    const TaskId running = submit(KernelKind::Aic);
+    dispatch();
+    const TaskId ready = submit(KernelKind::Aiv);
+    ASSERT_TRUE(latch_scheduler_error(shared.header, 2, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+    // A second registration for a full per-task condition list must fail during poll.
+    auto &waits = scheduler->async_wait_list;
+    waits.entries[0].task_token = running;
+    waits.entries[0].condition_count = MAX_COMPLETIONS_PER_TASK;
+    waits.count.store(1);
+    ASSERT_TRUE(mailbox->try_push_condition(running, 0, 0, 1, COMPLETION_ENGINE_CCU, COMPLETION_TYPE_COUNTER));
+    auto device_runtime = std::make_unique<Runtime>();
+    context->resolve_and_dispatch(device_runtime.get(), 0);
+    EXPECT_TRUE(context->is_completed());
+    EXPECT_EQ(shared.header->sched_error_code.load(), SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(shared.header->sched_error_thread.load(), 2);
+    EXPECT_EQ(shared.header->sched_error_bitmap.load(), 5U);
+    expect_no_occupancy(ready);
+}
+
 TEST_F(EarlyDispatchDeferredCompletion, AsyncCompletionWaitIsNotReadyBeforeOrAfterMailboxDrain) {
     alignas(64) volatile uint32_t notification = 0;
     const TaskId producer = submit(KernelKind::Aic);
@@ -423,6 +470,35 @@ TEST_F(EarlyDispatchDeferredCompletion, RunningAndAsyncWaitRemainSeparateAndTime
     EXPECT_EQ(shared.header->sched_stall_task_id.load(), producer);
     EXPECT_EQ(shared.header->sched_stall_core.load(), -1);
     EXPECT_EQ(slot(producer)->task_state.load(), CHIP_TASK_PENDING);
+}
+
+TEST_F(EarlyDispatchDeferredCompletion, TimeoutKeepsFirstSnapshotWhenShutdownAlreadyHasAnOwner) {
+    const TaskId running = submit(KernelKind::Aic);
+    dispatch();
+    ASSERT_TRUE(MixAdmissionTestPeer::claim_shutdown(*context));
+    MixAdmissionTestPeer::timeout(*context, *shared.header);
+    ASSERT_EQ(shared.header->sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    ASSERT_EQ(shared.header->sched_stall_detail.load(), SIMPLER_STALL_DETAIL_RUNNING_STALLED);
+    ASSERT_EQ(shared.header->sched_stall_task_id.load(), running);
+
+    finish(running);
+    ASSERT_NE(MixAdmissionTestPeer::classification(*context).detail, SIMPLER_STALL_DETAIL_RUNNING_STALLED);
+    MixAdmissionTestPeer::timeout(*context, *shared.header, 1);
+    EXPECT_EQ(shared.header->sched_error_thread.load(), 0);
+    EXPECT_EQ(shared.header->sched_error_bitmap.load(), 3U);
+    EXPECT_EQ(shared.header->sched_stall_detail.load(), SIMPLER_STALL_DETAIL_RUNNING_STALLED);
+    EXPECT_EQ(shared.header->sched_stall_cnt_running.load(), 1);
+    EXPECT_EQ(shared.header->sched_stall_task_id.load(), running);
+}
+
+TEST_F(EarlyDispatchDeferredCompletion, TimeoutStartsShutdownWhenAnotherSchedulerErrorWasLatched) {
+    ASSERT_TRUE(latch_scheduler_error(shared.header, 2, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW));
+    MixAdmissionTestPeer::timeout(*context, *shared.header);
+    EXPECT_FALSE(MixAdmissionTestPeer::claim_shutdown(*context));
+    EXPECT_EQ(shared.header->sched_error_code.load(), SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    EXPECT_EQ(shared.header->sched_error_thread.load(), 2);
+    EXPECT_EQ(shared.header->sched_error_bitmap.load(), 5U);
+    EXPECT_EQ(shared.header->sched_stall_detail.load(), SIMPLER_STALL_DETAIL_NONE);
 }
 
 TEST_F(EarlyDispatchDeferredCompletion, DeferredRegistrationDoesNotHideUnfinishedSubtasks) {

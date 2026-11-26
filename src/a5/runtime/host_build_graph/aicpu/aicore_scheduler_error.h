@@ -20,6 +20,8 @@
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
 #include "host_build_graph/runtime_status.h"
+#include "runtime_status/error_names.h"
+#include "runtime_status/scheduler_error.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 
@@ -42,29 +44,13 @@ inline int32_t aicore_scheduler_runtime_error_code(uint64_t scheduler_error) {
 }
 
 inline const char *aicore_scheduler_error_name(uint64_t scheduler_error) {
-    switch (aicore_scheduler_runtime_error_code(scheduler_error)) {
-    case SIMPLER_ERROR_NONE:
-        return "NONE";
-    case SIMPLER_ERROR_SCHEDULER_TIMEOUT:
-        return "SCHEDULER_TIMEOUT";
-    case SIMPLER_ERROR_ASYNC_COMPLETION_INVALID:
-        return "ASYNC_COMPLETION_INVALID";
-    case SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW:
-        return "ASYNC_WAIT_OVERFLOW";
-    case SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED:
-        return "ASYNC_REGISTRATION_FAILED";
-    default:
-        return "INVALID_ARGS";
-    }
+    if (scheduler_error == 0) return "NONE";
+    return error_name(aicore_scheduler_runtime_error_code(scheduler_error));
 }
 
 inline bool latch_aicore_scheduler_runtime_error(std::atomic<int32_t> *sched_error_code, uint64_t scheduler_error) {
-    if (sched_error_code == nullptr || scheduler_error == 0) return false;
-    int32_t expected = SIMPLER_ERROR_NONE;
-    return sched_error_code->compare_exchange_strong(
-        expected, aicore_scheduler_runtime_error_code(scheduler_error), std::memory_order_acq_rel,
-        std::memory_order_acquire
-    );
+    return sched_error_code != nullptr &&
+           try_latch_runtime_error(*sched_error_code, aicore_scheduler_runtime_error_code(scheduler_error));
 }
 
 inline bool record_aicore_scheduler_runtime_error(

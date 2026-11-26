@@ -172,6 +172,41 @@ snapshot. A timeout observation does not establish a transport fault's root caus
 A2/A3 HBG reports `state=ASYNC_WAIT` and `scan_async_wait`, but does not use TMR's
 S1–S6 timeout sub-classification. A5 HBG has a separate diagnostic path.
 
+On A2/A3 and A5 TMR, the first scheduler thread to latch code 100 publishes the
+task, core, counts and stall detail together (detail last). A different thread
+can already own emergency shutdown. Inspect the recorded task/core even when
+the thread requesting retirement differs from the timeout reporter.
+
+On both TMR architectures, a failure reported at AICore FIN or while polling
+asynchronous completions preserves the first scheduler code and thread ID.
+The reporter bitmap can include more than one AICPU thread. The detecting
+thread stops before dispatching another ready task in that iteration. Use the
+run's terminal record for the result and the retirement acknowledgements for
+core release.
+
+On A5 HBG, the AICPU supervisor maps the recorded AICore scheduler result to a
+runtime code and preserves the first latched failure. The finalizer samples it
+again after the participants finish their shutdown partitions, so an error seen
+while waiting for core exit can still determine the run result. To locate that
+failure, read the device's scheduler identity and `site`.
+
+On Host, a known execution error and proof of device completion are separate.
+When a submitted run still lacks completion proof, finalization retains its
+storage and bindings. Once the backend has proved completion, cleanup proceeds
+through its existing reference and binding checks, retaining the prior error.
+
+If an onboard Host thread cannot attach before observing a launched run, the public
+wait returns `SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE` and logs the original binding
+failure. The same Worker can retry wait or finalize and deliver successful
+outputs. The blocking `simpler_run()` reports the final observation when its
+first wait was incomplete.
+
+On A2/A3 and A5 simulators, joining this run's producers establishes physical
+completion. A later diagnostic export exception contributes
+`PTO_RUNTIME_ERR_INTERNAL`. A prior device error takes precedence. Finalization
+can release the slot after the usual ownership checks. A failed join leaves
+the slot held until the run's producers have been stopped.
+
 **S1 has end-to-end fault coverage; S6 has CPU scheduler regression coverage
 for deferred completion.** S3, S4, S5 and unknown have no stable public-API scene
 reproducer — see [Codes with no end-to-end test](device-error-codes/untested.md).

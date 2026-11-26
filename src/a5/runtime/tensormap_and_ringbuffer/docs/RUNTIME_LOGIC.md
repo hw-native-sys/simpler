@@ -648,17 +648,22 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 | `bind_runtime(rt)` | device-orch only | Wire `sched_` to `rt->scheduler` once the orchestrator thread creates `rt` |
 | `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
 | `shutdown(thread_idx)` | per thread on exit | Claim the published retirement group, finalize PMU on healthy runs, then retire the group |
-| `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_`, and run `emergency_shutdown` on fatal |
+| `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_`, and report a latched orchestration error to `handle_failure` |
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
 | Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
 
-Private internals are split across three .cpp files by responsibility:
+The scheduler implementation is split by responsibility:
 
 - `scheduler_completion.cpp` — completion polling, drain protocol
 - `scheduler_dispatch.cpp` — task dispatch loop and helpers
-- `scheduler_cold_path.cpp` — exit checks, stall diagnostics, profiling, lifecycle (`pre_handshake_init` / `handshake_partition` / `post_handshake_init` / `deinit`), core management (`assign_cores_to_threads` / `emergency_shutdown`), and `on_orchestration_done`
+- `scheduler_failure.cpp` (shared TMR AICPU source) — failure policy, exit checks, timeout reporting
+- `scheduler_cold_path.cpp` — stall diagnostics, profiling, lifecycle (`pre_handshake_init` / `handshake_partition` / `post_handshake_init` / `deinit`), core management (`assign_cores_to_threads` / `signal_emergency_shutdown`), and `on_orchestration_done`
 
-`AicpuExecutor` calls neither `handshake_*`, `assign_*`, `reassign_*`, nor `emergency_shutdown` directly — they are private, invoked only by `init` and `on_orchestration_done`.
+**AICPU failure handling.** If orchestration setup fails before runtime binding, `AicpuExecutor::run` calls `SchedulerContext::handle_failure` to release the waiting scheduler threads. They skip dispatch and reach their own `shutdown()`. The orchestrator's return contributes to the run's terminal result. A shared fatal observed after binding, a progress timeout, or an explicit abort instead elects an emergency retirement owner via `begin_emergency_shutdown()`. Core claims prevent duplicate retirement when other threads subsequently call `shutdown()`.
+
+When FIN reports a completion error or the asynchronous wait list fails during polling, the detecting scheduler calls `handle_failure` with `LocalSchedulerFailure`. It preserves the first scheduler code and reporter, adds its reporter bit and stops dispatch before the next ready task in that iteration. Participants retire their own assigned cores on exit. A concurrent emergency request can claim those cores first.
+
+`AicpuExecutor::init` coordinates the handshake partitions. `SchedulerContext` owns core assignments and retirement claims.
 
 ### 8.6 Dispatch model — two sources, sync tiers, occupancy order
 

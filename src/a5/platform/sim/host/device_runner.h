@@ -73,6 +73,7 @@ private:
     int invoke_device_register(const RegisterCallableArgs &reg_args) override;
     void unload_executor_binaries();
     void cleanup_active_run() noexcept;
+    int collect_run_diagnostics(const PreparedExecution &prepared, int device_rc);
 
     /**
      * Build this run's collector pools and profiling flag under the execution

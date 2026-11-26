@@ -2427,6 +2427,51 @@ TEST_F(NativeAdmissionTest, UnstartedLaunchWithFailedCleanupPublishesNoReleasePr
     EXPECT_EQ(runner.reservations(), 0u);
 }
 
+TEST_F(NativeAdmissionTest, WorkerDeliversOutputAfterRetryingAnUnobservedWait) {
+    FencedCompletionRunner runner;
+    runner.use_inout_argument();
+    ChipWorker worker;
+    bind_program_lane(worker, runner);
+    Attempt input(runner, 0, 10);
+    const auto run = worker.prepare_native_run_on_slot(
+        1, &input.args, input.config, 0, 1, 10, 10, nullptr, 0, false, NativeRunProvenance{}, worker.prepare_run_fn_
+    );
+    worker.launch_native_run(run);
+    const auto upload = std::find_if(control().uploads.begin(), control().uploads.end(), [&](const auto &row) {
+        return row.second == input.bytes.data();
+    });
+    ASSERT_NE(upload, control().uploads.end());
+    std::memset(upload->first, 0x42, input.bytes.size());
+
+    control().attach_rc = -77;
+    EXPECT_THROW(worker.wait_native_run(run), std::runtime_error);
+    EXPECT_EQ(runner.drain_calls, 0);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->result_observed);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->pending_rc_set);
+    EXPECT_NE(input.bytes.front(), 0x42);
+
+    control().attach_rc = 0;
+    EXPECT_NO_THROW(worker.wait_native_run(run));
+    EXPECT_NO_THROW(worker.finalize_native_run(run));
+    EXPECT_EQ(program_lane_wait_results, (std::vector<int>{SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE, 0}));
+    EXPECT_EQ(input.bytes, std::vector<uint8_t>(input.bytes.size(), 0x42));
+    worker.device_ctx_ = nullptr;
+}
+
+TEST_F(NativeAdmissionTest, BlockingRunReturnsFinalizeResultAfterTransientWaitRefusal) {
+    class OneRefusedWait : public FencedCompletionRunner {
+        LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+            auto result = FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
+            control().next_attach_rc = -77;
+            return result;
+        }
+    } runner;
+    Attempt run(runner, 0, 10);
+    EXPECT_EQ(simpler_run(&runner, run.storage, 1, &run.args, &run.config, &run.descriptor), 0);
+    EXPECT_EQ(runner.drain_calls, 1);
+    EXPECT_TRUE(run.empty());
+}
+
 TEST_F(NativeAdmissionTest, LostDrainAttachmentPreservesSubmittedOwnershipAndAllowsObservationRetry) {
     EXPECT_EXIT(
         {
@@ -2434,7 +2479,7 @@ TEST_F(NativeAdmissionTest, LostDrainAttachmentPreservesSubmittedOwnershipAndAll
             Attempt active(runner, 0, 10);
             if (active.prepare() != 0 || simpler_launch_run(&runner, active.storage) != 0) std::_Exit(1);
             control().attach_rc = -77;
-            if (simpler_wait_run(&runner, active.storage) != -77) std::_Exit(2);
+            if (simpler_wait_run(&runner, active.storage) != SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) std::_Exit(2);
             if (!runner.accepts_new_run() || !runner.holds_epoch(10) || active.empty()) std::_Exit(3);
             if (runner.drain_calls != 0 || runner.quarantine_calls != 0 || runner.reservations() != 1) std::_Exit(4);
             control().attach_rc = 0;
@@ -2470,6 +2515,17 @@ TEST_F(NativeAdmissionTest, LostDrainAttachmentPreservesSubmittedOwnershipAndAll
     );
 }
 
+TEST_F(NativeAdmissionTest, FinalizeObservesTheRunOnItsAlreadyAttachedThread) {
+    Runner runner;
+    Attempt active(runner, 0, 10);
+    ASSERT_EQ(active.prepare(), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, active.storage), 0);
+    const size_t before = control().attach_calls;
+    EXPECT_EQ(simpler_finalize_run(&runner, active.storage), 0);
+    EXPECT_EQ(runner.drain_calls, 1);
+    EXPECT_EQ(control().attach_calls - before, 1u);
+}
+
 TEST_F(NativeAdmissionTest, EscapingDrainExceptionStopsAdmissionAndPreservesResources) {
     for (bool finalize_without_wait : {false, true}) {
         SCOPED_TRACE(finalize_without_wait);
@@ -2492,6 +2548,9 @@ TEST_F(NativeAdmissionTest, EscapingDrainExceptionStopsAdmissionAndPreservesReso
                 if (runner.drain_calls != 1 || runner.quarantine_calls != 1) std::_Exit(4);
                 Attempt next(runner, 1, 20);
                 if (next.prepare() == 0 || runner.launch_calls != 1) std::_Exit(5);
+                runner.drain_throws = false;
+                if (simpler_finalize_run(&runner, active.storage) != PTO_RUNTIME_ERR_INTERNAL || !active.empty())
+                    std::_Exit(6);
                 std::_Exit(0);
             },
             ::testing::ExitedWithCode(0), ""
@@ -2539,7 +2598,8 @@ TEST_F(NativeAdmissionTest, UndrainedFinalizationRetainsCallableCodeAndTables) {
                 if (failure < 2) control().attach_rc = -77;
                 else if (failure == 2) runner.drain_throws = true;
                 const int rc = failure < 2 ? -77 : failure == 2 ? PTO_RUNTIME_ERR_INTERNAL : -4321;
-                if (failure == 0 && simpler_wait_run(&runner, active.storage) != rc) std::_Exit(2);
+                if (failure == 0 && simpler_wait_run(&runner, active.storage) != SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE)
+                    std::_Exit(2);
                 if (simpler_finalize_run(&runner, active.storage) != rc) std::_Exit(3);
                 control().attach_rc = 0;
                 if (runner.accepts_new_run()) std::_Exit(4);

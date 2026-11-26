@@ -76,6 +76,20 @@ struct NativeRunContext {
         return true;
     }
 
+    // A drain may contribute a failure, a proof of physical completion, or both.
+    // Preserve each independently across observation and finalization.
+    void record_drain_outcome(const DrainOutcome &drain) noexcept {
+        if (completion_rc == 0) completion_rc = drain.combined();
+        physical_complete = physical_complete || drain.physical_complete;
+    }
+
+    // A submitted or partially submitted run keeps its carrier until the runner
+    // proves physical completion. Binding and wait-reference checks still follow.
+    int check_finalize_drain(bool launched) const noexcept {
+        if (!launched || physical_complete) return 0;
+        return completion_rc != 0 ? completion_rc : PTO_RUNTIME_ERR_INTERNAL;
+    }
+
     uint64_t magic{0};
     Runner *runner{nullptr};
     CallConfig config{};

@@ -1356,11 +1356,9 @@ int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) 
         if (state->active_execution == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
         if (!state->physical_complete) {
             const DrainOutcome drain = state->runner->drain_execution(*state->active_execution);
-            if (state->completion_rc == 0) state->completion_rc = drain.combined();
-            if (!drain.physical_complete) return drain.device_rc != 0 ? drain.device_rc : PTO_RUNTIME_ERR_INTERNAL;
-            // The backend consumes its active run during drain. Preserve that proof
-            // before allocating the host result owner, so retirement can retry.
-            state->physical_complete = true;
+            // Preserve the proof before allocating the host result owner, so retirement can retry.
+            state->record_drain_outcome(drain);
+            if (!state->physical_complete) return drain.device_rc != 0 ? drain.device_rc : PTO_RUNTIME_ERR_INTERNAL;
         }
         try {
             state->runner->retain_run_result(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
@@ -1445,9 +1443,8 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // Sim records no device lifecycle facts, so the run takes the composed
     // result: a device error first, and a diagnostics ownership failure still
     // reaching the caller behind it.
-    if (state->completion_rc == 0) state->completion_rc = drain.combined();
+    state->record_drain_outcome(drain);
     state->result_observed = true;
-    state->physical_complete = drain.physical_complete;
     emit_native_run_runner_wall(state);
     collect_completion_feedback(state);
     if (state->physical_complete) state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
@@ -1502,14 +1499,11 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
                 LOG_ERROR("simpler_finalize_run: drain_execution threw (%s)", state->trace_attrs);
             }
         }
-        if (execution_rc == 0) execution_rc = drain.combined();
-        state->completion_rc = execution_rc;
-        state->physical_complete = state->physical_complete || drain.physical_complete;
+        state->record_drain_outcome(drain);
+        execution_rc = state->completion_rc;
         if (state->physical_complete) state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     }
-    if (launched && !state->physical_complete) {
-        return execution_rc != 0 ? execution_rc : PTO_RUNTIME_ERR_INTERNAL;
-    }
+    if (const int drain_rc = state->check_finalize_drain(launched); drain_rc != 0) return drain_rc;
     emit_native_run_runner_wall(state);
 
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
@@ -1587,7 +1581,11 @@ int simpler_run(
     int rc = simpler_prepare_run(ctx, runtime, callable_id, args, config, descriptor);
     if (rc != 0) return rc;
     rc = simpler_launch_run(ctx, runtime);
-    if (rc == 0) rc = simpler_wait_run(ctx, runtime);
+    if (rc == 0) {
+        rc = simpler_wait_run(ctx, runtime);
+        // Finalize observes the run itself when the earlier wait could not attach.
+        if (rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) return simpler_finalize_run(ctx, runtime);
+    }
     int finalize_rc = simpler_finalize_run(ctx, runtime);
     return finalize_rc != 0 ? finalize_rc : rc;
 }

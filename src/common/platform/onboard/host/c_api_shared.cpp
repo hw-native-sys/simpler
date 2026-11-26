@@ -2632,15 +2632,7 @@ int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) 
     }
 }
 
-int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
-    OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_wait_run");
-    if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    if (state->caller_owns_submission) return PTO_RUNTIME_ERR_UNSUPPORTED;
-    if (state->phase.load(std::memory_order_acquire) == NativeRunPhase::Prepared) return PTO_RUNTIME_ERR_INTERNAL;
-    if (state->result_observed) return state->completion_rc;
-    // Context refusal precedes observation and remains retryable.
-    const int attach_rc = state->runner->enter_run_thread();
-    if (attach_rc != 0) return attach_rc;
+static void observe_attached_run(OnboardNativeRunContext *state) {
     DrainOutcome drain{};
     note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
     try {
@@ -2654,16 +2646,31 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     } catch (...) {
         quarantine_undrained_run(*state->runner, drain.device_rc);
         LOG_ERROR("simpler_wait_run: drain threw (%s)", state->trace_attrs);
-        return drain.device_rc;
+        state->record_drain_outcome(drain);
+        return;
     }
-    if (state->completion_rc == 0) state->completion_rc = drain.combined();
+    state->record_drain_outcome(drain);
     state->result_observed = true;
-    state->physical_complete = state->physical_complete || drain.physical_complete;
     if (state->physical_complete) {
         note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     }
     emit_native_run_runner_wall(state);
+}
+
+int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_wait_run");
+    if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (state->caller_owns_submission) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (state->phase.load(std::memory_order_acquire) == NativeRunPhase::Prepared) return PTO_RUNTIME_ERR_INTERNAL;
+    if (state->result_observed) return state->completion_rc;
+    // Context refusal precedes observation and remains retryable.
+    const int attach_rc = state->runner->enter_run_thread();
+    if (attach_rc != 0) {
+        LOG_ERROR("simpler_wait_run: enter_run_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+        return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+    }
+    observe_attached_run(state);
     return state->completion_rc;
 }
 
@@ -2804,7 +2811,6 @@ static int finalize_native_run(
 
     STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
-    int execution_rc = state->completion_rc;
     const bool caller_owned = state->caller_owns_submission;
     // The launch owner covers both submitted and potentially submitted work:
     // a backend exception is Partial and keeps its ActiveExecution. Only an
@@ -2851,15 +2857,9 @@ static int finalize_native_run(
         state, launched || caller_submitted ? WorkspaceManager::RunFact::Launched :
                                               WorkspaceManager::RunFact::NoDeviceSubmission
     );
-    if (!transfer && !state->result_observed && launched && attach_rc == 0) {
-        execution_rc = simpler_wait_run(ctx, runtime);
-    }
-    state->completion_rc = execution_rc;
-    if (launched && !state->physical_complete) {
-        // A cached error is not permission to release a live or unknown reader.
-        // Keep the carrier, IO, actual streams and all unresolved cleanup debt.
-        return execution_rc != 0 ? execution_rc : PTO_RUNTIME_ERR_INTERNAL;
-    }
+    if (!transfer && !state->result_observed && launched) observe_attached_run(state);
+    const int execution_rc = state->completion_rc;
+    if (const int drain_rc = state->check_finalize_drain(launched); drain_rc != 0) return drain_rc;
     // Cleanup has begun, including for an unlaunched preparation. A failed
     // cleanup may be retried, but must never make the carrier launchable again.
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
@@ -3097,7 +3097,11 @@ int simpler_run(
     int rc = simpler_prepare_run(ctx, runtime, callable_id, args, config, descriptor);
     if (rc != 0) return rc;
     rc = simpler_launch_run(ctx, runtime);
-    if (rc == 0) rc = simpler_wait_run(ctx, runtime);
+    if (rc == 0) {
+        rc = simpler_wait_run(ctx, runtime);
+        // Finalize observes the run itself when the earlier wait could not attach.
+        if (rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) return simpler_finalize_run(ctx, runtime);
+    }
     int finalize_rc = simpler_finalize_run(ctx, runtime);
     return finalize_rc != 0 ? finalize_rc : rc;
 }

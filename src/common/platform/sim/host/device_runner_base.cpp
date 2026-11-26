@@ -1536,7 +1536,17 @@ int SimDeviceRunnerBase::close_args_dump_run_boundary(
     // Non-zero when the close could not prove this run's published buffers were
     // processed into host-owned storage inside its execution claim. That is an
     // ownership failure, not a file annotation, so it travels out of here.
-    const int rc = dump_collector_.run_close(run_epoch, device_execution_complete);
+    // Sim holds the execution slot exclusively until finalize. After join, a failed run can drain
+    // its published buffers even though it has no terminal accounting to read.
+    if (device_producers_stopped && !device_execution_complete) dump_collector_.quiesce();
+    int rc;
+    try {
+        rc = dump_collector_.run_close(run_epoch, device_execution_complete);
+    } catch (...) {
+        if (device_producers_stopped && device_execution_complete) dump_collector_.quiesce();
+        throw;
+    }
+    if (rc != 0 && device_producers_stopped && device_execution_complete) dump_collector_.quiesce();
     simpler::dfx::runs::settle_failed_run_terminal_bank(
         dump_collector_, run_epoch, device_execution_complete, device_producers_stopped
     );
@@ -1564,23 +1574,10 @@ void SimDeviceRunnerBase::close_scope_stats_run_boundary(
     );
 }
 
-int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
-    const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete,
-    bool device_producers_stopped
+void SimDeviceRunnerBase::close_chip_swimlane_run_boundary(
+    uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
-    // The order is fixed by two couplings, not by preference: the host phase
-    // records reach the collector before the swimlane export serializes them,
-    // and each collector drains before it reconciles before it exports.
-    // Diagnostic exports use the per-task output prefix the user set on
-    // CallConfig (CallConfig::validate() enforces non-empty upstream).
-    //
-    // Only ArgsDump's close reports anything here: a retained run whose
-    // published buffers it could not prove processed inside the execution claim
-    // is an ownership failure the caller has to see, because releasing the
-    // claim past one would let the successor reuse an arena whose bytes nobody
-    // copied. Every other collector's close is void, as it was.
-    int args_dump_rc = 0;
-    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.retains_runs()) {
+    if (chip_swimlane_collector_.retains_runs()) {
         // Both publications precede the epoch's metadata snapshot, which is
         // what copies them. The extensions belong here for the same reason the
         // host phase records do: a5's host_build_graph supplies a real
@@ -1598,66 +1595,86 @@ int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
                 publish_chip_swimlane_runtime_extensions();
             }
         );
-        write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
-        if (dfx.dump_args_enabled()) {
-            args_dump_rc =
-                close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
-        }
-        if (dfx.pmu_enabled) {
-            close_pmu_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
-        }
-        if (dfx.scope_stats_enabled) {
-            close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
-        }
-        return args_dump_rc;
+        return;
     }
+    chip_swimlane_collector_.quiesce();
+    chip_swimlane_collector_.read_phase_header_metadata();
+    chip_swimlane_collector_.reconcile_counters();
+    // Only the completion path reads the bank; see the onboard base for why
+    // an incomplete run's snapshot says nothing about that run. Whether the
+    // bank itself comes back is a separate question, and on a simulated
+    // device it has an answer: the producers are this process's AICPU and
+    // AICore threads, and the drain joined every one of them before it got
+    // here.
+    const int bank = chip_swimlane_collector_.run_terminal_bank_of(run_epoch);
+    if (device_execution_complete) {
+        if (bank >= 0) {
+            chip_swimlane_collector_.report_run_terminal_snapshot(static_cast<uint32_t>(bank), run_epoch);
+            chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
+        }
+    } else if (bank >= 0) {
+        if (device_producers_stopped) {
+            // Nothing reads what this run left there — `quiesce` above
+            // stopped the host's readers, and the entries carry their own
+            // epoch, so a survivor is counted as foreign by the next
+            // occupant rather than attributed to it.
+            chip_swimlane_collector_.discard_run_terminal_bank(run_epoch);
+        } else {
+            chip_swimlane_collector_.quarantine_run_terminal_bank(run_epoch);
+        }
+    }
+    publish_host_phase_records_to_swimlane(pipeline_slot);
+    publish_chip_swimlane_runtime_extensions();
+    chip_swimlane_collector_.export_swimlane_json();
+}
+
+int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
+    const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete,
+    bool device_producers_stopped
+) {
+    // A failed export must not skip another owner's reader drain or leave its terminal bank open.
+    int diagnostics_rc = 0;
+    auto close_owner = [&](const char *owner, auto close) {
+        try {
+            const int rc = close();
+            if (diagnostics_rc == 0) diagnostics_rc = rc;
+        } catch (...) {
+            LOG_ERROR(
+                "Sim diagnostics: %s threw while closing run %llu", owner, static_cast<unsigned long long>(run_epoch)
+            );
+            if (diagnostics_rc == 0) diagnostics_rc = PTO_RUNTIME_ERR_INTERNAL;
+        }
+    };
     if (dfx.chip_swimlane_enabled()) {
-        chip_swimlane_collector_.quiesce();
-        chip_swimlane_collector_.read_phase_header_metadata();
-        chip_swimlane_collector_.reconcile_counters();
-        // Only the completion path reads the bank; see the onboard base for why
-        // an incomplete run's snapshot says nothing about that run. Whether the
-        // bank itself comes back is a separate question, and on a simulated
-        // device it has an answer: the producers are this process's AICPU and
-        // AICore threads, and the drain joined every one of them before it got
-        // here.
-        const int bank = chip_swimlane_collector_.run_terminal_bank_of(run_epoch);
-        if (device_execution_complete) {
-            if (bank >= 0) {
-                chip_swimlane_collector_.report_run_terminal_snapshot(static_cast<uint32_t>(bank), run_epoch);
-                chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
-            }
-        } else if (bank >= 0) {
-            if (device_producers_stopped) {
-                // Nothing reads what this run left there — `quiesce` above
-                // stopped the host's readers, and the entries carry their own
-                // epoch, so a survivor is counted as foreign by the next
-                // occupant rather than attributed to it.
-                chip_swimlane_collector_.discard_run_terminal_bank(run_epoch);
-            } else {
-                chip_swimlane_collector_.quarantine_run_terminal_bank(run_epoch);
-            }
-        }
-        publish_host_phase_records_to_swimlane(pipeline_slot);
-        publish_chip_swimlane_runtime_extensions();
-        chip_swimlane_collector_.export_swimlane_json();
+        close_owner("chip_swimlane", [&] {
+            close_chip_swimlane_run_boundary(
+                pipeline_slot, run_epoch, device_execution_complete, device_producers_stopped
+            );
+            return 0;
+        });
     }
-
-    write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
-
+    close_owner("host phases", [&] {
+        write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
+        return 0;
+    });
     if (dfx.dump_args_enabled()) {
-        args_dump_rc =
-            close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
+        close_owner("args_dump", [&] {
+            return close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
+        });
     }
-
     if (dfx.pmu_enabled) {
-        close_pmu_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
+        close_owner("pmu", [&] {
+            close_pmu_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
+            return 0;
+        });
     }
-
     if (dfx.scope_stats_enabled) {
-        close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
+        close_owner("scope_stats", [&] {
+            close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
+            return 0;
+        });
     }
-    return args_dump_rc;
+    return diagnostics_rc;
 }
 
 // Whether this runtime's device scheduler dispatches from resolved kernel-entry
