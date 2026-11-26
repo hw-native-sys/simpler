@@ -102,4 +102,4 @@ allreduce/
 └── README.md
 ```
 
-See the [minimal allreduce example](../../../../../../examples/workers/l3/allreduce/) for a simpler "how to do a collective" demo.
+See the [minimal allreduce example](../../../../../examples/workers/l3/allreduce/) for a simpler "how to do a collective" demo.
