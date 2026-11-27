@@ -1010,6 +1010,12 @@ class Orchestrator:
     def _begin_run(self) -> int:
         return int(self._o._begin_run())
 
+    def _request_parent_cancel(self, run_id: int) -> None:
+        self._o._request_parent_cancel(run_id)
+
+    def _abandon_parent_cancel(self, run_id: int) -> None:
+        self._o._abandon_parent_cancel(run_id)
+
     def _close_run_submission(self, run_id: int) -> None:
         self._o._close_run_submission(run_id)
 
@@ -1029,7 +1035,10 @@ class Orchestrator:
         return bool(self._o._wait_run_for(run_id, timeout_seconds))
 
     def _run_done(self, run_id: int) -> bool:
-        return bool(self._o._run_done(run_id))
+        return bool(self._o._run_done(run_id) or self._run_cancel_cleanup_failed(run_id))
+
+    def _run_cancel_cleanup_failed(self, run_id: int) -> bool:
+        return bool(self._o._run_cancel_cleanup_failed(run_id))
 
     def _release_run(self, run_id: int) -> None:
         self._o._release_run(run_id)

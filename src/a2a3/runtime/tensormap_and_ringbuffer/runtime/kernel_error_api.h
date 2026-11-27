@@ -29,3 +29,21 @@ inline __aicore__ bool report_kernel_error(AsyncCtx &ctx, KernelErrorCode code) 
     pto2::detail::defer_flush(ctx);
     return true;
 }
+
+inline __aicore__ bool report_kernel_error(AsyncCtx &ctx, KernelErrorCode code, const KernelErrorDetail &detail) {
+    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_error_code == nullptr ||
+        !is_kernel_error(static_cast<int32_t>(code)) || detail.arg_index < 0)
+        return false;
+    auto *slab = reinterpret_cast<volatile __gm__ DeferredCompletionSlab *>(ctx.completion_count);
+    if (ctx.completion_error_code != &slab->error_code || ctx.completion_entries != slab->entries ||
+        *ctx.completion_error_code != 0)
+        return false;
+    slab->kernel_error_detail.value = detail.value;
+    slab->kernel_error_detail.lower = detail.lower;
+    slab->kernel_error_detail.upper = detail.upper;
+    slab->kernel_error_detail.arg_index = detail.arg_index;
+    pto2::detail::defer_flush_range(&slab->kernel_error_detail, sizeof(slab->kernel_error_detail));
+    *ctx.completion_error_code = static_cast<int32_t>(code) | kernel_validation::detail_bit;
+    pto2::detail::defer_flush(ctx);
+    return true;
+}

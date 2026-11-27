@@ -279,6 +279,26 @@ TEST(EntryCacheDeinit, AsyncSubmissionFailureDrainsPendingRecordsAndReturnsOrigi
     }
 }
 
+TEST(EntryCacheDeinit, DetailedKernelFailureDrainsItsPendingRecord) {
+    auto executor = std::make_unique<AicpuExecutor>();
+    auto runtime = std::make_unique<RuntimeContext>();
+    auto &slab = SchedulerContextTestPeer::prepare(executor->sched_ctx_, *runtime, TaskId::make(0, 19));
+    alignas(CHIP_ALIGN_SIZE) uint64_t record = 0;
+    slab.count = 1;
+    slab.error_code = static_cast<int32_t>(KernelErrorCode::INDEX_OUT_OF_RANGE) | kernel_validation::detail_bit;
+    slab.entries[0] = {reinterpret_cast<uint64_t>(&record), 7, 0, COMPLETION_ENGINE_SDMA,
+                       COMPLETION_TYPE_SDMA_EVENT_RECORD,   0};
+    KernelErrorCleanup cleanup{};
+    executor->sched_ctx_.drain_cancelled_run(0, cleanup);
+    EXPECT_EQ(cleanup.async_error, SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(cleanup.complete, 0u);
+    __atomic_store_n(&record, 7, __ATOMIC_RELEASE);
+    executor->sched_ctx_.drain_cancelled_run(UINT64_MAX, cleanup);
+    EXPECT_EQ(cleanup.async_error, 0);
+    EXPECT_EQ(cleanup.drained_conditions, 1u);
+    EXPECT_EQ(cleanup.complete, 1u);
+}
+
 TEST(EntryCacheDeinit, AsyncFailureRetainsPendingAndInvalidRecords) {
     for (const int code : {101, 102}) {
         auto executor = std::make_unique<AicpuExecutor>();

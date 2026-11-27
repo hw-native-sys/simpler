@@ -15,6 +15,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
+#include "tensormap_and_ringbuffer/cancelled_run_result.h"
 
 #include "scheduler/scheduler.h"
 
@@ -31,20 +32,6 @@
 class Runtime;
 struct Handshake;
 struct RuntimeContext;
-
-// Error-path retirement evidence. It does not authorize Host or Worker reuse.
-struct KernelErrorCleanup {
-    uint64_t run_epoch;
-    uint64_t task_token;
-    int32_t core_error;
-    int32_t async_error;
-    uint32_t source;
-    int32_t core;
-    uint32_t expected_cores;
-    uint32_t released_cores;
-    uint32_t drained_conditions;
-    uint32_t complete;
-};
 
 /**
  * SchedulerContext: owns all scheduler-side state and methods.

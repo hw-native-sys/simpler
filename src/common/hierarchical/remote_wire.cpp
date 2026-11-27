@@ -124,6 +124,7 @@ bool valid_frame_type(uint32_t v) {
     case FrameType::COMPLETION:
     case FrameType::HEALTH:
     case FrameType::SHUTDOWN:
+    case FrameType::CANCEL_TASK:
         return true;
     }
     return false;
@@ -251,7 +252,7 @@ std::vector<uint8_t> encode_frame(const FrameHeader &header, const std::vector<u
     return out;
 }
 
-DecodedFrame decode_frame(const uint8_t *data, size_t size) {
+FrameHeader decode_frame_header(const uint8_t *data, size_t size) {
     ensure(size >= FRAME_HEADER_BYTES, "remote_wire: truncated frame header");
     ensure(std::memcmp(data, MAGIC, sizeof(MAGIC)) == 0, "remote_wire: bad frame magic");
     size_t offset = sizeof(MAGIC);
@@ -259,18 +260,21 @@ DecodedFrame decode_frame(const uint8_t *data, size_t size) {
     ensure(version == PROTOCOL_VERSION, "remote_wire: unsupported frame version");
     uint32_t raw_type = get_u32(data, size, offset);
     ensure(valid_frame_type(raw_type), "remote_wire: unknown frame type");
-    DecodedFrame frame;
-    frame.header.frame_type = static_cast<FrameType>(raw_type);
-    frame.header.session_id = get_u64(data, size, offset);
-    frame.header.worker_id = get_i32(data, size, offset);
-    frame.header.sequence = get_u64(data, size, offset);
-    frame.header.payload_bytes = get_u32(data, size, offset);
-    frame.header.flags = get_u32(data, size, offset);
-    ensure((frame.header.flags & ~FRAME_FLAGS_KNOWN) == 0, "remote_wire: unknown frame flags");
-    ensure(frame.header.payload_bytes <= MAX_FRAME_PAYLOAD_BYTES, "remote_wire: frame payload exceeds maximum");
-    ensure(size - offset == frame.header.payload_bytes, "remote_wire: frame payload length mismatch");
-    frame.payload.assign(data + offset, data + size);
-    return frame;
+    FrameHeader header;
+    header.frame_type = static_cast<FrameType>(raw_type);
+    header.session_id = get_u64(data, size, offset);
+    header.worker_id = get_i32(data, size, offset);
+    header.sequence = get_u64(data, size, offset);
+    header.payload_bytes = get_u32(data, size, offset);
+    header.flags = get_u32(data, size, offset);
+    ensure((header.flags & ~FRAME_FLAGS_KNOWN) == 0, "remote_wire: unknown frame flags");
+    ensure(header.payload_bytes <= MAX_FRAME_PAYLOAD_BYTES, "remote_wire: frame payload exceeds maximum");
+    ensure(size - offset == header.payload_bytes, "remote_wire: frame payload length mismatch");
+    return header;
+}
+
+DecodedFrame decode_frame(const uint8_t *data, size_t size) {
+    return {decode_frame_header(data, size), std::vector<uint8_t>(data + FRAME_HEADER_BYTES, data + size)};
 }
 
 DecodedFrame decode_frame(const std::vector<uint8_t> &data) { return decode_frame(data.data(), data.size()); }

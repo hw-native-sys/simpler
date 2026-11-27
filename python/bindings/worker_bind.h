@@ -271,6 +271,7 @@ inline void mailbox_store_u64(uint64_t addr, uint64_t v) {
 }
 
 inline void bind_worker(nb::module_ &m) {
+    nb::exception<ParentCancelCleanupFailed>(m, "_ParentCancelCleanupFailed", PyExc_RuntimeError);
     m.attr("_REMOTE_FRAME_HEADER_BYTES") = remote_l3::FRAME_HEADER_BYTES;
     m.attr("_REMOTE_MAX_FRAME_PAYLOAD_BYTES") = remote_l3::MAX_FRAME_PAYLOAD_BYTES;
     nb::enum_<MpiDirectTag>(m, "_MpiDirectTag")
@@ -494,7 +495,15 @@ inline void bind_worker(nb::module_ &m) {
         .def("_scope_begin", &Orchestrator::scope_begin)
         .def("_scope_end", &Orchestrator::scope_end)
         .def("_begin_run", &Orchestrator::begin_run, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_request_parent_cancel", &Orchestrator::request_parent_cancel, nb::arg("run_id"),
+            nb::call_guard<nb::gil_scoped_release>()
+        )
         .def("_close_run_submission", &Orchestrator::close_run_submission, nb::arg("run_id"))
+        .def(
+            "_abandon_parent_cancel", &Orchestrator::abandon_parent_cancel, nb::arg("run_id"),
+            nb::call_guard<nb::gil_scoped_release>()
+        )
         .def(
             "_fail_run_submission",
             [](Orchestrator &self, RunId run_id, const std::string &message) {
@@ -521,6 +530,7 @@ inline void bind_worker(nb::module_ &m) {
             nb::call_guard<nb::gil_scoped_release>(), "Wait up to timeout_seconds for one run to become terminal."
         )
         .def("_run_done", &Orchestrator::run_done, nb::arg("run_id"))
+        .def("_run_cancel_cleanup_failed", &Orchestrator::run_cancel_cleanup_failed, nb::arg("run_id"))
         .def(
             "_current_run_failed_for_test", &Orchestrator::current_building_run_failed_for_test,
             "Report whether an asynchronous failure has reached the run whose graph is still being built."

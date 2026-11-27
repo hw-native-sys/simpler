@@ -156,12 +156,15 @@ struct RunState {
     // Explicit observation is a run-lifetime demand, including tasks not yet
     // dispatched when the waiter arrives. Publication reads it once per entry.
     std::atomic<bool> observation_requested{false};
+    std::atomic<bool> parent_cancel_requested{false};
+    std::mutex cancel_sweep_mu;
     mutable std::mutex completion_mu;
     std::condition_variable completion_cv;
     std::exception_ptr first_error;
     std::vector<TaskSlot> task_slots;
     bool submission_closed{false};
     bool submission_failed{false};
+    bool cancel_cleanup_failed{false};  // Protected by completion_mu. Resources remain owned until teardown.
     bool lease_released{false};
     // Protected by completion_mu. Physical ends release execution admission;
     // semantic active_tasks and IO references remain until normal delivery.

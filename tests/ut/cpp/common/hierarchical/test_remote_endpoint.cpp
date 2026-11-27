@@ -389,6 +389,8 @@ uint16_t start_split_header_reply_server(
 
 class FakeRemoteTransport : public RemoteL3Transport {
 public:
+    std::vector<remote_l3::FrameHeader> cancellations;
+    void request_task_cancel(const remote_l3::FrameHeader &header) override { cancellations.push_back(header); }
     int32_t next_error_code{0};
     std::string next_error_message;
     std::vector<uint8_t> next_control_result_bytes;
@@ -542,6 +544,35 @@ TEST(RemoteEndpoint, TaskDispatchUsesProgressSubmissionAndPolling) {
     EXPECT_EQ(progress.dispatch.dispatch_id, 7u);
     EXPECT_EQ(progress.completion.outcome, EndpointOutcome::SUCCESS);
     EXPECT_FALSE(transport->last_frame.empty());
+    ring.shutdown();
+}
+
+TEST(RemoteEndpoint, CancelAddressesOnlyItsOutstandingTaskAndDoesNotCompleteIt) {
+    Ring ring;
+    ring.init(1ULL << 20);
+    WorkerDispatch dispatch{};
+    dispatch.task_slot = make_slot(ring, scalar_args());
+    ring.slot_state(dispatch.task_slot)->run_id = 40;
+    auto *transport = new FakeRemoteTransport();
+    transport->progress_polls_before_ready = 1;
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+    endpoint.submit_progress(&ring, dispatch);
+    auto task = remote_l3::decode_frame(transport->last_frame);
+    endpoint.request_peer_cancel(39);
+    EXPECT_TRUE(transport->cancellations.empty());
+    endpoint.request_peer_cancel(40);
+    endpoint.request_peer_cancel(40);
+    ASSERT_EQ(transport->cancellations.size(), 1u);
+    auto cancel = transport->cancellations.front();
+    EXPECT_EQ(cancel.frame_type, remote_l3::FrameType::CANCEL_TASK);
+    EXPECT_EQ(cancel.sequence, task.header.sequence);
+    EXPECT_EQ(cancel.session_id, 99u);
+    EXPECT_EQ(cancel.worker_id, 3);
+    WorkerEndpointProgress progress;
+    EXPECT_FALSE(endpoint.poll_progress(progress));
+    EXPECT_TRUE(endpoint.poll_progress(progress));
+    endpoint.request_peer_cancel(40);
+    EXPECT_EQ(transport->cancellations.size(), 1u);
     ring.shutdown();
 }
 
@@ -1062,6 +1093,10 @@ void respond_with_payloads(std::vector<uint8_t> &mailbox, const std::vector<std:
 
 }  // namespace
 
+static std::vector<uint8_t> task_frame(int32_t worker_id, uint64_t sequence) {
+    return remote_l3::encode_frame({remote_l3::FrameType::TASK, 77, worker_id, sequence}, {0x11});
+}
+
 TEST(MpiGroupMailboxChannel, FullGroupTaskUsesOnePerRankEnvelope) {
     using namespace mpi_group_mailbox;
     auto mailbox = ready_mpi_mailbox(2);
@@ -1069,10 +1104,10 @@ TEST(MpiGroupMailboxChannel, FullGroupTaskUsesOnePerRankEnvelope) {
     std::vector<uint8_t> reply0;
     std::vector<uint8_t> reply1;
     std::thread rank0([&]() {
-        reply0 = channel.exchange_group_task({0x10}, 0, 7, 2);
+        reply0 = channel.exchange_group_task(task_frame(0, 0x10), 0, 7, 2);
     });
     std::thread rank1([&]() {
-        reply1 = channel.exchange_group_task({0x20}, 1, 7, 2);
+        reply1 = channel.exchange_group_task(task_frame(1, 0x20), 1, 7, 2);
     });
 
     while (mailbox_state(mailbox, OFF_REQUEST_STATE) != static_cast<int32_t>(RequestState::REQUEST_READY)) {}
@@ -1082,6 +1117,11 @@ TEST(MpiGroupMailboxChannel, FullGroupTaskUsesOnePerRankEnvelope) {
     std::memcpy(&request_count, mailbox.data() + OFF_REQUEST_COUNT, sizeof(request_count));
     EXPECT_EQ(target, static_cast<uint32_t>(Target::PER_RANK));
     EXPECT_EQ(request_count, 2U);
+    auto *cancel = reinterpret_cast<uint64_t *>(mailbox.data() + OFF_CANCEL_SEQUENCE);
+    channel.request_task_cancel(1, 0x10);
+    EXPECT_EQ(__atomic_load_n(cancel, __ATOMIC_ACQUIRE), 0u);
+    channel.request_task_cancel(1, 0x20);
+    EXPECT_EQ(__atomic_load_n(cancel, __ATOMIC_ACQUIRE), channel.read_u64(OFF_SEQUENCE_ID));
     respond_with_payloads(mailbox, {{0xA0}, {0xA1}});
 
     rank0.join();
@@ -1102,7 +1142,7 @@ TEST(MpiGroupMailboxChannel, TimeoutMakesGroupTerminal) {
     using namespace mpi_group_mailbox;
     auto mailbox = ready_mpi_mailbox(1);
     MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 1, -1, 0.01);
-    EXPECT_THROW(channel.exchange_group_task({0x10}, 0, 9, 1), std::runtime_error);
+    EXPECT_THROW(channel.exchange_group_task(task_frame(0, 0x10), 0, 9, 1), std::runtime_error);
     EXPECT_TRUE(channel.terminal());
     EXPECT_EQ(mailbox_state(mailbox, OFF_GROUP_STATE), static_cast<int32_t>(GroupState::TERMINAL));
 }
@@ -1111,17 +1151,17 @@ TEST(MpiGroupMailboxChannel, GroupArrivalTimeoutFailsTaskWithoutKillingGroup) {
     using namespace mpi_group_mailbox;
     auto mailbox = ready_mpi_mailbox(2);
     MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 2, -1, 0.05);
-    EXPECT_THROW(channel.exchange_group_task({0x10}, 0, 9, 2), std::runtime_error);
+    EXPECT_THROW(channel.exchange_group_task(task_frame(0, 0x10), 0, 9, 2), std::runtime_error);
     EXPECT_FALSE(channel.terminal());
     EXPECT_EQ(mailbox_state(mailbox, OFF_GROUP_STATE), static_cast<int32_t>(GroupState::READY));
     // The withdrawn arrival leaves a clean slate: a later full batch succeeds.
     std::vector<uint8_t> reply0;
     std::vector<uint8_t> reply1;
     std::thread rank0([&]() {
-        reply0 = channel.exchange_group_task({0x11}, 0, 10, 2);
+        reply0 = channel.exchange_group_task(task_frame(0, 0x11), 0, 10, 2);
     });
     std::thread rank1([&]() {
-        reply1 = channel.exchange_group_task({0x21}, 1, 10, 2);
+        reply1 = channel.exchange_group_task(task_frame(1, 0x21), 1, 10, 2);
     });
     respond_with_payloads(mailbox, {{0xB0}, {0xB1}});
     rank0.join();
@@ -1136,7 +1176,7 @@ TEST(MpiGroupMailboxChannel, CompletedReplyWinsAfterTimedWaitReacquiresMutex) {
     auto mailbox = ready_mpi_mailbox(2);
     MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 2, -1, 0.5);
     auto reply = std::async(std::launch::async, [&] {
-        return channel.exchange_group_task({0x10}, 0, 9, 2);
+        return channel.exchange_group_task(task_frame(0, 0x10), 0, 9, 2);
     });
     const auto ready_deadline = std::chrono::steady_clock::now() + 2s;
     while (true) {
@@ -1170,7 +1210,7 @@ TEST(MpiGroupMailboxChannel, RetiredPriorBatchWinsAfterTimedWaitReacquiresMutex)
     channel.group_active_ = true;
     channel.group_task_slot_ = 9;
     auto reply = std::async(std::launch::async, [&] {
-        return channel.exchange_group_task({0x10}, 0, 10, 1);
+        return channel.exchange_group_task(task_frame(0, 0x10), 0, 10, 1);
     });
     ASSERT_EQ(reply.wait_for(5ms), std::future_status::timeout);
     {
@@ -1194,14 +1234,6 @@ TEST(MpiGroupMailboxTransport, GroupProgressSubmitAndPollRoundTrip) {
     MpiGroupMailboxTransport rank0(channel, 0);
     MpiGroupMailboxTransport rank1(channel, 1);
 
-    auto task_frame = [](int32_t worker_id, uint64_t sequence) {
-        remote_l3::FrameHeader header;
-        header.frame_type = remote_l3::FrameType::TASK;
-        header.session_id = 77;
-        header.worker_id = worker_id;
-        header.sequence = sequence;
-        return remote_l3::encode_frame(header, {0x11});
-    };
     auto completion_frame = [](int32_t worker_id, uint64_t sequence, uint8_t marker) {
         remote_l3::FrameHeader header;
         header.frame_type = remote_l3::FrameType::COMPLETION;

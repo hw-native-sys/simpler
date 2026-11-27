@@ -1149,10 +1149,12 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     const int32_t header_status = runtime_status_from_error_codes(orch_error, sched_error);
     // An earlier orchestration failure can outrank a later async failure.
     // Drain either channel's known records without changing the primary error.
-    if (orch_error == SIMPLER_ERROR_PEER_RUN_FAILED || sched_error == SIMPLER_ERROR_PEER_RUN_FAILED ||
-        is_kernel_error(orch_error) || is_async_tracking_error(orch_error) || is_kernel_error(sched_error) ||
-        is_async_tracking_error(sched_error)) {
-        KernelErrorCleanup cleanup{};
+    const bool needs_drain = orch_error == SIMPLER_ERROR_PEER_RUN_FAILED ||
+                             sched_error == SIMPLER_ERROR_PEER_RUN_FAILED || is_kernel_error(orch_error) ||
+                             is_async_tracking_error(orch_error) || is_kernel_error(sched_error) ||
+                             is_async_tracking_error(sched_error);
+    KernelErrorCleanup cleanup;
+    if (needs_drain) {
         sched_ctx_.drain_cancelled_run(platform_aicore_exit_deadline(), cleanup);
         LOG_ERROR(
             "kernel retirement: core_error=%d async_error=%d cores=%u/%u drained=%u complete=%u "
@@ -1174,6 +1176,14 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
             // the scene is copied out of it here rather than read in place.
             payload = reinterpret_cast<const uint8_t *>(sm) + SHARED_MEMORY_ERROR_TAIL_OFFSET;
             payload_bytes = SHARED_MEMORY_ERROR_TAIL_BYTES;
+            if (needs_drain) {
+                TmrCancelledRunResult<SHARED_MEMORY_ERROR_TAIL_BYTES> snapshot;
+                static_assert(sizeof(snapshot) <= DEVICE_RUN_RESULT_PAYLOAD_BYTES);
+                std::memcpy(snapshot.header, payload, sizeof(snapshot.header));
+                snapshot.retirement = cleanup;
+                terminal_publisher_.take(selection, &snapshot, sizeof(snapshot));
+                return;
+            }
         }
     }
     terminal_publisher_.take(selection, payload, payload_bytes);

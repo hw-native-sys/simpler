@@ -601,7 +601,7 @@ def test_executor_reports_release_failures_before_returning_nonzero(monkeypatch,
     worker = Mock(close=Mock(side_effect=RuntimeError("worker release failed")))
     monkeypatch.setattr(runtime_mod, "_ExecutorFrameSocket", lambda *_args: channel)
 
-    def loop(*_args, cleanup_errors):
+    def loop(*_args, cleanup_errors, cancellation):
         if loop_release_fails:
             cleanup_errors.append(RuntimeError("buffer release failed"))
 

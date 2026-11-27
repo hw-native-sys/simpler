@@ -16,12 +16,14 @@ prestarts the embedded L3 Worker, then exposes the Remote L3 command lane.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import importlib
 import json
 import math
 import os
+import select
 import signal
 import socket
 import struct
@@ -33,6 +35,7 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Callable
 
+from ._parent_cancel import ParentTaskCancelled, SessionCancellation
 from .buffer import (
     AccessMode,
     AddressSpace,
@@ -68,7 +71,9 @@ from .global_comm_domain import (
     encode_domain_buffer_refs,
     resolve_global_comm_capability,
 )
+from .remote_l3_limits import FRAME_HEADER_BYTES
 from .remote_l3_protocol import (
+    FEATURE_TASK_CANCEL,
     HOST_TCP_TRANSPORT_PROFILE,
     PROTOCOL_VERSION,
     CallableKind,
@@ -87,6 +92,7 @@ from .remote_l3_protocol import (
     decode_control,
     decode_digest_callable_command,
     decode_export_buffer_request,
+    decode_frame,
     decode_import_buffer_request,
     decode_register_callable_command,
     decode_release_import_request,
@@ -270,15 +276,23 @@ def _startup_deadline(manifest: dict[str, Any]) -> float:
     return time.monotonic() + _startup_remaining_s(manifest)
 
 
-def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, worker_id: int) -> None:
+def _health_loop(
+    sock: socket.socket,
+    stop: threading.Event,
+    session_id: int,
+    worker_id: int,
+    cancellation: SessionCancellation | None = None,
+) -> None:
     conn: socket.socket | None = None
     sock.settimeout(0.2)
     try:
         sequence = 0
+        incoming = bytearray()
         while not stop.is_set():
             if conn is None:
                 try:
                     conn, _addr = sock.accept()
+                    incoming.clear()
                     conn.settimeout(0.2)
                 except socket.timeout:
                     continue
@@ -286,8 +300,18 @@ def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, wo
                 sequence += 1
                 header = FrameHeader(FrameType.HEALTH, session_id, worker_id, sequence)
                 conn.sendall(encode_frame(header, b""))
-                stop.wait(0.2)
-            except OSError:
+                if cancellation is None:
+                    stop.wait(0.2)
+                    continue
+                if select.select([conn], [], [], 0.2)[0]:
+                    data = conn.recv(FRAME_HEADER_BYTES - len(incoming))
+                    if not data:
+                        raise ConnectionError("parent health lane closed")
+                    incoming.extend(data)
+                    if len(incoming) == FRAME_HEADER_BYTES:
+                        cancellation.accept_frame(decode_frame(bytes(incoming)), session_id, worker_id)
+                        incoming.clear()
+            except (OSError, ValueError):
                 try:
                     conn.close()
                 except OSError:
@@ -697,6 +721,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     task_completed: Callable[[], None] | None = None,
     *,
     cleanup_errors: list[BaseException] | None = None,
+    cancellation: SessionCancellation | None = None,
 ) -> None:
     """Collect release errors separately when the caller supplies a cleanup ledger.
 
@@ -767,7 +792,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
         worker_id=worker_id,
         protocol_version=PROTOCOL_VERSION,
         comm_profile=str(manifest.get("comm_profile", GLOBAL_DOMAIN_PROFILE_SIM)),
-        feature_flags=0,
+        feature_flags=FEATURE_TASK_CANCEL,
         ready_state=ReadyState.READY,
     )
     send_frame(conn, FrameHeader(FrameType.HELLO, session_id, worker_id, 0), encode_hello(hello))
@@ -1283,7 +1308,12 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 )
                 try:
                     task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)
-                    inner_worker.run(orch_fn, task_args, task.config)
+                    with (
+                        cancellation.task(header.sequence, inner_worker)
+                        if cancellation is not None
+                        else contextlib.nullcontext()
+                    ):
+                        inner_worker.run(orch_fn, task_args, task.config)
                     # Hook-owned invocation state can outlive the Python graph
                     # callback. Retire it only after Worker.run drains the DAG;
                     # a failed/uncertain run retains it until worker shutdown.
@@ -1293,6 +1323,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                     for backing in inline_backings:
                         backing.close()
                 payload = encode_completion(header.sequence, 0, "")
+            except ParentTaskCancelled as exc:
+                payload = encode_completion(header.sequence, 108, str(exc))
             except BaseException as exc:  # noqa: BLE001
                 payload = encode_completion(
                     header.sequence,
@@ -1337,6 +1369,7 @@ def run_session(
     command_sock: socket.socket | None = None
     health_sock: socket.socket | None = None
     stop_health = threading.Event()
+    cancellation = SessionCancellation()
     health_thread: threading.Thread | None = None
     ready_sent = False
 
@@ -1379,7 +1412,7 @@ def run_session(
         health_sock = _bind_listener(listen_host) if health_port == 0 else _bind_listener(listen_host, health_port)
         health_thread = threading.Thread(
             target=_health_loop,
-            args=(health_sock, stop_health, int(manifest["session_id"]), int(manifest["worker_id"])),
+            args=(health_sock, stop_health, int(manifest["session_id"]), int(manifest["worker_id"]), cancellation),
             daemon=True,
         )
         health_thread.start()
@@ -1420,6 +1453,7 @@ def run_session(
                 manifest_inner_handles,
                 manifest_dispatch_registry,
                 global_domain_prepare_import,
+                cancellation=cancellation,
             )
         return 0
     except BaseException as exc:  # noqa: BLE001

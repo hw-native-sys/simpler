@@ -60,6 +60,8 @@
 #include "common/platform_config.h"
 #include "common/strace.h"
 #include "common/unified_log.h"
+#include "runtime_status/kernel_validation_log.h"
+#include "tensormap_and_ringbuffer/cancelled_run_result.h"
 #include "host/platform_compile_info.h"
 #include "host/kernel_pipeline_contract.h"
 #include "worker/pipeline_contract.h"
@@ -297,8 +299,27 @@ static int32_t read_published_run_status(const HostApi *api, SharedMemoryHeader 
     if (api == nullptr || host_header == nullptr) return 0;
     size_t bytes = 0;
     const void *snapshot = api->run_result(&bytes);
-    if (snapshot == nullptr || bytes != SHARED_MEMORY_ERROR_TAIL_BYTES) return 0;
-    memcpy(reinterpret_cast<uint8_t *>(host_header) + SHARED_MEMORY_ERROR_TAIL_OFFSET, snapshot, bytes);
+    using Cancelled = TmrCancelledRunResult<SHARED_MEMORY_ERROR_TAIL_BYTES>;
+    if (snapshot == nullptr || (bytes != SHARED_MEMORY_ERROR_TAIL_BYTES && bytes != sizeof(Cancelled))) return 0;
+    memcpy(
+        reinterpret_cast<uint8_t *>(host_header) + SHARED_MEMORY_ERROR_TAIL_OFFSET, snapshot,
+        SHARED_MEMORY_ERROR_TAIL_BYTES
+    );
+    if (bytes == sizeof(Cancelled)) {
+        KernelErrorCleanup cleanup;
+        memcpy(
+            &cleanup, reinterpret_cast<const uint8_t *>(snapshot) + offsetof(Cancelled, retirement), sizeof(cleanup)
+        );
+        if (cleanup.run_epoch == api->run_epoch()) {
+            LOG_ERROR(
+                "Run retirement: epoch=%llu core_error=%d async_error=%d cores=%u/%u drained=%u complete=%u "
+                "source=%u core=%d task=0x%llx",
+                static_cast<unsigned long long>(cleanup.run_epoch), cleanup.core_error, cleanup.async_error,
+                cleanup.released_cores, cleanup.expected_cores, cleanup.drained_conditions, cleanup.complete,
+                cleanup.source, cleanup.core, static_cast<unsigned long long>(cleanup.task_token)
+            );
+        }
+    }
     int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
     int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
@@ -1135,6 +1156,8 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
         LOG_RUNTIME_FAILURE(orch_error_code, sched_error_code, runtime_status);
+        if (host_header.kernel_failure.code == orch_error_code || host_header.kernel_failure.code == sched_error_code)
+            log_kernel_validation(host_header.kernel_failure, api->run_epoch());
         // A scheduler no-progress timeout (code 100) carries a device-classified
         // sub-reason + locators so the failure line is self-diagnosing without a
         // device-log dive. The full stall snapshot stays in the device log / plog.

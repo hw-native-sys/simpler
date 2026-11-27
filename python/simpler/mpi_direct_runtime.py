@@ -25,6 +25,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable, TypedDict, cast
 
+from ._parent_cancel import SessionCancellation
 from .mpi_direct_bootstrap import receive_startup
 from .mpi_direct_cleanup import MpiDirectCleanupReport, _RankCleanupReporter, cleanup_failure
 from .mpi_direct_protocol import (
@@ -53,6 +54,7 @@ class _MpiDirectCleanupError(RuntimeError):
 
 
 class _CommandLoopOptions(TypedDict, total=False):
+    cancellation: SessionCancellation
     cleanup_errors: list[BaseException]
     task_completed: Callable[[], None] | None
 
@@ -176,9 +178,9 @@ def _pre_mpi_gate(
             continue
 
 
-def _receive_frame(MPI, world, source: int):
+def _receive_frame(MPI, world, source: int, tag: int | None = None):
     status = MPI.Status()
-    message = world.improbe(source=source, tag=MPI.ANY_TAG, status=status)
+    message = world.improbe(source=source, tag=MPI.ANY_TAG if tag is None else tag, status=status)
     if message is None:
         return None
     count = int(status.Get_count(MPI.BYTE))
@@ -369,6 +371,7 @@ class _ExecutorFrameSocket:
         session_id: int,
         heartbeat_interval_s: float,
         reporter: _RankCleanupReporter | None = None,
+        cancellation: SessionCancellation | None = None,
     ) -> None:
         self._MPI = MPI
         self._world = world
@@ -381,6 +384,7 @@ class _ExecutorFrameSocket:
         self._health_thread: threading.Thread | None = None
         self._health_error: BaseException | None = None
         self._health_sequence = 0
+        self.cancellation = cancellation if cancellation is not None else SessionCancellation()
         self._cleanup_reporter = reporter
         self.shutdown_observed = False
         self._shutdown_frame: bytes | None = None
@@ -397,7 +401,7 @@ class _ExecutorFrameSocket:
         self._health_thread.start()
 
     def _health_loop(self) -> None:
-        from .remote_l3_protocol import FrameHeader, FrameType, encode_frame  # noqa: PLC0415
+        from .remote_l3_protocol import FrameHeader, FrameType, decode_frame, encode_frame  # noqa: PLC0415
 
         try:
             while not self._health_stop.wait(self._heartbeat_interval_s):
@@ -412,6 +416,10 @@ class _ExecutorFrameSocket:
                     b"",
                 )
                 self._send(frame, HEALTH_TAG)
+                with self._mpi_mu:
+                    received = _receive_frame(self._MPI, self._world, 0, HEALTH_TAG)
+                if received is not None:
+                    self.cancellation.accept_frame(decode_frame(received[1]), self._session_id, self._spec.worker_id)
         except BaseException as exc:  # noqa: BLE001
             self._health_error = exc
 
@@ -447,6 +455,9 @@ class _ExecutorFrameSocket:
             status, frame = received
             tag = int(status.Get_tag())
             decoded = decode_frame(frame)
+            if tag == HEALTH_TAG:
+                self.cancellation.accept_frame(decoded, self._session_id, self._spec.worker_id)
+                continue
             expected_tag = LIFECYCLE_TAG if decoded.header.frame_type == FrameType.SHUTDOWN else COMMAND_REQUEST_TAG
             if tag != expected_tag:
                 raise RuntimeError("controller MPI tag does not match SLR3 request type")
@@ -533,7 +544,8 @@ def _run_executor(
 ) -> int:
     from .remote_l3_session import _run_command_loop  # noqa: PLC0415
 
-    channel = _ExecutorFrameSocket(MPI, world, spec, session_id, topology.heartbeat_interval_s, reporter)
+    cancellation = SessionCancellation()
+    channel = _ExecutorFrameSocket(MPI, world, spec, session_id, topology.heartbeat_interval_s, reporter, cancellation)
     manifest = {
         **spec.to_dict(),
         "session_id": session_id,
@@ -548,7 +560,7 @@ def _run_executor(
     cleanup_errors: list[BaseException] = []
     fatal_error: BaseException | None = None
     try:
-        kwargs: _CommandLoopOptions = {"cleanup_errors": cleanup_errors}
+        kwargs: _CommandLoopOptions = {"cleanup_errors": cleanup_errors, "cancellation": cancellation}
         if hook_state is not None:
             kwargs["task_completed"] = getattr(hook_state, "task_completed", None)
         _run_command_loop(cast(socket.socket, channel), manifest, worker, inner_handles, dispatch_registry, **kwargs)

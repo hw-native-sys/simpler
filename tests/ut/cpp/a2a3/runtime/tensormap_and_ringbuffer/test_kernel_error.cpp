@@ -153,7 +153,9 @@ TEST(KernelError, ConcurrentBlocksPreserveFirstCode) {
         threads.emplace_back([&, i] {
             DeferredCompletionSlab slab{};
             auto ctx = AsyncCtx::make(task.task_id, &slab);
-            ASSERT_TRUE(report_kernel_error(ctx, static_cast<KernelErrorCode>(105 + i % 3)));
+            ASSERT_TRUE(
+                report_kernel_error(ctx, static_cast<KernelErrorCode>(105 + i % 3), {129280 + i, 0, 129280, i})
+            );
             SchedulerContextTestPeer::finish(*context, producer, i, i, slab);
         });
     }
@@ -161,6 +163,13 @@ TEST(KernelError, ConcurrentBlocksPreserveFirstCode) {
         thread.join();
     EXPECT_TRUE(is_kernel_error(header->sched_error_code.load()));
     EXPECT_TRUE(is_kernel_error(header->orch_error_code.load()));
+    const auto &failure = header->kernel_failure;
+    ASSERT_GE(failure.block, 0);
+    ASSERT_LT(failure.block, 8);
+    EXPECT_EQ(failure.code, header->orch_error_code.load());
+    EXPECT_EQ(failure.code, 105 + failure.block % 3);
+    EXPECT_EQ(failure.arg_index, failure.block);
+    EXPECT_EQ(failure.value, 129280 + failure.block);
     EXPECT_EQ(
         runtime_status_from_error_codes(header->orch_error_code.load(), header->sched_error_code.load()),
         -header->orch_error_code.load()

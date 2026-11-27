@@ -44,6 +44,7 @@
 
 #include "utils/device_arena.h"
 #include "runtime_types.h"
+#include "kernel_error.h"
 
 // =============================================================================
 // Shared Memory Header
@@ -164,6 +165,7 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     std::atomic<TaskId> sched_stall_task_id;          // S1/S6: stuck task_id (invalid() if N/A)
     std::atomic<int32_t> sched_stall_core;            // S1: stuck core id (-1 if N/A)
     std::atomic<int32_t> sched_stall_cnt_async_wait;  // tasks whose FINs handed completion to the async consumer
+    kernel_validation::Failure kernel_failure;
 };
 
 static_assert(sizeof(SharedMemoryHeader) == 896, "SharedMemoryHeader layout drift");

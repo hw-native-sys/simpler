@@ -57,6 +57,7 @@ static void init_header_fields(
     header->orch_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
     header->sched_error_bitmap.store(0, std::memory_order_relaxed);
     header->sched_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
+    header->kernel_failure.code = 0;
     header->sched_error_thread.store(-1, std::memory_order_relaxed);
     header->sched_stall_detail.store(SIMPLER_STALL_DETAIL_NONE, std::memory_order_relaxed);
     header->sched_stall_completed.store(0, std::memory_order_relaxed);

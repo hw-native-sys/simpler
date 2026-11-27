@@ -55,7 +55,9 @@ inline constexpr size_t OFF_ERROR_BYTES = 76;
 // them and every attach path rejects a mailbox whose reserved bytes are
 // non-zero, so a later field can claim them. The word at offset 8 is likewise
 // unclaimed and left zero.
-inline constexpr size_t RESERVED_OFFSET = 80;
+inline constexpr size_t OFF_CANCEL_SEQUENCE = 80;
+inline constexpr size_t OFF_FIRST_ERROR_BYTES = 88;
+inline constexpr size_t RESERVED_OFFSET = 92;
 
 // The request-state word doubles as a shared futex: the mailbox is mapped by
 // more than one process, so the wake must not use FUTEX_PRIVATE_FLAG. Both

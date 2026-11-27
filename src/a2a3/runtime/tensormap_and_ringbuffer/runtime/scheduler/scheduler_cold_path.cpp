@@ -936,19 +936,19 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
             // FIN/exit stopped this slab's writer. Preserve scheduler-owned
             // suffix compaction: slab storage is already coherent on AICPU.
             const uint32_t count = slab.count;
+            const int32_t slab_error = kernel_validation::code(slab.error_code);
             const TaskId task = payload_per_core_[core][buffer].local_context.async_ctx.task_token;
             if (count > MAX_COMPLETIONS_PER_TASK || (count != 0 && !task.is_valid()) ||
-                (slab.error_code != 0 && !is_kernel_error(slab.error_code) &&
-                 !is_async_tracking_error(slab.error_code))) {
-                result.async_error = slab.error_code != 0 && !is_kernel_error(slab.error_code) ?
-                                         slab.error_code :
+                (slab_error != 0 && !is_kernel_error(slab_error) && !is_async_tracking_error(slab_error))) {
+                result.async_error = slab_error != 0 && !is_kernel_error(slab_error) ?
+                                         slab_error :
                                          SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
                 result.source = 4;
                 result.core = core;
                 result.task_token = TaskId::to_uint64(task);
                 return;
             }
-            if (is_async_tracking_error(slab.error_code) && result.async_error == 0) {
+            if (is_async_tracking_error(slab_error) && result.async_error == 0) {
                 // The recorded prefix is still drainable. A failed registration
                 // or malformed SDK event may have omitted other identities, so
                 // retaining their owners remains mandatory after this prefix.

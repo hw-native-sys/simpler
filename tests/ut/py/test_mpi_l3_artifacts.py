@@ -603,7 +603,8 @@ def test_wedged_processor_exits_rank_without_closing_live_hook_state(
         context.inner_worker.close = lambda: worker_closed.write_text("closed", encoding="utf-8")
         return HookState()
 
-    def stalled_processor(connection, *args):
+    def stalled_processor(connection, *args, cancellation):
+        assert cancellation is not None
         connection.sendall(encode_frame(FrameHeader(FrameType.HELLO, 11, 3, 0), b""))
         threading.Event().wait(10.0)
 

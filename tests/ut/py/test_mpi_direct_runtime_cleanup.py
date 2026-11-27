@@ -28,7 +28,7 @@ def test_fatal_command_error_is_independent_of_release_result(monkeypatch, buffe
     )
     command_error = RuntimeError("controller SLR3 frame identity mismatch")
 
-    def loop(*_args, cleanup_errors=None):
+    def loop(*_args, cleanup_errors=None, cancellation):
         if buffer_fails and cleanup_errors is not None:
             cleanup_errors.append(RuntimeError("buffer release failed"))
         raise command_error

@@ -45,6 +45,7 @@ std::vector<uint8_t> make_hello() {
     hello.session_id = SESSION_ID;
     hello.worker_id = WORKER_ID;
     hello.protocol_version = remote_l3::PROTOCOL_VERSION;
+    hello.feature_flags = remote_l3::FEATURE_TASK_CANCEL;
     hello.comm_profile = "sim";
     hello.ready_state = remote_l3::ReadyState::READY;
     return make_frame(remote_l3::FrameType::HELLO, 0, remote_l3::encode_hello(hello));
@@ -187,6 +188,31 @@ TEST(MpiDirectTransport, ProgressApiIsNonBlocking) {
     hub->deliver(MPI_RANK, MpiDirectTag::COMMAND_REPLY, completion);
     ASSERT_TRUE(transport.poll_progress_reply(remote_l3::FrameType::COMPLETION, 21, reply));
     EXPECT_EQ(reply, completion);
+}
+
+TEST(MpiDirectTransport, CancelRetriesAfterOutboundCreditReturns) {
+    auto hub = std::make_shared<MpiDirectTransportHub>(MAX_FRAME_BYTES);
+    hub->register_route(WORKER_ID, MPI_RANK, SESSION_ID, "sim");
+    MpiDirectTransport transport(hub, WORKER_ID, 1.0, 2.0);
+    hub->deliver(MPI_RANK, MpiDirectTag::LIFECYCLE, make_hello());
+    transport.expect_hello_ready();
+    transport.submit_progress_frame(
+        make_frame(remote_l3::FrameType::TASK, 21, std::vector<uint8_t>(remote_l3::MAX_FRAME_PAYLOAD_BYTES))
+    );
+    auto task = hub->poll_outbound(0.0);
+    ASSERT_TRUE(task.has_value());
+    auto header = remote_l3::decode_frame(make_frame(remote_l3::FrameType::CANCEL_TASK, 21)).header;
+    EXPECT_NO_THROW(transport.request_task_cancel(header));
+    EXPECT_FALSE(hub->poll_outbound(0.0).has_value());
+    hub->complete_outbound(task->ticket);
+    std::vector<uint8_t> reply;
+    EXPECT_FALSE(transport.poll_progress_reply(remote_l3::FrameType::COMPLETION, 21, reply));
+    auto cancel = hub->poll_outbound(0.0);
+    ASSERT_TRUE(cancel.has_value());
+    EXPECT_EQ(cancel->tag, MpiDirectTag::HEALTH);
+    EXPECT_EQ(cancel->frame, remote_l3::encode_frame(header, {}));
+    hub->complete_outbound(cancel->ticket);
+    EXPECT_EQ(hub->pending_frame_bytes(), 0u);
 }
 
 TEST(MpiDirectTransport, ShutdownWakesOnlyItsRouteWaiter) {

@@ -40,7 +40,23 @@ void Orchestrator::init(
 
 bool Orchestrator::is_terminal(RunPhase phase) { return phase == RunPhase::COMPLETED || phase == RunPhase::FAILED; }
 
+namespace {
+void check_cancel_cleanup(const RunState &run) {
+    if (!run.cancel_cleanup_failed) return;
+    constexpr const char *reason = "parent cancellation cleanup failed after repeated allocation failures";
+    try {
+        if (run.first_error) std::rethrow_exception(run.first_error);
+    } catch (const std::exception &exc) {
+        throw ParentCancelCleanupFailed(std::string(exc.what()) + ": " + reason);
+    } catch (...) {
+        // The run retains the original exception even when it has no diagnostic text.
+    }
+    throw ParentCancelCleanupFailed(std::string("parent dispatch failed (peer error 108): ") + reason);
+}
+}  // namespace
+
 bool Orchestrator::acceptance_ready(const std::shared_ptr<RunState> &run) {
+    check_cancel_cleanup(*run);
     return run->submission_closed && (run->pending_accepts.load(std::memory_order_acquire) == 0 ||
                                       is_terminal(run->phase.load(std::memory_order_acquire)));
 }
@@ -79,13 +95,14 @@ RunId Orchestrator::begin_run() {
             // pipeline-slot lease here; `refresh_leases_locked` hands one out
             // when a run reaches a role that can use it.
             runs_cv_.wait(lk, [this] {
-                return run_fifo_.size() < pending_run_limit_;
+                return run_fifo_.size() < pending_run_limit_ || cancel_cleanup_failed_;
             });
         } catch (...) {
             --begin_run_waiters_;
             throw;
         }
         --begin_run_waiters_;
+        if (cancel_cleanup_failed_) throw ParentCancelCleanupFailed("parent cancellation cleanup failed; close worker");
         // The pre-wait check was evaluated before the wait released the mutex,
         // so several callers can pass it and wake to find a builder published.
         if (building_run_id_ != INVALID_RUN_ID) {
@@ -258,7 +275,8 @@ void Orchestrator::finish_run_if_ready(const std::shared_ptr<RunState> &run) {
     {
         std::lock_guard<std::mutex> lk(run->completion_mu);
         RunPhase phase = run->phase.load(std::memory_order_acquire);
-        if (!run->submission_closed || run->active_tasks.load(std::memory_order_acquire) != 0 || is_terminal(phase) ||
+        if (run->cancel_cleanup_failed || !run->submission_closed ||
+            run->active_tasks.load(std::memory_order_acquire) != 0 || is_terminal(phase) ||
             (phase != RunPhase::EXECUTING && !run->submission_failed)) {
             return;
         }
@@ -282,6 +300,7 @@ void Orchestrator::retire_terminal_run(const std::shared_ptr<RunState> &run) {
     bool authorized_early_launch = false;
     {
         std::lock_guard<std::mutex> lk(runs_mu_);
+        if (cancel_cleanup_failed_) return;
         if (active_run_id_ == run->id) active_run_id_ = INVALID_RUN_ID;
         auto pos = std::find(run_fifo_.begin(), run_fifo_.end(), run->id);
         if (pos != run_fifo_.end()) run_fifo_.erase(pos);
@@ -318,7 +337,7 @@ void Orchestrator::activate_fifo_head() {
     std::shared_ptr<RunState> run;
     {
         std::lock_guard<std::mutex> lk(runs_mu_);
-        if (active_run_id_ != INVALID_RUN_ID || run_fifo_.empty()) return;
+        if (active_run_id_ != INVALID_RUN_ID || run_fifo_.empty() || cancel_cleanup_failed_) return;
         auto it = runs_.find(run_fifo_.front());
         if (it == runs_.end()) return;
         run = it->second;
@@ -350,6 +369,7 @@ void Orchestrator::activate_fifo_head() {
 
 void Orchestrator::close_run_submission(RunId run_id) {
     auto run = get_run(run_id);
+    bool cancel_pending = false;
     {
         std::lock_guard<std::mutex> runs_lk(runs_mu_);
         if (building_run_id_ != run_id) {
@@ -364,6 +384,8 @@ void Orchestrator::close_run_submission(RunId run_id) {
             throw std::logic_error("Orchestrator::close_run_submission: submission already closed");
         }
         run->submission_closed = true;
+        cancel_pending = run->parent_cancel_requested.load(std::memory_order_relaxed);
+        if (cancel_pending) run->submission_failed = true;
         if (run->phase.load(std::memory_order_acquire) == RunPhase::BUILDING) {
             if (test_hook_) test_hook_(OrchestratorTestPoint::RUN_CLOSE_PHASE_OBSERVED);
             // Activation uses runs_mu_, so completion_mu alone cannot protect
@@ -372,6 +394,7 @@ void Orchestrator::close_run_submission(RunId run_id) {
             run->phase.compare_exchange_strong(expected, RunPhase::PREPARED, std::memory_order_acq_rel);
         }
     }
+    if (cancel_pending) cancel_unstarted_run(run, "parent dispatch failed (peer error 108)");
     run->completion_cv.notify_all();
     {
         // Before the wake, not after: the scheduler's wake is a generation
@@ -421,6 +444,61 @@ void Orchestrator::fail_run_submission(RunId run_id, std::exception_ptr error) {
     finish_run_if_ready(run);
 }
 
+void Orchestrator::request_parent_cancel(RunId run_id) {
+    // Finish a scheduler round already handing slots to endpoints before
+    // scanning their installed identities. The builder still owns its scope.
+    std::unique_lock<std::mutex> scheduler;
+    if (sched_loop_mu_ != nullptr) scheduler = std::unique_lock<std::mutex>(*sched_loop_mu_);
+    auto run = find_run(run_id);
+    if (!run) return;
+    const std::string message = "parent dispatch failed (peer error 108)";
+    bool cancel_pending = false;
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        if (run->cancel_cleanup_failed || is_terminal(run->phase.load(std::memory_order_acquire))) return;
+        if (!run->first_error) run->first_error = std::make_exception_ptr(std::runtime_error(message));
+        run->parent_cancel_requested.store(true, std::memory_order_release);
+        // While submission is open its owner can still be wiring a BUILDING
+        // slot. Closing submission takes responsibility for that sweep.
+        cancel_pending = run->submission_closed;
+        if (cancel_pending) run->submission_failed = true;
+    }
+    if (manager_ != nullptr) manager_->request_peer_cancel(run_id);
+    if (cancel_pending) cancel_unstarted_run(run, message);
+    run->completion_cv.notify_all();
+    if (ready_notify_cb_) ready_notify_cb_();
+    finish_run_if_ready(run);
+}
+
+void Orchestrator::abandon_parent_cancel(RunId run_id) {
+    std::unique_lock<std::mutex> scheduler;
+    if (sched_loop_mu_ != nullptr) scheduler = std::unique_lock<std::mutex>(*sched_loop_mu_);
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    const auto failed = runs_.find(run_id);
+    if (failed == runs_.end() || cancel_cleanup_failed_) return;
+    std::exception_ptr first_error;
+    {
+        std::lock_guard<std::mutex> run_lk(failed->second->completion_mu);
+        if (is_terminal(failed->second->phase.load(std::memory_order_acquire))) return;
+        failed->second->cancel_cleanup_failed = true;
+        first_error = failed->second->first_error;
+    }
+    // A nonterminal predecessor can no longer return its leases. Wake every
+    // admitted waiter without publishing a terminal fence or releasing resources.
+    cancel_cleanup_failed_ = true;
+    active_run_id_ = INVALID_RUN_ID;
+    for (auto &entry : runs_) {
+        auto &run = *entry.second;
+        std::lock_guard<std::mutex> run_lk(run.completion_mu);
+        if (is_terminal(run.phase.load(std::memory_order_acquire))) continue;
+        if (!run.first_error) run.first_error = first_error;
+        run.cancel_cleanup_failed = true;
+        run.parent_cancel_requested.store(true, std::memory_order_release);
+        run.completion_cv.notify_all();
+    }
+    runs_cv_.notify_all();
+}
+
 void Orchestrator::wait_run_accepted(RunId run_id) {
     // A released run is past acceptance by definition, so a waiter that raced
     // the run's completion returns instead of throwing.
@@ -456,6 +534,7 @@ void Orchestrator::wait_run(RunId run_id) {
             lk.lock();
         }
         run->completion_cv.wait(lk, [&run] {
+            check_cancel_cleanup(*run);
             return is_terminal(run->phase.load(std::memory_order_acquire));
         });
         error = run->first_error;
@@ -475,6 +554,7 @@ bool Orchestrator::wait_run_for(RunId run_id, double timeout_seconds) {
             lk.lock();
         }
         if (!run->completion_cv.wait_until(lk, deadline, [&run] {
+                check_cancel_cleanup(*run);
                 return is_terminal(run->phase.load(std::memory_order_acquire));
             }))
             return false;
@@ -486,6 +566,13 @@ bool Orchestrator::wait_run_for(RunId run_id, double timeout_seconds) {
 
 bool Orchestrator::run_done(RunId run_id) const {
     return is_terminal(get_run(run_id)->phase.load(std::memory_order_acquire));
+}
+
+bool Orchestrator::run_cancel_cleanup_failed(RunId run_id) const {
+    const auto run = find_run(run_id);
+    if (run == nullptr) return false;
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    return run->cancel_cleanup_failed;
 }
 
 bool Orchestrator::run_observation_requested(RunId run_id) const noexcept {
@@ -516,7 +603,9 @@ RunId Orchestrator::dispatchable_run_id() const {
     // FIFO head: a head whose lease has been released is not dispatchable, and
     // answering with its id would send the scheduler looking for its tasks.
     std::lock_guard<std::mutex> lk(runs_mu_);
-    return dispatchable_locked(active_run_id_) ? active_run_id_ : INVALID_RUN_ID;
+    if (!dispatchable_locked(active_run_id_)) return INVALID_RUN_ID;
+    return runs_.at(active_run_id_)->parent_cancel_requested.load(std::memory_order_acquire) ? INVALID_RUN_ID :
+                                                                                               active_run_id_;
 }
 
 RunId Orchestrator::active_run_id() const {
@@ -537,6 +626,7 @@ std::vector<RunId> Orchestrator::preparable_run_ids() const {
         auto it = runs_.find(run_fifo_[index]);
         if (it == runs_.end()) break;
         if (it->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) break;
+        if (it->second->parent_cancel_requested.load(std::memory_order_acquire)) break;
         if (!run_resources_.owns(it->second->lease)) break;
         ids.push_back(it->first);
     }
@@ -547,6 +637,7 @@ bool Orchestrator::can_stage_run_on_worker(RunId run_id, int32_t worker_id) cons
     std::lock_guard<std::mutex> lk(runs_mu_);
     auto candidate = runs_.find(run_id);
     if (candidate == runs_.end() || candidate->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
+        candidate->second->parent_cancel_requested.load(std::memory_order_acquire) ||
         !run_resources_.owns(candidate->second->lease)) {
         return false;
     }
@@ -619,6 +710,7 @@ RunId Orchestrator::preparable_run_id() const {
     }
     auto it = runs_.find(run_fifo_[1]);
     if (it == runs_.end() || it->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
+        it->second->parent_cancel_requested.load(std::memory_order_acquire) ||
         !run_resources_.owns(it->second->lease)) {
         return INVALID_RUN_ID;
     }
@@ -730,6 +822,10 @@ void Orchestrator::release_run(RunId run_id) {
 
 void Orchestrator::register_run_slot(const std::shared_ptr<RunState> &run, TaskSlot slot, size_t members) {
     std::lock_guard<std::mutex> lk(run->completion_mu);
+    if (run->parent_cancel_requested.load(std::memory_order_relaxed)) {
+        check_cancel_cleanup(*run);
+        std::rethrow_exception(run->first_error);
+    }
     // Registration and the identity stamp are one step, paired with the
     // publication in `acquire_lease_locked`: whichever of the two runs second
     // sees the other's effect.
@@ -746,9 +842,12 @@ void Orchestrator::register_run_slot(const std::shared_ptr<RunState> &run, TaskS
 }
 
 void Orchestrator::cancel_unstarted_run(const std::shared_ptr<RunState> &run, const std::string &message) {
+    // Graph close and the cancel lane can both resume an interrupted sweep.
+    std::lock_guard<std::mutex> sweep(run->cancel_sweep_mu);
     std::vector<TaskSlot> slots;
     {
         std::lock_guard<std::mutex> lk(run->completion_mu);
+        check_cancel_cleanup(*run);
         slots.assign(run->task_slots.begin(), run->task_slots.end());
     }
 
@@ -973,6 +1072,7 @@ void Orchestrator::await_run_admission(RunId run_id) {
     if (run_id == INVALID_RUN_ID) return;
     std::unique_lock<std::mutex> lk(runs_mu_);
     runs_cv_.wait(lk, [this, run_id] {
+        if (cancel_cleanup_failed_) throw ParentCancelCleanupFailed("parent cancellation cleanup failed; close worker");
         if (active_run_id_ == run_id) return true;
         auto it = runs_.find(run_id);
         return it == runs_.end() || is_terminal(it->second->phase.load(std::memory_order_acquire));

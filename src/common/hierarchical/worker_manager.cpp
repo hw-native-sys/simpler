@@ -1780,6 +1780,8 @@ void WorkerManager::request_peer_cancel(RunId run_id) {
     if (run_id == INVALID_RUN_ID) return;
     for (auto &worker : next_level_threads_)
         worker->request_peer_cancel(run_id);
+    for (auto &worker : sub_threads_)
+        worker->request_peer_cancel(run_id);
 }
 
 void WorkerManager::request_observation(RunId run_id) {
