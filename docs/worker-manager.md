@@ -495,6 +495,10 @@ protocol revision. See the
 [direct MPI example](../examples/workers/l4/vector_add_mpi_direct_l3/README.md)
 for launcher ownership, failure handling, and polling costs.
 
+The same supervisor can also start external
+[P/D service ranks](../examples/workers/l4/mpi_direct_service/README.md).
+Each service owns its L3 and uses the MPI job for peer control and status.
+
 A control request issued while a remote task is in flight waits for that task
 to complete or for endpoint progress to stop. The command and task share one
 ordered socket lane, so the remaining task runtime is part of the control

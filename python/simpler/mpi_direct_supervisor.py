@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import hmac
 import json
 import os
 import secrets
@@ -21,9 +22,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from itertools import groupby
+from pathlib import Path
 from typing import Any
 
 from .mpi_direct_bootstrap import encode_startup, send_startup
@@ -34,6 +37,8 @@ from .mpi_direct_cleanup import (
     _print_cleanup_reports,
 )
 from .mpi_direct_protocol import MPI_DIRECT_STARTUP_TOKEN_ENV, _gate_recv, _gate_send
+from .mpi_direct_service import ROUTER_TOKEN_ENV, ServiceConfig, _read_frame, _write_frame
+from .mpi_direct_service_relay import close_socket, listen
 from .mpi_direct_topology import MpiDirectTopology
 
 _EXPORTED_ENV_VARS = (
@@ -54,7 +59,14 @@ class _StartupGateRankFailure(RuntimeError):
     pass
 
 
-def _host_slots(topology: MpiDirectTopology) -> tuple[tuple[str, int], ...]:
+def _launcher_environment(startup_token: str) -> dict[str, str]:
+    inherited = dict(os.environ)
+    inherited.pop(MPI_DIRECT_STARTUP_TOKEN_ENV, None)
+    # MPICH 5.0.2 skips the last inherited environment entry in -genvlist lookups.
+    return {MPI_DIRECT_STARTUP_TOKEN_ENV: startup_token, **inherited}
+
+
+def _host_slots(topology: MpiDirectTopology | ServiceConfig) -> tuple[tuple[str, int], ...]:
     return tuple((host, sum(1 for _ in ranks)) for host, ranks in groupby(topology.hosts))
 
 
@@ -125,22 +137,25 @@ def _detect_mpi4py_family(python_executable: str | None = None) -> tuple[str, st
 
 
 @contextlib.contextmanager
-def _launcher_hostfile(topology: MpiDirectTopology, launcher_family: str):
+def _launcher_hostfile(topology: MpiDirectTopology | ServiceConfig, launcher_family: str):
     if launcher_family != "mpich":
         yield None
         return
-    with tempfile.NamedTemporaryFile(mode="w", prefix="simpler-mpi-hosts-", suffix=".txt", encoding="utf-8") as stream:
-        for host, slots in _host_slots(topology):
-            stream.write(f"{host}:{slots}\n")
-        stream.flush()
-        yield stream.name
+    with tempfile.TemporaryDirectory(prefix="simpler-mpi-hosts-") as directory:
+        hostfile = Path(directory) / "hosts.txt"
+        hostfile.write_text("".join(f"{host}:{slots}\n" for host, slots in _host_slots(topology)), encoding="utf-8")
+        yield str(hostfile)
 
 
-def _family_launcher_args(topology: MpiDirectTopology, launcher_family: str, hostfile_path: str | None) -> list[str]:
+def _family_launcher_args(
+    topology: MpiDirectTopology | ServiceConfig, launcher_family: str, hostfile_path: str | None
+) -> list[str]:
     if launcher_family == "mpich":
         if not hostfile_path:
             raise ValueError("MPICH/Hydra launch requires a local hostfile")
         args = ["-f", hostfile_path]
+        if isinstance(topology, ServiceConfig) and os.name == "nt" and len(set(topology.hosts)) == 1:
+            args = ["-localonly"]
         for name in _EXPORTED_ENV_VARS:
             if name == MPI_DIRECT_STARTUP_TOKEN_ENV or name in os.environ:
                 if name == MPI_DIRECT_STARTUP_TOKEN_ENV:
@@ -151,7 +166,7 @@ def _family_launcher_args(topology: MpiDirectTopology, launcher_family: str, hos
     if launcher_family == "openmpi":
         host_spec = ",".join(f"{host}:{slots}" for host, slots in _host_slots(topology))
         args = ["--host", host_spec, "--map-by", "slot", "--bind-to", "none"]
-        if os.geteuid() == 0:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
             args.append("--allow-run-as-root")
         for name in _EXPORTED_ENV_VARS:
             if name == MPI_DIRECT_STARTUP_TOKEN_ENV or name in os.environ:
@@ -192,7 +207,7 @@ def _build_command(  # noqa: PLR0913 -- launcher construction mirrors the comple
 
 
 def _drain_failed_startup(
-    topology: MpiDirectTopology,
+    topology: MpiDirectTopology | ServiceConfig,
     token: str,
     listener: socket.socket,
     proc: subprocess.Popen[Any],
@@ -245,7 +260,7 @@ def _drain_failed_startup(
 
 
 def _startup_gate(  # noqa: PLR0912 -- one owner validates bootstrap, readiness and rank failure messages
-    topology: MpiDirectTopology,
+    topology: MpiDirectTopology | ServiceConfig,
     token: str,
     listener: socket.socket,
     proc: subprocess.Popen[Any],
@@ -325,6 +340,19 @@ def _terminate_job(proc: subprocess.Popen[Any], timeout_s: float = 5.0) -> None:
     if proc.poll() is not None:
         proc.wait()
         return
+    if os.name == "nt":
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_s,
+                check=False,
+            )
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=timeout_s)
+        return
     with contextlib.suppress(OSError, ProcessLookupError):
         os.killpg(proc.pid, signal.SIGTERM)
     try:
@@ -339,14 +367,20 @@ def _terminate_job(proc: subprocess.Popen[Any], timeout_s: float = 5.0) -> None:
 
 
 @contextlib.contextmanager
-def _job_termination_handlers():
+def _job_termination_handlers(stop=None):
     previous = {}
 
     def terminate(signum, _frame):
+        if stop is not None:
+            stop.set()
+            return
         raise SystemExit(128 + signum)
 
     try:
-        for signum in (signal.SIGTERM, signal.SIGHUP):
+        managed = (signal.SIGINT, getattr(signal, "SIGBREAK", None)) if stop is not None else ()
+        for signum in (signal.SIGTERM, getattr(signal, "SIGHUP", None), *managed):
+            if signum is None:
+                continue
             previous[signum] = signal.signal(signum, terminate)
         yield
     finally:
@@ -416,9 +450,7 @@ def run_supervisor(
                         python_executable=python_executable,
                         startup_port=gate_port,
                     )
-                    proc = subprocess.Popen(
-                        command, start_new_session=True, env={**os.environ, MPI_DIRECT_STARTUP_TOKEN_ENV: gate_token}
-                    )
+                    proc = subprocess.Popen(command, start_new_session=True, env=_launcher_environment(gate_token))
                     _startup_gate(topology, gate_token, listener, proc, startup_payloads)
                     return int(proc.wait())
             except BaseException:
@@ -433,14 +465,129 @@ def run_supervisor(
         _print_cleanup_reports(ledger)
 
 
+def _wait_coordinated(proc, topology, listener, admin, stop):
+    """Own mpirun and deliver a cooperative stop to rank zero."""
+    listener.settimeout(0.2)
+    deadline = time.monotonic() + topology.startup_timeout_s
+    while proc.poll() is None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("rank zero did not connect to the Supervisor")
+        try:
+            peer, _ = listener.accept()
+        except socket.timeout:
+            continue
+        with peer:
+            peer.settimeout(5)
+            try:
+                hello = _read_frame(peer)
+            except (OSError, ValueError):
+                continue
+            token = hello.get("token")
+            if (
+                hello.get("type") != "hello"
+                or not isinstance(token, str)
+                or not hmac.compare_digest(token.encode(), admin["token"].encode())
+            ):
+                continue
+            while proc.poll() is None:
+                if stop.wait(0.2):
+                    try:
+                        _write_frame(peer, {"type": "shutdown"})
+                    except OSError:
+                        # Rank zero treats loss of the admin connection as a shutdown request.
+                        close_socket(peer)
+                    try:
+                        return proc.wait(
+                            timeout=topology.coordination["drain_timeout_s"] + 2 * topology.session_timeout_s + 45
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        raise TimeoutError("MPI shutdown unconfirmed by the Supervisor") from exc
+            return proc.returncode
+    return proc.returncode
+
+
+def run_service_supervisor(
+    config_path: str,
+    *,
+    mpirun_path: str = "mpirun",
+    launcher_family: str = "auto",
+    python_executable: str | None = None,
+) -> int:
+    """Launch and own an MPI job whose service ranks each run one external process."""
+    topology = ServiceConfig.load(config_path)
+    router_token = os.environ.get(ROUTER_TOKEN_ENV)
+    if not router_token:
+        raise ValueError(f"{ROUTER_TOKEN_ENV} must contain the Router's job token")
+    if launcher_family == "auto":
+        launcher_family = _detect_launcher_family(mpirun_path)
+    mpi4py_family, mpi4py_vendor = _detect_mpi4py_family(python_executable)
+    if mpi4py_family != launcher_family:
+        raise RuntimeError(f"MPI launcher family {launcher_family} does not match mpi4py vendor {mpi4py_vendor}")
+
+    token = secrets.token_urlsafe(32)
+    coordination = topology.coordination
+    stop = threading.Event() if coordination is not None else None
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_job_termination_handlers(stop))
+        listener = stack.enter_context(socket.socket())
+        admin_listener = admin = None
+        if coordination is not None:
+            admin_listener = stack.enter_context(listen())
+            admin = {"port": admin_listener.getsockname()[1], "token": secrets.token_urlsafe(32)}
+        payloads = {rank: encode_startup(record) for rank, record in topology.records(router_token, admin).items()}
+        listener.bind((topology.controller_host, 0))
+        listener.listen(topology.world_size)
+        with _launcher_hostfile(topology, launcher_family) as hostfile:
+            command = [
+                mpirun_path,
+                *_family_launcher_args(topology, launcher_family, hostfile),
+                *topology.launcher_args,
+                "-np",
+                str(topology.world_size),
+                python_executable or sys.executable,
+                "-m",
+                "simpler.mpi_direct_service",
+                "--startup-host",
+                topology.controller_host,
+                "--startup-port",
+                str(listener.getsockname()[1]),
+                "--startup-timeout",
+                str(topology.startup_timeout_s),
+            ]
+            env = _launcher_environment(token)
+            env.pop(ROUTER_TOKEN_ENV, None)
+            proc = subprocess.Popen(command, start_new_session=os.name != "nt", env=env)
+            try:
+                _startup_gate(topology, token, listener, proc, payloads)
+                if admin_listener is not None:
+                    return _wait_coordinated(proc, topology, admin_listener, admin, stop)
+                return proc.wait()
+            except BaseException:
+                _terminate_job(proc)
+                raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--topology", required=True)
-    parser.add_argument("--controller", required=True, help="Python file with main(context), or module:callable")
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--topology")
+    modes.add_argument("--service-config", help="JSON configuration for external P/D service ranks")
+    parser.add_argument("--controller", help="Python file with main(context), or module:callable")
     parser.add_argument("--mpirun", default="mpirun")
     parser.add_argument("--launcher-family", choices=("auto", "openmpi", "mpich"), default="auto")
     parser.add_argument("--python", dest="python_executable", help="Python executable available on every MPI host")
     ns = parser.parse_args(argv)
+    if ns.service_config:
+        if ns.controller is not None:
+            parser.error("--controller applies only to --topology")
+        return run_service_supervisor(
+            ns.service_config,
+            mpirun_path=ns.mpirun,
+            launcher_family=ns.launcher_family,
+            python_executable=ns.python_executable,
+        )
+    if ns.controller is None:
+        parser.error("--topology requires --controller")
     return run_supervisor(
         ns.topology,
         ns.controller,
