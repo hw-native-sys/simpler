@@ -210,3 +210,22 @@ inline void acknowledge_aicore_cond_nonce_and_wait(AicoreTeardownControl *contro
     }
     wait_for_post_close_release(&control->post_close_release);
 }
+
+inline void publish_startup_markers(
+    volatile uint64_t *ack, volatile uint32_t *done, volatile uint64_t *stamp, uint32_t ready, uint64_t report_epoch
+) {
+    if (report_epoch != 0) __atomic_store_n(ack, 0, __ATOMIC_RELAXED);
+    // done is fresh even when a captured graph reuses the same stamp.
+    __atomic_store_n(done, ready, __ATOMIC_RELEASE);
+    if (report_epoch != 0) __atomic_store_n(stamp, report_epoch, __ATOMIC_RELEASE);
+}
+
+// The current startup report commits a cleared ACK. After EXIT, publish the
+// exact epoch once, then wait on the CPU-owned post-CLOSE release line.
+inline void publish_aicore_epoch_and_wait(volatile uint64_t *ack, AicoreTeardownControl *control, uint64_t epoch) {
+    __atomic_store_n(ack, epoch, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&control->release_epoch, __ATOMIC_ACQUIRE) != epoch) {
+        SPIN_WAIT_HINT();
+    }
+    OUT_OF_ORDER_STORE_BARRIER();
+}

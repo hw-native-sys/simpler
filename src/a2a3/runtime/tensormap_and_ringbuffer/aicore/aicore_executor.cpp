@@ -69,9 +69,9 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Dispat
  * @param core_type Core type (AIC or AIV)
  */
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
-    __gm__ Handshake *my_hank =
-        (__gm__ Handshake *)(&reinterpret_cast<__gm__ RuntimeSharedState *>(runtime->dev.shared_state_addr)
-                                  ->workers[block_idx]);
+    auto *shared = reinterpret_cast<__gm__ RuntimeSharedState *>(runtime->dev.shared_state_addr);
+    __gm__ Handshake *my_hank = &shared->workers[block_idx];
+    auto *gate = &shared->teardown_gates[block_idx];
 
     // Phase 1: report physical core ID + core type and signal done in one write,
     // with no wait for the AICPU — both fields are self-known. The AICPU opens
@@ -81,20 +81,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     const uint64_t report_epoch = get_aicore_report_epoch();
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
-    if (report_epoch != 0) {
-        // Native program run: `aicore_done` is payload, and `report_epoch` is
-        // the marker that commits it. The barrier separates the two, so the
-        // AICPU cannot see this run's epoch without the report it stands for.
-        my_hank->aicore_done = block_idx + 1;
-        OUT_OF_ORDER_STORE_BARRIER();
-        my_hank->report_epoch = report_epoch;
-    } else {
-        // Kernel/persistent launch: unchanged. `aicore_done` is itself the
-        // marker, its per-run reset is what makes it meaningful, and no stamp
-        // is written.
-        OUT_OF_ORDER_STORE_BARRIER();
-        my_hank->aicore_done = block_idx + 1;
-    }
+    publish_startup_markers(
+        &my_hank->retired_epoch, &my_hank->aicore_done, &my_hank->report_epoch, block_idx + 1, report_epoch
+    );
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // Phase 2: Wait for the AICPU to open our register window. A kernel launch
@@ -112,9 +101,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Entry rejection can cancel before tasks or profiling state are published.
     // Acknowledge without accessing those buffers or writing an initial IDLE.
     if (read_reg(RegId::DATA_MAIN_BASE) == AICORE_EXIT_SIGNAL) {
-        acknowledge_aicore_cond_nonce_and_wait(
-            &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime->dev.shared_state_addr)->teardown_gates[block_idx]
-        );
+        if (report_epoch != 0) {
+            publish_aicore_epoch_and_wait(&my_hank->retired_epoch, gate, report_epoch);
+        } else {
+            acknowledge_aicore_cond_nonce_and_wait(gate);
+        }
         return;
     }
     // Report initial idle status via register (FAST_PATH is now open).
@@ -292,12 +283,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         }
     }
 
+    if (report_epoch != 0) {
+        publish_aicore_epoch_and_wait(&my_hank->retired_epoch, gate, report_epoch);
+        return;
+    }
     // Flush all dirty cache lines to HBM before kernel exit.
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
     // The exit acknowledgement follows quiescence; the AICPU opens the gate after it
     // has closed this core's fast-path window. The gate is a line of its own,
     // outside the Handshake the dcci above writes back.
-    acknowledge_aicore_cond_nonce_and_wait(
-        &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime->dev.shared_state_addr)->teardown_gates[block_idx]
-    );
+    acknowledge_aicore_cond_nonce_and_wait(gate);
 }

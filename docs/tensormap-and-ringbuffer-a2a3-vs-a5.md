@@ -284,13 +284,16 @@ grouped EXIT signaling with a shared ACK deadline, register close/readback/drain
 and an isolated GM return gate. AICore waits for that gate before returning;
 a timed-out, unacknowledged core is not released and requires host recovery.
 
-A2/A3 and A5 HBG/TMR confirm retirement with a reserved COND nonce
-chosen to differ from the target physical core's retained value. The core
-completes preceding writes, echoes the request once, then only polls the GM
-post-close gate. Native, legacy and unstamped modes use the same protocol.
+Stamped A2/A3 TMR confirms retirement with a Core-owned 64-bit GM epoch ACK.
+The Core clears that ACK before its startup report, including replay of the same
+prepared epoch, and publishes it after observing EXIT and completing preceding
+writes. It then only polls the separate CPU-owned post-close release epoch.
+A2/A3 HBG, unstamped A2/A3 TMR and A5 HBG/TMR use a reserved COND nonce chosen
+to differ from the target physical core's retained value. Those cores complete
+preceding writes, echo the request once, then only poll the GM post-close gate.
 A5 HBG accepts EXIT before the request arrives by waiting for the request;
 its early-failure paths wait for current AICPU EXIT before reading the reused
-control. AICPU clears both words in the 64-byte control before READY or EXIT.
+control. AICPU clears the entire 64-byte control before READY or EXIT.
 The retirement paths keep exclusive ownership, the shared deadline and
 close/readback/drain/release ordering; a silent core is not released.
 See [the freshness contract](hardware/cache-coherency.md#exit-acknowledgement-freshness).

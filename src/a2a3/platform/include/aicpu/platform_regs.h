@@ -153,18 +153,21 @@ struct AicoreTeardownControl;
 struct AicoreExitTarget {
     uint64_t reg_addr;
     AicoreTeardownControl *teardown;
+    volatile uint64_t *retired_epoch = nullptr;
+    uint64_t expected_epoch = 0;
 };
 
 // Enable exit signalling without releasing a core into normal initialization.
 void platform_open_aicore_exit_window(uint64_t reg_addr);
 
 // Retires one exclusively claimed set of cores. Each target's request and
-// release gate must be reset before READY or any EXIT; Native and unstamped
-// launches use the same reserved COND nonce protocol. Each core echoes its
-// current request once after quiescence and makes no subsequent SPR writes.
+// release gate must be reset before READY or any EXIT. A nonzero expected_epoch
+// selects a Core-owned ACK cleared before the accepted startup report; zero
+// selects the reserved COND nonce protocol. After quiescence each core publishes
+// its acknowledgment once and makes no subsequent SPR writes.
 //
-// Publish requests, broadcast EXIT to the group, and collect matching COND
-// values against one shared deadline. Close/read back every acknowledged
+// Publish nonce requests, broadcast EXIT to the group, and collect matching
+// acknowledgments against one shared deadline. Close/read back every acknowledged
 // window, drain the closes, then release only those cores. An unacknowledged
 // core is neither closed nor released; it remains owned by host recovery.
 // ACK arriving after return does not run another close/release pass. A failed

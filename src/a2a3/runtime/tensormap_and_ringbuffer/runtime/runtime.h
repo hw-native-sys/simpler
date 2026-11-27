@@ -105,6 +105,7 @@ struct Handshake {
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
     volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
+    volatile uint64_t retired_epoch;     // Core publishes this run after quiescence.
 } __attribute__((aligned(64)));
 
 // The AICore owns this line's writeback: it flushes the whole line with
@@ -123,6 +124,7 @@ static_assert(offsetof(Handshake, task) == 8);
 static_assert(offsetof(Handshake, core_type) == 16);
 static_assert(offsetof(Handshake, physical_core_id) == 20);
 static_assert(offsetof(Handshake, report_epoch) == 24);
+static_assert(offsetof(Handshake, retired_epoch) == 32);
 
 /**
  * Whether `handshake` carries a report this run may act on.
@@ -139,8 +141,8 @@ static_assert(offsetof(Handshake, report_epoch) == 24);
  * follow — the caller's existing `rmb()` does that.
  */
 inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t expected_epoch) {
-    if (handshake->aicore_done == 0) return false;
-    return expected_epoch == 0 || handshake->report_epoch == expected_epoch;
+    if (__atomic_load_n(&handshake->aicore_done, __ATOMIC_ACQUIRE) == 0) return false;
+    return expected_epoch == 0 || __atomic_load_n(&handshake->report_epoch, __ATOMIC_ACQUIRE) == expected_epoch;
 }
 
 /** The retirement owner invalidates only after this core's final writeback
