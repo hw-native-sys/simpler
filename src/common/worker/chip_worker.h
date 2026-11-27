@@ -527,6 +527,7 @@ public:
     std::optional<ExecutionEnvironment> execution_environment() const { return execution_environment_; }
     unsigned pipeline_depth() const { return pipeline_contract_.pipeline_depth; }
     size_t runtime_slot_count() const { return runtime_bufs_.size(); }
+    int native_prepare_mode() const;
     bool supports_concurrent_native_prepare() const;
 
     /**

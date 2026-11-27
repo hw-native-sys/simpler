@@ -1153,10 +1153,14 @@ int simpler_prepare_caller_run(
     const NativeRunDescriptor *descriptor
 );
 
-/**
- * Return nonzero when non-diagnostic preparation may overlap the execution
- * claim held by a run in another pipeline slot.
- */
+enum {
+    PTO_NATIVE_PREPARE_UNAVAILABLE = 0,
+    PTO_NATIVE_PREPARE_CONCURRENT = 1,
+    // Concurrent prepare uses application DEVICE arguments only for their addresses and metadata.
+    PTO_NATIVE_PREPARE_DEVICE_ADDRESS_ONLY = 2,
+};
+
+/** Return the supported preparation mode for a run in another pipeline slot. */
 int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
 
 /**
