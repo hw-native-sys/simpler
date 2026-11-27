@@ -44,9 +44,11 @@
 #include "intrinsic.h"
 #include "host/platform_compile_info.h"
 #include "callable_entry.h"
+#include "fanin_reduction.h"
 #include "image/image_pack.h"
 #include "scheduler/argument_metadata.h"
 #include "graph_template.h"
+#include "partial_join.h"
 #include "region_plan.h"
 #include "scheduler/scheduler_layout.h"
 #include "profiling.h"
@@ -293,7 +295,9 @@ inline StateSelection select_percounter_state(
     // Keep sync cohorts first in the lease so allocation pressure does not
     // displace their existing mappings. The AICPU clears both groups before READY.
     std::vector<uint64_t> notify_addresses;
-    const uint64_t notify_count = sync_cohort_count + completion_plan.chains.size();
+    const size_t join_begin = sync_cohort_count + completion_plan.chains.size();
+    const size_t join_capacity = layout.graph_invocation_count ? 0 : partial_join_slot_capacity(inputs);
+    const uint64_t notify_count = join_begin + join_capacity;
     if (notify_count != 0) {
         SchedulerDoneNotifications notifications{};
         if (api->acquire_scheduler_notifications(
@@ -330,10 +334,11 @@ inline StateSelection select_percounter_state(
     external.callable_count = static_cast<uint64_t>(runtime->callable_table_len());
     external.sync_notify = notify_addresses.data();
     external.sync_notify_count = std::min<uint64_t>(notify_addresses.size(), sync_cohort_count);
-    if (notify_addresses.size() > sync_cohort_count) {
+    if (!completion_plan.chains.empty() && notify_addresses.size() > sync_cohort_count) {
         external.completion_plan = &completion_plan;
         external.completion_notify = notify_addresses.data() + sync_cohort_count;
-        external.completion_notify_count = notify_addresses.size() - sync_cohort_count;
+        external.completion_notify_count =
+            std::min(notify_addresses.size() - sync_cohort_count, completion_plan.chains.size());
     }
     BuildResult build{};
     const GraphPlanInput graph_plan{
@@ -364,6 +369,13 @@ inline StateSelection select_percounter_state(
         return StateSelection::FAILED;
     }
 
+    const size_t redundant = reduce_table_waits(inputs, layout, host_base, device_base);
+    LOG_TIMING("A5 percounter: table=%zu transitive_refs_removed=%zu", inputs.size(), redundant);
+    const auto joins = build_partial_joins(inputs, layout, host_base, device_base, notify_addresses, join_begin);
+    LOG_TIMING(
+        "A5 percounter: table=%zu partial_joins=%zu removed_refs=%zu moved_from_gm=%zu terminal_refs=%zu",
+        inputs.size(), joins.groups, joins.removed_refs, joins.moved_from_gm, joins.removed_terminal_refs
+    );
     const auto *terminal_control = region_at<PercounterControl>(host_base, layout.control_offset);
     if (terminal_control->terminal.step_count != 0)
         LOG_TIMING(
