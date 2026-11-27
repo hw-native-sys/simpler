@@ -52,6 +52,7 @@ struct ChipRunState {
     ChipRunPreparationDisposition disposition{ChipRunPreparationDisposition::VALIDATED_ONLY};
     bool pipeline_leased{true};
     bool activated{false};
+    bool prepare_ordered{false};
     bool crossed_launch_fence{false};
     bool depth_one_fallback{false};
     // Its prepare asked to wait: the device resources it needs are held by a
@@ -90,6 +91,7 @@ struct ChipRunState {
     // False can still mean partial lifetime references; caller_references_live
     // tracks the release obligation independently of full coverage.
     bool device_spans_borrowed{false};
+    uint64_t comm_generation{0};
     // This run's identity may still name something in the caller-buffer table: the borrow it took
     // at admission, or the declaration of what it produces that its own bind made later. Set for
     // every admitted run rather than only for one that borrowed, because the declaration is the
@@ -410,9 +412,11 @@ struct ChipRunLaneState {
             if (bytes == 0) continue;
             spans.push_back(ChipWorker::CallerDeviceSpan{tensor.buffer.addr, bytes});
         }
+        run->comm_generation = worker->append_joined_comm_spans(spans);
         if (!spans.empty()) {
             run->device_spans_borrowed =
                 worker->borrow_caller_device_spans(borrow_identity(*run), spans.data(), spans.size());
+            if (!run->device_spans_borrowed) run->comm_generation = 0;
         }
         // Last, and whether or not a borrow was taken: reaching here is what admits the run, and
         // an admitted run's identity may name something in the table from here on — the borrow
@@ -657,10 +661,11 @@ struct ChipRunLaneState {
             }
             return;
         }
-        if (!run->activated || run->phase == ChipRunState::Phase::LAUNCHED ||
+        if ((!run->activated && !run->prepare_ordered) || run->phase == ChipRunState::Phase::LAUNCHED ||
             run->phase == ChipRunState::Phase::TERMINAL) {
             return;
         }
+        if (cancel_before_launch(run)) return;
         if (run->phase == ChipRunState::Phase::QUEUED) {
             try {
                 prepare(run);
@@ -679,6 +684,7 @@ struct ChipRunLaneState {
             }
             run->resource_wait = false;
         }
+        if (!run->activated) return;
         // Read before the attempt, so a release landing between the two cannot
         // be missed by a waiter that parks on it.
         const uint64_t generation_before = credit_generation();
@@ -823,8 +829,8 @@ struct ChipRunLaneState {
      *
      * Both runs are checked for shape, not just the joining one: the ordering
      * makes them share a device generation that either one's failure can end.
-     * A live communication resource disqualifies every run on the worker, for
-     * the same reason — the child releases those before its reset.
+     * Both runs retain the same complete communication resource snapshot.
+     * Untracked resources and unknown last use prohibit joining or reclamation.
      *
      * Every device diagnostic owner can hold two runs open: each stamps the
      * run that produced a record onto it, and each run's accounting is
@@ -841,7 +847,10 @@ struct ChipRunLaneState {
         if (!successor.activated || successor.depth_one_fallback || successor.error != nullptr) return false;
         if (successor.joined_launch_declined) return false;
         if (!joinable_shape(predecessor) || !joinable_shape(successor)) return false;
-        if (worker->holds_live_comm_resources()) return false;
+        const auto comm_generation = worker->joined_comm_generation();
+        if (comm_generation == 0 || predecessor.comm_generation != comm_generation ||
+            successor.comm_generation != comm_generation)
+            return false;
         if (predecessor.config.diagnostics_any() || successor.config.diagnostics_any()) {
             return permits_joined_diagnostic_launch(predecessor, successor);
         }
@@ -1438,6 +1447,25 @@ void ChipRun::expire_credit_deadline_for_test() {
     std::lock_guard<std::mutex> lk(lane_->mu);
     run_->credit_deadline_set = true;
     run_->credit_deadline = Clock::now() - std::chrono::milliseconds(1);
+}
+
+void ChipRun::authorize_prepare() {
+    if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    if (run_->owner == ChipRunOwner::Caller)
+        throw std::logic_error("the caller owns submission and finalization of this run");
+    if (run_->phase == ChipRunState::Phase::TERMINAL) {
+        lane_->rethrow_run_error(run_);
+        return;
+    }
+    lane_->require_reclamation_allowed();
+    lane_->worker->validate_execution_context();
+    run_->prepare_ordered = true;
+    // launch_front still refuses execution until the independent activation
+    // arrives. Normal lane progress retries a resource-blocked preparation.
+    lane_->launch_front();
+    lane_->prepare_queued_successors();
 }
 
 void ChipRun::activate() {

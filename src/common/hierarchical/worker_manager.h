@@ -84,6 +84,7 @@ enum class MailboxState : int32_t {
     ACTIVATE = 11,
     PREPARE_READY = 12,
     TASK_ENDED = 13,
+    CANCEL_STAGED = 14,
 };
 
 enum class MailboxPreparationDisposition : int32_t {
@@ -181,6 +182,9 @@ struct MailboxRunEntry {
     int32_t observation_requested;
     /* Parent, identity-checked while occupied. Read by the child's native wait. */
     int32_t peer_cancel_requested;
+    /* Parent, identity-checked: no earlier dispatch can still arrive. This
+       permits native preparation only; activation has its own protocol. */
+    int32_t prepare_ordered;
 };
 static_assert(
     std::is_trivially_copyable_v<MailboxRunEntry> && std::is_standard_layout_v<MailboxRunEntry>,
@@ -573,7 +577,9 @@ public:
      */
     virtual size_t available_request_transport();
     virtual bool poll_progress(WorkerEndpointProgress &progress);
+    virtual void cancel_staged_progress(RunId run_id);
     virtual bool activate_progress(RunId run_id);
+    virtual bool authorize_preparation(RunId run_id);
     virtual void request_progress_stop() noexcept;
     virtual void request_observation(RunId) {}
     virtual void request_peer_cancel(RunId) {}
@@ -673,7 +679,9 @@ public:
     void submit_progress(Ring *ring, const WorkerDispatch &dispatch) override;
     size_t available_request_transport() override;
     bool poll_progress(WorkerEndpointProgress &progress) override;
+    void cancel_staged_progress(RunId run_id) override;
     bool activate_progress(RunId run_id) override;
+    bool authorize_preparation(RunId run_id) override;
     void request_progress_stop() noexcept override;
     void request_observation(RunId run_id) override;
     void request_peer_cancel(RunId run_id) override;
@@ -791,6 +799,7 @@ private:
         bool accepted_reported{false};
         bool ended_reported{false};
         bool activation_requested{false};
+        bool cancellation_requested{false};
         bool activation_published{false};
         // The disposition this run was last reported with. A staged run may be
         // prepared later than it was staged — its own predecessor had not
@@ -899,6 +908,8 @@ public:
     // still needs its conservative terminal fallback.
     void complete_unpublished(WorkerDispatch d, const std::string &error_message);
     bool has_staged_run(RunId run_id) const;
+    void cancel_staged_run(RunId run_id);
+    bool authorize_preparation(RunId run_id);
     bool activate_prepared(RunId run_id);
 
     /**
@@ -1188,6 +1199,8 @@ public:
 
     bool any_busy() const;
     bool has_staged_run(RunId run_id) const;
+    void cancel_staged_run(RunId run_id);
+    bool authorize_preparation(RunId run_id);
     bool activate_prepared_run(RunId run_id);
     /** @see WorkerThread::authorize_staged_launch. */
     bool authorize_staged_launch(RunId run_id);

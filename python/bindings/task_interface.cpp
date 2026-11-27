@@ -3785,6 +3785,7 @@ NB_MODULE(_task_interface, m) {
     nb::class_<ChipRun>(m, "_ChipRun")
         .def("done", &ChipRun::done)
         .def("activate", &ChipRun::activate)
+        .def("_authorize_prepare", &ChipRun::authorize_prepare)
         .def(
             "bind_peer_cancel",
             [](ChipRun &self, uint64_t address) {

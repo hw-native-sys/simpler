@@ -557,7 +557,7 @@ void *DeviceRunnerBase::allocate_caller_buffer(std::size_t bytes) {
     void *ptr = allocate_tensor(bytes);
     if (ptr == nullptr) return nullptr;
     try {
-        caller_device_buffers_.record(ptr, bytes);
+        device_buffer_owners_.record(ptr, bytes);
     } catch (...) {
         // Recording allocates, and the entry is what makes this allocation the caller's. Without
         // it the caller would be handed nothing while the device memory stayed committed to no
@@ -574,28 +574,28 @@ int DeviceRunnerBase::adopt_caller_buffer(
     void *base, size_t logical_bytes, size_t physical_bytes, MemoryAllocator::StorageReleaseFn release_storage,
     void *storage
 ) {
-    if (caller_device_buffers_.recorded(base)) return PTO_RUNTIME_ERR_INVALID_STATE;
-    caller_device_buffers_.record(base, logical_bytes);
+    if (device_buffer_owners_.recorded(base)) return PTO_RUNTIME_ERR_INVALID_STATE;
+    device_buffer_owners_.record(base, logical_bytes);
     try {
         if (mem_alloc_.adopt(base, logical_bytes, physical_bytes, release_storage, storage)) return 0;
     } catch (...) {
-        caller_device_buffers_.forget_if_unborrowed(base);
+        device_buffer_owners_.forget_if_unborrowed(base);
         throw;
     }
-    caller_device_buffers_.forget_if_unborrowed(base);
+    device_buffer_owners_.forget_if_unborrowed(base);
     return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
 int DeviceRunnerBase::free_caller_buffer(void *dev_ptr) {
     if (dev_ptr == nullptr) return 0;
     int status = PTO_RUNTIME_ERR_INVALID_STATE;
-    if (!caller_device_buffers_.forget_if_unborrowed(dev_ptr, [&] {
+    if (!device_buffer_owners_.forget_if_unborrowed(dev_ptr, [&] {
             status = free_tensor(dev_ptr);
             return status == 0;
         })) {
         LOG_ERROR(
             "free_caller_buffer: %p release refused or failed with status %d (%zu borrows, %zu retained references)",
-            dev_ptr, status, caller_device_buffers_.borrow_count(), caller_device_buffers_.retained_count()
+            dev_ptr, status, device_buffer_owners_.borrow_count(), device_buffer_owners_.retained_count()
         );
         return status;
     }
@@ -605,11 +605,11 @@ int DeviceRunnerBase::free_caller_buffer(void *dev_ptr) {
 bool DeviceRunnerBase::borrow_caller_buffers(
     uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count
 ) {
-    return caller_device_buffers_.borrow(identity, spans, count);
+    return device_buffer_owners_.borrow(identity, spans, count);
 }
 
 void DeviceRunnerBase::release_caller_buffers(uint64_t identity, bool keep) {
-    caller_device_buffers_.release(identity, keep);
+    device_buffer_owners_.release(identity, keep);
 }
 
 bool DeviceRunnerBase::retire_caller_buffer_carrier(const void *owner, const NativeRunIdentity &identity) {
@@ -621,9 +621,9 @@ bool DeviceRunnerBase::retire_caller_buffer_carrier(const void *owner, const Nat
     if (reserved == native_run_reservations_.end()) return false;
     // Ordinary lane reservations leave slot borrows with their caller.
     if (!reserved->independent_preparation) return true;
-    caller_device_buffers_.detach_reference(owner);
+    device_buffer_owners_.detach_reference(owner);
     // The reservation still belongs to this exact call; a delayed close cannot erase a successor.
-    caller_device_buffers_.release(static_cast<uint64_t>(identity.pipeline_slot) + 1, false);
+    device_buffer_owners_.release(static_cast<uint64_t>(identity.pipeline_slot) + 1, false);
     return true;
 }
 
@@ -4259,15 +4259,15 @@ int DeviceRunnerBase::prepare_caller_submission(void *owner, PreparedExecution &
     if (!execution_mode_latch().is_kernel() || (prepared.dfx.diagnostics_any() && !prepared.diagnostic_window_open))
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     if (!prepared.prepared_resources || !prepared.streams.ready()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (!caller_device_buffers_.retain_reference(owner, static_cast<uint64_t>(prepared.pipeline_slot) + 1))
+    if (!device_buffer_owners_.retain_reference(owner, static_cast<uint64_t>(prepared.pipeline_slot) + 1))
         return PTO_RUNTIME_ERR_INVALID_STATE;
     try {
         if (!workspace_.preserve_run_record(prepared.pipeline_slot, prepared.identity.run_epoch)) {
-            caller_device_buffers_.release_reference(owner, false);
+            device_buffer_owners_.release_reference(owner, false);
             return PTO_RUNTIME_ERR_INVALID_STATE;
         }
     } catch (...) {
-        caller_device_buffers_.release_reference(owner, false);
+        device_buffer_owners_.release_reference(owner, false);
         throw;
     }
     prepared.caller_owns_submission = true;
@@ -4278,8 +4278,8 @@ int DeviceRunnerBase::prepare_caller_submission(void *owner, PreparedExecution &
 }
 
 void DeviceRunnerBase::yield_caller_submission(void *owner, const NativeRunIdentity &identity) {
-    caller_device_buffers_.detach_reference(owner);
-    caller_device_buffers_.release(static_cast<uint64_t>(identity.pipeline_slot) + 1, false);
+    device_buffer_owners_.detach_reference(owner);
+    device_buffer_owners_.release(static_cast<uint64_t>(identity.pipeline_slot) + 1, false);
     release_device_run_timing(identity.pipeline_slot);
     release_native_run(owner);
     release_native_run_reservation(owner);

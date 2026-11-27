@@ -1167,6 +1167,8 @@ class CommDomainHandle:
         "_initialization_failed",
         "_domain_ranks",
         "_release_fn",
+        "_run_use_lock",
+        "_run_uses",
         "_release_scope",
         "_use_fn",
         "_released",
@@ -1229,6 +1231,8 @@ class CommDomainHandle:
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
         )
+        self._run_use_lock = threading.RLock()
+        self._run_uses: dict[int, Any] = {}
         self._release_fn = _release_fn
         self._release_scope = _release_scope
         self._use_fn = _use_fn

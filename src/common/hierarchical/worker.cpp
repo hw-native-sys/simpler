@@ -278,6 +278,9 @@ void Worker::init() {
     cfg.preparable_runs_cb = [this] {
         return orchestrator_.preparable_run_ids();
     };
+    cfg.preparation_ordered_run_cb = [this] {
+        return orchestrator_.preparation_ordered_run_id();
+    };
     cfg.can_stage_run_on_worker_cb = [this](RunId run_id, int32_t worker_id) {
         return orchestrator_.can_stage_run_on_worker(run_id, worker_id);
     };

@@ -36,6 +36,7 @@
 
 #include "call_config.h"
 #include "host/caller_device_buffers.h"
+#include "host/device_buffer_owners.h"
 #include "run_resource_arena.h"
 #include "runtime_c_api.h"
 #include "task_args.h"
@@ -1455,3 +1456,371 @@ TEST(ChipRunLaneJoinedLaunchTest, MissingOrStalePrepareReleaseKeepsItsBorrow) {
         EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 1}, {1, 0}}));
     }
 }
+
+TEST(ChipRunLaneCallerBuffersTest, ANativeBorrowFailureIsNotAnUnknownExternalSpan) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_buffers(worker);
+    const ChipWorker::CallerDeviceSpan span{0x2000, 1};
+    g_borrow_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    EXPECT_FALSE(worker.borrow_caller_device_spans(1, &span, 1));
+    g_borrow_rc = PTO_RUNTIME_ERR_INTERNAL;
+    EXPECT_THROW(worker.borrow_caller_device_spans(2, &span, 1), std::runtime_error);
+    worker.finalize();
+}
+
+namespace {
+int g_domain_release_calls;
+int g_domain_destroy_calls;
+int g_domain_backend_rc;
+class ChipWorkerDomainOwnersTest : public ::testing::Test {
+protected:
+    DeviceBufferOwners owners;
+    ChipWorker worker;
+    static constexpr uint64_t session = 7;
+    void SetUp() override {
+        g_domain_release_calls = g_domain_destroy_calls = g_domain_backend_rc = 0;
+        prime_worker(worker);
+        worker.device_ctx_ = &owners;
+        worker.comm_alloc_domain_windows_fn_ = [](void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t,
+                                                  uint32_t, uint64_t *ctx, uint64_t *base, size_t *size,
+                                                  const CommWorkspaceConfig *) {
+            *ctx = 0x8000;
+            *base = 0xA000;
+            *size = 4096;
+            return 0;
+        };
+        worker.comm_query_domain_allocation_fn_ = [](CommHandle, uint64_t, CommAllocationSpan *spans, size_t capacity,
+                                                     size_t *count) {
+            *count = 2;
+            if (spans == nullptr && capacity == 0) return 0;
+            if (capacity < 2) return -1;
+            spans[0] = {0x8000, 128};
+            spans[1] = {0xA000, 4096};
+            return 0;
+        };
+        worker.device_register_domain_owner_ctx_fn_ = [](void *ctx, uint64_t s, uint64_t a,
+                                                         const CallerBufferSpan *spans, uint32_t count) {
+            std::vector<DeviceBufferOwners::Span> views;
+            for (uint32_t i = 0; i < count; ++i)
+                views.push_back({spans[i].addr, spans[i].bytes});
+            return static_cast<DeviceBufferOwners *>(ctx)->register_domain_owner(s, a, views.data(), views.size()) ?
+                       0 :
+                       PTO_RUNTIME_ERR_INVALID_STATE;
+        };
+        worker.device_domain_owner_registered_ctx_fn_ = [](void *ctx, uint64_t s, uint64_t a) {
+            return static_cast<DeviceBufferOwners *>(ctx)->has_domain_owner(s, a) ? 1 : 0;
+        };
+        worker.device_begin_domain_release_ctx_fn_ = [](void *ctx, uint64_t s, uint64_t a) {
+            return static_cast<DeviceBufferOwners *>(ctx)->begin_domain_release(s, a) ? 0 :
+                                                                                        PTO_RUNTIME_ERR_INVALID_STATE;
+        };
+        worker.device_finish_domain_release_ctx_fn_ = [](void *ctx, uint64_t s, uint64_t a, int confirmed) {
+            auto *owners = static_cast<DeviceBufferOwners *>(ctx);
+            return (confirmed ? owners->finish_domain_release(s, a) : owners->mark_domain_release_unconfirmed(s, a)) ?
+                       0 :
+                       PTO_RUNTIME_ERR_INVALID_STATE;
+        };
+        worker.device_begin_domain_session_release_ctx_fn_ = [](void *ctx, uint64_t s) {
+            return static_cast<DeviceBufferOwners *>(ctx)->begin_domain_session_release(s) ?
+                       0 :
+                       PTO_RUNTIME_ERR_INVALID_STATE;
+        };
+        worker.device_finish_domain_session_release_ctx_fn_ = [](void *ctx, uint64_t s, int confirmed) {
+            return static_cast<DeviceBufferOwners *>(ctx)->finish_domain_session_release(s, confirmed != 0) ?
+                       0 :
+                       PTO_RUNTIME_ERR_INVALID_STATE;
+        };
+        worker.comm_release_domain_windows_fn_ = [](void *, uint64_t, size_t, uint32_t) {
+            ++g_domain_release_calls;
+            return g_domain_backend_rc;
+        };
+        worker.comm_destroy_fn_ = [](void *) {
+            ++g_domain_destroy_calls;
+            return g_domain_backend_rc;
+        };
+    }
+    void TearDown() override {
+        worker.comm_sessions_.clear();
+        worker.comm_session_index_.clear();
+        worker.device_ctx_ = nullptr;
+        worker.initialized_ = false;
+    }
+    void enable_run_borrows() {
+        worker.device_borrow_caller_buffers_ctx_fn_ = [](void *ctx, const CallerBufferSpan *spans, uint32_t count,
+                                                         uint64_t identity) {
+            std::vector<DeviceBufferOwners::Span> views;
+            for (uint32_t i = 0; i < count; ++i)
+                views.push_back({spans[i].addr, spans[i].bytes});
+            return static_cast<DeviceBufferOwners *>(ctx)->borrow(identity, views.data(), views.size()) ?
+                       0 :
+                       PTO_RUNTIME_ERR_INVALID_STATE;
+        };
+        worker.device_release_caller_buffers_ctx_fn_ = [](void *ctx, uint64_t identity, int keep) {
+            static_cast<DeviceBufferOwners *>(ctx)->release(identity, keep != 0);
+        };
+    }
+    void allocate() { worker.comm_alloc_domain_windows(session, 11, {0}, 0, 4096, 0); }
+    void grant() {
+        const DeviceBufferOwners::Span spans[] = {{0x8000, 128}, {0xA000, 4096}};
+        ASSERT_TRUE(owners.register_domain_owner(session, 11, spans, 2));
+    }
+};
+
+TEST_F(ChipWorkerDomainOwnersTest, JoinedRunsBorrowContextEvenWithoutDeviceTensorOperands) {
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, true);
+    allocate();
+    enable_run_borrows();
+    ChipRunLane lane(worker);
+    auto args = host_args();
+    ChipRun first = submit(lane, 101, 0, true, args);
+    ChipRun second = submit(lane, 102, 1, false, args);
+    second.activate();
+    EXPECT_TRUE(second.launched());
+    EXPECT_FALSE(g_complete[0]);
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_EQ(g_domain_release_calls, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_EQ(g_domain_release_calls, 0);
+    g_complete[1] = true;
+    EXPECT_TRUE(second.done());
+    lane.close();
+    EXPECT_NO_THROW(worker.comm_release_domain_windows(session, 11, 1, 0));
+    EXPECT_EQ(g_domain_release_calls, 1);
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, LatePredecessorErrorDoesNotReleaseAnUnrelatedJoinedConsumersLoan) {
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, true);
+    allocate();
+    enable_run_borrows();
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0, true, host_args());
+    ChipRun second = submit(lane, 102, 1, false, host_args());
+    second.activate();
+    ASSERT_TRUE(second.launched());
+    g_complete[0] = true;
+    ASSERT_TRUE(first.done());
+    g_wait_rc = -7;
+    EXPECT_THROW(first.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+    EXPECT_FALSE(g_complete[1]);
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_THROW(worker.comm_destroy(session), std::runtime_error);
+    EXPECT_EQ(g_domain_release_calls, 0);
+    EXPECT_EQ(g_domain_destroy_calls, 0);
+    EXPECT_FALSE(owners.begin_domain_release(session, 11));
+    g_wait_rc = 0;
+    g_complete[1] = true;
+    EXPECT_THROW(lane.close(), std::runtime_error);
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, UnknownDrainRetainsBothJoinedConsumersAndSession) {
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, true);
+    allocate();
+    enable_run_borrows();
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0, true, host_args());
+    ChipRun second = submit(lane, 102, 1, false, host_args());
+    second.activate();
+    ASSERT_TRUE(second.launched());
+    g_completion_rc = -6;
+    g_wait_rc = -7;
+    g_finalize_rc = -5;
+    EXPECT_THROW(first.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_THROW(worker.comm_destroy(session), std::runtime_error);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_domain_release_calls, 0);
+    EXPECT_EQ(g_domain_destroy_calls, 0);
+    EXPECT_FALSE(owners.begin_domain_release(session, 11));
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, PartialJoinedLaunchKeepsDomainUntilLastUseIsProven) {
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, true);
+    allocate();
+    enable_run_borrows();
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0, true, host_args());
+    ChipRun second = submit(lane, 102, 1, false, host_args());
+    g_joined_throws = true;
+    g_wait_rc = -7;
+    g_finalize_rc = -5;
+    second.activate();
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    EXPECT_EQ(g_domain_release_calls, 0);
+    EXPECT_FALSE(owners.begin_domain_release(session, 11));
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, RejectedJoinFallsBackWithoutLosingDomainOwnership) {
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, true);
+    allocate();
+    enable_run_borrows();
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0, true, host_args());
+    ChipRun second = submit(lane, 102, 1, false, host_args());
+    g_joined_rc = PTO_RUNTIME_ERR_UNSUPPORTED;
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    EXPECT_FALSE(lane.poisoned());
+    EXPECT_FALSE(owners.begin_domain_release(session, 11));
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.launched());
+    second.wait_until(ChipRunLane::Deadline::max());
+    lane.close();
+    EXPECT_NO_THROW(worker.comm_release_domain_windows(session, 11, 1, 0));
+    EXPECT_EQ(g_domain_release_calls, 1);
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, AnUnattestedAllocationBlocksJoinsBesideAnOwnedDomain) {
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, true);
+    allocate();
+    enable_run_borrows();
+    worker.comm_query_domain_allocation_fn_ = [](CommHandle, uint64_t, CommAllocationSpan *, size_t, size_t *) {
+        return -1;
+    };
+    EXPECT_THROW(worker.comm_alloc_domain_windows(session, 12, {0}, 0, 4096, 0), std::runtime_error);
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0, true, host_args());
+    ChipRun second = submit(lane, 102, 1, false, host_args());
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    lane.close();
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, NewAllocationCannotJoinAnOlderResourceSnapshot) {
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, true);
+    enable_run_borrows();
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0, true, host_args());
+    allocate();
+    ChipRun second = submit(lane, 102, 1, false, host_args());
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    lane.close();
+    EXPECT_NO_THROW(worker.comm_release_domain_windows(session, 11, 1, 0));
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, WorkspaceDomainsKeepSerialLaunch) {
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, true);
+    worker.comm_alloc_domain_windows(session, 11, {0}, 0, 4096, 1);
+    enable_run_borrows();
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0, true, host_args());
+    ChipRun second = submit(lane, 102, 1, false, host_args());
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    lane.close();
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, AllocationEnrollsBackendAttestedViews) {
+    allocate();
+    EXPECT_TRUE(owners.has_domain_owner(session, 11));
+    EXPECT_TRUE(owners.resolve(0x8000, 128, nullptr));
+    EXPECT_TRUE(owners.resolve(0xA000, 4096, nullptr));
+    EXPECT_EQ(owners.caller_allocation_count(), 0u);
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, LoanWithoutNativeTokenStillBlocksExplicitRelease) {
+    grant();
+    const DeviceBufferOwners::Span span{0xA000, 1};
+    ASSERT_TRUE(owners.borrow(23, &span, 1));
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_EQ(g_domain_release_calls, 0);
+    owners.release(23, false);
+    EXPECT_NO_THROW(worker.comm_release_domain_windows(session, 11, 1, 0));
+    EXPECT_EQ(g_domain_release_calls, 1);
+    EXPECT_FALSE(owners.has_domain_owner(session, 11));
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, ImplicitSessionCloseRevokesAndForgetsEnrolledViews) {
+    grant();
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, false);
+    const DeviceBufferOwners::Span span{0xA000, 1};
+    ASSERT_TRUE(owners.borrow(23, &span, 1));
+    EXPECT_THROW(worker.comm_destroy(session), std::runtime_error);
+    EXPECT_EQ(g_domain_destroy_calls, 0);
+    owners.release(23, false);
+    EXPECT_NO_THROW(worker.comm_destroy(session));
+    EXPECT_EQ(g_domain_destroy_calls, 1);
+    EXPECT_FALSE(owners.has_domain_owner(session, 11));
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, FailedBackendReleaseCannotBeRetriedOrReminted) {
+    grant();
+    g_domain_backend_rc = -77;
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_EQ(g_domain_release_calls, 1);
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_EQ(g_domain_release_calls, 1);
+    const DeviceBufferOwners::Span span{0xA000, 1};
+    EXPECT_THROW(owners.borrow(23, &span, 1), std::runtime_error);
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, FailedBackendCloseQuarantinesViews) {
+    grant();
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, false);
+    g_domain_backend_rc = -77;
+    EXPECT_THROW(worker.comm_destroy(session), std::runtime_error);
+    EXPECT_EQ(g_domain_destroy_calls, 1);
+    const DeviceBufferOwners::Span span{0xA000, 1};
+    EXPECT_THROW(owners.borrow(23, &span, 1), std::runtime_error);
+    EXPECT_TRUE(worker.comm_reclamation_unconfirmed_);
+    EXPECT_TRUE(worker.comm_cleanup_unconfirmed_);
+    ASSERT_EQ(worker.comm_sessions_.size(), 1u);
+    EXPECT_EQ(reinterpret_cast<uint64_t>(worker.comm_sessions_.front().handle), session);
+    EXPECT_THROW(worker.comm_destroy(session), std::runtime_error);
+    EXPECT_EQ(g_domain_destroy_calls, 1);
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, UnenrolledLegacyDomainKeepsItsOriginalReleasePath) {
+    EXPECT_NO_THROW(worker.comm_release_domain_windows(session, 11, 1, 0));
+    EXPECT_EQ(g_domain_release_calls, 1);
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, ThrowingBackendCloseQuarantinesSession) {
+    grant();
+    worker.create_comm_session(reinterpret_cast<void *>(session), nullptr, false);
+    worker.comm_destroy_fn_ = [](void *) -> int {
+        ++g_domain_destroy_calls;
+        throw std::runtime_error("backend close raised after partial cleanup");
+    };
+    EXPECT_THROW(worker.comm_destroy(session), std::runtime_error);
+    EXPECT_TRUE(worker.comm_reclamation_unconfirmed_);
+    EXPECT_TRUE(worker.comm_cleanup_unconfirmed_);
+    ASSERT_EQ(worker.comm_sessions_.size(), 1u);
+    EXPECT_EQ(reinterpret_cast<uint64_t>(worker.comm_sessions_.front().handle), session);
+    EXPECT_THROW(worker.comm_destroy(session), std::runtime_error);
+    EXPECT_EQ(g_domain_destroy_calls, 1);
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, InitializationAbortRetiresPublishedOwnerGrants) {
+    grant();
+    worker.comm_abort_domain_windows_fn_ = [](void *, uint64_t, size_t, uint32_t) {
+        ++g_domain_release_calls;
+        return 0;
+    };
+    EXPECT_NO_THROW(worker.comm_abort_domain_windows(session, 11, 1, 0));
+    EXPECT_EQ(g_domain_release_calls, 1);
+    EXPECT_FALSE(owners.has_domain_owner(session, 11));
+    const DeviceBufferOwners::Span spans[] = {{0x8000, 128}, {0xA000, 4096}};
+    EXPECT_TRUE(owners.register_domain_owner(session, 12, spans, 2));
+}
+
+TEST_F(ChipWorkerDomainOwnersTest, ThrowingBackendReleaseQuarantinesDomain) {
+    grant();
+    worker.comm_release_domain_windows_fn_ = [](void *, uint64_t, size_t, uint32_t) -> int {
+        ++g_domain_release_calls;
+        throw std::runtime_error("backend release raised after partial cleanup");
+    };
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_TRUE(worker.comm_reclamation_unconfirmed_);
+    EXPECT_TRUE(worker.comm_cleanup_unconfirmed_);
+    EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
+    EXPECT_EQ(g_domain_release_calls, 1);
+}
+}  // namespace

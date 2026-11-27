@@ -11,12 +11,7 @@
 
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
-#include <mutex>
-#include <unordered_map>
-#include <utility>
-#include <vector>
+#include "host/device_buffer_owners.h"
 
 /**
  * The device allocations a caller minted here, and which runs are still using them.
@@ -47,8 +42,7 @@
  * **A borrow belongs to a run identity, not to a count.** `borrow` is keyed on the run's own
  * identity, so a release names the run that took it and cannot discharge another run's reference.
  * Re-borrowing under one identity replaces that identity's set, which is what a re-prepared run
- * needs. A caller-owned submission keeps these facts under the original run handle before
- * releasing the slot. Checked finalization ends that run's borrows.
+ * needs.
  *
  * **A borrow is about lifetime, and says nothing about readability.** Holding an allocation is not
  * producing it: two runs may legitimately take the same immutable input, and neither makes the
@@ -63,10 +57,10 @@
  * declared by nobody and stays readable, which is what keeps every path that does not produce a
  * device tensor on the behaviour it already had.
  *
- * A declaration shares the borrow's identity and lifetime. A caller-owned run keeps
- * both facts through its final stream use, even after its slot is reused. The two
- * facts are discharged independently, including when the call held no borrow. A span that resolves
- * to no recorded allocation is ignored: there is nothing to protect.
+ * A declaration is keyed on the same identity as the borrow and released with it, so it cannot
+ * outlive the run that made it — including when that run held no borrow, which is why the release
+ * discharges the two facts independently. A span that resolves to no recorded allocation is
+ * ignored: there is nothing to protect.
  *
  * **An unproven run's facts are permanent, and they belong to the allocation.** When a run ended
  * without its last consumer being proven finished, the device may still be reading those bytes and
@@ -83,410 +77,27 @@
  * successful reset that ends the generation, a failed release it records, a quarantine — is
  * decided where those outcomes are known, not here.
  *
- * Release holds this table's mutex before the allocator lock; release callbacks
- * must not reenter this table. Other operations call no external code under the lock.
+ * Its own mutex, and a leaf: nothing called while it is held takes another lock.
  */
-class CallerDeviceBuffers {
-    struct Identity {
-        uint64_t active{0};
-        const void *reference{nullptr};
-        Identity(uint64_t value = 0) :
-            active(value) {}
-        static Identity retained(const void *value) {
-            Identity key;
-            key.reference = value;
-            return key;
-        }
-        bool operator==(const Identity &other) const { return active == other.active && reference == other.reference; }
-    };
-    struct IdentityHash {
-        size_t operator()(const Identity &key) const noexcept {
-            return std::hash<uint64_t>{}(key.active) ^ std::hash<const void *>{}(key.reference);
-        }
-    };
-    struct Records {
-        std::vector<uint64_t> bases;
-        uint64_t active_alias{0};
-        Records() = default;
-        Records(std::vector<uint64_t> values, uint64_t alias = 0) :
-            bases(std::move(values)),
-            active_alias(alias) {}
-    };
-
+class CallerDeviceBuffers final : private DeviceBufferOwners {
 public:
-    // Compute borrows use pipeline-slot IDs; external buffer leases use the high-bit namespace.
-    static constexpr uint64_t EXTERNAL_BORROW_MIN_ID = uint64_t{1} << 63;
-
-    /** One span of a caller allocation a run names. */
-    struct Span {
-        uint64_t addr{0};
-        uint64_t bytes{0};
-    };
-
-    /** A recorded allocation's own extent. */
-    struct Allocation {
-        uint64_t base{0};
-        uint64_t bytes{0};
-    };
-
-    /**
-     * Record one caller mint. Replaces any stale entry at the same base.
-     *
-     * A replacement is not an error: the platform may hand back an address a previous allocation
-     * released, and the previous entry can only still be here if it was never borrowed — a borrowed
-     * one cannot be freed. The new entry carries neither of the old one's marks, which is the same
-     * statement: an allocation whose release was refused was never handed back to be re-minted.
-     */
-    void record(void *base, std::size_t bytes) {
-        if (base == nullptr || bytes == 0) return;
-        std::scoped_lock lk(mu_);
-        allocations_[reinterpret_cast<uint64_t>(base)] = Entry{static_cast<uint64_t>(bytes)};
-    }
-
-    /** Whether `base` is a recorded caller mint. */
-    bool recorded(void *base) const {
-        if (base == nullptr) return false;
-        std::scoped_lock lk(mu_);
-        return allocations_.count(reinterpret_cast<uint64_t>(base)) != 0;
-    }
-
-    /**
-     * The recorded allocation covering `[addr, addr + bytes)`, if any.
-     *
-     * A zero-length span resolves to nothing: it names no bytes, so there is nothing to own and
-     * nothing to borrow. An empty tensor therefore stays on the path it has today.
-     */
-    bool resolve(uint64_t addr, uint64_t bytes, Allocation *out) const {
-        if (addr == 0 || bytes == 0) return false;
-        std::scoped_lock lk(mu_);
-        return resolve_locked(addr, bytes, out);
-    }
-
-    /**
-     * Take `identity`'s borrow over every span's containing allocation.
-     *
-     * Known allocations stay borrowed even when another span is external. The result reports
-     * full coverage for joined admission, not whether any lifetime references were acquired.
-     * Re-borrowing replaces this identity's set only after the new set has been collected.
-     *
-     * @return true when every span resolved; false still requires release(identity, keep).
-     */
-    bool borrow(uint64_t identity, const Span *spans, std::size_t count) {
-        if (identity == 0) return false;
-        std::scoped_lock lk(mu_);
-        std::vector<uint64_t> taken;
-        taken.reserve(count);
-        bool all_resolved = true;
-        for (std::size_t i = 0; i < count; ++i) {
-            Allocation allocation;
-            if (resolve_locked(spans[i].addr, spans[i].bytes, &allocation)) {
-                taken.push_back(allocation.base);
-            } else {
-                all_resolved = false;
-            }
-        }
-        if (taken.empty()) {
-            borrows_.erase(identity);
-        } else {
-            borrows_[identity] = std::move(taken);
-        }
-        return all_resolved;
-    }
-
-    /**
-     * Discharge everything `identity` established, or keep it for good.
-     *
-     * Both facts are discharged, and independently: the borrow over the allocations this run
-     * named, and its declaration of which of them it produces. A run can hold either without the
-     * other — a declaration may be recorded without an admission borrow — and a slot holds
-     * exactly one run at a time, so a later run under this
-     * identity must inherit neither.
-     *
-     * `keep` is for a run whose last consumer could not be proven finished. It does not merely
-     * delay the drop: each allocation is marked instead, so the release stays refused and the
-     * bytes this run had declared stay unreadable, because nothing later can establish what the
-     * device no longer holds or no longer writes. Marking is an update in place, so this call
-     * allocates nothing and cannot fail on a teardown path.
-     */
-    void release(uint64_t identity, bool keep) {
-        std::scoped_lock lk(mu_);
-        release_locked(Identity(identity), keep);
-    }
-
-    /** Keep the slot's current borrows and writes under the original run handle. */
-    bool retain_reference(const void *reference, uint64_t active_identity) {
-        if (reference == nullptr || active_identity == 0) return false;
-        std::scoped_lock lk(mu_);
-        const auto key = Identity::retained(reference);
-        if (borrows_.count(key) != 0 || writes_.count(key) != 0) return false;
-        const auto borrowed = borrows_.find(active_identity);
-        const auto written = writes_.find(active_identity);
-        Records retained_borrows(
-            borrowed == borrows_.end() ? std::vector<uint64_t>{} : borrowed->second.bases, active_identity
-        );
-        Records retained_writes(
-            written == writes_.end() ? std::vector<uint64_t>{} : written->second.bases, active_identity
-        );
-        borrows_.emplace(key, std::move(retained_borrows));
-        try {
-            writes_.emplace(key, std::move(retained_writes));
-        } catch (...) {
-            borrows_.erase(key);
-            throw;
-        }
-        return true;
-    }
-
-    /** The run now owns the borrows independently of its reusable slot. */
-    void detach_reference(const void *reference) {
-        std::scoped_lock lk(mu_);
-        const auto key = Identity::retained(reference);
-        const auto borrowed = borrows_.find(key);
-        const auto written = writes_.find(key);
-        if (borrowed != borrows_.end()) borrowed->second.active_alias = 0;
-        if (written != writes_.end()) written->second.active_alias = 0;
-    }
-
-    /** Release this run's borrows and writes without altering a later occupant of its slot. */
-    void release_reference(const void *reference, bool keep) {
-        std::scoped_lock lk(mu_);
-        release_locked(Identity::retained(reference), keep);
-    }
-
-    /**
-     * Whether the allocation based at `base` may not be released — because a run still holds it,
-     * or because one ended while it may still have been reaching it.
-     */
-    bool borrowed(void *base) const {
-        if (base == nullptr) return false;
-        std::scoped_lock lk(mu_);
-        return borrowed_locked(reinterpret_cast<uint64_t>(base));
-    }
-
-    /**
-     * Declare that `identity` writes the allocations covering `spans`.
-     *
-     * Made by the run's own bind, which is where the orchestration signature says which arguments
-     * are outputs. Replaces this identity's previous declaration, so a re-prepared run states its
-     * writes again rather than accumulating them, and is discharged by `release`.
-     *
-     * A span resolving to no recorded allocation is skipped rather than refused: this is a
-     * statement about caller buffers, and an address that is not one protects nothing. It is also
-     * not *nothing* — it is an unknown — so `unresolved_out` reports how many spans were skipped.
-     * A caller that named a span it believes is produced can tell "this run produces no caller
-     * buffer" from "this run produces bytes whose owner this context cannot prove", and the
-     * readability fence is exactly as wide as what was recorded: it says nothing about a span
-     * that did not resolve, and no protection is claimed for one.
-     *
-     * @return true when the statement is recorded. False means it is not, and the caller must not
-     *         proceed as if it were: an undeclared producer reads as no producer, so a run whose
-     *         declaration failed has to fail before it can write anything. The only way to fail is
-     *         the allocation this statement needs. What makes that safe is the caller's refusal,
-     *         not the state left behind: the previous declaration stays, and it may well name
-     *         spans disjoint from the new one, so it is no substitute — the bind that could not
-     *         declare is rejected before it publishes anything, which is why nothing of this run's
-     *         ever reaches the device for another run to read.
-     */
-    bool
-    declare_writes(uint64_t identity, const Span *spans, std::size_t count, std::size_t *unresolved_out = nullptr) {
-        if (unresolved_out != nullptr) *unresolved_out = 0;
-        if (identity == 0) return false;
-        std::scoped_lock lk(mu_);
-        try {
-            std::vector<uint64_t> written;
-            written.reserve(count);
-            for (std::size_t i = 0; i < count; ++i) {
-                Allocation allocation;
-                if (!resolve_locked(spans[i].addr, spans[i].bytes, &allocation)) {
-                    if (unresolved_out != nullptr) ++*unresolved_out;
-                    continue;
-                }
-                written.push_back(allocation.base);
-            }
-            if (written.empty()) {
-                writes_.erase(identity);
-                return true;
-            }
-            writes_[identity] = std::move(written);
-        } catch (...) {
-            return false;
-        }
-        return true;
-    }
-
-    /**
-     * Whether `[addr, addr + bytes)` has no readable content for `identity` yet.
-     *
-     * The question a host reader inside this process asks before reading a caller device buffer's
-     * bytes: those bytes have no defined content until their producer finishes. A shared immutable
-     * input has no declared writer and so stays readable — holding an allocation is not producing
-     * it, which is why this asks about declarations and not about borrows.
-     *
-     * True when another live run has declared it produces them, or when a run that had declared
-     * them ended without being proven finished. `identity` is excluded from the first, because a
-     * run's own output is its own business: it is building the graph that will write those bytes.
-     * It is not excluded from the second — that mark belongs to the allocation, not to a run, so
-     * the next run to occupy this slot is refused just the same.
-     */
-    bool written_by_other_run(uint64_t identity, uint64_t addr, uint64_t bytes) const {
-        if (addr == 0 || bytes == 0) return false;
-        std::scoped_lock lk(mu_);
-        Allocation allocation;
-        if (!resolve_locked(addr, bytes, &allocation)) return false;
-        const auto entry = allocations_.find(allocation.base);
-        if (entry != allocations_.end() && entry->second.write_unproven) return true;
-        for (const auto &[writer, written] : writes_) {
-            if (writer == Identity(identity) || (identity != 0 && written.active_alias == identity)) continue;
-            for (const uint64_t one : written.bases) {
-                if (one == allocation.base) return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Forget `base` so the caller's release may proceed, or refuse.
-     *
-     * Check and forget are one step under this lock. The release overload runs
-     * its callback under the same lock and forgets only a successful release.
-     *
-     * @return true when nothing holds it and the entry is now gone.
-     */
-    bool forget_if_unborrowed(void *base) {
-        return forget_if_unborrowed(base, [] {
-            return true;
-        });
-    }
-
-    /** Keep the record until release succeeds, excluding new borrows throughout. */
-    template <typename Release>
-    bool forget_if_unborrowed(void *base, Release release) {
-        if (base == nullptr) return false;
-        const uint64_t key = reinterpret_cast<uint64_t>(base);
-        std::scoped_lock lk(mu_);
-        if (borrowed_locked(key)) return false;
-        if (!release()) return false;
-        allocations_.erase(key);
-        return true;
-    }
-
-    /** How many runs have declared a write. */
-    std::size_t write_declaration_count() const {
-        std::scoped_lock lk(mu_);
-        std::size_t count = 0;
-        for (const auto &[key, records] : writes_)
-            if (!records.bases.empty() && records.active_alias == 0) ++count;
-        return count;
-    }
-
-    /** Count original borrows at or above minimum_identity; zero includes retained references. */
-    std::size_t borrow_count(uint64_t minimum_identity = 0) const {
-        std::scoped_lock lk(mu_);
-        std::size_t count = 0;
-        for (const auto &[key, records] : borrows_) {
-            if (key.active >= minimum_identity && !records.bases.empty() && records.active_alias == 0) ++count;
-        }
-        return count;
-    }
-
-    /** How many allocations are retained for the process's remaining life. */
-    std::size_t retained_count() const {
-        std::scoped_lock lk(mu_);
-        std::size_t count = 0;
-        for (const auto &[base, entry] : allocations_) {
-            (void)base;
-            if (entry.release_refused) ++count;
-        }
-        return count;
-    }
-
-    /** Recorded caller mints. */
-    std::size_t allocation_count() const {
-        std::scoped_lock lk(mu_);
-        return allocations_.size();
-    }
-
-private:
-    void release_locked(Identity identity, bool keep) {
-        const auto borrowed = borrows_.find(identity);
-        if (borrowed != borrows_.end()) {
-            if (keep) {
-                for (const uint64_t base : borrowed->second.bases)
-                    mark_release_refused(base);
-            }
-            borrows_.erase(borrowed);
-        }
-        const auto written = writes_.find(identity);
-        if (written == writes_.end()) return;
-        if (keep) {
-            for (const uint64_t base : written->second.bases) {
-                // Both marks, for the same reason: a consumer that may still be writing these
-                // bytes may still be reading them too, so the pages cannot go back either. The
-                // borrow usually said that already — this reaches the allocation a run declared
-                // through a declaration even if no admission borrow was taken.
-                mark_write_unproven(base);
-                mark_release_refused(base);
-            }
-        }
-        writes_.erase(written);
-    }
-
-    /** One recorded caller mint: its extent, and the two facts that can outlive every run. */
-    struct Entry {
-        uint64_t bytes{0};
-        // The allocation may never be released: a run that could still reach it ended without its
-        // last consumer being proven finished.
-        bool release_refused{false};
-        // Its bytes may never be read on the host: a run that had declared it produces them ended
-        // the same way, so nothing can establish that the write completed.
-        bool write_unproven{false};
-    };
-
-    // Linear over the recorded mints, under the leaf mutex. The set is only what a caller minted
-    // through this context — not its workspace, retained temporaries or arena banks — so it is
-    // small, and every question is asked on a bind or a free rather than per task. One path pays
-    // it per element: a `get_tensor_data` loop over a child-memory region whose platform host view
-    // was refused (issue #1531) resolves again on each element read.
-    bool resolve_locked(uint64_t addr, uint64_t bytes, Allocation *out) const {
-        for (const auto &[base, entry] : allocations_) {
-            if (addr < base) continue;
-            // Both halves matter: the span has to start inside the allocation and end inside it,
-            // and the end test is written against the remaining extent so a caller-supplied length
-            // cannot overflow the address into a pass.
-            if (addr - base > entry.bytes || bytes > entry.bytes - (addr - base)) continue;
-            if (out != nullptr) *out = Allocation{base, entry.bytes};
-            return true;
-        }
-        return false;
-    }
-
-    void mark_release_refused(uint64_t base) {
-        const auto entry = allocations_.find(base);
-        if (entry != allocations_.end()) entry->second.release_refused = true;
-    }
-
-    void mark_write_unproven(uint64_t base) {
-        const auto entry = allocations_.find(base);
-        if (entry != allocations_.end()) entry->second.write_unproven = true;
-    }
-
-    bool borrowed_locked(uint64_t base) const {
-        const auto entry = allocations_.find(base);
-        if (entry != allocations_.end() && entry->second.release_refused) return true;
-        for (const auto &[identity, held] : borrows_) {
-            (void)identity;
-            for (const uint64_t one : held.bases) {
-                if (one == base) return true;
-            }
-        }
-        return false;
-    }
-
-    mutable std::mutex mu_;
-    std::unordered_map<uint64_t, Entry> allocations_;
-    std::unordered_map<Identity, Records, IdentityHash> borrows_;
-    // Which allocations each run has said it produces. Separate from `borrows_` because the two
-    // answer different questions and are established at different moments: the borrow at
-    // admission, the declaration at that run's own bind.
-    std::unordered_map<Identity, Records, IdentityHash> writes_;
+    using DeviceBufferOwners::Allocation;
+    using DeviceBufferOwners::allocation_count;
+    using DeviceBufferOwners::borrow;
+    using DeviceBufferOwners::borrow_count;
+    using DeviceBufferOwners::borrowed;
+    using DeviceBufferOwners::declare_writes;
+    using DeviceBufferOwners::detach_reference;
+    using DeviceBufferOwners::EXTERNAL_BORROW_MIN_ID;
+    using DeviceBufferOwners::forget_if_unborrowed;
+    using DeviceBufferOwners::record;
+    using DeviceBufferOwners::recorded;
+    using DeviceBufferOwners::release;
+    using DeviceBufferOwners::release_reference;
+    using DeviceBufferOwners::resolve;
+    using DeviceBufferOwners::retain_reference;
+    using DeviceBufferOwners::retained_count;
+    using DeviceBufferOwners::Span;
+    using DeviceBufferOwners::write_declaration_count;
+    using DeviceBufferOwners::written_by_other_run;
 };

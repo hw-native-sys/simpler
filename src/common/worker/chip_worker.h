@@ -429,6 +429,7 @@ public:
     /// retaining every known allocation even if another span is external.
     /// True proves every span's owner; false refuses joined admission but can
     /// still hold references until `release_caller_device_borrow`.
+    /// Other native errors reject admission rather than granting a serial fallback.
     ///
     /// The three `device_*_caller_buffer(s)_ctx` entries are mandatory C ABI,
     /// like the rest of the `device_*_ctx` family: `init` resolves them with
@@ -595,14 +596,10 @@ public:
     CreditEntries credit_entries() const {
         return CreditEntries{device_ctx_, credit_generation_fn_, credit_wait_fn_, credit_cancel_fn_};
     }
-    /**
-     * Whether this worker holds a live communication session or global domain.
-     *
-     * A joined successor must not depend on either: both are released by the
-     * child before its device reset, so a run ordered behind another one cannot
-     * be allowed to still be naming them when that happens.
-     */
     bool holds_live_comm_resources() const;
+    /// Zero refuses joined launch; a nonzero snapshot identifies the complete resource set.
+    uint64_t joined_comm_generation() const;
+    uint64_t append_joined_comm_spans(std::vector<CallerDeviceSpan> &spans) const;
     /**
      * Declare whether this worker's host side still owns exported device
      * regions — resources this class does not itself create and so cannot see.
@@ -658,6 +655,14 @@ private:
     using DeviceFreeCallerBufferCtxFn = decltype(&device_free_caller_buffer_ctx);
     using DeviceBorrowCallerBuffersCtxFn = decltype(&device_borrow_caller_buffers_ctx);
     using DeviceReleaseCallerBuffersCtxFn = decltype(&device_release_caller_buffers_ctx);
+    using DeviceRegisterDomainOwnerCtxFn = decltype(&device_register_domain_owner_ctx);
+    using DeviceDomainOwnerRegisteredCtxFn = decltype(&device_domain_owner_registered_ctx);
+    using DeviceBeginDomainReleaseCtxFn = decltype(&device_begin_domain_release_ctx);
+    using DeviceFinishDomainReleaseCtxFn = decltype(&device_finish_domain_release_ctx);
+    using DeviceBeginDomainSessionReleaseCtxFn = decltype(&device_begin_domain_session_release_ctx);
+    using DeviceFinishDomainSessionReleaseCtxFn = decltype(&device_finish_domain_session_release_ctx);
+    using CommQueryDomainAllocationFn = decltype(&comm_query_domain_allocation);
+
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
@@ -745,8 +750,12 @@ private:
     CommSession *find_comm_session(uint64_t comm_handle);
     CommSession *create_comm_session(void *handle, void *stream, bool is_base);
     int destroy_comm_session(CommSession &session);
+    void release_domain_windows(
+        uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool abort_initialization
+    );
     uint64_t create_base_comm(int rank, int nranks, const std::string &rootinfo_path);
     void clear_comm_sessions();
+    void advance_comm_join_generation();
     void retain_unconfirmed_comm_cleanup() noexcept;
     void retain_unconfirmed_ccu_cleanup() noexcept;
     void retain_unconfirmed_comm_stream(void *stream);
@@ -767,6 +776,14 @@ private:
     DeviceFreeCallerBufferCtxFn device_free_caller_buffer_ctx_fn_ = nullptr;
     DeviceBorrowCallerBuffersCtxFn device_borrow_caller_buffers_ctx_fn_ = nullptr;
     DeviceReleaseCallerBuffersCtxFn device_release_caller_buffers_ctx_fn_ = nullptr;
+    DeviceRegisterDomainOwnerCtxFn device_register_domain_owner_ctx_fn_ = nullptr;
+    DeviceDomainOwnerRegisteredCtxFn device_domain_owner_registered_ctx_fn_ = nullptr;
+    DeviceBeginDomainReleaseCtxFn device_begin_domain_release_ctx_fn_ = nullptr;
+    DeviceFinishDomainReleaseCtxFn device_finish_domain_release_ctx_fn_ = nullptr;
+    DeviceBeginDomainSessionReleaseCtxFn device_begin_domain_session_release_ctx_fn_ = nullptr;
+    DeviceFinishDomainSessionReleaseCtxFn device_finish_domain_session_release_ctx_fn_ = nullptr;
+    CommQueryDomainAllocationFn comm_query_domain_allocation_fn_ = nullptr;
+
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
@@ -904,6 +921,10 @@ private:
     KernelLaunchFn kernel_launch_fn_ = nullptr;
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
+    // An empty view list owns admission debt, including partial allocation or registration failure.
+    std::map<std::pair<uint64_t, uint64_t>, std::vector<CallerDeviceSpan>> joined_domain_spans_;
+    uint64_t comm_join_generation_ = 1;
+    bool comm_join_unsupported_ = false;
     std::unordered_map<uint64_t, size_t> comm_session_index_;
     std::unordered_set<uint64_t> global_domain_ids_;
     uint64_t base_comm_handle_ = 0;

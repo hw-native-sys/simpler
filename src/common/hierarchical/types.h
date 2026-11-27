@@ -129,8 +129,8 @@ static constexpr RunId INVALID_RUN_ID = 0;
 using TaskSlot = int32_t;
 
 // Admission reserves a generation-safe pipeline slot before graph construction.
-// Closing the graph publishes PREPARED; only the whole-run FIFO head may enter
-// EXECUTING and reach a device endpoint.
+// Closing the graph publishes PREPARED. The FIFO head enters EXECUTING; eligible
+// prepared successors may join its native stream after resource admission.
 enum class RunPhase : int32_t {
     RESERVED = 0,
     BUILDING = 1,
@@ -144,6 +144,22 @@ struct RunState {
     RunState(RunId run_id, PipelineSlotLease slot_lease) :
         id(run_id),
         lease(slot_lease) {}
+
+    // Protected by runs_mu_; immutable after resource_sealed. Rank is diagnostic:
+    // aliases on different endpoints still name the same canonical backing.
+    struct TensorResource {
+        TensorByteRange bytes{};
+        int32_t rank{-1};
+        bool write{true};
+    };
+    // Per-backing envelope bounds repeated authorization checks linearly in
+    // the number of backings, not the number of submitted argument pairs.
+    std::unordered_map<CanonicalIdentity, TensorResource, CanonicalIdentityHash> tensor_resources;
+    std::vector<uint64_t> domain_resources;
+    bool activation_held{false};
+    bool resource_sealed{false};
+    bool resources_complete{false};
+    bool native_resources_complete{true};
 
     RunId id{INVALID_RUN_ID};
     // Written only while holding both the Orchestrator's `runs_mu_` and this

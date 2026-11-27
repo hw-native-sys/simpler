@@ -304,6 +304,15 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     g_comm_stream_rc = 0;
     g_comm_alloc_calls = 0;
     g_comm_abort_calls = 0;
+    worker.comm_query_domain_allocation_fn_ = [](CommHandle, uint64_t, CommAllocationSpan *spans, size_t,
+                                                 size_t *count) {
+        *count = 1;
+        if (spans != nullptr) *spans = {0x200, 4096};
+        return 0;
+    };
+    worker.device_register_domain_owner_ctx_fn_ = [](void *, uint64_t, uint64_t, const CallerBufferSpan *, uint32_t) {
+        return 0;
+    };
     worker.initialized_ = true;
     // The stubs ignore it, but teardown refuses to run without one, which is the production
     // guard against closing a worker that never reached a device.
@@ -2082,4 +2091,18 @@ TEST(NativeRunOperationLeaseTest, CompletedExecutionErrorStaysComplete) {
         EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
         EXPECT_EQ(g_finalize_calls, 1);
     }
+}
+
+TEST(NativeRunOperationLeaseTest, MissingDomainOwnershipRefusesBeforeBackendAllocation) {
+    ChipWorker worker;
+    prime(worker);
+    worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
+    uint64_t ownership = 0;
+    worker.device_register_domain_owner_ctx_fn_ = nullptr;
+    EXPECT_THROW(worker.comm_alloc_domain_windows(1, 1, {0}, 0, 4096, 0, &ownership), UnsupportedRuntimeOperation);
+    EXPECT_EQ(g_comm_alloc_calls, 0);
+    EXPECT_EQ(ownership, 0u);
+    worker.comm_query_domain_allocation_fn_ = nullptr;
+    EXPECT_THROW(worker.comm_alloc_domain_windows(1, 1, {0}, 0, 4096, 0, &ownership), UnsupportedRuntimeOperation);
+    EXPECT_EQ(g_comm_alloc_calls, 0);
 }

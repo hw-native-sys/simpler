@@ -7,12 +7,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Onboard validation for bounded whole-run FIFO admission.
+"""Onboard validation for whole-run FIFO admission and retained-domain joins.
 
 The second run builds and backend-prepares in the other pipeline slot while the
 first run acknowledges its device gate, but cannot launch until that gate and
 the first run's SubTask fence release. A third submission blocks before its
 graph callback while both slots are admitted.
+
+Single-rank retained-domain joined cases omit the SubTask fence: the successor reaches the
+native launch boundary while its predecessor is gated, but its device gate is
+entered only after the predecessor is released.
+Multi-rank peer cases keep activation behind the whole parent even after one
+local predecessor has retired, preserving window contents for its remote reader.
 """
 
 import atexit
@@ -30,6 +36,7 @@ import torch
 from simpler.task_interface import (
     MAILBOX_RUN_ENTRY_STRIDE,
     MAILBOX_RUN_ENTRY_TABLE_OFFSET,
+    CommBufferSpec,
     DataType,
     TaskArgs,
     TensorArgType,
@@ -44,6 +51,8 @@ from simpler.worker import (
     _OFF_ENTRY_PREPARATION_DISPOSITION,
     _OFF_ENTRY_RUN_ID,
     _OFF_ENTRY_STATE,
+    _TASK_DONE,
+    _TASK_ENDED,
     _TASK_LAUNCHED,
     _VALIDATED_ONLY,
     _mailbox_load_i32,
@@ -186,6 +195,76 @@ def _wait_for_backend_prepared_successor(
         f"run {successor} never published disposition {disposition} behind active run {predecessor}; "
         f"last rank snapshots (run, state, disposition, accepted): {snapshots}"
     )
+
+
+def _wait_for_joined_successor(worker, predecessor, successor, worker_indices=(0, 1), timeout=5.0):
+    entries = []
+    for rank in worker_indices:
+        mapping = worker._chip_shms[rank].buf  # noqa: SLF001 -- identified mailbox evidence
+        assert mapping is not None
+        base = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+        count = (len(mapping) - MAILBOX_RUN_ENTRY_TABLE_OFFSET) // MAILBOX_RUN_ENTRY_STRIDE
+        entries.append([base + MAILBOX_RUN_ENTRY_TABLE_OFFSET + i * MAILBOX_RUN_ENTRY_STRIDE for i in range(count)])
+
+    def read(address):
+        generation = _mailbox_load_u64(address + _OFF_ENTRY_GENERATION)
+        row = (
+            _mailbox_load_u64(address + _OFF_ENTRY_RUN_ID),
+            _mailbox_load_i32(address + _OFF_ENTRY_STATE),
+        )
+        return row if generation % 2 == 1 and generation == _mailbox_load_u64(address + _OFF_ENTRY_GENERATION) else None
+
+    snapshots = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snapshots = [[read(address) for address in rank_entries] for rank_entries in entries]
+        if snapshots != [[read(address) for address in rank_entries] for rank_entries in entries]:
+            continue
+        if all((predecessor, _TASK_LAUNCHED) in rows and (successor, _TASK_LAUNCHED) in rows for rows in snapshots):
+            return
+        time.sleep(0.001)
+    raise AssertionError(
+        f"run {successor} never launched behind gated run {predecessor}; last rank snapshots: {snapshots}"
+    )
+
+
+def _wait_for_chip_run_entry(worker, rank, run_id, state, timeout=5.0, *, disposition=None):
+    mapping = worker._chip_shms[rank].buf  # noqa: SLF001 -- identified mailbox evidence
+    assert mapping is not None
+    base = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+    count = (len(mapping) - MAILBOX_RUN_ENTRY_TABLE_OFFSET) // MAILBOX_RUN_ENTRY_STRIDE
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for index in range(count):
+            address = base + MAILBOX_RUN_ENTRY_TABLE_OFFSET + index * MAILBOX_RUN_ENTRY_STRIDE
+            generation = _mailbox_load_u64(address + _OFF_ENTRY_GENERATION)
+            if (
+                generation % 2 == 1
+                and _mailbox_load_u64(address + _OFF_ENTRY_RUN_ID) == run_id
+                and _mailbox_load_i32(address + _OFF_ENTRY_STATE) == state
+                and (
+                    disposition is None
+                    or _mailbox_load_i32(address + _OFF_ENTRY_PREPARATION_DISPOSITION) == disposition
+                )
+                and generation == _mailbox_load_u64(address + _OFF_ENTRY_GENERATION)
+            ):
+                return address, generation
+        time.sleep(0.001)
+    raise AssertionError(f"rank {rank} run {run_id} never published state {state}, disposition {disposition}")
+
+
+def _wait_for_chip_run_retirement(entry, timeout=5.0):
+    address, generation = entry
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        # The saved entry belonged to the acknowledged, gated invocation. A
+        # changed generation is its terminal handback, even if END was brief.
+        if _mailbox_load_u64(address + _OFF_ENTRY_GENERATION) != generation or _mailbox_load_i32(
+            address + _OFF_ENTRY_STATE
+        ) in (_TASK_ENDED, _TASK_DONE):
+            return
+        time.sleep(0.001)
+    raise AssertionError("the released local predecessor never retired")
 
 
 @scene_test(level=3, runtime="host_build_graph")
@@ -729,6 +808,441 @@ class TestWorkerAsyncWholeRunFifoTmrMultiRank(SceneTestCase):
                     buffer.close()
                 for gate in gates:
                     gate.close()
+
+
+@scene_test(level=3, runtime="host_build_graph")
+class TestWorkerAsyncWholeRunFifoHbgMultiRank(TestWorkerAsyncWholeRunFifoTmrMultiRank):
+    """Apply the original all-rank preparation/FIFO assertions to HBG."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncWholeRunFifoTmrMultiRank.CASES)
+    CASES[0]["name"] = "whole_run_fifo_hbg_multi_rank"
+
+
+@scene_test(level=3, runtime="host_build_graph")
+class TestWorkerAsyncRetainedDomainFifoHbgMultiRank(TestWorkerAsyncWholeRunFifoHbgMultiRank):
+    """Retained VMM operands keep all-rank preparation and whole-parent FIFO."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncWholeRunFifoHbgMultiRank.CASES)
+    CASES[0]["name"] = "retained_domain_fifo_hbg_multi_rank"
+    EXPECT_JOINED_LAUNCH = False
+    DOMAIN_RANKS = (0, 1)
+
+    def _observe_successor(self, worker, first, second, gates, successor_gates):
+        _wait_for_backend_prepared_successor(worker, first._run_id, second._run_id, worker_indices=self.DOMAIN_RANKS)
+
+    def _release_successor(self, domain, gates):
+        for gate in gates:
+            gate.wait_entered()
+        for gate in gates:
+            gate.release()
+
+    def _verify_domain_result(self, worker, domain):
+        for rank in self.DOMAIN_RANKS:
+            for name, expected in (("first_out", 5.0 + 2 * rank), ("second_out", 12.0 + 2 * rank)):
+                payload = worker._orch.copy_from_domain(domain, rank, _SIZE * 4, buffer=name)
+                actual = torch.frombuffer(bytearray(payload), dtype=torch.float32)
+                assert torch.allclose(actual, torch.full((_SIZE,), expected, dtype=torch.float32)), (rank, name)
+        domain.release()
+        assert domain.freed
+
+    def _validate_all_ranks_prepare_successor_while_predecessor_active(self, st_platform, st_worker):
+        assert st_platform == "a2a3"
+        _SUB_ENTERED.clear()
+        _SUB_RELEASE.clear()
+        request = {
+            "name": "fifo_retained",
+            "members": self.DOMAIN_RANKS,
+            "window_size": 6 * _SIZE * 4,
+            "buffers": [
+                CommBufferSpec(name, "float32", _SIZE, _SIZE * 4)
+                for name in ("first_a", "first_b", "first_out", "second_a", "second_b", "second_out")
+            ],
+            "retain_after_run": True,
+        }
+        saved = []
+        first = None
+        second = None
+        gates = []
+        successor_gates = []
+        vector = type(self)._st_chip_handles["vector"]
+        signature = type(self)._st_chip_handles["vector_sig"]
+        sub = type(self)._st_sub_handles["wait_for_release"]
+        config = self._build_config(self.CASES[0]["config"])
+
+        def initialize(orch, _args, _cfg):
+            domain = orch.allocate_domain(**request)
+            saved.append(domain)
+            for rank in self.DOMAIN_RANKS:
+                for name, value in zip(
+                    ("first_a", "first_b", "first_out", "second_a", "second_b", "second_out"),
+                    (2.0 + rank, 3.0 + rank, 0.0, 5.0 + rank, 7.0 + rank, 0.0),
+                ):
+                    payload = torch.full((_SIZE,), value, dtype=torch.float32).numpy().tobytes()
+                    orch.copy_to_domain(domain, rank, payload, buffer=name)
+
+        def vectors(orch, prefix, *, hold_open=False, ungated=False):
+            domain = orch.get_or_allocate_domain(**request)
+            assert domain is saved[0]
+            for rank in self.DOMAIN_RANKS:
+                buffers = domain.local_context(rank).buffers
+                operands = [buffers[f"{prefix}_{suffix}"] for suffix in ("a", "b", "out")]
+                gate_address = 0
+                if not ungated:
+                    gate_address = (
+                        gates[rank].address
+                        if hold_open
+                        else (successor_gates[rank].address if self.EXPECT_JOINED_LAUNCH else 0)
+                    )
+                args = _chip_args(operands, signature, gate_address)
+                orch.submit_next_level(vector, args, config, worker=rank)
+            if hold_open and not self.EXPECT_JOINED_LAUNCH:
+                orch.submit_sub(sub)
+
+        try:
+            gates.extend(DeviceGate(st_worker, rank) for rank in self.DOMAIN_RANKS)
+            if self.EXPECT_JOINED_LAUNCH:
+                successor_gates.extend(DeviceGate(st_worker, rank) for rank in self.DOMAIN_RANKS)
+            st_worker.run(initialize)
+            if self.EXPECT_JOINED_LAUNCH:
+                st_worker.run(lambda orch, _args, _cfg: vectors(orch, "first", ungated=True))
+            first = st_worker.submit(lambda orch, _args, _cfg: vectors(orch, "first", hold_open=True))
+            for gate in gates:
+                gate.wait_entered()
+            if not self.EXPECT_JOINED_LAUNCH:
+                assert _SUB_ENTERED.wait(10.0)
+            second = st_worker.submit(lambda orch, _args, _cfg: vectors(orch, "second"))
+            self._observe_successor(st_worker, first, second, gates, successor_gates)
+            assert not saved[0].released and not saved[0].freed
+            for gate in gates:
+                gate.release()
+            _SUB_RELEASE.set()
+            self._release_successor(saved[0], successor_gates)
+            for handle in (second, first) if self.EXPECT_JOINED_LAUNCH else (first, second):
+                handle.wait(30.0)
+            self._verify_domain_result(st_worker, saved[0])
+        finally:
+            for gate in (*gates, *successor_gates):
+                with suppress(Exception):
+                    gate.release()
+            _SUB_RELEASE.set()
+            handles = (first, second)
+            for handle in handles:
+                if handle is not None:
+                    with suppress(Exception):
+                        handle.wait(30.0)
+            if saved and all(handle is None or handle.done for handle in handles):
+                with suppress(Exception):
+                    saved[0].release()
+                for gate in (*gates, *successor_gates):
+                    gate.close()
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestWorkerAsyncRetainedDomainFifoTmrMultiRank(TestWorkerAsyncRetainedDomainFifoHbgMultiRank):
+    """Apply the same retained-domain FIFO contract to TMR."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncRetainedDomainFifoHbgMultiRank.CASES)
+    CASES[0]["name"] = "retained_domain_fifo_tmr_multi_rank"
+
+
+@scene_test(level=3, runtime="host_build_graph", automatic_admission=True)
+class TestWorkerAsyncRetainedDomainJoinedHbgSingleRank(TestWorkerAsyncRetainedDomainFifoHbgMultiRank):
+    """A single-rank domain enqueues a successor behind a gated predecessor."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncRetainedDomainFifoHbgMultiRank.CASES)
+    CASES[0]["name"] = "retained_domain_joined_hbg_single_rank"
+    CASES[0]["config"]["device_count"] = 1
+    EXPECT_JOINED_LAUNCH = True
+    DOMAIN_RANKS = (0,)
+
+    def _observe_successor(self, worker, first, second, gates, successor_gates):
+        _wait_for_joined_successor(worker, first._run_id, second._run_id, worker_indices=self.DOMAIN_RANKS)
+        for first_gate, second_gate in zip(gates, successor_gates):
+            second_gate._copy(to_device=False, offset=0)  # noqa: SLF001 -- independent test-control storage
+            assert ctypes.c_int64.from_buffer(second_gate.host.shm.buf).value == 0
+            first_gate.wait_entered()
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer", automatic_admission=True)
+class TestWorkerAsyncRetainedDomainJoinedTmrSingleRank(TestWorkerAsyncRetainedDomainJoinedHbgSingleRank):
+    """TMR preserves device ordering and domain lifetime across a native join."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncRetainedDomainJoinedHbgSingleRank.CASES)
+    CASES[0]["name"] = "retained_domain_joined_tmr_single_rank"
+
+
+@scene_test(level=3, runtime="host_build_graph", automatic_admission=True)
+class TestWorkerAsyncRetainedDomainJoinedReleaseHbgSingleRank(TestWorkerAsyncRetainedDomainJoinedHbgSingleRank):
+    """Revocation retains backing until every joined successor has finished."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncRetainedDomainJoinedHbgSingleRank.CASES)
+    CASES[0]["name"] = "retained_domain_joined_release_hbg_single_rank"
+
+    def _release_successor(self, domain, gates):
+        for gate in gates:
+            gate.wait_entered()
+        domain.release()
+        assert domain.released and not domain.freed
+        for gate in gates:
+            gate.release()
+
+    def _verify_domain_result(self, worker, domain):
+        assert domain.released and domain.freed
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer", automatic_admission=True)
+class TestWorkerAsyncRetainedDomainJoinedReleaseTmrSingleRank(TestWorkerAsyncRetainedDomainJoinedReleaseHbgSingleRank):
+    """TMR defers a joined domain's release through the successor fence."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncRetainedDomainJoinedReleaseHbgSingleRank.CASES)
+    CASES[0]["name"] = "retained_domain_joined_release_tmr_single_rank"
+
+
+@scene_test(level=3, runtime="host_build_graph")
+class TestWorkerAsyncRetainedDomainPeerFenceHbg(TestWorkerAsyncWholeRunFifoHbgMultiRank):
+    """A local END cannot authorize overwriting a window its peer still reads."""
+
+    CALLABLE = copy.deepcopy(TestWorkerAsyncWholeRunFifoHbgMultiRank.CALLABLE)
+    CALLABLE["callables"] = [CALLABLE["callables"][0]]
+    CALLABLE["callables"].append(
+        {
+            "name": "peer_read",
+            "orchestration": {
+                "source": "kernels/orchestration/peer_read_orch.cpp",
+                "function_name": "aicpu_orchestration_entry",
+                "signature": [D.IN, D.OUT],
+            },
+            "incores": [
+                {
+                    "func_id": 0,
+                    "source": "../../../../../examples/a5/host_mte_domain/kernels/aiv/peer_read.cpp",
+                    "core_type": "aiv",
+                    "signature": [D.IN, D.OUT],
+                }
+            ],
+        }
+    )
+    CASES = [
+        {
+            "name": "retained_domain_peer_fence_hbg",
+            "platforms": ["a2a3"],
+            "config": {"device_count": 2, "num_sub_workers": 0},
+            "params": {},
+        }
+    ]
+
+    def _validate_all_ranks_prepare_successor_while_predecessor_active(self, st_platform, st_worker):
+        assert st_platform == "a2a3"
+        request = {
+            "name": "peer_fifo",
+            "members": (0, 1),
+            "window_size": 6 * _SIZE * 4,
+            "buffers": [
+                CommBufferSpec(name, "float32", _SIZE, _SIZE * 4)
+                for name in ("a", "b", "x", "peer_out", "new_a", "new_b")
+            ],
+            "retain_after_run": True,
+        }
+        saved = []
+        gates = []
+        first = second = None
+        vector = type(self)._st_chip_handles["vector"]
+        vector_signature = type(self)._st_chip_handles["vector_sig"]
+        peer_read = type(self)._st_chip_handles["peer_read"]
+        config = self._build_config(self.CASES[0]["config"])
+
+        def initialize(orch, _args, _cfg):
+            domain = orch.allocate_domain(**request)
+            saved.append(domain)
+            for rank in (0, 1):
+                for name, value in (
+                    ("a", 2.0),
+                    ("b", 3.0),
+                    ("x", 5.0),
+                    ("peer_out", 0.0),
+                    ("new_a", 5.0),
+                    ("new_b", 7.0),
+                ):
+                    payload = torch.full((_SIZE,), value, dtype=torch.float32).numpy().tobytes()
+                    orch.copy_to_domain(domain, rank, payload, buffer=name)
+
+        def submit_writer(orch, domain, names, gate_address):
+            buffers = domain.local_context(0).buffers
+            args = _chip_args([buffers[name] for name in names], vector_signature, gate_address)
+            orch.submit_next_level(vector, args, config, worker=0)
+
+        def predecessor(orch, _args, _cfg):
+            domain = orch.get_or_allocate_domain(**request)
+            submit_writer(orch, domain, ("a", "b", "x"), gates[0].address)
+            context = domain.local_context(1)
+            args = TaskArgs()
+            args.add_tensor(context.buffers["x"].tensor((_SIZE,), DataType.FLOAT32), TensorArgType.INPUT)
+            args.add_tensor(
+                context.buffers["peer_out"].tensor((_SIZE,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING
+            )
+            args.add_scalar(context.device_ctx)
+            args.add_scalar(gates[1].address)
+            orch.submit_next_level(peer_read, args, config, worker=1)
+
+        def successor(orch, _args, _cfg):
+            domain = orch.get_or_allocate_domain(**request)
+            submit_writer(orch, domain, ("new_a", "new_b", "x"), 0)
+
+        try:
+            gates.extend(DeviceGate(st_worker, rank) for rank in (0, 1))
+            st_worker.run(initialize)
+            first = st_worker.submit(predecessor)
+            for gate in gates:
+                gate.wait_entered()
+            local_entry = _wait_for_chip_run_entry(st_worker, 0, first._run_id, _TASK_LAUNCHED)
+            gates[0].release()
+            _wait_for_chip_run_retirement(local_entry)
+            second = st_worker.submit(successor)
+            # A materialized local front cannot prepare before activation:
+            # an earlier dispatch may still arrive ahead of it in this lane.
+            _wait_for_chip_run_entry(st_worker, 0, second._run_id, _FRAME_STAGED, disposition=_VALIDATED_ONLY)
+            assert not st_worker._orch._run_activation_authorized(second._run_id)
+            gates[1].wait_entered()
+            gates[1].release()
+            second.wait(30.0)
+            first.wait(30.0)
+            for rank, name, expected in ((1, "peer_out", 5.0), (0, "x", 12.0)):
+                payload = st_worker._orch.copy_from_domain(saved[0], rank, _SIZE * 4, buffer=name)
+                actual = torch.frombuffer(bytearray(payload), dtype=torch.float32)
+                assert torch.equal(actual, torch.full((_SIZE,), expected, dtype=torch.float32)), (rank, name)
+            saved[0].release()
+            assert saved[0].freed
+        finally:
+            for gate in gates:
+                with suppress(Exception):
+                    gate.release()
+            handles = (first, second)
+            for handle in handles:
+                if handle is not None:
+                    with suppress(Exception):
+                        handle.wait(30.0)
+            if saved and all(handle is None or handle.done for handle in handles):
+                with suppress(Exception):
+                    saved[0].release()
+                for gate in gates:
+                    gate.close()
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestWorkerAsyncRetainedDomainPeerFenceTmr(TestWorkerAsyncRetainedDomainPeerFenceHbg):
+    """TMR keeps a peer's old window contents until its whole parent ends."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncRetainedDomainPeerFenceHbg.CASES)
+    CASES[0]["name"] = "retained_domain_peer_fence_tmr"
+
+
+@scene_test(level=3, runtime="host_build_graph", automatic_admission=True)
+class TestWorkerAsyncIndependentDomainsHbg(TestWorkerAsyncRetainedDomainPeerFenceHbg):
+    """An independent successor advances while another rank still reads its predecessor."""
+
+    CALLABLE = copy.deepcopy(TestWorkerAsyncRetainedDomainPeerFenceHbg.CALLABLE)
+    CALLABLE["callables"][0]["orchestration"]["source"] = "kernels/orchestration/resource_vector_orch.cpp"
+    CALLABLE["callables"][0]["orchestration"]["signature"] = [D.IN, D.IN, D.OUT, D.INOUT]
+    CALLABLE["callables"][1]["orchestration"]["source"] = "kernels/orchestration/resource_peer_read_orch.cpp"
+    CALLABLE["callables"][1]["orchestration"]["signature"] = [D.IN, D.OUT, D.INOUT]
+    CASES = copy.deepcopy(TestWorkerAsyncRetainedDomainPeerFenceHbg.CASES)
+    CASES[0]["name"] = "independent_domains_hbg"
+
+    def _validate_all_ranks_prepare_successor_while_predecessor_active(self, st_platform, st_worker):
+        assert st_platform == "a2a3"
+        domains, gates, runs = [], [], []
+        config = self._build_config(self.CASES[0]["config"])
+        vector = type(self)._st_chip_handles["vector"]
+        peer = type(self)._st_chip_handles["peer_read"]
+
+        def initialize(orch, _args, _cfg):
+            for slot in range(2):
+                domain = orch.allocate_domain(
+                    name=f"independent_{slot}",
+                    members=(0, 1),
+                    window_size=4 * _SIZE * 4,
+                    buffers=[CommBufferSpec(name, "float32", _SIZE, _SIZE * 4) for name in ("a", "b", "x", "peer_out")],
+                    retain_after_run=True,
+                )
+                domains.append(domain)
+                for rank in (0, 1):
+                    for name, value in (("a", 2.0 + 3 * slot), ("b", 3.0 + 4 * slot), ("x", 5.0), ("peer_out", 0.0)):
+                        prepared = getattr(self, "_prepared_domain_payloads", None)
+                        payload = (
+                            prepared[value] if prepared is not None else torch.full((_SIZE,), value).numpy().tobytes()
+                        )
+                        orch.copy_to_domain(domain, rank, payload, buffer=name)
+
+        def submit(orch, slot, *, ungated=False):
+            domain = orch.get_domain(domains[slot].name)
+            orch.declare_comm_domains([domain])
+            for rank in (0, 1):
+                context = domain.local_context(rank)
+                gate = gates[slot * 2 + rank]
+                args = TaskArgs()
+                reading_peer = slot == 0 and rank == 1
+                for name, tag in (
+                    (("x", TensorArgType.INPUT), ("peer_out", TensorArgType.OUTPUT_EXISTING))
+                    if reading_peer
+                    else (("a", TensorArgType.INPUT), ("b", TensorArgType.INPUT), ("x", TensorArgType.OUTPUT_EXISTING))
+                ):
+                    args.add_tensor(context.buffers[name].tensor((_SIZE,), DataType.FLOAT32), tag)
+                # The scalar gate pointer aliases this tracked tensor resource.
+                args.add_tensor(gate.device.tensor((32,), DataType.INT64), TensorArgType.INOUT)
+                if reading_peer:
+                    args.add_scalar(context.device_ctx)
+                args.add_scalar(0 if ungated else gate.address)
+                orch.submit_next_level(peer if reading_peer else vector, args, config, worker=rank)
+
+        try:
+            gates.extend(DeviceGate(st_worker, rank) for _slot in range(2) for rank in (0, 1))
+            st_worker.run(initialize)
+            assert domains[0].allocation_id != domains[1].allocation_id
+            st_worker.run(lambda orch, _a, _c: submit(orch, 1, ungated=True))
+            runs.append(st_worker.submit(lambda orch, _a, _c: submit(orch, 0)))
+            for gate in gates[:2]:
+                gate.wait_entered()
+            runs.append(st_worker.submit(lambda orch, _a, _c: submit(orch, 1)))
+            _wait_for_joined_successor(st_worker, runs[0]._run_id, runs[1]._run_id, worker_indices=(0, 1))
+            gates[0].release()
+            gates[2].wait_entered()
+            gates[1].wait_entered()
+            assert not runs[0].done
+            gates[2].release()
+            gates[1].release()
+            gates[3].wait_entered()
+            gates[3].release()
+            for run in runs:
+                run.wait(30.0)
+            for domain, rank, name, expected in (
+                (domains[0], 1, "peer_out", 5.0),
+                (domains[1], 0, "x", 12.0),
+                (domains[1], 1, "x", 12.0),
+            ):
+                payload = st_worker._orch.copy_from_domain(domain, rank, _SIZE * 4, buffer=name)
+                actual = torch.frombuffer(bytearray(payload), dtype=torch.float32)
+                assert torch.equal(actual, torch.full((_SIZE,), expected)), (rank, name)
+        finally:
+            for gate in gates:
+                with suppress(Exception):
+                    gate.release()
+            for run in runs:
+                with suppress(Exception):
+                    run.wait(30.0)
+            if all(run.done for run in runs):
+                for domain in domains:
+                    domain.release()
+                    assert domain.freed
+                for gate in gates:
+                    gate.close()
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer", automatic_admission=True)
+class TestWorkerAsyncIndependentDomainsTmr(TestWorkerAsyncIndependentDomainsHbg):
+    """TMR enqueues independent domains while preserving skewed peer reads."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncIndependentDomainsHbg.CASES)
+    CASES[0]["name"] = "independent_domains_tmr"
 
 
 if __name__ == "__main__":

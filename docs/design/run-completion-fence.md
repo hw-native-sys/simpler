@@ -117,6 +117,10 @@ completion does not replace strong error observation or Program output delivery.
 A host wait deadline and the configured RTS stream-synchronization budget are
 separate limits; this host protocol does not change either timeout budget.
 
+Hierarchical callers can additionally require [explicit predecessor
+success](hierarchical-success-dependencies.md), including outer-runtime cleanup
+and output publication, before activating a prepared successor.
+
 ## Stream binding
 
 `PreparedExecution::streams` records the actual AICPU/AICore handles at launch,

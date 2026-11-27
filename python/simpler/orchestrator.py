@@ -321,6 +321,24 @@ class Orchestrator:
             return "LOCAL_CHIP"
         return None
 
+    def declare_comm_domains(self, handles: Sequence[CommDomainHandle]) -> None:
+        """Declare the complete implicit memory-access contract for this run.
+
+        All leaf tasks must restrict implicit communication (including scalar
+        context pointers) to these domains. Every other memory access must be
+        described by its actual TaskArgs tensor and access tag. This assertion
+        permits independent runs to enqueue before all predecessor ranks end.
+        It does not remove tensor dependencies or authorize concurrent reuse of
+        a domain. Repeated declarations accumulate until submission closes.
+
+        Only owned, retained Device domains without auxiliary workspaces are
+        supported. Runs without this declaration retain conservative ordering.
+        """
+        _check_domain_initializer_context(self._worker, "declare_comm_domains")
+        if self._worker is None:
+            raise RuntimeError("declare_comm_domains requires a Worker orchestration callback")
+        self._worker._declare_comm_domains(handles)
+
     # ------------------------------------------------------------------
     # User-facing submit API
     # ------------------------------------------------------------------
@@ -388,7 +406,10 @@ class Orchestrator:
             final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
-                worker._record_touched_identities(c_args)
+                if needs_prov:
+                    worker._record_touched_identities_locked(c_args)
+                else:
+                    worker._record_touched_identities(c_args)
             _admit_task_submission(self._worker)
             return self._o.submit_next_level(
                 digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
@@ -516,7 +537,10 @@ class Orchestrator:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:
                 for c_args in c_args_list:
-                    worker._record_touched_identities(c_args)
+                    if member_checks:
+                        worker._record_touched_identities_locked(c_args)
+                    else:
+                        worker._record_touched_identities(c_args)
             _admit_task_submission(self._worker)
             return self._o.submit_next_level_group(
                 digest, kind, target_namespace, c_args_list, cfg, worker_ids, worker_id_sets, remote_sidecars
@@ -1007,11 +1031,32 @@ class Orchestrator:
     def _scope_end(self) -> None:
         self._o._scope_end()
 
-    def _begin_run(self) -> int:
-        return int(self._o._begin_run())
+    def _begin_run(self, hold_activation: bool = False) -> int:
+        return int(self._o._begin_run(hold_activation))
+
+    def _resolve_held_run(self, run_id: int, success: bool) -> None:
+        self._o._resolve_held_run(run_id, success)
+
+    def _wait_any_run(self, run_ids: list[int], timeout: float) -> int:
+        return int(self._o._wait_any_run(run_ids, timeout))
+
+    def _wake_wait_any(self) -> None:
+        self._o._wake_wait_any()
+
+    def _cancel_wait_any(self) -> None:
+        self._o._cancel_wait_any()
+
+    def _set_comm_execution_fence(self, allocation_id: int, enabled: bool) -> None:
+        self._o._set_comm_execution_fence(allocation_id, enabled)
+
+    def _run_activation_authorized(self, run_id: int) -> bool:
+        return bool(self._o._run_activation_authorized(run_id))
 
     def _close_run_submission(self, run_id: int) -> None:
         self._o._close_run_submission(run_id)
+
+    def _seal_run_resources(self, run_id: int, domain_allocation_ids: list[int], complete: bool) -> None:
+        self._o._seal_run_resources(run_id, domain_allocation_ids, complete)
 
     def _fail_run_submission(self, run_id: int, message: str = "") -> None:
         self._o._fail_run_submission(run_id, message)

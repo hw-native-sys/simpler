@@ -45,6 +45,8 @@ public:
     bool framework_transferred() const;
     bool wait_until(Deadline deadline);
     void activate();
+    // Parent proof that no earlier dispatch can arrive; never grants execution.
+    void authorize_prepare();
     void abandon();
     // Release a caller-owned submission after its last possible execution.
     // Keep the handle for a checked retry if finalization fails.

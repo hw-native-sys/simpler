@@ -275,7 +275,10 @@ void WorkerEndpoint::submit_progress(Ring *, const WorkerDispatch &) {
 }
 bool WorkerEndpoint::poll_progress(WorkerEndpointProgress &) { return false; }
 size_t WorkerEndpoint::available_request_transport() { return std::numeric_limits<size_t>::max(); }
+void WorkerEndpoint::cancel_staged_progress(RunId) {}
+
 bool WorkerEndpoint::activate_progress(RunId) { return false; }
+bool WorkerEndpoint::authorize_preparation(RunId) { return false; }
 void WorkerEndpoint::request_progress_stop() noexcept {}
 void WorkerEndpoint::report_progress_error(const std::string &) { request_progress_stop(); }
 bool WorkerEndpoint::report_submission_error(const WorkerDispatch &, const std::string &reason) {
@@ -737,6 +740,10 @@ bool WorkerThread::authorize_staged_launch(RunId run_id) {
     return true;
 }
 
+bool WorkerThread::authorize_preparation(RunId run_id) { return endpoint_->authorize_preparation(run_id); }
+
+void WorkerThread::cancel_staged_run(RunId run_id) { endpoint_->cancel_staged_progress(run_id); }
+
 bool WorkerThread::has_staged_run(RunId run_id) const {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
     return staged_lane_of_locked(run_id) < lanes_.size();
@@ -1178,6 +1185,7 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     entry->error = 0;
     entry->observation_requested = 0;
     entry->peer_cancel_requested = 0;
+    entry->prepare_ordered = 0;
     entry->preparation_disposition = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
     std::memset(entry->error_text, 0, MAILBOX_ERROR_MSG_SIZE);
     entry->run_epoch = 0;
@@ -1484,6 +1492,14 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
                 poison_progress("stale run-state entry identity at endpoint staging");
                 break;
             }
+            if (record.cancellation_requested) {
+                int32_t expected = static_cast<int32_t>(MailboxState::FRAME_STAGED);
+                (void)__atomic_compare_exchange_n(
+                    &entry->state, &expected, static_cast<int32_t>(MailboxState::CANCEL_STAGED), false,
+                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
+                );
+                continue;
+            }
             if (record.activation_requested) {
                 (void)try_publish_activation(record, entry);
                 if (endpoint_poisoned_) break;
@@ -1552,7 +1568,7 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
 
         if (state != MailboxState::IDLE && state != MailboxState::TASK_READY && state != MailboxState::PREPARE_READY &&
             state != MailboxState::ACTIVATE && state != MailboxState::TASK_LAUNCHED &&
-            state != MailboxState::TASK_ENDED) {
+            state != MailboxState::TASK_ENDED && state != MailboxState::CANCEL_STAGED) {
             poison_progress("run-state entry entered an invalid state " + std::to_string(static_cast<int32_t>(state)));
             break;
         }
@@ -1591,12 +1607,52 @@ void LocalMailboxEndpoint::release_entry_locked(size_t index) {
     record = EntryRecord{};
 }
 
+void LocalMailboxEndpoint::cancel_staged_progress(RunId run_id) {
+    std::lock_guard<std::mutex> lk(progress_mu_);
+    for (auto &record : entries_) {
+        if (!record.occupied || record.run_id != run_id) continue;
+        if (!record.dispatch.prepare_only || record.activation_requested) {
+            throw std::logic_error("cannot cancel an activated endpoint frame");
+        }
+        record.cancellation_requested = true;
+    }
+}
+
+bool LocalMailboxEndpoint::authorize_preparation(RunId run_id) {
+    std::lock_guard<std::mutex> lk(progress_mu_);
+    if (endpoint_poisoned_) return false;
+    bool published = false;
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        const auto &record = entries_[index];
+        if (!record.occupied || !record.dispatch.prepare_only || record.run_id != run_id ||
+            record.cancellation_requested)
+            continue;
+        auto *entry = run_entry(index);
+        if (!entry_identity_matches(record, entry)) {
+            poison_progress("stale run-state entry identity before preparation authorization");
+            return false;
+        }
+        const auto state = static_cast<MailboxState>(load_entry_i32(&entry->state));
+        if (state == MailboxState::TASK_DONE || state == MailboxState::TASK_FAILED ||
+            state == MailboxState::CANCEL_STAGED || load_entry_i32(&entry->peer_cancel_requested) != 0)
+            continue;
+        // The grant is sticky for this entry generation. Do not bounce the
+        // shared cache line on every scheduler pass after publication.
+        if (load_entry_i32(&entry->prepare_ordered) != 0) continue;
+        store_entry_i32(&entry->prepare_ordered, 1);
+        published = true;
+    }
+    return published;
+}
+
 bool LocalMailboxEndpoint::activate_progress(RunId run_id) {
     std::unique_lock<std::mutex> lk(progress_mu_);
     if (endpoint_poisoned_) return false;
     for (size_t index = 0; index < entries_.size(); ++index) {
         EntryRecord &record = entries_[index];
-        if (!record.occupied || !record.dispatch.prepare_only || record.run_id != run_id) continue;
+        if (!record.occupied || !record.dispatch.prepare_only || record.run_id != run_id ||
+            record.cancellation_requested)
+            continue;
 #if SIMPLER_HOST_STRACE
         std::optional<simpler::host_trace::SpanScope> activate_trace;
         if (simpler::host_trace::enabled()) {
@@ -2405,6 +2461,19 @@ bool WorkerManager::has_staged_run(RunId run_id) const {
     for (const auto &worker : next_level_threads_)
         if (worker->has_staged_run(run_id)) return true;
     return false;
+}
+
+bool WorkerManager::authorize_preparation(RunId run_id) {
+    bool published = false;
+    for (const auto &worker : next_level_threads_) {
+        published = worker->authorize_preparation(run_id) || published;
+    }
+    return published;
+}
+
+void WorkerManager::cancel_staged_run(RunId run_id) {
+    for (const auto &worker : next_level_threads_)
+        worker->cancel_staged_run(run_id);
 }
 
 bool WorkerManager::activate_prepared_run(RunId run_id) {

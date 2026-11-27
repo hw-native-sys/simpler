@@ -485,7 +485,10 @@ void Scheduler::dispatch_ready(bool scan_preparable) {
     std::optional<RunId> run_snapshot;
     if (cfg_.active_run_cb) {
         RunId active_run = cfg_.active_run_cb();
-        if (active_run == INVALID_RUN_ID) return;
+        if (active_run == INVALID_RUN_ID) {
+            if (scan_preparable) dispatch_preparable_next_level_singles();
+            return;
+        }
         run_snapshot = active_run;
         cfg_.manager->activate_prepared_run(active_run);
     }
@@ -560,6 +563,10 @@ void Scheduler::dispatch_preparable_next_level_singles() {
     // it a worker to stage into.
     for (RunId run_id : preparable) {
         stage_preparable_run(run_id);
+    }
+    if (cfg_.preparation_ordered_run_cb) {
+        const RunId ordered = cfg_.preparation_ordered_run_cb();
+        if (ordered != INVALID_RUN_ID) cfg_.manager->authorize_preparation(ordered);
     }
 }
 
