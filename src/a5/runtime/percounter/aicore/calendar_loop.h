@@ -591,9 +591,11 @@ inline __aicore__ bool percounter_wait_spmd_input(
     return percounter_wait_dmb_count<CALENDAR_PEER_SPMD_ENDPOINT>(cfg, *counter, threshold, token_base, entry);
 }
 
+template <typename Prepare>
 inline __aicore__ bool percounter_calendar_enter(
     const LaneConfig &cfg, const __gm__ CalendarLocalJoin *join, const __gm__ CalendarWait *waits, uint32_t wait_count,
-    uint32_t sequence_base, uint32_t blocks, bool sync, uint64_t entry, bool spmd_wait, uint32_t worker
+    uint32_t sequence_base, uint32_t blocks, bool sync, uint64_t entry, bool spmd_wait, uint32_t worker,
+    Prepare &&prepare
 ) {
     // Keep the first probes immediate. Longer groups use a staggered
     // retry interval so idle lanes do not flood one completion word.
@@ -609,7 +611,10 @@ inline __aicore__ bool percounter_calendar_enter(
         );
         return true;
     };
-    if (join == nullptr) return enter();
+    if (join == nullptr) {
+        prepare();
+        return enter();
+    }
 
     ProfileScope mix_scope(cfg.scalar, ProfilePhase::MixRendezvous, entry);
     const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
@@ -624,6 +629,7 @@ inline __aicore__ bool percounter_calendar_enter(
     // satisfies an observer still polling an older arrival or release.
     if (lead != lane) {
         percounter_ssbuf_store_release(&signal->arrive[lane], arrivals[lane]);
+        prepare();
         if (!percounter_calendar_wait(cfg, [&]() __aicore__ {
                 return percounter_ssbuf_load_field(&signal->release[lead]) >= arrivals[lead];
             }))
@@ -633,6 +639,7 @@ inline __aicore__ bool percounter_calendar_enter(
         );
         return true;
     }
+    prepare();
     if (!percounter_calendar_wait(cfg, [&]() __aicore__ {
             for (uint32_t peer = 0; peer < PLATFORM_CORES_PER_BLOCKDIM; ++peer)
                 if (peer != lane && arrivals[peer] != 0 &&
@@ -1051,12 +1058,20 @@ inline __aicore__ bool percounter_calendar_execute_range(
                 );
         }
         percounter_record_task_event(cfg, PercounterTaskEventKind::RowBegin, entry, row_begin);
+        CalendarKernelCall call{};
+        const auto prepare = [&]() __aicore__ {
+            // Predicated rows bind only once their data-dependent predicate selects the kernel.
+            if (!control_row && !has_predicate)
+                call = percounter_prepare_kernel_call(cfg, *dispatch, block, blocks, entry);
+        };
         if (peer != nullptr && peer->input_count != 0) {
+            prepare();
             if (!percounter_wait_peer_inputs(cfg, *peer, waits, row->wait_count, worker, entry)) return false;
             percounter_record_task_event(
                 cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg)
             );
         } else if ((flags & CALENDAR_EXEC_INPUT_FOLLOWER) != 0) {
+            prepare();
             if (row->wait_count != 0) {
                 percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS, percounter_order_task_id(entry));
                 return false;
@@ -1067,6 +1082,7 @@ inline __aicore__ bool percounter_calendar_execute_range(
                                    percounter_calendar_wait_cluster_input(cfg, waits[0], sequence, entry);
             if (!ready) return false;
         } else if ((flags & CALENDAR_EXEC_FANIN) != 0) {
+            prepare();
             const auto retry_cycles = percounter_calendar_retry_cycles(cfg, blocks, row->wait_count != 0);
             if (!percounter_calendar_wait_fanin(cfg, waits, mix_delta, row->wait_count, entry, retry_cycles))
                 return false;
@@ -1075,7 +1091,7 @@ inline __aicore__ bool percounter_calendar_execute_range(
             );
         } else if (!percounter_calendar_enter(
                        cfg, join, waits, row->wait_count, sequence_base, blocks, sync, entry,
-                       (flags & CALENDAR_EXEC_SPMD_WAIT) != 0, worker
+                       (flags & CALENDAR_EXEC_SPMD_WAIT) != 0, worker, prepare
                    )) {
             return false;
         }
@@ -1104,7 +1120,8 @@ inline __aicore__ bool percounter_calendar_execute_range(
                 sample->end = cycles;
             }
         } else {
-            if (!percounter_run_task(cfg, *dispatch, extra, block, blocks, role, entry, sample)) return false;
+            if (has_predicate) call = percounter_prepare_kernel_call(cfg, *dispatch, block, blocks, entry);
+            if (!percounter_run_task(cfg, call, extra, role, entry, sample)) return false;
             auto *touched = &cfg.ssbuf->contexts[cfg.cluster_lane].value.async_touched;
             if (percounter_ssbuf_load_field(touched) != 0) {
                 if (!percounter_calendar_seal(cfg, extra, sink, sample, entry, &deferred)) return false;

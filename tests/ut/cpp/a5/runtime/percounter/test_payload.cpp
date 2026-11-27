@@ -263,6 +263,8 @@ TEST_F(CalendarDeferTest, PeerWaitSeparatesExitCancellationFromInvalidMetadata) 
     program.peer.input_count = 2;
     program.peer.join_read = reinterpret_cast<uint64_t>(&done);
     program.peer.join_target = 2;
+    PercounterSsbufRegion cluster{};
+    producer.ssbuf = &cluster;
     CalendarPeerEndpoint endpoint{};
     endpoint.input_count = 2;
     producer.peer_endpoints = &endpoint;
