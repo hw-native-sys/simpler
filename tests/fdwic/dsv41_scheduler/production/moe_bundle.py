@@ -90,14 +90,16 @@ def prepare_bundle(bundle, build_dir, reuse=None):
     bundle = Path(bundle)
     if bundle.exists():
         raise ValueError("Prepare native MoE into a new bundle directory")
-    if reuse is not None:
-        validate_bundle(reuse)
-        shutil.copytree(reuse, bundle)
-        return validate_bundle(bundle)
     build_dir = Path(build_dir)
     callable_path = build_dir / "callable.bin"
     if not callable_path.is_file():
         raise ValueError("Build native MoE with build.sh --flavor pypto_lib_latest first")
+    if reuse is not None:
+        metadata = validate_bundle(reuse)
+        if metadata["callable_sha256"] != hashlib.sha256(callable_path.read_bytes()).hexdigest():
+            raise ValueError("Native MoE bundle does not match the selected build's callable")
+        shutil.copytree(reuse, bundle)
+        return validate_bundle(bundle)
     inputs = load_module("moe_inputs")
     cache = load_module("weight_cache")
     source = json.loads(SOURCE.read_text())
