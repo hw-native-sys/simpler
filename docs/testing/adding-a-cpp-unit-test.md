@@ -282,24 +282,47 @@ platform_single_case(test_device_fault_cross_dso.cpp
 `$<TARGET_FILE:...>` is what keeps the path right without the case knowing the
 build layout.
 
-## 6. Hardware cases
+## 6. CPU, SDK and hardware cases
 
-A case needing a device declares its label and its devices through the same
-factory:
+CTest labels each build of a case with its coverage scope. `ut_common` covers
+shared behavior. An architecture build carries `ut_a2a3`, `ut_a5` or
+`ut_wse`. The runtime and platform case factories set the scope for each
+architecture they build. A CPU lane runs the common suite and its selected
+architecture suites. For example, to run the common and A5 CPU suites:
+
+```bash
+ctest --test-dir tests/ut/cpp/build -L '^ut_(common|a5)$' \
+    -LE '^requires_(hardware|toolkit)' --output-on-failure
+```
+
+Put a test that allocates a real device in `tests/ut/cpp/<arch>/hardware/`
+and register it with `LABEL requires_hardware_<arch>`. The A2/A3
+communication lifecycle test uses the directory's macro:
 
 ```cmake
 platform_comm_case(test_comm_lifecycle.cpp
     DEFINES PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}")
 ```
 
-The directory's macro already carries `LABEL requires_hardware_a2a3` and
-`RESOURCES "2,npus:1"`. `common/platform_comm/` is entered only under
-`-DSIMPLER_ENABLE_HARDWARE_TESTS=ON`, which is what lets everything in it link
-CANN freely without breaking the no-hardware build.
+The macro also sets `RESOURCES "2,npus:1"`. CI configures
+`SIMPLER_ENABLE_HARDWARE_TESTS=ON` and builds `ut_hardware_a2a3` before
+requesting devices. CTest supplies their IDs through `CTEST_RESOURCE_GROUP_COUNT`
+and `CTEST_RESOURCE_GROUP_<n>_NPUS`. See the parser in
+[a2a3/hardware/test_comm_lifecycle.cpp](../../tests/ut/cpp/a2a3/hardware/test_comm_lifecycle.cpp).
 
-CTest hands the allocated device ids to the test through
-`CTEST_RESOURCE_GROUP_COUNT` and `CTEST_RESOURCE_GROUP_<n>_NPUS`; see
-`test_comm_lifecycle.cpp::read_ctest_devices()` for the parsing.
+Put a CPU test that needs the CANN SDK in `tests/ut/cpp/<arch>/toolkit/`
+and use `LABEL requires_toolkit`. CI configures
+`SIMPLER_ENABLE_TOOLKIT_TESTS=ON`, builds `ut_toolkit_<arch>`, and runs CTest
+on the host before any NPU allocation. The A5 domain-release case links the
+SDK and injects ACL failures against synthetic allocations.
+
+Both A2/A3 and A5 have a `hardware/` and a `toolkit/` CMake directory.
+In A2/A3 `toolkit/` and A5 `hardware/`, the directory's case macro registers
+each `test_*.cpp` by default. Call the macro explicitly to supply a fixture's
+extra sources or libraries. Set `RESOURCES` when a hardware test needs more
+than the default one NPU. CI selects the C++ step when the corresponding
+directory contains test sources. A selected suite must register at least one
+CTest case.
 
 ## 7. If you added a runtime
 
@@ -333,7 +356,7 @@ without one they carry the full name, which is fine.
 rm -rf tests/ut/cpp/build
 cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 cmake --build tests/ut/cpp/build --parallel 8
-ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j8 --output-on-failure
+ctest --test-dir tests/ut/cpp/build -LE '^requires_(hardware|toolkit)' -j8 --output-on-failure
 python tests/lint/check_ut_cpp_axis.py
 python tests/lint/check_ut_cpp_stub_linkage.py
 ```

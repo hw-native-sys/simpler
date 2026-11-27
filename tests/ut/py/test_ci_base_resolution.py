@@ -174,6 +174,11 @@ def test_missing_remote_does_not_silently_skip_checks(tmp_path, fork_history, wo
             "wse_changed": "true",
             "st_affected": "true",
             "ut_affected": "true",
+            "ut_arches": "a2a3,a5,wse",
+            "ut_hardware_a2a3": "true",
+            "ut_hardware_a5": "true",
+            "ut_sdk_a2a3": "true",
+            "ut_sdk_a5": "true",
             "examples_only": "false",
             "tests_only": "false",
         }

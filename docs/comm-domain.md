@@ -819,7 +819,7 @@ The workspace coverage is split by platform and execution layer:
 
 | Platform / layer | Supported behavior | Coverage |
 | ---------------- | ------------------ | -------- |
-| A5 host | SDMA and URMA plus optional RDMA in one build; URMA and RDMA each require a dedicated domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
+| A5 host | SDMA and URMA plus optional RDMA in one build; URMA and RDMA each require a dedicated domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/a5/toolkit/test_a5_comm_workspaces.py` |
 | A5 TMR | URMA peer MR addressing | Two-rank transfer with a nonzero input offset in `urma_deferred_completion_demo` |
 | A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
 | A2/A3 | Worker-owned SDMA and optional peer mappings for L3 TMR Host domains | SDMA and prefetch examples, and `test_a3_host_source_domain.py` for Host MTE and peer SDMA |

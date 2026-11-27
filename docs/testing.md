@@ -17,15 +17,11 @@ configuration, execution and authoring in detail.
 
 ## Design Principles
 
-Three axioms govern hardware classification across all test categories:
-
-1. **sim = no hardware**: `a2a3sim`, `a5sim`, and no `--platform` are all equivalent — no hardware required.
-2. **a2a3 / a5 are distinct platforms**: Tests may support one, both, or neither.
-3. **`requires_hardware` has two levels**:
-   - `requires_hardware` (no argument) — needs *any* hardware (a2a3 or a5)
-   - `requires_hardware("a2a3")` — needs *specifically* a2a3
-
-These principles apply uniformly to ut-py (pytest markers), ut-cpp (ctest labels), and st (`@scene_test(platforms=[...])`).
+UT selection combines architecture ownership with the execution requirement.
+Common CPU cases run on every UT change. Architecture-specific cases run for
+the affected A2/A3, A5 and WSE targets. SDK-only cases need the corresponding
+toolchain; device cases additionally require an allocation. See
+[unit-test classification](testing/environments.md#unit-tests).
 
 ### Assertion principle: no wall-clock proxies
 
@@ -57,17 +53,17 @@ from correctness tests. See [#1496](https://github.com/hw-native-sys/simpler/iss
 
 ```bash
 # Python unit tests, no hardware (sim or github-hosted)
-pytest tests/ut
+pytest tests/ut -m 'not requires_hardware and not requires_toolkit'
 
 # Python unit tests, a2a3 hardware
-pytest tests/ut --platform a2a3
+pytest tests/ut -m requires_hardware --platform a2a3
 
 # C++ unit tests, no hardware
 cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build
-ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
+ctest --test-dir tests/ut/cpp/build -L '^no_hardware$' --output-on-failure
 
 # C++ unit tests, a2a3 hardware (only hw + a2a3-specific tests)
-ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$" --output-on-failure
+ctest --test-dir tests/ut/cpp/build -L "^requires_hardware_a2a3$" --output-on-failure
 
 # Scene tests (pytest, @scene_test classes)
 pytest examples tests/st --platform a2a3sim       # A2/A3 simulation
@@ -123,9 +119,12 @@ If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/ut/cp
 ```text
 tests/
   conftest.py          # pytest configuration (markers, fixtures, parametrization)
-  ut/                  # Python unit tests (ut-py)
-    test_task_interface.py
-    test_runtime_builder.py
+  ut/
+    py/                # Python unit tests (ut-py), including cross-platform contracts
+      test_runtime_builder.py
+      a2a3/, a5/, wse/ # Platform-specific modules and fixtures
+      hardware/        # Shared modules containing device cases
+      toolkit/         # Shared modules containing SDK cases
     cpp/               # C++ unit tests (ut-cpp, GoogleTest)
   st/                  # Scene tests
     setup/             # Compilation toolchain (KernelCompiler, RuntimeBuilder, etc.)
@@ -192,9 +191,7 @@ link for the full section.
 | <a id="profiling-under-parallelism"></a>Profiling under parallelism | [Read section](testing/parallel-execution.md#profiling-under-parallelism) |
 | <a id="dispatcher-skip-conditions-normal-pytest-runs"></a>Dispatcher skip conditions (normal pytest runs) | [Read section](testing/parallel-execution.md#dispatcher-skip-conditions-normal-pytest-runs) |
 | <a id="hardware-classification"></a>Hardware Classification | [Read section](testing/environments.md#hardware-classification) |
-| <a id="helper-function"></a>Helper function | [Read section](testing/environments.md#helper-function) |
-| <a id="ut-py-pytestmarkrequires_hardwareplatform"></a>ut-py: `@pytest.mark.requires_hardware[(platform)]` | [Read section](testing/environments.md#ut-py-pytestmarkrequires_hardwareplatform) |
-| <a id="ut-cpp-ctest-labels"></a>ut-cpp: ctest labels | [Read section](testing/environments.md#ut-cpp-ctest-labels) |
+| <a id="unit-test-classification"></a>Unit-test architectures and execution requirements | [Read section](testing/environments.md#unit-tests) |
 | <a id="st-scene_testplatforms"></a>st: `@scene_test(platforms=[...])` | [Read section](testing/environments.md#st-scene_testplatforms) |
 | <a id="test-types"></a>Test Types | [Read section](testing/unit-tests.md#test-types) |
 | <a id="c-unit-tests-testsutcpp"></a>C++ Unit Tests (`tests/ut/cpp/`) | [Read section](testing/unit-tests.md#c-unit-tests-testsutcpp) |

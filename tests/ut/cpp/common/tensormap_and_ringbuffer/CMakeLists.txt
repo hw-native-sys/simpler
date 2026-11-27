@@ -183,7 +183,7 @@ tmr_case(test_dep_gen_retained_runs.cpp
 
 # TaskId is arch-agnostic (src/common/tensormap_and_ringbuffer/task_id.h) and
 # header-only, so one arch's include path exercises the whole handle.
-tmr_case(test_task_id.cpp ARCHS a2a3)
+tmr_case(test_task_id.cpp ARCHS a2a3 SCOPE common)
 
 tmr_case(test_trb_runtime_temp_buffer.cpp
     SOURCES

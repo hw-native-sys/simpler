@@ -19,6 +19,11 @@ on:
         description: github or self-cpu.
         required: true
         type: string
+      ut_arches:
+        description: Architectures whose no-hardware unit tests are affected.
+        type: string
+        required: false
+        default: a2a3,a5,wse
       python_version:
         description: Hosted Python version; CI requires Python 3.10 or newer.
         required: false
@@ -33,6 +38,7 @@ jobs:
     # Single-host CPU MPI tests must not select the runner's unsupported RDMA devices.
     env:
       UCX_TLS: "self,sm,tcp"
+      UT_ARCHES: ${{ inputs.ut_arches }}
     steps:
       - name: Checkout target
         uses: actions/checkout@v5
@@ -136,7 +142,11 @@ jobs:
           # runner Daily uses does not.
           PARALLEL=()
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then PARALLEL=(-n 32); fi
-          .venv/bin/python -m pytest tests/ut -m "not requires_hardware" -q -rs "${PARALLEL[@]}"
+          # Finish runtime builds before tests read their published binaries in parallel.
+          builder=tests/ut/py/toolkit/test_runtime_builder_integration.py
+          cpu=(-m "not requires_hardware and not requires_toolkit" --ut-arches "$UT_ARCHES")
+          .venv/bin/python -m pytest "$builder" "${cpu[@]}" -q
+          .venv/bin/python -m pytest tests/ut --ignore="$builder" "${cpu[@]}" -q -rs "${PARALLEL[@]}"
 
       - name: Build and run C++ unit tests (sim)
         run: |
@@ -178,7 +188,17 @@ jobs:
           if command -v ccache >/dev/null 2>&1; then
             ccache --show-stats
           fi
-          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j32 --output-on-failure --timeout 300
+          # CTest labels follow each target's coverage; the common unit tests run on every CPU leg.
+          scope="ut_common"
+          IFS=, read -ra arches <<< "$UT_ARCHES"
+          for arch in "${arches[@]}"; do
+            case "$arch" in
+              a2a3|a5|wse) scope+="|ut_$arch" ;;
+              *) echo "Unknown UT architecture: $arch" >&2; exit 1 ;;
+            esac
+          done
+          ctest --test-dir tests/ut/cpp/build -L "^($scope)$" -LE '^requires_(hardware|toolkit)' \
+            -j32 --output-on-failure --timeout 300 --no-tests=error
 
       - name: Verify C++ unit-test axis coverage (sim)
         run: |
@@ -217,4 +237,4 @@ jobs:
           # it runs here rather than in the pyut sweep above (which precedes this
           # build and skips it). Asserting the parser against hand-written JSON
           # would not catch the exporter and the reader drifting apart.
-          .venv/bin/python -m pytest tests/ut/py/test_swimlane_export_run_identity.py -v
+          .venv/bin/python -m pytest tests/ut/py/test_swimlane_export_run_identity.py --ut-arches "$UT_ARCHES" -v

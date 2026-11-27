@@ -257,7 +257,7 @@ During execution, collection can lose samples without introducing a functional
 dependency on DFX.
 
 The native qualification is
-`tests/ut/py/test_tmr_scope_capture.py`: it checks cold recording without user
+`tests/ut/py/a2a3/hardware/test_tmr_scope_capture.py`: it checks cold recording without user
 execution, original-run retirement, three numerical replays with changed input
 contents, actual outer/inner scope samples, model release, zero-replay cancellation
 and a subsequent ordinary eager run. Run it with the usual exclusive `task-submit`

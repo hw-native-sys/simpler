@@ -15,6 +15,14 @@ on:
       runs_on:
         required: true
         type: string
+      run_hardware:
+        type: boolean
+        required: false
+        default: true
+      run_sdk:
+        type: boolean
+        required: false
+        default: true
       include_cann_examples:
         required: false
         default: false
@@ -38,6 +46,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up environment
+        id: setup
         uses: ./.github/actions/setup-venv
         with:
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
@@ -46,31 +55,43 @@ jobs:
           system-site-packages: "true"
           source-cann: "true"
 
-      - name: Build C++ unit tests (a2a3)
+      - name: Run SDK Python unit tests on the host (a2a3)
+        id: sdk_py
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && inputs.run_sdk }}
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          source .venv/bin/activate
-          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
-          cmake --build tests/ut/cpp/build --target test_comm_lifecycle
+          .venv/bin/python -m pytest tests/ut -m requires_toolkit --ut-arches a2a3 -q
 
-      # `ctest --timeout 300` matches the no-hardware lane. It is not a budget:
-      # the only test in this label set, test_comm_lifecycle, runs in 2.4-3.2 s
-      # across sampled CI runs, so 300 s is ~90x its slowest observed run and
-      # cannot fail a healthy one. It exists so a hung test reports
-      # `test_comm_lifecycle (Timeout)` in five minutes instead of consuming the
-      # 45-minute job budget while holding this lane's exclusive device lock.
-      - name: Run unit tests (a2a3)
+      - name: Build and run SDK C++ unit tests on the host (a2a3)
+        id: sdk_cpp
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && inputs.run_sdk && hashFiles('tests/ut/cpp/a2a3/toolkit/**/test_*.cpp') != '' }}
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          # RuntimeBuilder integration can refresh build/cache while publication probes read it.
-          ut_command="python -m pytest tests/ut -m 'requires_hardware and device_count' --platform a2a3 --device \$TASK_DEVICE -q &&"
-          ut_command+=" python -m pytest tests/ut -m 'requires_hardware and not device_count' -k TestRuntimeBuilderIntegration --platform a2a3 --device \$TASK_DEVICE -q &&"
-          ut_command+=" python -m pytest tests/ut -m 'requires_hardware and not device_count' -k 'not TestRuntimeBuilderIntegration' --platform a2a3 --device \$TASK_DEVICE -n $DEVICE_NUM -q &&"
-          ut_command+=" python3 -c \"import json,os; ids=os.environ['TASK_DEVICE'].split(','); json.dump({'version':{'major':1,'minor':0},'local':[{'npus':[{'id':i,'slots':1} for i in ids]}]}, open('tests/ut/cpp/build/resources.json','w'))\" &&"
-          ut_command+=" ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a2a3)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure --timeout 300"
+          cmake -B build/ut-toolkit -S tests/ut/cpp -DSIMPLER_ENABLE_TOOLKIT_TESTS=ON -DSIMPLER_ENABLE_HARDWARE_TESTS=OFF
+          cmake --build build/ut-toolkit --target ut_toolkit_a2a3
+          ctest --test-dir build/ut-toolkit -L '^requires_toolkit$' -L '^ut_a2a3$' \
+            --output-on-failure --timeout 300 --no-tests=error
+
+      - name: Build hardware C++ unit tests (a2a3)
+        id: hardware_cpp
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && inputs.run_hardware && hashFiles('tests/ut/cpp/a2a3/hardware/**/test_*.cpp') != '' }}
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          cmake -B build/ut-hardware -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON -DSIMPLER_ENABLE_TOOLKIT_TESTS=OFF
+          cmake --build build/ut-hardware --target ut_hardware_a2a3
+
+      - name: Run hardware unit tests (a2a3)
+        id: hardware
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && inputs.run_hardware }}
+        env:
+          RUN_CPP: ${{ steps.hardware_cpp.outcome == 'success' }}
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run "$ut_command"
+            --run "bash tools/run_hardware_ut.sh a2a3 $RUN_CPP"
 
       # Every tool under tools/cann-examples, discovered rather than named, and
       # each one smoke-run on a locked device via its own smoke.sh. The by-name
@@ -80,7 +101,8 @@ jobs:
       # both unnoticed. Adding a tool now needs no workflow edit, and a tool that
       # builds but cannot run is a failure rather than a silent pass.
       - name: Build and smoke-run tools/cann-examples (a2a3)
-        if: inputs.include_cann_examples
+        id: smoke
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' && inputs.run_hardware && inputs.include_cann_examples }}
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \

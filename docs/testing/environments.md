@@ -171,62 +171,34 @@ strategy; profiles do not install arbitrary dependencies or infer new CI runners
 
 ## Hardware Classification
 
-The `--platform` flag is the single source of truth for hardware availability. No separate `-m` flags are needed.
+### Unit tests
 
-### Helper function
+A unit test has an architecture scope and an execution requirement. Common
+CPU tests run on every UT change. Platform-specific cases run when their
+architecture is affected. WSE currently has a CPU simulator. A2/A3 and A5 also
+have SDK-enabled hosts and devices.
 
-```python
-def is_device(platform: str | None) -> bool:
-    """sim and None are both no-hardware."""
-    return platform is not None and not platform.endswith("sim")
-```
+| Execution requirement | Python selection | CTest selection |
+| --------------------- | ---------------- | --------------- |
+| CPU | `-m 'not requires_hardware and not requires_toolkit' --ut-arches a5,wse` | `-L '^(ut_common\|ut_a5\|ut_wse)$' -L '^no_hardware$'` |
+| CANN SDK, no device | `-m requires_toolkit --ut-arches a5` | `-L '^ut_a5$' -L '^requires_toolkit$'` |
+| Real device | `-m requires_hardware --platform a2a3` | `-L '^requires_hardware_a2a3$'` with the allocated device resources |
 
-### ut-py: `@pytest.mark.requires_hardware[(platform)]`
+Python platform-specific modules and fixtures live under
+`tests/ut/py/{a2a3,a5,wse}/`. Shared modules remain in the common tree.
+Place modules containing device cases under `hardware/`, and modules containing
+SDK cases under `toolkit/`, within the appropriate tree. Mark those cases
+with `requires_hardware` or `requires_toolkit` and their supported onboard
+`platforms`. An ordinary CPU case in the same file still runs on the CPU.
+Store CPU-only supporting fixtures in `nohardware/` when their resource scope cannot be inferred from a test-module path. Shared build infrastructure can affect every environment. A mixed-platform module can use `ut_arches` to declare case ownership. For a
+parametrized platform or architecture, the collector selects matching rows.
+Omitting `--ut-arches` retains all architectures.
 
-| Declaration | no-hw runner | a2a3 runner | a5 runner |
-| ----------- | ------------ | ----------- | --------- |
-| *(no marker)* | run | skip | skip |
-| `@pytest.mark.requires_hardware` | skip | run | run |
-| `@pytest.mark.requires_hardware("a2a3")` | skip | run | skip |
-| `@pytest.mark.requires_hardware("a5")` | skip | skip | run |
-
-Skip logic (conftest.py):
-
-```python
-marker = item.get_closest_marker("requires_hardware")
-on_device = is_device(platform)
-if marker is None:
-    if on_device:
-        skip("no-hardware test, runs in no-hw job")
-elif marker.args:
-    if platform != marker.args[0]:
-        skip(f"requires --platform {marker.args[0]}")
-else:
-    if not on_device:
-        skip("requires hardware")
-```
-
-### ut-cpp: ctest labels
-
-| Declaration (CMakeLists.txt) | no-hw runner | a2a3 runner | a5 runner |
-| ---------------------------- | ------------ | ----------- | --------- |
-| *(no label)* | run | skip | skip |
-| `LABELS "no_hardware"` | run | skip | skip |
-| `LABELS "requires_hardware"` | skip | run | run |
-| `LABELS "requires_hardware_a2a3"` | skip | run | skip |
-| `LABELS "requires_hardware_a5"` | skip | skip | run |
-
-Selection:
-
-| Runner | Command |
-| ------ | ------- |
-| No hardware | `ctest -LE requires_hardware` |
-| a2a3 | `ctest -L "^requires_hardware(_a2a3)?$"` |
-| a5 | `ctest -L "^requires_hardware(_a5)?$"` |
-
-`-LE` (exclude regex) on no-hw runner: `requires_hardware` matches all three
-hardware label variants. Unlabeled tests and tests labeled `no_hardware` run.
-`-L` (include regex) on device runners: only labeled tests run, unlabeled ones are excluded.
+A CTest case carries both its architecture label (`ut_common`, `ut_a2a3`,
+`ut_a5` or `ut_wse`) and its execution label. SDK-only cases run directly on a
+host with the corresponding toolchain. Physical device cases run through the
+device queue. The automatic PR jobs derive these selections from the changed
+files. Daily runs the full supported selection.
 
 ### st: `@scene_test(platforms=[...])`
 

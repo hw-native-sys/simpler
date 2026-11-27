@@ -26,6 +26,8 @@ from simpler.task_interface import ChipCallable
 from simpler_setup import environment, pto_isa, toolchain
 from simpler_setup.kernel_compiler import KernelCompiler
 
+pytestmark = pytest.mark.ut_arches("a5")
+
 
 @pytest.fixture
 def sdk_files(tmp_path, monkeypatch):
@@ -523,7 +525,15 @@ def test_compile_ccu_reports_missing_extra_source(toolchain_files, tmp_path):
         KernelCompiler("a5").compile_ccu(str(source), extra_sources=[str(tmp_path / "missing.cpp")])
 
 
-@pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5sim", "wsesim"])
+@pytest.mark.parametrize(
+    "platform",
+    [
+        pytest.param("a2a3", marks=pytest.mark.ut_arches("a2a3")),
+        pytest.param("a2a3sim", marks=pytest.mark.ut_arches("a2a3")),
+        "a5sim",
+        pytest.param("wsesim", marks=pytest.mark.ut_arches("wse")),
+    ],
+)
 def test_ccu_rejects_unsupported_platform(toolchain_files, platform):
     compiler = KernelCompiler(platform)
     assert compiler.ccu is None

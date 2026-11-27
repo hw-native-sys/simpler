@@ -235,5 +235,5 @@ Use the [shared-table examples](../../examples/a5/tensormap_and_ringbuffer/host_
 for BF16 gathers and MXFP8 payloads with Device scales and dependent consumers,
 in serial and staged L3 execution on A5. The A3 hardware test
 `test_same_host_table_maps_to_two_a3_chips` in
-`tests/ut/py/test_host_ddr_onboard.py` uses two local TMR devices to check shared
+`tests/ut/py/hardware/test_host_ddr_onboard.py` uses two local TMR devices to check shared
 table reads, disjoint writes and CPU readback, followed by Buffer release.

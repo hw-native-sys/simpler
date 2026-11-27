@@ -30,6 +30,7 @@ def test_sim_role_macros_follow_the_explicit_argument(platform, role, macro):
 
 
 @pytest.mark.parametrize("shared_source", [False, True])
+@pytest.mark.ut_arches("wse")
 def test_only_included_wse_headers_invalidate_real_kernel_cache(tmp_path, monkeypatch, shared_source):
     compiler = KernelCompiler("wsesim")
     include = tmp_path / "platform/include"

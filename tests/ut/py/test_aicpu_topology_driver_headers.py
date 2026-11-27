@@ -170,6 +170,7 @@ def test_shared_driver_root_resolution(tmp_path: Path, mode: str) -> None:
     subprocess.run(["cmake", "-P", str(script)], check=True, capture_output=True, text=True)
 
 
+@pytest.mark.ut_arches("a5")
 def test_oversized_driver_topology_falls_back(tmp_path: Path) -> None:
     _write_headers(tmp_path, "enum")
     header = tmp_path / "driver/include/dsmi_common_interface.h"

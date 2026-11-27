@@ -12,8 +12,8 @@ notices until a flake in it reddens an unrelated PR.
 
 The explicit maintainer/admin `/run-a5` command in `ci-a5-comment.yml` is a separate
 exception: it runs A5 UT and onboard scene tests without change detection,
-even for non-code PRs. Ordinary `ci.yml` runs A5 UT behind
-`a5_changed && ut_affected` and A5 framework tests behind
+even for non-code PRs. Ordinary `ci.yml` runs A5 UT behind the
+A5 device and SDK outputs and A5 framework tests behind
 `a5_changed && st_affected`, alongside the existing simulation, CPU and profiling
 gates. Daily retains its A5 jobs.
 
@@ -84,8 +84,9 @@ A job composes the axes it is actually subject to:
 | `st-sim-{a2a3,a5}`, `st-onboard-*` | `<arch>_changed && st_affected` |
 | `st-sim-wse` | `wse_changed && st_affected` |
 | `profiling-flags-smoke` | `(a2a3_changed \|\| a5_changed) && !examples_only && !tests_only` |
-| `ut`, `ut-a2a3` | `non_code_only != true && ut_affected` |
-| `ut-a5` | `a5_changed && ut_affected` |
+| `ut` | `non_code_only != true && ut_affected` |
+| `ut-a2a3` | `ut_hardware_a2a3 \|\| ut_sdk_a2a3` |
+| `ut-a5` | `ut_hardware_a5 \|\| ut_sdk_a5` |
 | `packaging-matrix` | `non_code_only != true && !examples_only && !tests_only` |
 
 WSE has a simulation scene job and no onboard job. `profiling-flags-smoke`
@@ -104,12 +105,14 @@ the scene-test job that reads the same corpus. A change to a payload file was
 the historical reason `tests/` stayed in — a now-deleted claim that `tests/`
 was "in the sdist include", which no configuration ever made true.
 
-The `ut` and `ut-a2a3` jobs stay off the arch axis on purpose — unit tests cover shared
-contracts, so the cost of a falsely-skipped regression outweighs the minutes.
-That is a decision about the *arch* axis only; the category axis is a different
-question, because a scene-test-only change genuinely cannot break a unit test.
-`ut-a5` additionally requires `a5_changed`, so changes confined to the other
-platforms do not schedule A5 hardware. Shared code still selects A5.
+The CPU `ut` job runs common cases and the architectures in `ut_arches`.
+For each UT-affecting path, classify both its architecture and its execution
+requirements before combining the results. An A5 scene test alongside a WSE
+unit test must not request A5 hardware. A platform source change selects that
+platform's supported UT environments. A change confined to CPU test modules
+needs no device. Device and SDK-test directories select their own host steps.
+Shared production, test infrastructure and unattributable changes retain full
+coverage. Account for both paths of a rename.
 
 The vocabulary exists once, in `.github/workflows/_detect-changes.yml`.
 `.github/workflows/ci.yml` calls that workflow and consumes its declared

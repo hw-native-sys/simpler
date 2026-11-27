@@ -25,11 +25,4 @@ add_subdirectory(runtime_status)
 add_subdirectory(task_interface)
 add_subdirectory(hierarchical)
 
-# platform_comm's only case needs a device to run and CANN to build.
-if(SIMPLER_ENABLE_HARDWARE_TESTS)
-    add_subdirectory(platform_comm)
-else()
-    simpler_ut_skip_dir(platform_comm)
-endif()
-
 add_subdirectory(aicpu_loader)

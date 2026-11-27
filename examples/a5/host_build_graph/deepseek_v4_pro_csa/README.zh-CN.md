@@ -126,8 +126,8 @@ python tests/fdwic/pa_hbg/csa/test_csa_business.py \
   -p a5 -d 0 --manual include --case TestCSABusiness:: --rounds 3
 python tests/fdwic/pa_hbg/csa/test_csa_business.py \
   -p a5 -d 0 --manual include --case TestCSAResident::
-python -m pytest -q tests/ut/py/test_csa_*.py \
-  tests/ut/py/hbg_spmd_contracts/test_csa_protocol.py \
+python -m pytest -q tests/ut/py/a5/test_csa_*.py \
+  tests/ut/py/a5/nohardware/hbg_spmd_contracts/test_csa_protocol.py \
   tests/fdwic/pa_hbg/csa/test_csa_snapshot.py
 ```
 
