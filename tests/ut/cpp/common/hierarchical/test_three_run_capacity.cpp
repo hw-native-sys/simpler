@@ -1018,6 +1018,48 @@ TEST(ThreeRunCapacityEndpointTest, PhysicalEndRetainsTheEntryUntilStrongTerminal
     allocator.shutdown();
 }
 
+TEST(ThreeRunCapacityEndpointTest, PeerCancellationNamesOnlyTheLiveRunAndDoesNotRetireIt) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(0);
+    const TaskSlot first = capacity_progress_slot(allocator, 171, 0, 15);
+    const TaskSlot second = capacity_progress_slot(allocator, 172, 1, 16);
+    const TaskSlot replacement = capacity_progress_slot(allocator, 173, 0, 17);
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 3);
+    endpoint.submit_progress(&allocator, WorkerDispatch{first, 0, 181, false});
+    capacity_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
+    endpoint.submit_progress(&allocator, WorkerDispatch{second, 0, 182, false});
+    capacity_consume_frame(mailbox, 1, MailboxPreparationDisposition::NATIVE_PREPARED);
+    auto *entry = capacity_entry(mailbox, 0);
+    auto *other = capacity_entry(mailbox, 1);
+    const auto state = capacity_entry_state(entry);
+    const auto generation = entry->entry_generation;
+    endpoint.request_peer_cancel(171);
+    EXPECT_EQ(entry->peer_cancel_requested, 1);
+    EXPECT_EQ(other->peer_cancel_requested, 0);
+    EXPECT_EQ(entry->entry_generation, generation);
+    EXPECT_EQ(capacity_entry_state(entry), state);
+
+    // A damaged/stale identity never grants a write into the occupied entry.
+    const auto dispatch = other->dispatch_id;
+    other->dispatch_id++;
+    endpoint.request_peer_cancel(172);
+    EXPECT_EQ(other->peer_cancel_requested, 0);
+    other->dispatch_id = dispatch;
+    set_capacity_entry_state(entry, MailboxState::TASK_FAILED);
+    WorkerEndpointProgress progress;
+    while (endpoint.poll_progress(progress)) {
+        if (progress.kind == WorkerProgressKind::COMPLETED) break;
+    }
+    ASSERT_EQ(progress.kind, WorkerProgressKind::COMPLETED);
+    endpoint.submit_progress(&allocator, WorkerDispatch{replacement, 0, 183, false});
+    ASSERT_NE(entry->entry_generation, generation);
+    EXPECT_EQ(entry->peer_cancel_requested, 0);
+    endpoint.request_peer_cancel(171);
+    EXPECT_EQ(entry->peer_cancel_requested, 0);
+    allocator.shutdown();
+}
+
 TEST(ThreeRunCapacityEndpointTest, AWaitBeforePublicationPersistsWithoutPeriodicRequests) {
     class CountingEndpoint : public LocalMailboxEndpoint {
     public:

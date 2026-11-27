@@ -454,7 +454,8 @@ _OFF_ENTRY_ERROR_TEXT = 104
 # semantic terminal. A count of identities; zero means no capacity report.
 _OFF_ENTRY_ADMISSIBLE_SETS = _OFF_ENTRY_ERROR_TEXT + MAILBOX_ERROR_MSG_SIZE
 _OFF_ENTRY_OBSERVATION_REQUESTED = _OFF_ENTRY_ADMISSIBLE_SETS + 4
-_ENTRY_BYTES = _OFF_ENTRY_OBSERVATION_REQUESTED + 4
+_OFF_ENTRY_PEER_CANCEL_REQUESTED = _OFF_ENTRY_OBSERVATION_REQUESTED + 4
+_ENTRY_BYTES = _OFF_ENTRY_PEER_CANCEL_REQUESTED + 4
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
@@ -599,6 +600,10 @@ def _assert_mailbox_wire_constants() -> None:
         "entry.observation_requested": (
             _OFF_ENTRY_OBSERVATION_REQUESTED,
             MAILBOX_RUN_ENTRY_OFFSETS["observation_requested"],
+        ),
+        "entry.peer_cancel_requested": (
+            _OFF_ENTRY_PEER_CANCEL_REQUESTED,
+            MAILBOX_RUN_ENTRY_OFFSETS["peer_cancel_requested"],
         ),
         # And the request frame's header, which binds a payload to its entry.
         "frame.entry_index": (_OFF_FRAME_ENTRY_INDEX, MAILBOX_REQUEST_FRAME_OFFSETS["entry_index"]),
@@ -4119,6 +4124,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             ccu_binding: Any = None
             ccu_started: bool = False
             native_activated: bool = False
+            cancelled_before_launch: bool = False
 
         staged_runs: dict[int, _StagedRun] = {}
         terminal_staged_runs: list[_StagedRun] = []
@@ -4279,6 +4285,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     import_registry.host_mappings.release(staged.identity)
                 raise
             staged.pending_args = None  # type: ignore[attr-defined]
+            staged.chip_run.bind_peer_cancel(staged.entry_addr + _OFF_ENTRY_PEER_CANCEL_REQUESTED)
             raw_disposition = staged.chip_run.preparation_disposition
             disposition = int(getattr(raw_disposition, "value", raw_disposition))
             if disposition not in (_VALIDATED_ONLY, _NATIVE_PREPARED):
@@ -4301,6 +4308,15 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             cw._fence_chip_run_lane()
 
         def activate_run(staged: _StagedRun) -> bool:
+            if _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_PEER_CANCEL_REQUESTED):
+                staged.chip_run.abandon()
+                discard_unlaunched_ccu(staged)
+                if import_registry.host_mappings is not None and not staged.chip_run._owner_recovery_required:
+                    import_registry.host_mappings.release(staged.identity)
+                staged.cancelled_before_launch = True
+                fail_run(staged, "peer failed in the same run before activation")
+                staged_runs.pop(staged.index, None)
+                return True
             for previous in staged_runs.values():
                 if (
                     previous.identity[4] < staged.identity[4]
@@ -4549,7 +4565,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                             shutdown_message = message
                         fail_run(staged, message)
                     else:
-                        staged_runs[staged.index] = staged
+                        if not staged.cancelled_before_launch:
+                            staged_runs[staged.index] = staged
 
                 if ccu_terminal_requested:
                     break

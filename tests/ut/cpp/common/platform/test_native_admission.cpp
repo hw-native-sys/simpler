@@ -1469,6 +1469,42 @@ TEST_F(NativeAdmissionTest, UnmanagedWorkspaceKeepsPendingHostOutputsAcrossSlotR
     }
 }
 
+TEST_F(NativeAdmissionTest, FinalizeTimeoutLeavesTheOutcomeAndOutputForRetry) {
+    class DelayedRunner : public FencedCompletionRunner {
+    public:
+        DelayedRunner() { timeout_config_.stream_sync_timeout_ms = 0; }
+        bool ready{false};
+        int poll_execution(const ActiveExecution &active) override {
+            return ready ? FencedCompletionRunner::poll_execution(active) : SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+        }
+    } runner;
+    runner.use_inout_argument();
+    Attempt call(runner, 0, 10);
+    ASSERT_EQ(call.prepare(), 0);
+    int32_t cancel = 0;
+    const int bound = simpler_bind_peer_cancel(&runner, call.storage, &cancel);
+    if (bound == PTO_RUNTIME_ERR_UNSUPPORTED) {
+        ASSERT_EQ(simpler_finalize_run(&runner, call.storage), 0);
+        GTEST_SKIP() << "runtime does not support peer cancellation";
+    }
+    ASSERT_EQ(bound, 0);
+    const auto upload = std::find_if(control().uploads.begin(), control().uploads.end(), [&](const auto &item) {
+        return item.second == call.bytes.data();
+    });
+    ASSERT_NE(upload, control().uploads.end());
+    void *const backing = upload->first;
+    ASSERT_EQ(simpler_launch_run(&runner, call.storage), 0);
+    std::memset(backing, 0x42, call.bytes.size());
+    EXPECT_EQ(simpler_finalize_run(&runner, call.storage), SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE);
+    EXPECT_FALSE(call.empty());
+    EXPECT_EQ(call.bytes, std::vector<uint8_t>(call.bytes.size(), 0x71));
+    runner.ready = true;
+    EXPECT_EQ(simpler_wait_run(&runner, call.storage), 0);
+    EXPECT_EQ(simpler_finalize_run(&runner, call.storage), 0);
+    EXPECT_EQ(call.bytes, std::vector<uint8_t>(call.bytes.size(), 0x42));
+    EXPECT_TRUE(call.empty());
+}
+
 TEST_F(NativeAdmissionTest, RetiredProgramCallKeepsItsOutputAndIdentityAcrossBindRefusal) {
     FencedCompletionRunner runner(false);
     ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_PROGRAM), 0);

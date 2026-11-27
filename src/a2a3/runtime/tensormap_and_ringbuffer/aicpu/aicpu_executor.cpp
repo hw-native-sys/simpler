@@ -1149,7 +1149,8 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     const int32_t header_status = runtime_status_from_error_codes(orch_error, sched_error);
     // An earlier orchestration failure can outrank a later async failure.
     // Drain either channel's known records without changing the primary error.
-    if (is_kernel_error(orch_error) || is_async_tracking_error(orch_error) || is_kernel_error(sched_error) ||
+    if (orch_error == SIMPLER_ERROR_PEER_RUN_FAILED || sched_error == SIMPLER_ERROR_PEER_RUN_FAILED ||
+        is_kernel_error(orch_error) || is_async_tracking_error(orch_error) || is_kernel_error(sched_error) ||
         is_async_tracking_error(sched_error)) {
         KernelErrorCleanup cleanup{};
         sched_ctx_.drain_cancelled_run(platform_aicore_exit_deadline(), cleanup);

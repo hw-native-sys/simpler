@@ -1071,6 +1071,7 @@ inline void bind_worker(nb::module_ &m) {
     entry_offsets["admissible_run_resource_sets"] =
         static_cast<uint64_t>(offsetof(MailboxRunEntry, admissible_run_resource_sets));
     entry_offsets["observation_requested"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, observation_requested));
+    entry_offsets["peer_cancel_requested"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, peer_cancel_requested));
     m.attr("MAILBOX_RUN_ENTRY_OFFSETS") = entry_offsets;
     nb::dict frame_offsets;
     frame_offsets["entry_index"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_ENTRY_INDEX);

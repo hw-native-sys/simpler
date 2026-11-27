@@ -3883,6 +3883,19 @@ DeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, 
     return region.payload;
 }
 
+int DeviceRunnerBase::request_peer_cancel(uint32_t pipeline_slot, uint64_t run_epoch) {
+    if (run_epoch == 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    std::lock_guard<std::mutex> lock(run_result_mu_);
+    const auto it = run_result_storage_.find(run_epoch);
+    if (it == run_result_storage_.end() || it->second.pipeline_slot != pipeline_slot ||
+        it->second.lease.device_ptr == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    auto *storage = reinterpret_cast<NativeInvocationResultStorage *>(it->second.lease.device_ptr);
+    return rtMemcpy(
+        &storage->peer_cancel_epoch, sizeof(run_epoch), &run_epoch, sizeof(run_epoch), RT_MEMCPY_HOST_TO_DEVICE
+    );
+}
+
 int DeviceRunnerBase::ensure_device_run_result_region(
     const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
 ) {

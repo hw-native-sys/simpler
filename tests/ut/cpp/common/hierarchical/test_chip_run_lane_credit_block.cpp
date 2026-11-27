@@ -285,6 +285,32 @@ TEST(ChipRunLaneCreditBlockTest, ACapacityRefusalLeavesTheRunPreparedRatherThanF
     finalize_worker(worker);
 }
 
+TEST(ChipRunLaneCreditBlockTest, PeerCancelBeforeCreditRetryRetiresWithoutAnotherSubmission) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    int32_t cancel = 0;
+    int32_t accepted = 0;
+    g_launch_rc[0] = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+    auto run =
+        lane.submit(1, host_args(), diagnostic_config(), PipelineSlotLease{0, 0, 321}, 321, 321, &accepted, 1, false);
+    run.bind_peer_cancel(&cancel);
+    run.activate();
+    ASSERT_FALSE(run.launched());
+    ASSERT_EQ(g_events.back(), "launch0");
+    const auto attempts = std::count(g_events.begin(), g_events.end(), "launch0");
+    __atomic_store_n(&cancel, 1, __ATOMIC_RELEASE);
+    g_launch_rc[0] = 0;
+    g_generation.fetch_add(1);
+    EXPECT_THROW(run.wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(1)), std::runtime_error);
+    EXPECT_EQ(accepted, 0);
+    EXPECT_FALSE(run.launched());
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "launch0"), attempts);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 1);
+    lane.close();
+    finalize_worker(worker);
+}
+
 TEST(ChipRunLaneCreditBlockTest, AReleaseWakesTheWaiterAndTheRunLaunches) {
     ChipWorker worker;
     prime_worker(worker);

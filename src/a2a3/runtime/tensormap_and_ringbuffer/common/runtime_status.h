@@ -49,6 +49,7 @@
 #define SIMPLER_ERROR_KERNEL_INVALID_OUTPUT 105
 #define SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE 106
 #define SIMPLER_ERROR_KERNEL_NON_FINITE_VALUE 107
+#define SIMPLER_ERROR_PEER_RUN_FAILED 108
 
 // These failures can leave a valid registered prefix and an untracked request.
 // Draining that prefix does not prove complete retirement of the failed run.

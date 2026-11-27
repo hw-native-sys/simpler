@@ -364,6 +364,7 @@ void ChipWorker::init(
         launch_run_joined_fn_ = module->required<SimplerJoinedLaunchFn>("simpler_launch_run_joined");
         poll_run_fn_ = module->required<SimplerNativeRunFn>("simpler_poll_run");
         query_run_completion_fn_ = module->optional<SimplerNativeRunFn>("simpler_query_run_completion");
+        peer_cancel_fn_ = module->optional<decltype(&simpler_bind_peer_cancel)>("simpler_bind_peer_cancel");
         wait_run_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run");
         wait_run_completion_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run_completion");
         finalize_run_fn_ = module->required<SimplerFinalizeRunFn>("simpler_finalize_run_with_delivery");
@@ -988,6 +989,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     launch_run_joined_fn_ = nullptr;
     poll_run_fn_ = nullptr;
     query_run_completion_fn_ = nullptr;
+    peer_cancel_fn_ = nullptr;
     wait_run_fn_ = nullptr;
     wait_run_completion_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
@@ -1658,6 +1660,7 @@ ChipWorker::RunStorageTag ChipWorker::read_run_storage_tag(const void *storage) 
 
 bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase) {
     switch (op) {
+    case NativeRunOp::BindPeerCancel:
     case NativeRunOp::Launch:
         return phase == NativeRunPhase::PREPARED;
     case NativeRunOp::Poll:
@@ -1969,6 +1972,19 @@ bool ChipWorker::launch_native_run_joined(
     }
     if (failure != nullptr) std::rethrow_exception(failure);
     return !declined;
+}
+
+void ChipWorker::bind_peer_cancel(const ChipWorkerNativeRun &run, const int32_t *request) {
+    validate_execution_process();
+    void *storage = nullptr;
+    NativeRunOpLease held;
+    const NativeRunLease lease = acquire_native_run_op(run, NativeRunOp::BindPeerCancel, &storage, nullptr, &held);
+    if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "bind_peer_cancel");
+    validate_execution_context();
+    const int rc =
+        peer_cancel_fn_ == nullptr ? PTO_RUNTIME_ERR_UNSUPPORTED : peer_cancel_fn_(device_ctx_, storage, request);
+    if (rc != 0 && rc != PTO_RUNTIME_ERR_UNSUPPORTED)
+        throw std::runtime_error("bind_peer_cancel failed with code " + std::to_string(rc));
 }
 
 bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {

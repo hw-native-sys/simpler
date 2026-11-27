@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Local failure drains peer counters without granting domain reuse."""
+"""Local failure drains counters and cancels active peers without granting reuse."""
 
 import os
 import re
@@ -79,6 +79,7 @@ def build_callable(platform, directory):
         pytest.param(0, id="normal"),
         pytest.param(1, id="notify_after_error", marks=pytest.mark.manual(["a2a3"])),
         pytest.param(2, id="missing_notify", marks=pytest.mark.manual(["a2a3"])),
+        pytest.param(3, id="peer_cancel", marks=pytest.mark.manual(["a2a3"])),
     ],
 )
 def test_local_failure_with_peer_counter(st_platform, st_device_ids, tmp_path, mode):
@@ -201,7 +202,7 @@ def run_case(st_platform, st_device_ids, tmp_path, mode):
             assert domains, str(failure.value)
             assert not domains[0].freed
             assert struct.unpack_from("I", outputs[0].shm.buf)[0] == 0x55555555
-            assert struct.unpack_from("I", outputs[1].shm.buf)[0] == 37
+            assert struct.unpack_from("I", outputs[1].shm.buf)[0] == (0x55555555 if mode == 3 else 37)
             with pytest.raises(RuntimeError):
                 worker.run(lambda *_: None)
             assert not domains[0].freed
@@ -209,9 +210,9 @@ def run_case(st_platform, st_device_ids, tmp_path, mode):
             worker.run(run, config=config)
             assert [struct.unpack_from("I", output.shm.buf)[0] for output in outputs] == [37, 37]
             assert domains[0].freed
-        # A failed run leaves rank 0 quarantined. The healthy rank can wait
-        # 120 s in domain release (comm_sim/comm_hccl), separate from the local
-        # drain deadline. Cross-rank abort is not supplied here.
+        # Failed native runs remain quarantined. A rank that already completed
+        # can still wait 120 s in domain release (comm_sim/comm_hccl), separate
+        # from cancellation of an active rank and the local drain deadline.
         run_limit = 160 if mode else 60
         assert time.monotonic() - started < run_limit
     finally:
@@ -231,6 +232,14 @@ def run_case(st_platform, st_device_ids, tmp_path, mode):
 def assert_failure_evidence(st_platform, mode, evidence):
     if mode:
         assert "runtime_status=-106" in evidence, evidence
+        if mode == 3:
+            assert "runtime_status=-108" in evidence, evidence
+            if st_platform.endswith("sim"):
+                assert "PEER_CANCEL_KERNEL_EXITED" in evidence, evidence
+                assert "PEER_NOTIFY_CONSUMER_ENTERED" not in evidence, evidence
+            else:
+                assert "507018" in evidence, evidence
+            return
         if st_platform.endswith("sim"):
             assert "PEER_NOTIFY_CONSUMER_ENTERED" not in evidence
         else:

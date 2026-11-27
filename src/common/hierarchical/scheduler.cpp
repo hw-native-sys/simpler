@@ -156,6 +156,7 @@ void Scheduler::worker_done(WorkerCompletion completion) {
     if (failure_reported && cfg_.on_task_failed_cb) {
         cfg_.on_task_failed_cb(completion.task_slot, completion.error_message);
     }
+    if (failure_reported) cfg_.manager->request_peer_cancel(s.run_id);
 
     // Group aggregation: only push to completion queue when ALL workers done
     if (s.is_group()) {
@@ -237,8 +238,9 @@ void Scheduler::worker_done(WorkerCompletion completion) {
         completion = std::move(terminal);
     }
 
-    if (!failure_reported && is_failure(completion.outcome) && cfg_.on_task_failed_cb) {
-        cfg_.on_task_failed_cb(completion.task_slot, completion.error_message);
+    if (!failure_reported && is_failure(completion.outcome)) {
+        if (cfg_.on_task_failed_cb) cfg_.on_task_failed_cb(completion.task_slot, completion.error_message);
+        cfg_.manager->request_peer_cancel(s.run_id);
     }
 
     {
