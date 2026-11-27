@@ -92,6 +92,53 @@ Buffer wrappers until a later drain succeeds. `Worker.close()` uses its public
 cleanup budget; Torch-NPU stream synchronization has no timeout argument, so
 the RunHandle timeout is not an overall process deadline.
 
+## Real-prefill numerical validation
+
+`validate_torch_eager.py` creates a local Transformers 4.57.1 BF16 eager
+reference for the qualified checkpoint and 3338-token prompt. It imports all
+40 layers of logical prefill KV into the caller-owned paged cache, then runs
+common-prefix and greedy free-generation comparisons. Prefill supplies token 1;
+127 decode calls supply tokens 2 through 128, including the position-3456 page
+crossing. This is a single-active-request Torch diagnostic contract.
+K/V backing tensors must be contiguous, on one device, and have disjoint byte
+ranges. Source KV tensors must also be disjoint from both target caches.
+Disjoint views of shared storage are supported. Invalid inputs are rejected
+before either cache is written.
+
+Supply the checkpoint input manifest with its revision, `small_files` digest
+records and `shards` entries containing `path` and `sha256`. Every consumed
+checkpoint shard and present tokenizer/configuration auxiliary file must be
+authenticated. Each invocation requires a new output directory. The generated
+prefill, reference and actual tensors are saved as safetensors beside the JSON
+receipt, which retains partial progress and separate execution/cleanup errors.
+
+The reference uses the pinned safetensors shard index. A root
+`model.safetensors` overrides that index in Transformers and is rejected.
+
+```bash
+python validate_torch_eager.py --artifact /path/to/qwen3-14b-hbg-release \
+  --model /path/to/Qwen3-14B --prompt-ids /path/to/prompt-3338-token-ids.json \
+  --input-manifest /path/to/input-manifest.json --device "$TASK_DEVICE" \
+  --output /path/to/new-validation-directory
+```
+
+Use this command inside an exclusive device-queue allocation, with CANN and the
+project's Torch-NPU environment loaded as for the smoke. The entry uses the same
+stage-0 artifact ABI as the adapter; newly generated releases require their own
+ABI check. CPU tests exercise the validator without importing Torch-NPU or
+Transformers, including Python 3.9. Model execution additionally requires the
+pinned Transformers reference and compatible Torch/Torch-NPU installation.
+
+Success requires complete 128-token equality in both modes, 127 logits checks
+and all 80 per-layer K/V checks in common-prefix mode, finite tensors, exact
+prefill preservation, untouched zero-initialized cache tails, successful close
+and caller-stream preservation. Every step uses relative L2 <= 0.05 and cosine
+>= 0.999. Missing evidence or a failed tensor gate returns failure even when
+token IDs agree. This entry provides a numerical gate; successful real-model
+qualification must be established for the selected source/release combination.
+The two-round, sixteen-request native vLLM qualification remains a separate
+Engine acceptance gate tracked by #2429.
+
 ## Other qualification tools
 
 The directory also contains longer fixture-driven qualification entry points:
