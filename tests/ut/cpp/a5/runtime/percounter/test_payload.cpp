@@ -255,14 +255,17 @@ TEST_F(CalendarDeferTest, PeerWaitSeparatesExitCancellationFromInvalidMetadata) 
         CalendarRangeHeader header;
         CalendarExecutionRow row;
         CalendarDispatch dispatch;
+        CalendarWait waits[2];
         CalendarPeerExtra peer;
     } program{};
     program.row.block_count = 1;
     program.row.flags = CALENDAR_EXEC_PEER;
+    program.row.wait_count = 2;
     program.dispatch.extra_offset = offsetof(Program, peer) - offsetof(Program, dispatch);
     program.peer.input_count = 2;
-    program.peer.join_read = reinterpret_cast<uint64_t>(&done);
-    program.peer.join_target = 2;
+    program.dispatch.waits_offset = offsetof(Program, waits) - offsetof(Program, dispatch);
+    program.waits[0] = wait;
+    program.waits[1] = {reinterpret_cast<uint64_t>(&shell_done) | CALENDAR_WAIT_NOTIFY, 1};
     CalendarPeerEndpoint endpoint{};
     endpoint.input_count = 2;
     producer.peer_endpoints = &endpoint;
@@ -340,6 +343,22 @@ TEST_F(CalendarDeferTest, SinglePeerWaitRequiresItsBoundCompletionEvenWithAMatch
     EXPECT_FALSE(run());
     EXPECT_EQ(arguments.args[0], 1);
     EXPECT_EQ(control.lane_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
+}
+
+TEST_F(CalendarDeferTest, PeerReturnHintDoesNotReplaceDeferredCompletion) {
+    seal(sample);
+    write_reg(RegId::DATA_MAIN_BASE, 2);
+    lifecycle = AICORE_LIFECYCLE_EXIT_BIT;
+    EXPECT_FALSE((percounter_wait_paced_inputs<1, true>(producer, &wait, 2, 0)));
+    EXPECT_EQ(done, defer_bit);
+    EXPECT_EQ(control.lane_error, 0U);
+
+    lifecycle = 0;
+    signal = 1;
+    write_reg(RegId::DATA_MAIN_BASE, 0);
+    ASSERT_TRUE((percounter_wait_paced_inputs<1, true>(producer, &wait, 2, 0)));
+    EXPECT_EQ(done, defer_bit | 1U);
+    EXPECT_EQ(control.async_settled, 1U);
 }
 
 TEST_F(CalendarDeferTest, SharesADeferredCompletionOnlyAfterTheOwnerHasObservedIt) {

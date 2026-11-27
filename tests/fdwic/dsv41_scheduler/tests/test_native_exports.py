@@ -71,34 +71,33 @@ def native_runner(tmp_path_factory):
     return build / "native-runner"
 
 
-def test_kernel_completion_declaration_survives_packing_and_orchestration_replacement(tmp_path, native_runner):
+def test_kernel_signatures_survive_packing_and_orchestration_replacement(tmp_path, native_runner):
     kernel = tmp_path / "kernel.bin"
     kernel.write_bytes(bytes(range(32)))
     host = tmp_path / "host.so"
     host.write_bytes(bytes(range(64)))
     manifest = tmp_path / "kernels.txt"
-    manifest.write_text(f'1 3\n2\n0 1 3 "{kernel}"\n1 1 3 "{kernel}" on_return\n')
+    manifest.write_text(f'1 3\n2\n0 1 3 "{kernel}"\n1 1 1 "{kernel}"\n')
     packed, repacked = tmp_path / "callable.bin", tmp_path / "replacement.bin"
     subprocess.run([native_runner, "--assemble-orchestration", manifest, host, packed], check=True)
     host.write_bytes(b"changed orchestration")
     subprocess.run([native_runner, "--repack-orchestration", packed, host, repacked], check=True)
     for path in (packed, repacked):
         description = json.loads(subprocess.check_output([native_runner, "--describe-callable", path], text=True))
-        assert [k["completes_on_return"] for k in description["kernels"]] == [False, True]
+        assert description["kernels"] == [{"id": 0, "signature": [3]}, {"id": 1, "signature": [1]}]
 
 
-@pytest.mark.parametrize("declaration", ["1 1 0 0", "1 2 2 1", "1 0 0 0", "unknown", "on_return extra"])
-def test_native_assembly_rejects_invalid_completion_declarations(tmp_path, native_runner, declaration):
+def test_native_assembly_rejects_trailing_kernel_fields(tmp_path, native_runner):
     kernel = tmp_path / "kernel.bin"
     kernel.write_bytes(bytes(range(32)))
     host = tmp_path / "host.so"
     host.write_bytes(bytes(range(64)))
     manifest = tmp_path / "kernels.txt"
-    manifest.write_text(f'1 3\n1\n0 1 3 "{kernel}" {declaration}\n')
+    manifest.write_text(f'1 3\n1\n0 1 3 "{kernel}" extra\n')
     output = tmp_path / "callable.bin"
     result = subprocess.run(
         [native_runner, "--assemble-orchestration", manifest, host, output], capture_output=True, text=True, check=False
     )
     assert result.returncode != 0
-    assert "kernel completion declaration" in result.stderr
+    assert "Unexpected trailing fields in kernel manifest" in result.stderr
     assert not output.exists()

@@ -186,9 +186,9 @@ def test_calendar_peer_dmb_markers_keep_target_token_and_observed_count(mte3):
         "records": [
             {**sender, "kind": "peer_dmb_write_begin", "target_worker": 1, "token": 2, "cycles": 8},
             {**sender, "target_worker": 1, "token": 2, **({"transport": "MTE3"} if mte3 else {})},
-            {**receiver, "token": 2, "count": 1},
-            {**receiver, "token": 3, "count": 2, "cycles": 12},
-            {**receiver, "kind": "peer_dmb_wait_begin", "join_threshold": 2, "cycles": 6},
+            {**receiver, "token": 2, "ready_inputs": 1},
+            {**receiver, "token": 3, "ready_inputs": 2, "cycles": 12},
+            {**receiver, "kind": "peer_dmb_wait_begin", "input_count": 2, "cycles": 6},
         ],
         "range_records": [],
         "dropped": 0,
@@ -201,21 +201,21 @@ def test_calendar_peer_dmb_markers_keep_target_token_and_observed_count(mte3):
     ticks = [e for e in events if e["ph"] == "i"]
     assert [e["args"]["token"] for e in ticks] == [2, 2, 3]
     assert ticks[0]["args"]["target_worker"] == 1
-    assert [e["args"]["count"] for e in ticks[1:]] == [1, 2]
+    assert [e["args"]["ready_inputs"] for e in ticks[1:]] == [1, 2]
     assert ticks[0]["tid"] != ticks[1]["tid"] == ticks[2]["tid"]
     write, wait = (e for e in events if e["cat"] == "percounter_dmb")
     assert (write["tid"], write["ts"], write["dur"]) == (ticks[0]["tid"], 8, 2)
     assert (wait["tid"], wait["ts"], wait["dur"]) == (ticks[1]["tid"], 6, 6)
     assert write["name"].endswith("Issue MTE3 DMB write → 8" if mte3 else "Write DMB → 8")
     assert write["args"]["transport"] == ("MTE3" if mte3 else "Scalar")
-    assert wait["args"]["observed_tokens"] == wait["args"]["join_threshold"] == 2
-    partial = {**capture, "records": [r for r in capture["records"] if r.get("count") != 2]}
+    assert wait["args"]["observed_tokens"] == wait["args"]["input_count"] == 2
+    partial = {**capture, "records": [r for r in capture["records"] if r.get("ready_inputs") != 2]}
     assert not any("Wait on local DMB" in e["name"] for e in scheduler_view.trace_events(partial, 3, str))
     with pytest.raises(ValueError, match="completion count"):
         scheduler_view.parse_capture({**section, "records": [{**receiver, "token": 2}]})
-    with pytest.raises(ValueError, match="join threshold"):
+    with pytest.raises(ValueError, match="input count"):
         scheduler_view.parse_capture(
-            {**section, "records": [{**receiver, "kind": "peer_dmb_wait_begin", "join_threshold": 0}]}
+            {**section, "records": [{**receiver, "kind": "peer_dmb_wait_begin", "input_count": 0}]}
         )
 
 
@@ -224,7 +224,7 @@ def test_dmb_register_observation_precedes_completion_check_on_receiver_lane():
     records = [
         dict(identity, kind="peer_dmb_mov_at_entry", cycles=12, token=7, sequence=0),
         dict(identity, kind="peer_dmb_mov_changed", cycles=25, token=10, sequence=13, previous_poll_cycles=22),
-        dict(identity, kind="peer_dmb_observed", cycles=38, token=10, count=2),
+        dict(identity, kind="peer_dmb_observed", cycles=38, token=10, ready_inputs=2),
     ]
     section = dict(
         records=records,
@@ -249,9 +249,9 @@ def test_dmb_register_observation_precedes_completion_check_on_receiver_lane():
 def test_periodic_count_releases_wait_without_a_new_dmb_token():
     row = dict(run_epoch=1, task_id=3, worker_id=0, block_index=0, block_count=1, cluster_index=0, cluster_lane=0)
     records = [
-        dict(row, kind="peer_dmb_wait_begin", cycles=1, join_threshold=2),
-        dict(row, kind="peer_dmb_initial_proof", cycles=12, token=9, count=1),
-        dict(row, kind="peer_dmb_periodic_ready", cycles=336, cycles_since_last_check=310, count=2),
+        dict(row, kind="peer_dmb_wait_begin", cycles=1, input_count=2),
+        dict(row, kind="peer_dmb_initial_proof", cycles=12, token=9, ready_inputs=1),
+        dict(row, kind="peer_dmb_periodic_ready", cycles=336, cycles_since_last_check=310, ready_inputs=2),
     ]
     section = dict(
         records=records,
@@ -266,7 +266,7 @@ def test_periodic_count_releases_wait_without_a_new_dmb_token():
     (wait,) = [e for e in events if e["cat"] == "percounter_dmb" and e["ph"] == "X"]
     assert (wait["ts"], wait["dur"]) == (1, 335)
     assert wait["args"]["observed_tokens"] == 0
-    assert wait["args"]["join_threshold"] == wait["args"]["count"] == 2
+    assert wait["args"]["input_count"] == wait["args"]["ready_inputs"] == 2
     assert wait["args"]["cycles_since_last_check"] == 310
     assert "token" not in wait["args"]
     assert any(e["ph"] == "i" and e["args"].get("kind") == "peer_dmb_periodic_ready" for e in events)

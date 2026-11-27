@@ -35,11 +35,9 @@ std::vector<TaskInput> cube_tasks(const std::vector<std::vector<int32_t>> &fanin
     return tasks;
 }
 
-TEST(CalendarPhases, PeerDiamondUsesCubeCompletionForFanoutAndVectorNotificationsForJoin) {
+TEST(CalendarPhases, PeerDiamondPreservesBothOriginalJoinWaits) {
     const std::vector<std::vector<int32_t>> fanins{{}, {0}, {0}, {1, 2}};
     auto tasks = cube_tasks(fanins);
-    for (auto &task : tasks)
-        task.known_synchronous = true;
     for (const int id : {1, 2}) {
         tasks[id].core_type_index = 1;
         tasks[id].active_mask = 2;
@@ -53,14 +51,14 @@ TEST(CalendarPhases, PeerDiamondUsesCubeCompletionForFanoutAndVectorNotification
     RangeCalendarImage image;
     ASSERT_TRUE(build_range_calendar(inputs, {}, tasks.size(), clusters, &image));
     ASSERT_EQ(image.peer_single_waits, 0U);
-    ASSERT_EQ(image.peer_counter_waits, 2U);
     ASSERT_EQ(image.peer_double_waits, 1U);
     ASSERT_NE(image.peer_endpoints_offset, 0U);
-    ASSERT_EQ(image.fused_fanins.size(), 1U);
+    EXPECT_TRUE(image.fused_fanins.empty());
+
     struct Tables {
         PercounterControl control{};
         std::array<PercounterCounter, 4> counters{};
-    } tables;
+    } tables, without_hints;
     PercounterLayout layout{};
     layout.counters_offset = offsetof(Tables, counters);
     layout.task_count = 4;
@@ -68,36 +66,67 @@ TEST(CalendarPhases, PeerDiamondUsesCubeCompletionForFanoutAndVectorNotification
     for (size_t i = 0; i < slots.size(); ++i)
         slots[i] = 0x1000 + i * 32;
     ASSERT_TRUE(bind_range_calendar(image, 0, layout, &tables, slots));
-    auto extra = [&](size_t id) {
-        return image.load<CalendarPeerExtra>(image.extras[id].offset);
+
+    RangeCalendarImage baseline;
+    ASSERT_TRUE(build_range_calendar(inputs, {}, tasks.size(), clusters, &baseline, false));
+    EXPECT_EQ(baseline.peer_endpoints_offset, 0U);
+    ASSERT_EQ(baseline.load<CalendarRangeHeader>(0).notify_slots_count, slots.size());
+    ASSERT_TRUE(bind_range_calendar(baseline, 0, layout, &without_hints, slots));
+
+    const auto join = image.load<CalendarPeerExtra>(image.extras[3].offset);
+    ASSERT_EQ(join.input_count, 2U);
+    const auto bound_waits = [](const RangeCalendarImage &bound, uint32_t task) {
+        const auto header = bound.load<CalendarRangeHeader>(0);
+        const auto range = bound.load<CalendarRange>(header.range_offset);
+        const auto dispatch = bound.load<CalendarDispatch>(bound.dispatches[task].offset);
+        return range.binding_offset + dispatch.waits_offset;
     };
-    const auto join = extra(3);
-    ASSERT_EQ(join.input_count, 2);
-    ASSERT_EQ(join.join_target, 2U);
-    ASSERT_NE(join.join_read, 0U);
-    for (size_t id : {1U, 2U}) {
-        EXPECT_EQ(tables.counters[id].completion_notify_address, join.join_read);
-        const auto producer = extra(id);
-        ASSERT_EQ(producer.send_count, 1);
-        EXPECT_EQ(producer.input_count, 0);
-        const auto send = image.load<CalendarPeerSend>(producer.sends_offset);
-        EXPECT_EQ(send.ordinal, id - 1);
-        EXPECT_EQ(send.join_add, 0U);  // The standard DONE already contributes.
+    for (uint32_t id = 1; id <= 2; ++id) {
+        EXPECT_EQ(tables.counters[id].completion_notify_address, without_hints.counters[id].completion_notify_address);
+        const auto producer = image.load<CalendarPeerExtra>(image.extras[id].offset);
+        ASSERT_EQ(producer.send_count, 1U);
+        EXPECT_EQ(image.load<CalendarPeerSend>(producer.sends_offset).ordinal, id - 1);
+        const uint32_t offset = (id - 1) * sizeof(CalendarWait);
+        const auto wait = image.load<CalendarWait>(bound_waits(image, 3) + offset);
+        const auto original = baseline.load<CalendarWait>(bound_waits(baseline, 3) + offset);
+        EXPECT_EQ(wait.read_cmd, original.read_cmd);
+        EXPECT_EQ(wait.target, original.target);
+        EXPECT_EQ(wait.read_cmd & CALENDAR_WAIT_TAG_MASK, CALENDAR_WAIT_DEFER);
     }
+}
 
-    // B and C observe A's original DONE threshold; the sink shares that counter.
-    EXPECT_EQ(tables.counters[0].completion_notify_address, tables.counters[3].completion_notify_address);
-    EXPECT_EQ(tables.counters[0].completion_notify_target, 1U);
-    EXPECT_EQ(tables.counters[3].completion_notify_target, 2U);
-
-    // Rebuilding the same placement with an undeclared branch must drop its shared join.
-    phases[0].tasks[1].known_synchronous = false;
-    ASSERT_TRUE(build_range_calendar(inputs, {}, tasks.size(), clusters, &image));
-    EXPECT_EQ(image.peer_single_waits, 0U);
-    EXPECT_EQ(image.peer_counter_waits, 1U);
-    EXPECT_EQ(image.peer_double_waits, 0U);
-    EXPECT_EQ(image.peer_endpoints_offset, 0U);
-    EXPECT_TRUE(image.fused_fanins.empty());
+TEST(CalendarPhases, CubeFanoutKeepsPacedPollingWithoutDmbEndpoints) {
+    constexpr uint32_t clusters = 2;
+    const std::vector<std::vector<int32_t>> fanins{{}, {0}, {0}};
+    auto tasks = cube_tasks(fanins);
+    calendar_detail::PlacementState placement;
+    placement.workers.resize(clusters * PLATFORM_CORES_PER_BLOCKDIM);
+    placement.workers[0].push_back({{percounter_order_entry(0, 0, 1), CALENDAR_NO_JOIN, 0}, 0});
+    for (uint32_t task = 1; task <= 2; ++task) {
+        tasks[task].active_mask = 2;
+        tasks[task].core_type_index = 1;
+        placement.workers[clusters + (task - 1) * 2].push_back(
+            {{percounter_order_entry(task, 0, 1), CALENDAR_NO_JOIN, 0}, task}
+        );
+    }
+    std::vector<CalendarPhase> phases;
+    ASSERT_TRUE(plan_calendar_phases(tasks, {}, &phases));
+    auto plan = std::make_shared<CalendarPlan>();
+    ASSERT_TRUE(calendar_detail::pack(placement, phases[0].tasks, tasks.size(), 0, plan.get()));
+    for (const bool hints : {false, true}) {
+        RangeCalendarImage image;
+        ASSERT_TRUE(build_range_calendar({{&phases[0], plan, false}}, {}, tasks.size(), clusters, &image, hints));
+        const auto header = image.load<CalendarRangeHeader>(0);
+        EXPECT_EQ(header.peer_endpoints_offset, 0U);
+        for (const uint32_t worker : {clusters, clusters + 2}) {
+            const auto range_index = image.load<uint32_t>(header.worker_index_offset + worker * sizeof(uint32_t));
+            const auto range = image.load<CalendarRange>(header.range_offset + range_index * sizeof(CalendarRange));
+            ASSERT_EQ(range.row_count, 1U);
+            const auto row = image.load<CalendarExecutionRow>(range.rows_offset);
+            EXPECT_EQ(row.wait_count, 1U);
+            EXPECT_NE(row.flags & CALENDAR_EXEC_PACED_WAIT, 0U);
+        }
+    }
 }
 
 TEST(CalendarPhases, TwoCubePublishersKeepIndividualCompletionWaits) {
@@ -107,8 +136,6 @@ TEST(CalendarPhases, TwoCubePublishersKeepIndividualCompletionWaits) {
         std::vector<std::vector<int32_t>> fanins{{}, {}, {0, 1}};
         if (other_consumer) fanins.push_back({0});
         auto tasks = cube_tasks(fanins);
-        for (auto &task : tasks)
-            task.known_synchronous = true;
         std::vector<CalendarPhase> phases;
         ASSERT_TRUE(plan_calendar_phases(tasks, {}, &phases));
         // Each task occupies a different cube, so the join must wait for both producers.
@@ -152,11 +179,9 @@ TEST(CalendarPhases, TwoCubePublishersKeepIndividualCompletionWaits) {
     }
 }
 
-TEST(CalendarPhases, SinglePeerConsumersKeepTheSharedPredecessorThresholdWhenTheirOwnDoneIsFused) {
+TEST(CalendarPhases, SinglePeerConsumersKeepTheSharedPredecessorThreshold) {
     const std::vector<std::vector<int32_t>> fanins{{}, {0}, {1}, {1}, {2, 3}};
     auto tasks = cube_tasks(fanins);
-    for (auto &task : tasks)
-        task.known_synchronous = true;
     for (const auto id : {1, 2}) {
         tasks[id].active_mask = 2;
         tasks[id].core_type_index = 1;
@@ -169,7 +194,6 @@ TEST(CalendarPhases, SinglePeerConsumersKeepTheSharedPredecessorThresholdWhenThe
     RangeCalendarImage image;
     ASSERT_TRUE(build_range_calendar({{&phases[0], plan, false}}, {}, tasks.size(), clusters, &image));
     ASSERT_EQ(image.peer_single_waits, 2U);
-    ASSERT_EQ(image.fused_fanins.size(), 1U);
     struct Tables {
         PercounterControl control{};
         std::array<PercounterCounter, 5> counters{};
@@ -177,9 +201,11 @@ TEST(CalendarPhases, SinglePeerConsumersKeepTheSharedPredecessorThresholdWhenThe
     PercounterLayout layout{};
     layout.task_count = tasks.size();
     layout.counters_offset = offsetof(Tables, counters);
-    ASSERT_TRUE(bind_range_calendar(image, 0, layout, &tables, {0x1000, 0x1020}));
-
     const auto header = image.load<CalendarRangeHeader>(0);
+    std::vector<uint64_t> slots(header.notify_slots_count);
+    for (size_t i = 0; i < slots.size(); ++i)
+        slots[i] = 0x1000 + i * 32;
+    ASSERT_TRUE(bind_range_calendar(image, 0, layout, &tables, slots));
     const auto range = image.load<CalendarRange>(header.range_offset);
     for (const uint32_t consumer : {2U, 3U}) {
         ASSERT_EQ(image.dispatches[consumer].global_task, consumer);
@@ -187,7 +213,6 @@ TEST(CalendarPhases, SinglePeerConsumersKeepTheSharedPredecessorThresholdWhenThe
         const auto wait = image.load<CalendarWait>(range.binding_offset + dispatch.waits_offset);
         EXPECT_EQ(wait.read_cmd, 0x1000U | CALENDAR_WAIT_DEFER);
         EXPECT_EQ(wait.target, (uint64_t{1} << 32) | (uint64_t{25} << 24) | 2);
-        EXPECT_EQ(tables.counters[consumer].completion_notify_address, 0x1020U);
     }
 }
 
@@ -196,7 +221,6 @@ TEST(CalendarPhases, SpmdNotificationsPreserveIndependentStartAndOrdinaryInputWa
     auto tasks = cube_tasks(fanins);
     constexpr uint32_t clusters = 4;
     for (auto &task : tasks) {
-        task.known_synchronous = true;
         task.block_num = clusters;
     }
     for (const uint32_t id : {0U, 2U}) {
@@ -212,16 +236,25 @@ TEST(CalendarPhases, SpmdNotificationsPreserveIndependentStartAndOrdinaryInputWa
     RangeCalendarImage image;
     ASSERT_TRUE(build_range_calendar(inputs, {}, tasks.size(), clusters, &image));
     EXPECT_EQ(image.peer_spmd_edges, 1U);
-    EXPECT_EQ(image.peer_counter_waits, 1U);
     const auto sender = image.load<CalendarSpmdPeerExtra>(image.extras[0].offset);
     EXPECT_GT(sender.target_count, 1U);
     EXPECT_NE(sender.fanout_offset, 0U);
     EXPECT_EQ(sender.target_count, image.peer_spmd_wait_rows);
-
-    phases[0].tasks[1].known_synchronous = false;
-    ASSERT_TRUE(build_range_calendar(inputs, {}, tasks.size(), clusters, &image));
-    EXPECT_EQ(image.peer_spmd_edges, 0U);
-    EXPECT_EQ(image.peer_endpoints_offset, 0U);
+    const auto header = image.load<CalendarRangeHeader>(0);
+    uint32_t sends = 0, waits = 0;
+    for (uint32_t i = 0; i < header.range_count; ++i) {
+        const auto range = image.load<CalendarRange>(header.range_offset + i * sizeof(CalendarRange));
+        for (uint32_t row = 0; row < range.row_count; ++row) {
+            const auto exec = image.load<CalendarExecutionRow>(range.rows_offset + row * sizeof(CalendarExecutionRow));
+            if ((exec.flags & CALENDAR_EXEC_SPMD_SEND) != 0) ++sends;
+            if ((exec.flags & CALENDAR_EXEC_SPMD_WAIT) != 0) {
+                EXPECT_EQ(exec.wait_count, 1);
+                ++waits;
+            }
+        }
+    }
+    EXPECT_EQ(sends, clusters);
+    EXPECT_EQ(waits, sender.target_count);
 }
 
 TEST(CalendarPhases, SharedFanoutRebindsAddressesAndHandlesDifferentInitialTokens) {

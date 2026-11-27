@@ -106,17 +106,6 @@ topology tables from a full 40-layer capture, place its `deps.json` and matching
 The exporter recognizes the fused attention output and the following MoE boundary and
 checks all 40 pairs before refreshing only the selected replay regions. Native MoE remains a native descriptor.
 
-The `pypto_lib_latest` kernel manifest records which generated kernels complete
-their outputs when they return. These are the same vendored sources and
-declarations as revision `279c88201`. The communication kernel
-`combine_wait` can defer completion. In `kernels.txt` an optional trailing
-`on_return` marks a trusted synchronous child. The packer binds this
-declaration to the child's instructions and preserves it when replacing the
-Host orchestration. A bare row has no completion proof. On A5 hardware the
-PGO planner uses these declarations to select eligible peer notification edges
-automatically. Use the L2 trace to see which AIV kernels published DMB tokens
-and which consumers passed their completion check.
-
 ## Native MoE Host controls
 
 The selected `pypto_lib_latest/moe` inherits

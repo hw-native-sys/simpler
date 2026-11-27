@@ -2901,7 +2901,6 @@ protected:
         // and offsets, so every cid sharing this entry has exactly this table.
         std::vector<uint64_t> object_table;
         std::vector<CoreInputCacheProof> input_cache_proofs;
-        std::vector<uint8_t> synchronous_kernels;
         uint64_t object_table_dev{0};
         // The same domain resolved to kernel-entry addresses, present only on a
         // runtime whose device scheduler dispatches from them.

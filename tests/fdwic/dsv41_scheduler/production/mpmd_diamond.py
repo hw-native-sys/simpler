@@ -90,7 +90,7 @@ def build(output, runner, runtime, pto_isa, slow_steps=4096):
     manifest = ["5 1 3 3 3 3", "4"]
     for task, (name, _, _, dirs) in enumerate(STAGES):
         signature = " ".join(map(str, dirs))
-        manifest.append(f'{task} {len(dirs)} {signature} "{name}.bin" on_return')
+        manifest.append(f'{task} {len(dirs)} {signature} "{name}.bin"')
     (output / "kernels.txt").write_text("\n".join(manifest) + "\n")
     subprocess.run(
         [runner, "--assemble-orchestration", "kernels.txt", "orchestration.so", "callable.bin"], cwd=output, check=True

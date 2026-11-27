@@ -95,14 +95,14 @@ def _validate_peer_event(row):
             raise ValueError("invalid percounter DMB command count")
         return
     if row["kind"] == "peer_dmb_wait_begin":
-        threshold = row.get("join_threshold")
-        if type(threshold) is not int or not 0 < threshold < 2**24:
-            raise ValueError("invalid percounter DMB join threshold")
+        threshold = row.get("input_count")
+        if type(threshold) is not int or not 1 <= threshold <= 2:
+            raise ValueError("invalid percounter DMB input count")
         return
     if row["kind"] == "peer_dmb_periodic_ready":
         interval = row.get("cycles_since_last_check")
-        count = row.get("count")
-        if type(interval) is not int or interval <= 0 or type(count) is not int or not 0 < count < 2**24:
+        count = row.get("ready_inputs")
+        if type(interval) is not int or interval <= 0 or type(count) is not int or not 1 <= count <= 2:
             raise ValueError("invalid periodic DMB completion check")
         return
     token = row.get("token")
@@ -122,7 +122,7 @@ def _validate_peer_event(row):
         target = row.get("target_worker")
         if type(target) is not int or target < 0:
             raise ValueError("invalid percounter DMB target worker")
-    elif type(row.get("count")) is not int or not 0 <= row["count"] < 2**24:
+    elif type(row.get("ready_inputs")) is not int or not 0 <= row["ready_inputs"] <= 2:
         raise ValueError("invalid percounter DMB completion count")
 
 
@@ -369,16 +369,16 @@ def _dmb_spans(rows, waiting_tasks):
     start = next((r for r in rows if r["kind"] == "peer_dmb_wait_begin"), None)
     if start is None:
         return
-    threshold = start["join_threshold"]
+    threshold = start["input_count"]
     checks = (
         r for r in rows if r["kind"] in ("peer_dmb_initial_proof", "peer_dmb_observed", "peer_dmb_periodic_ready")
     )
     tokens = 0
     for r in sorted(checks, key=lambda row: row["cycles"]):
         tokens += r["kind"] == "peer_dmb_observed"
-        if r["cycles"] < start["cycles"] or r["count"] < threshold:
+        if r["cycles"] < start["cycles"] or r["ready_inputs"] < threshold:
             continue
-        args = {"observed_tokens": tokens, "join_threshold": threshold, "count": r["count"]}
+        args = {"observed_tokens": tokens, "input_count": threshold, "ready_inputs": r["ready_inputs"]}
         if "token" in r:
             args["token"] = r["token"]
         label = "Wait on local DMB + CntNotify"

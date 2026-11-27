@@ -166,11 +166,6 @@ def build(flavor, output, tools, pto, jobs, runtime):
 
     def compile_kernel(kernel):
         source = sources / kernel["source"]
-        completes_on_return = kernel.get("completes_on_return", False)
-        if not isinstance(completes_on_return, bool):
-            raise ValueError(f"Invalid completion declaration for {kernel['name']}")
-        if completes_on_return and hashlib.sha256(source.read_bytes()).hexdigest() != kernel["source_sha256"]:
-            raise ValueError(f"Update the completion declaration for changed source {kernel['name']}")
         extra = common_includes + [str(sources / item) for item in kernel["include_dirs"]]
         includes = [
             str(pto / "include"),
@@ -233,7 +228,6 @@ def build(flavor, output, tools, pto, jobs, runtime):
             "core_type": kernel["core_type"],
             "file": target.name,
             "registration_file": registration_file.name,
-            "completes_on_return": completes_on_return,
             "cache_key": key,
             "cache_hit": not compiled,
         }
@@ -263,7 +257,6 @@ def build(flavor, output, tools, pto, jobs, runtime):
         rows.append(
             f"{kernel['func_id']} {len(signature)} {' '.join(map(str, signature))} "
             + json.dumps(str(output / record["registration_file"]))
-            + (" on_return" if record["completes_on_return"] else "")
         )
     signature = manifest["entry_signature"]
     (output / "kernels.txt").write_text(
