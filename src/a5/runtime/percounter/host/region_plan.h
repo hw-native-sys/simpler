@@ -246,7 +246,6 @@ struct TaskInput {
     int32_t graph_invocation{-1};
     // Actual kernels; a dependency-only block uses no kernel but still targets AIV.
     uint32_t active_mask{0};
-    bool known_synchronous{false};  // Positive completion evidence for this kernel.
 };
 
 // Fold only top-level joins with no payload, predicate or sync-start.

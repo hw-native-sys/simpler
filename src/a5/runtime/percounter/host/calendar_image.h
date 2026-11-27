@@ -81,18 +81,10 @@ struct RangeCalendarImage {
     std::vector<uint32_t> sample_offsets;
     std::vector<uint32_t> graph_shells;
     std::vector<FusedFanin> fused_fanins;
-    // Offsets of peer join addresses that bind patches with a CntNotify lease.
-    struct PeerCounterPatch {
-        uint32_t offset;
-        uint32_t slot;
-        bool add;
-    };
-    std::vector<PeerCounterPatch> peer_counter_patches;
     uint32_t peer_endpoints_offset{0};
     uint32_t peer_fanouts_offset{0};
     uint32_t peer_single_waits{0};
     uint32_t peer_double_waits{0};
-    uint32_t peer_counter_waits{0};
     uint32_t peer_spmd_edges{0};
     uint32_t peer_spmd_wait_rows{0};
     CalendarCompletionPlan completion;
@@ -303,12 +295,9 @@ struct PeerTask {
     struct Send {
         uint32_t worker;
         uint32_t ordinal;
-        uint32_t add_slot;
     };
     std::vector<Send> sends;
-    uint32_t join_slot{UINT32_MAX};
     uint16_t input_count{0};
-    bool requires_completion_on_return{false};
     std::vector<uint32_t> spmd_targets;
     uint32_t token_begin{0};
     uint32_t fanout_offset{0};
@@ -341,8 +330,8 @@ inline bool prepare_peer_fanouts(RangeCalendarImage &image, std::vector<PeerTask
 
 inline void plan_spmd_notifications(
     const CalendarPhase &phase, const CalendarWaitPlan &waits, const Template &tmpl,
-    const std::vector<bool> &fused_producers, std::vector<CalendarPeerEndpoint> &endpoints,
-    std::vector<PeerTask> &peers, RangeCalendarImage &image
+    std::vector<CalendarPeerEndpoint> &endpoints, std::vector<PeerTask> &peers, RangeCalendarImage &image,
+    bool enable_peer_hints
 ) {
     // A wait must already carry a whole-task completion proof. Keep the original
     // counter and the MIX/sync_start rendezvous; only its polling mechanism changes.
@@ -350,8 +339,8 @@ inline void plan_spmd_notifications(
     std::vector<int32_t> producer_for(tasks, -1);
     const auto available = [&](size_t task) {
         const auto &shape = phase.tasks[task];
-        return shape.known_synchronous && shape.active_mask != 0 && !shape.has_predicate && !fused_producers[task] &&
-               peers[task].input_count == 0 && peers[task].sends.empty();
+        return shape.active_mask != 0 && !shape.has_predicate && peers[task].input_count == 0 &&
+               peers[task].sends.empty();
     };
     for (size_t task = 0; task < tasks; ++task) {
         const auto &inputs = waits.task_fanins[task];
@@ -359,7 +348,7 @@ inline void plan_spmd_notifications(
             inputs[0] != phase.fanins[task][0] || waits.summarized_fanins[task])
             continue;
         const uint32_t source = inputs[0];
-        if (!available(source)) continue;
+        if (!available(source) || (phase.tasks[source].active_mask & 6U) == 0) continue;
         const auto &from = phase.tasks[source];
         const auto &to = phase.tasks[task];
         if (from.block_num == 1 && from.subtask_count == 1 && to.block_num == 1 && to.subtask_count == 1) continue;
@@ -380,24 +369,23 @@ inline void plan_spmd_notifications(
             if (row.wait_count != 1 ||
                 (row.flags & (CALENDAR_EXEC_FANIN | CALENDAR_EXEC_INPUT_OWNER | CALENDAR_EXEC_INPUT_FOLLOWER)))
                 continue;
-            if (phase.tasks[source].active_mask == 1U) {
-                // A cube-only producer leaves the original DONE counter as the sole proof.
-                if (!selected[task]) ++image.peer_counter_waits;
-            } else {
-                auto &producer = peers[source];
-                if (producer.spmd_targets.empty()) {
-                    const uint64_t width = uint64_t{3} * phase.tasks[source].block_num;
-                    if (next_token + width - 1 > UINT32_MAX) continue;
-                    producer.token_begin = static_cast<uint32_t>(next_token);
-                    next_token += width;
-                }
-                if (producer.spmd_targets.empty() || producer.spmd_targets.back() != worker)
-                    producer.spmd_targets.push_back(static_cast<uint32_t>(worker));
-                endpoints[worker].input_count = CALENDAR_PEER_SPMD_ENDPOINT;
-                ++image.peer_spmd_wait_rows;
-                if (!selected[task]) ++image.peer_spmd_edges;
+            if (!enable_peer_hints) {
+                row.flags |= CALENDAR_EXEC_PACED_WAIT;
+                image.store(offset, row);
+                continue;
             }
-            peers[source].requires_completion_on_return = true;
+            auto &producer = peers[source];
+            if (producer.spmd_targets.empty()) {
+                const uint64_t width = uint64_t{PLATFORM_CORES_PER_BLOCKDIM} * phase.tasks[source].block_num;
+                if (next_token + width - 1 > UINT32_MAX) continue;
+                producer.token_begin = static_cast<uint32_t>(next_token);
+                next_token += width;
+            }
+            if (producer.spmd_targets.empty() || producer.spmd_targets.back() != worker)
+                producer.spmd_targets.push_back(static_cast<uint32_t>(worker));
+            endpoints[worker].input_count = CALENDAR_PEER_SPMD_ENDPOINT;
+            ++image.peer_spmd_wait_rows;
+            if (!selected[task]) ++image.peer_spmd_edges;
             selected[task] = true;
             row.flags |= CALENDAR_EXEC_SPMD_WAIT;
             image.store(offset, row);
@@ -407,28 +395,17 @@ inline void plan_spmd_notifications(
 
 inline std::vector<PeerTask> plan_peer_notifications(
     const CalendarPhase &phase, const CalendarWaitPlan &waits, const Template &tmpl, RangeCalendarImage &image,
-    std::vector<bool> &fused_producers
+    bool enable_peer_hints
 ) {
     const size_t tasks = phase.tasks.size();
     const size_t workers = tmpl.indexes.size() - 1;
-    if (std::none_of(phase.tasks.begin(), phase.tasks.end(), [](const TaskInput &task) {
-            return task.known_synchronous;
-        }))
-        return {};
-    fused_producers.resize(tasks);
-    std::vector<uint32_t> owner(tasks, UINT32_MAX), row(tasks), uses(tasks);
-    for (size_t i = 0; i < tasks; ++i) {
-        for (const int32_t producer : phase.fanins[i]) {
-            if (producer < 0 || static_cast<size_t>(producer) >= i) return {};
-            ++uses[producer];
-        }
-    }
+    std::vector<uint32_t> owner(tasks, UINT32_MAX), row(tasks);
     for (uint32_t worker = 0; worker < workers; ++worker) {
         for (uint32_t i = tmpl.indexes[worker]; i < tmpl.indexes[worker + 1]; ++i) {
             const auto id = static_cast<size_t>(percounter_order_task_id(tmpl.rows[i].entry));
             const auto &task = phase.tasks[id];
-            if (!task.known_synchronous || task.is_mix || task.sync_start || task.has_predicate ||
-                task.block_num != 1 || task.subtask_count != 1 || task.active_mask == 0)
+            if (task.is_mix || task.sync_start || task.has_predicate || task.block_num != 1 ||
+                task.subtask_count != 1 || task.active_mask == 0)
                 continue;
             owner[id] = worker;
             row[id] = i;
@@ -444,70 +421,40 @@ inline std::vector<PeerTask> plan_peer_notifications(
             waits.row_input_owners[row[id]] != CALENDAR_NO_INPUT_OWNER)
             continue;
         if (std::any_of(inputs.begin(), inputs.end(), [&](uint32_t producer) {
-                return producer >= id || owner[producer] == UINT32_MAX || owner[producer] == worker ||
-                       fused_producers[producer];
+                return producer >= id || owner[producer] == UINT32_MAX || owner[producer] == worker;
             }))
             continue;
-        const auto cube_only = [&](uint32_t producer) {
-            return phase.tasks[producer].active_mask == 1U;
+        const auto has_vector_sender = [&](uint32_t producer) {
+            return (phase.tasks[producer].active_mask & 6U) != 0;
         };
-        if (std::all_of(inputs.begin(), inputs.end(), cube_only)) {
-            // With no DMB publisher a join keeps its original input waits and leases.
-            if (inputs.size() != 1) continue;
+        const bool has_sender = std::any_of(inputs.begin(), inputs.end(), has_vector_sender);
+        if (!has_sender && inputs.size() != 1) continue;
+        if (!has_sender || !enable_peer_hints) {
             const uint32_t offset = tmpl.rows_offset + row[id] * sizeof(CalendarExecutionRow);
-            result[inputs.front()].requires_completion_on_return = true;
             auto execution = image.load<CalendarExecutionRow>(offset);
-            execution.flags |= CALENDAR_EXEC_SPMD_WAIT;
+            execution.flags |= CALENDAR_EXEC_PACED_WAIT;
             image.store(offset, execution);
-            ++image.peer_counter_waits;
-            continue;
         }
-        const bool dual = inputs.size() == 2;
-        if (dual && inputs.front() == inputs.back()) continue;
-        auto &target = result[id];
-        uint32_t extra_add_slot = UINT32_MAX;
-        if (dual) {
-            const bool exclusive = uses[inputs[0]] == 1 && uses[inputs[1]] == 1;
-            target.join_slot = image.fanin_slot_count++;
-            if (exclusive) {
-                // No independent DONE observer remains for either producer. Mapping their
-                // ordinary DONE to this slot contributes exactly once on each physical return.
-                RangeCalendarImage::FusedFanin group{};
-                group.producer_count = group.credits = 2;
-                group.slot = target.join_slot;
-                for (size_t i = 0; i < inputs.size(); ++i) {
-                    group.producers[i] = phase.task_ids[inputs[i]];
-                    fused_producers[inputs[i]] = true;
-                }
-                image.fused_fanins.push_back(group);
-            } else {
-                // Other consumers still need the original individual DONE proofs.
-                extra_add_slot = target.join_slot;
-            }
-            ++image.peer_double_waits;
-        } else {
-            ++image.peer_single_waits;
+        if (!has_sender) continue;
+        result[id].input_count = static_cast<uint16_t>(inputs.size());
+        endpoints[worker].input_count = result[id].input_count;
+        if (enable_peer_hints) {
+            if (inputs.size() == 2) ++image.peer_double_waits;
+            else ++image.peer_single_waits;
         }
-        target.input_count = static_cast<uint16_t>(inputs.size());
-        endpoints[worker].input_count = target.input_count;
-        for (uint32_t i = 0; i < inputs.size(); ++i) {
-            result[inputs[i]].requires_completion_on_return = true;
-            // For a separate join an AIC still owes its extra credit, even without a wakeup.
-            if (cube_only(inputs[i]) && extra_add_slot == UINT32_MAX) continue;
-            result[inputs[i]].sends.push_back({worker, i, extra_add_slot});
-        }
+        for (uint32_t i = 0; i < inputs.size(); ++i)
+            if (has_vector_sender(inputs[i])) result[inputs[i]].sends.push_back({worker, i});
     }
-    plan_spmd_notifications(phase, waits, tmpl, fused_producers, endpoints, result, image);
-    // The completion contract applies to every participating row, including a
-    // cube that contributes only its credit. Only vector rows publish DMB.
+    plan_spmd_notifications(phase, waits, tmpl, endpoints, result, image, enable_peer_hints);
+    if (!enable_peer_hints) return {};
+
     const uint32_t first_vector_row = tmpl.indexes[workers / PLATFORM_CORES_PER_BLOCKDIM];
-    for (size_t i = 0; i < tmpl.rows.size(); ++i) {
-        const auto &source = result[percounter_order_task_id(tmpl.rows[i].entry)];
-        if (!source.requires_completion_on_return) continue;
+    for (size_t i = first_vector_row; i < tmpl.rows.size(); ++i) {
+        const auto task = percounter_order_task_id(tmpl.rows[i].entry);
+        if (result[task].spmd_targets.empty()) continue;
         const uint32_t offset = tmpl.rows_offset + i * sizeof(CalendarExecutionRow);
         auto execution = image.load<CalendarExecutionRow>(offset);
-        execution.flags |= CALENDAR_EXEC_PEER_PRODUCER;
-        if (i >= first_vector_row && !source.spmd_targets.empty()) execution.flags |= CALENDAR_EXEC_SPMD_SEND;
+        execution.flags |= CALENDAR_EXEC_SPMD_SEND;
         image.store(offset, execution);
     }
     if (image.peer_single_waits != 0 || image.peer_double_waits != 0 || image.peer_spmd_edges != 0) {
@@ -539,10 +486,12 @@ emit_execution_extra(RangeCalendarImage &image, const CalendarExecutionExtra &ex
                         execution, {}, peer->spmd_targets.front(), count, peer->token_begin, peer->fanout_offset
                     }
         );
-        image.waits.push_back(
-            {static_cast<uint32_t>(offset + offsetof(CalendarSpmdPeerExtra, completion)),
-             RangeCalendarImage::WaitKind::COMPLETION, execution.task_id, 0}
-        );
+        if (count > 1) {
+            image.waits.push_back(
+                {static_cast<uint32_t>(offset + offsetof(CalendarSpmdPeerExtra, completion)),
+                 RangeCalendarImage::WaitKind::COMPLETION, execution.task_id, 0}
+            );
+        }
         return offset;
     }
     if (peer == nullptr || (peer->sends.empty() && peer->input_count == 0)) {
@@ -556,22 +505,11 @@ emit_execution_extra(RangeCalendarImage &image, const CalendarExecutionExtra &ex
     for (uint32_t i = 0; i < peer->sends.size(); ++i) {
         const auto &entry = peer->sends[i];
         const auto location = static_cast<uint32_t>(sends + i * sizeof(CalendarPeerSend));
-        image.store(location, CalendarPeerSend{0, entry.worker, entry.ordinal});
-        if (entry.add_slot != UINT32_MAX)
-            image.peer_counter_patches.push_back(
-                {static_cast<uint32_t>(location + offsetof(CalendarPeerSend, join_add)), entry.add_slot, true}
-            );
+        image.store(location, CalendarPeerSend{entry.worker, entry.ordinal});
     }
     image.store(
-        offset, CalendarPeerExtra{
-                    execution, sends, static_cast<uint16_t>(peer->sends.size()), peer->input_count, 0,
-                    peer->input_count == 2 ? 2U : 0U, 0
-                }
+        offset, CalendarPeerExtra{execution, sends, static_cast<uint16_t>(peer->sends.size()), peer->input_count}
     );
-    if (peer->input_count == 2)
-        image.peer_counter_patches.push_back(
-            {static_cast<uint32_t>(offset + offsetof(CalendarPeerExtra, join_read)), peer->join_slot, false}
-        );
     return offset;
 }
 
@@ -579,7 +517,7 @@ emit_execution_extra(RangeCalendarImage &image, const CalendarExecutionExtra &ex
 
 inline bool build_range_calendar(
     const std::vector<RangeCalendarInput> &inputs, const GraphPlanInput &graphs, uint32_t outer_count,
-    uint32_t clusters, RangeCalendarImage *out
+    uint32_t clusters, RangeCalendarImage *out, bool enable_peer_hints = true
 ) {
     using namespace range_calendar_detail;
     if (clusters == 0 || clusters > PLATFORM_MAX_BLOCKDIM || out == nullptr) return false;
@@ -621,7 +559,7 @@ inline bool build_range_calendar(
         std::vector<PeerTask> peer_tasks;
         if (inputs.size() == 1 && graphs.invocation_count == 0) {
             materialize_fused_fanins(phase, input.plan->waits, image, fused_consumers, fused_producers);
-            peer_tasks = plan_peer_notifications(phase, input.plan->waits, tmpl, image, fused_producers);
+            peer_tasks = plan_peer_notifications(phase, input.plan->waits, tmpl, image, enable_peer_hints);
             if (!prepare_peer_fanouts(image, peer_tasks)) return false;
             if ((image.peer_single_waits || image.peer_double_waits || image.peer_spmd_edges) &&
                 !image.peer_endpoints_offset)
@@ -686,10 +624,8 @@ inline bool build_range_calendar(
                 if (producer < 0 || static_cast<uint32_t>(producer) >= task) return false;
                 // No execution row reads the input bindings of an unobserved task.
                 if (!tmpl.polls_task_fanins[task] && !fused_producers.empty() && fused_producers[producer]) continue;
-                const bool peer_fused =
-                    !peer_tasks.empty() && peer_tasks[task].input_count == 2 && fused_producers[producer];
-                const auto kind = group != UINT32_MAX || peer_fused ? RangeCalendarImage::WaitKind::FUSED_PRODUCER :
-                                                                      RangeCalendarImage::WaitKind::COMPLETION;
+                const auto kind = group != UINT32_MAX ? RangeCalendarImage::WaitKind::FUSED_PRODUCER :
+                                                        RangeCalendarImage::WaitKind::COMPLETION;
                 image.waits.push_back(
                     {static_cast<uint32_t>(wait_offset + (i + fanin) * sizeof(CalendarWait)), kind,
                      physical_task(producer, phase, body_base), 0}
@@ -882,13 +818,6 @@ inline bool bind_range_calendar(
     }
     const size_t first_phase_slot = image.completion.slot_count;
     const size_t first_fanin_slot = first_phase_slot + image.phase_slot_count;
-    for (const auto &patch : image.peer_counter_patches) {
-        const size_t slot = first_fanin_slot + patch.slot;
-        if (slot >= notifications.size()) return false;
-        image.store(
-            patch.offset, patch.add ? a5_cnt_notify_increment_address(notifications[slot]) : notifications[slot]
-        );
-    }
     for (const auto &group : image.fused_fanins) {
         const size_t slot = first_fanin_slot + group.slot;
         if (slot >= notifications.size()) return false;

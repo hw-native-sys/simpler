@@ -19,7 +19,6 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <sstream>
 #include <stdexcept>
 #include <cstdlib>
 #include <string>
@@ -50,18 +49,6 @@ T read(std::istream &stream) {
     T value;
     if (!(stream >> value)) throw std::runtime_error("Incomplete native input manifest");
     return value;
-}
-
-// Read only this row so a bare kernel cannot consume the next kernel's fields.
-bool completion_on_return(std::istream &manifest) {
-    std::string row;
-    std::getline(manifest, row);
-    std::istringstream fields(row);
-    std::string declaration;
-    if (!(fields >> declaration)) return false;
-    fields >> std::ws;
-    if (declaration != "on_return" || !fields.eof()) throw std::runtime_error("Invalid kernel completion declaration");
-    return true;
 }
 
 // Host launch alignment only. Device dependencies and defer_wait remain owned
@@ -157,7 +144,7 @@ int run(int argc, char **argv) {
                 if (j) std::cout << ',';
                 std::cout << static_cast<int>(child.sig(j));
             }
-            std::cout << "],\"completes_on_return\":" << (child.completes_on_return() ? "true" : "false") << '}';
+            std::cout << "]}";
         }
         std::cout << "]}\n";
         return 0;
@@ -183,10 +170,10 @@ int run(int argc, char **argv) {
             const auto binary = read_binary(path);
             auto child =
                 make_callable<CORE_MAX_TENSOR_ARGS>(directions.data(), directions.size(), binary.data(), binary.size());
-            if (completion_on_return(manifest))
-                reinterpret_cast<CoreCallable *>(child.data())->declare_completion_on_return();
             children.push_back(std::move(child));
         }
+        manifest >> std::ws;
+        if (!manifest.eof()) throw std::runtime_error("Unexpected trailing fields in kernel manifest");
         const auto orchestration = read_binary(argv[3]);
         const auto packed = make_chip_callable(
             entry_signature.data(), entry_signature.size(), "aicpu_orchestration_entry", orchestration.data(),

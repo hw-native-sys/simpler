@@ -219,7 +219,7 @@ inline StateSelection select_percounter_state(
     const sm_layout::SegmentOffsets &device_segments, const void *uploaded_sm
 ) {
     if (total_tasks < 0) return StateSelection::FAILED;
-    const bool onboard_a5 = std::strcmp(get_platform(), "a5") == 0;
+    const bool enable_peer_hints = std::strcmp(get_platform(), "a5") == 0;
     const size_t task_count = static_cast<size_t>(total_tasks);
     std::vector<bool> inline_completed(task_count, false);
     for (int64_t id : inline_completed_task_ids)
@@ -282,15 +282,6 @@ inline StateSelection select_percounter_state(
             input.block_num = slot.logical_block_num;
             input.is_mix = placement == TaskPlacement::MIX;
             input.subtask_count = __builtin_popcount(active_mask);
-            if (onboard_a5 && !input.has_predicate && input.active_mask != 0) {
-                input.known_synchronous = true;
-                for (uint32_t mask = input.active_mask; mask; mask &= mask - 1) {
-                    if (!runtime->function_completes_on_return(task_metadata[t].kernel_ids[__builtin_ctz(mask)])) {
-                        input.known_synchronous = false;
-                        break;
-                    }
-                }
-            }
             if (input.active_mask != 0)
                 defer_rows += uint64_t{static_cast<uint32_t>(input.block_num)} * input.subtask_count;
             mix_task_count += input.is_mix;
@@ -442,7 +433,7 @@ inline StateSelection select_percounter_state(
             event.status = "MISS";
         }
         if (!build_range_calendar(
-                range_inputs, graph_plan, static_cast<uint32_t>(task_count), cluster_count, &calendar
+                range_inputs, graph_plan, static_cast<uint32_t>(task_count), cluster_count, &calendar, enable_peer_hints
             )) {
             LOG_ERROR("A5 calendar: could not plan execution ranges or completion counters");
             return StateSelection::FAILED;
@@ -583,9 +574,9 @@ inline StateSelection select_percounter_state(
             );
         }
         LOG_TIMING(
-            "A5 calendar: peer_single=%u peer_dual=%u peer_counter_only=%u peer_spmd_edges=%u peer_spmd_wait_rows=%u",
-            calendar.peer_single_waits, calendar.peer_double_waits, calendar.peer_counter_waits,
-            calendar.peer_spmd_edges, calendar.peer_spmd_wait_rows
+            "A5 calendar: peer_single=%u peer_dual=%u peer_spmd_edges=%u peer_spmd_wait_rows=%u",
+            calendar.peer_single_waits, calendar.peer_double_waits, calendar.peer_spmd_edges,
+            calendar.peer_spmd_wait_rows
         );
         std::array<size_t, CALENDAR_FUSED_FANIN_MAX_PRODUCERS + 1> fusion_counts{};
         for (const auto &group : calendar.fused_fanins)

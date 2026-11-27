@@ -87,9 +87,7 @@ def build_bundle(output: Path, runtime: str, runner: Path) -> Path:
 
     # Native runner wire format: seven tensor directions (IN then six INOUT),
     # two children with directions IN/INOUT.
-    (output / "kernels.txt").write_text(
-        '7 1 3 3 3 3 3 3\n2\n0 2 1 3 "aic.bin" on_return\n1 2 1 3 "aiv.bin" on_return\n'
-    )
+    (output / "kernels.txt").write_text('7 1 3 3 3 3 3 3\n2\n0 2 1 3 "aic.bin"\n1 2 1 3 "aiv.bin"\n')
     subprocess.run(
         [runner, "--assemble-orchestration", "kernels.txt", "orchestration.so", "callable.bin"],
         cwd=output,

@@ -172,17 +172,17 @@ bool export_profile(const ProfileOwner &owner) {
             if (event.previous_poll_delta != UINT32_MAX)
                 task_events << ",\"previous_poll_cycles\":" << (event.cycles - event.previous_poll_delta);
         }
-        if (event.kind == PercounterTaskEventKind::PeerWaitBegin) task_events << ",\"join_threshold\":" << event.detail;
+        if (event.kind == PercounterTaskEventKind::PeerWaitBegin) task_events << ",\"input_count\":" << event.detail;
         if (event.kind == PercounterTaskEventKind::PeerWriteBegin ||
             event.kind == PercounterTaskEventKind::PeerPublished ||
             event.kind == PercounterTaskEventKind::PeerMtePublished)
             task_events << ",\"target_worker\":" << (event.detail >> 32) << ",\"token\":" << uint32_t(event.detail);
         if (event.kind == PercounterTaskEventKind::PeerPeriodicReady)
             task_events << ",\"cycles_since_last_check\":" << (event.detail >> 32)
-                        << ",\"count\":" << uint32_t(event.detail);
+                        << ",\"ready_inputs\":" << uint32_t(event.detail);
         if (event.kind == PercounterTaskEventKind::PeerObserved ||
             event.kind == PercounterTaskEventKind::PeerInitialProof) {
-            task_events << ",\"token\":" << (event.detail >> 32) << ",\"count\":" << uint32_t(event.detail);
+            task_events << ",\"token\":" << (event.detail >> 32) << ",\"ready_inputs\":" << uint32_t(event.detail);
         }
         if (event.kind == PercounterTaskEventKind::CompletionIssue) task_events << ",\"contribution\":" << event.detail;
         if (event.kind == PercounterTaskEventKind::DeferRegistered || source_worker != SIZE_MAX)

@@ -2546,17 +2546,6 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     std::vector<uint8_t> scratch(alloc_size);
     std::vector<uint64_t> object_table(table_len, 0);
     auto input_cache_proofs = chip_callable_input_cache_proofs(callable, table_len);
-    std::vector<uint8_t> synchronous_kernels;
-    if constexpr (std::string_view(SIMPLER_RUNTIME_NAME) == "percounter") {
-        for (int32_t child = 0; child < callable->child_count(); ++child) {
-            const bool synchronous = callable->child(child).completes_on_return();
-            if (synchronous_kernels.empty()) {
-                if (!synchronous) continue;
-                synchronous_kernels.resize(table_len);
-            }
-            synchronous_kernels[callable->child_func_id(child)] = synchronous;
-        }
-    }
     std::vector<uint64_t> entry_table;
     if (want_entry_table) entry_table.assign(table_len, 0);
 
@@ -2641,7 +2630,6 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     auto inserted = chip_callable_buffers_.emplace(layout.content_hash, std::move(retained));
     inserted.first->second.object_table = std::move(object_table);
     inserted.first->second.input_cache_proofs = std::move(input_cache_proofs);
-    inserted.first->second.synchronous_kernels = std::move(synchronous_kernels);
     published = true;
     LOG_DEBUG(
         "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, table_len=%u, hash=0x%lx", chip_dev,
@@ -3185,10 +3173,7 @@ int DeviceRunnerBase::validate_caller_submission_args(int32_t callable_id, const
 }
 
 template <class RuntimeType>
-static void bind_runtime_kernel_proofs(
-    RuntimeType &runtime, const std::vector<CoreInputCacheProof> &proofs, const std::vector<uint8_t> &synchronous
-) {
-    if constexpr (std::string_view(SIMPLER_RUNTIME_NAME) == "percounter") runtime.bind_synchronous_kernels(synchronous);
+static void bind_runtime_input_cache_proofs(RuntimeType &runtime, const std::vector<CoreInputCacheProof> &proofs) {
     if constexpr (std::string_view(SIMPLER_RUNTIME_NAME) == "host_build_graph") {
         bind_registered_input_cache_proofs(runtime, proofs);
     }
@@ -3229,7 +3214,7 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     // Tell the AICPU which orch_so_table_ slot this run dispatches. The orch SO
     // descriptor itself was delivered at register time via RegisterCallableArgs.
     runtime.set_active_callable_id(callable_id);
-    bind_runtime_kernel_proofs(runtime, tables.input_cache_proofs, tables.synchronous_kernels);
+    bind_runtime_input_cache_proofs(runtime, tables.input_cache_proofs);
 
     // Per-run binding (tensor args, GM heap, SM alloc). host_orch_func_ptr is
     // non-null only on the hbg path; signature is the cached ChipCallable

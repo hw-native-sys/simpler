@@ -108,7 +108,7 @@ enum : uint16_t {
     CALENDAR_EXEC_PEER = 1 << 10,
     CALENDAR_EXEC_SPMD_WAIT = 1 << 11,
     CALENDAR_EXEC_SPMD_SEND = 1 << 12,
-    CALENDAR_EXEC_PEER_PRODUCER = 1 << 13,  // Its consumers rely on synchronous completion.
+    CALENDAR_EXEC_PACED_WAIT = 1 << 13,
 };
 
 struct alignas(16) CalendarExecutionRow {
@@ -143,13 +143,9 @@ struct CalendarPeerExtra {
     uint32_t sends_offset;
     uint16_t send_count;
     uint16_t input_count;
-    uint64_t join_read;
-    uint32_t join_target;
-    uint32_t reserved;
 };
 
 struct CalendarPeerSend {
-    uint64_t join_add;
     uint32_t worker;
     uint32_t ordinal;
 };
@@ -219,9 +215,9 @@ static_assert(sizeof(CalendarRange) == 64);
 static_assert(sizeof(CalendarExecutionRow) == 16);
 static_assert(sizeof(CalendarDispatch) == 32);
 static_assert(sizeof(CalendarExecutionExtra) == 32);
-static_assert(sizeof(CalendarPeerExtra) == 56 && offsetof(CalendarPeerExtra, execution) == 0);
-static_assert(sizeof(CalendarPeerEndpoint) == 16 && sizeof(CalendarPeerSend) == 16);
+static_assert(sizeof(CalendarPeerExtra) == 40 && offsetof(CalendarPeerExtra, execution) == 0);
+static_assert(sizeof(CalendarPeerEndpoint) == 16 && sizeof(CalendarPeerSend) == 8);
 static_assert(sizeof(CalendarWait) == 16);
-static_assert(sizeof(CalendarSpmdPeerExtra) == 64 && offsetof(CalendarSpmdPeerExtra, completion) == 32);
+static_assert(sizeof(CalendarSpmdPeerExtra) == 64 && offsetof(CalendarSpmdPeerExtra, execution) == 0);
 
 }  // namespace simpler::percounter
