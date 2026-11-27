@@ -84,7 +84,8 @@ A job composes the axes it is actually subject to:
 | `st-sim-{a2a3,a5}`, `st-onboard-*` | `<arch>_changed && st_affected` |
 | `st-sim-wse` | `wse_changed && st_affected` |
 | `profiling-flags-smoke` | `(a2a3_changed \|\| a5_changed) && !examples_only && !tests_only` |
-| `ut`, `ut-a2a3` | `non_code_only != true && ut_affected` |
+| `ut` | `non_code_only != true && ut_affected` |
+| `ut-a2a3` | `a2a3_changed && ut_affected` |
 | `ut-a5` | `a5_changed && ut_affected` |
 | `packaging-matrix` | `non_code_only != true && !examples_only && !tests_only` |
 
@@ -104,12 +105,26 @@ the scene-test job that reads the same corpus. A change to a payload file was
 the historical reason `tests/` stayed in — a now-deleted claim that `tests/`
 was "in the sdist include", which no configuration ever made true.
 
-The `ut` and `ut-a2a3` jobs stay off the arch axis on purpose — unit tests cover shared
-contracts, so the cost of a falsely-skipped regression outweighs the minutes.
-That is a decision about the *arch* axis only; the category axis is a different
-question, because a scene-test-only change genuinely cannot break a unit test.
-`ut-a5` additionally requires `a5_changed`, so changes confined to the other
-platforms do not schedule A5 hardware. Shared code still selects A5.
+The CPU `ut` job stays off the arch axis because it checks shared contracts and
+simulation behavior across architectures. UT can import, inspect or compile code
+from `examples/` and `tests/st/`, so every non-code-filtered automatic code change
+sets `ut_affected=true`; there is no per-example dependency list to maintain.
+Hardware UT jobs also require their own architecture flag: `ut-a2a3` requires
+`a2a3_changed`, and `ut-a5` requires `a5_changed`. A5-only example changes select
+CPU UT and A5 hardware UT; A2/A3-only example changes select CPU UT and A2/A3
+hardware UT. Shared code selects both hardware jobs. Non-code files remain
+excluded, and the manual-only benchmark exclusion below still applies.
+
+Architecture attribution follows actual build inputs as well as directory names.
+The A2/A3 CANN device-query smoke consumes A5 topology sources, their header,
+fallback JSON and platform configuration. `A2A3_SHARED_INPUTS` declares these
+cross-architecture inputs, so they select both Ascend hardware UT jobs while
+ordinary A5-only source still skips A2/A3 UT. Update the declaration when that
+cross-architecture build dependency changes.
+
+Collect changed paths with `git diff --no-renames --name-only`: a rename must
+contribute both its deleted and added paths. Moving source between architectures
+therefore selects both, even when Git would otherwise report a single `R100`.
 
 The vocabulary exists once, in `.github/workflows/_detect-changes.yml`.
 `.github/workflows/ci.yml` calls that workflow and consumes its declared
@@ -120,8 +135,10 @@ changes.
 
 ### Write every axis in the same shape
 
-The arch and category axes use one pattern: **a partition is unaffected only
+The arch axis and scene-test category filter use one pattern: **a partition is unaffected only
 when every changed file belongs exclusively to a sibling partition.**
+UT has no exclusive sibling code partition because it consumes scene/example
+inputs; its filter subtracts only `NON_CODE` from `AUTO_TEST_FILES`.
 
 ```bash
 SIBLING='^(...)'                     # what this partition is NOT
@@ -171,7 +188,7 @@ the intent. Let only the exit status decide and fold a failure into the empty
 case:
 
 ```bash
-if ! FILES=$(git diff --name-only "$BASE"..."$HEAD"); then
+if ! FILES=$(git diff --no-renames --name-only "$BASE"..."$HEAD"); then
   FILES=""
 fi
 ```
