@@ -210,27 +210,38 @@ inline __aicore__ __gm__ pto2::resident::AsyncGroupData *percounter_init_async_r
     return record;
 }
 
+struct CalendarKernelCall {
+    uint64_t function;
+    __gm__ DispatchPayload *arguments;
+};
+
+inline __aicore__ CalendarKernelCall percounter_prepare_kernel_call(
+    const LaneConfig &cfg, const __gm__ CalendarDispatch &dispatch, uint32_t block, uint32_t blocks, uint64_t entry
+) {
+    ProfileScope scope(cfg.scalar, ProfilePhase::BindContext, entry);
+    const __gm__ volatile CalendarDispatch &binding = dispatch;
+    CalendarKernelCall call{binding.kernel_entry, reinterpret_cast<__gm__ DispatchPayload *>(binding.args_address)};
+    auto *context = &cfg.ssbuf->contexts[cfg.cluster_lane].value;
+    percounter_ssbuf_store_field(&context->local.block_idx, static_cast<int32_t>(block));
+    percounter_ssbuf_store_field(&context->local.block_num, static_cast<int32_t>(blocks));
+    return call;
+}
+
 inline __aicore__ bool percounter_run_task(
-    const LaneConfig &cfg, const __gm__ CalendarDispatch &dispatch, const __gm__ CalendarExecutionExtra *extra,
-    uint32_t block, uint32_t blocks, uint32_t role, uint64_t entry, __gm__ CalendarTiming *calendar_timing
+    const LaneConfig &cfg, const CalendarKernelCall &call, const __gm__ CalendarExecutionExtra *extra, uint32_t role,
+    uint64_t entry, __gm__ CalendarTiming *calendar_timing
 ) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Run, entry);
     const bool timing_enabled = cfg.profile != nullptr || cfg.profile_buffer != nullptr;
     const uint64_t receive_time = timing_enabled ? get_sys_cnt_aicore() : 0;
-    const uint64_t function = dispatch.kernel_entry;
-    auto *arguments = reinterpret_cast<__gm__ DispatchPayload *>(dispatch.args_address);
+    const uint64_t function = call.function;
+    auto *arguments = call.arguments;
     if (function == 0 || arguments == nullptr) {
         percounter_fail(
             cfg, SchedulerGraphResult::INVALID_CALLABLE, extra == nullptr ? -1 : static_cast<int64_t>(extra->task_id),
             role
         );
         return false;
-    }
-    {
-        ProfileScope context_scope(cfg.scalar, ProfilePhase::BindContext, entry);
-        auto *context = &cfg.ssbuf->contexts[cfg.cluster_lane].value;
-        percounter_ssbuf_store_field(&context->local.block_idx, static_cast<int32_t>(block));
-        percounter_ssbuf_store_field(&context->local.block_num, static_cast<int32_t>(blocks));
     }
     // Order the observed dependencies and the SSBUF context stores before the kernel.
     percounter_memory_barrier();
