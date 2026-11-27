@@ -50,7 +50,7 @@ Build and run from the repository with its local venv and sourced A5 CANN:
   --no-build-isolation -e . --config-settings=build.targets=build_package_a5
 .claude/skills/onboard-arch-precheck/check.sh a5
 task-submit --device 4 --timeout 600 --max-time 600 --run \
-  "$PWD/.venv/bin/python -m pytest tests/ut/py/test_host_ddr_onboard.py --platform a5 --device 4 -q -s"
+  "$PWD/.venv/bin/python -m pytest tests/ut/py/hardware/test_host_ddr_onboard.py --platform a5 --device 4 -q -s"
 ```
 
 `run_write.py` maps two disjoint Float32 views of one Host Buffer. One is declared

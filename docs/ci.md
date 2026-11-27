@@ -6,17 +6,16 @@ The CI pipeline maps test categories (st, ut-py, ut-cpp) × hardware tiers to Gi
 
 Design principles:
 
-1. **Merge by runner, not by language** — Python and applicable C++ unit tests share setup cost and run as steps within a single job per runner tier. A runner with no platform-specific C++ tests does not carry an empty CTest step; currently `ut-a5` is Python-only.
+1. **Share setup by runner** — Python and C++ UT share the appropriate CPU or SDK-enabled host. SDK-only checks run outside the device allocation.
 2. **Runner matches hardware tier** — no-hardware PR jobs run on `[self-hosted, cpu]`, with Ubuntu/macOS coverage in Daily; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
-3. **`--platform` is the only filter** — pytest uses `--platform` + the `requires_hardware` marker; ctest uses label `-LE` exclusion. No `-m st`, no `-m "not requires_hardware"`.
+3. **Select architecture and execution requirements independently** — CPU and SDK UT use `--ut-arches`. Device UT use `requires_hardware` with the matching `--platform`. CTest targets carry both architecture and execution labels.
 4. **sim = no hardware** — `a2a3sim`/`a5sim`/`wsesim` PR jobs run on the self-hosted CPU pool alongside unit tests.
-5. **Skip irrelevant platforms, and irrelevant suites** — `detect-changes` gates `st-sim-*` and `st-onboard-*` by platform, so a PR confined to one of A2/A3, A5 or WSE skips the other platforms' scene-test runs. **`ut` and `ut-a2a3` are not gated by platform** — unit tests cover shared contracts and the cost of a falsely-skipped regression outweighs the savings. They *are* gated by test category: a diff confined to `tests/st/` or `examples/` cannot break a unit test, and one confined to `tests/ut/` cannot break a scene test, because the two suites execute disjoint trees (`pytest examples tests/st` vs `pytest tests/ut` plus the C++ ctest) and no unit test reads `examples/` or `tests/st/`. Shared test infrastructure — the root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/` — belongs to neither category and runs both.
+5. **Skip irrelevant platforms, and irrelevant suites** — `detect-changes` gates `st-sim-*` and `st-onboard-*` by platform, so a PR confined to one of A2/A3, A5 or WSE skips the other platforms' scene-test runs. The CPU `ut` job covers shared contracts on every platform. WSE-only changes skip both hardware UT jobs. Changes confined to `tests/st/` or `examples/` skip UT. Changes confined to `tests/ut/` or `tools/` skip scene tests. Changes to shared infrastructure such as the root `conftest.py`, `pyproject.toml`, `simpler_setup/` or `tests/lint/` select both suites.
 6. **Non-code PRs automatically run pre-commit and docs, and nothing else** — `detect-changes` sets `non_code_only` when *no* changed file falls outside the `NON_CODE` set. Skipping the UT jobs is riskless there because nothing in that set can change what the code does, and each member already has its own gate: markdownlint inside `pre-commit` reads the markdown, `docs.yml` (unconditional on every PR) builds the site with `--strict`, and `pre-commit` itself is ungated so a `.pre-commit-config.yaml` change is fully exercised by it.
 
-A5 UT runs automatically when `a5_changed && ut_affected` is true. A5 framework
-validation runs automatically under `a5_changed && st_affected`. Shared code
-changes select A5; changes confined to other platforms or non-code files skip
-these jobs. The full A5 onboard sweep is requested by a maintainer or admin
+The A5 UT runner starts when `ut_sdk_a5` or `ut_hardware_a5` is true.
+A change to an A5 CPU-only UT selects the common and A5 CPU suites. A5 framework
+validation runs under `a5_changed && st_affected`. The full A5 onboard sweep is requested by a maintainer or admin
 with `/run-a5`.
 A5 simulation, CPU tests and profiling remain automatic under their existing
 change gates. Daily retains its A5 jobs. A2/A3 multi-machine Network1 validation
@@ -37,7 +36,7 @@ The complete test-type × hardware-tier matrix across automatic CI, the A5 comme
 
 | Category | CPU (no hardware) | a2a3 runner | a5 runner |
 | -------- | ----------------- | ----------- | --------- |
-| **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py) |
+| **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py + SDK cpp) |
 | **st** | `st-sim-a2a3`, `st-sim-a5`, `st-sim-wse` | `st-onboard-a2a3`, `st-network1-onboard-a2a3` (Daily only), `st-model-onboard-a2a3`, `st-framework-a2a3` | `st-onboard-a5`, `st-framework-a5` |
 
 ## GitHub Actions Jobs
@@ -111,8 +110,8 @@ PullRequest
   ├── st-sim-a2a3            (self-hosted CPU)          — a2a3_changed && st_affected
   ├── st-sim-a5              (self-hosted CPU)          — a5_changed && st_affected
   ├── st-sim-wse             (self-hosted CPU)          — wse_changed && st_affected
-  ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
-  ├── ut-a5                  (a5 self-hosted)        — a5_changed && ut_affected; includes CANN examples
+  ├── ut-a2a3                (a2a3 self-hosted)       — ut_sdk_a2a3 or ut_hardware_a2a3
+  ├── ut-a5                  (a5 self-hosted)         — ut_sdk_a5 or ut_hardware_a5
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── st-framework-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
   ├── st-framework-a5   (a5 self-hosted)       — a5_changed && st_affected
@@ -120,20 +119,20 @@ PullRequest
 
 Admin PR comment /run-a5
   └── gate-and-resolve       (ubuntu-24.04)          — open PR to this repo main; pinned merge
-      ├── ut-a5             (a5 self-hosted)        — Python UT and CANN examples
+      ├── ut-a5             (a5 self-hosted)        — Python and C++ UT and CANN examples
       └── st-onboard-a5     (a5 self-hosted)        — onboard ST and DFX smokes
 ```
 
 | Job | Runner | What it runs |
 | --- | ------ | ------------ |
-| `ut` | self-hosted CPU, Python ≥3.10 | `pytest tests/ut` + `ctest -LE requires_hardware` |
+| `ut` | self-hosted CPU, Python ≥3.10 | Common no-hardware cases plus Python and C++ cases for `ut_arches`. |
 | `st-sim-a2a3` | self-hosted CPU | `pytest examples tests/st --platform a2a3sim` |
 | `st-sim-a5` | self-hosted CPU | `pytest examples tests/st --platform a5sim` |
 | [`st-sim-wse`](../src/wse/docs/README.md#build-and-test) | self-hosted CPU | `pytest examples tests/st --platform wsesim` |
-| `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
+| `ut-a2a3` | a2a3 self-hosted | SDK-only pytest and CTest run on the host. Device UT and CANN example smokes use the device queue. |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
 | `st-framework-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 4 -p no:xdist` in one exclusive four-device task, then verify plan/JUnit |
-| `ut-a5` | a5 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then CANN example smokes. |
+| `ut-a5` | a5 self-hosted | SDK-only pytest and CTest run on the host. Device UT and CANN example smokes use the device queue. |
 | `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA and the active URMA regressions, then adaptive-parallel DFX feature smokes |
 | `st-framework-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 4 -p no:xdist` in one exclusive four-device task, then verify plan/JUnit |
 | `st-network1-onboard-a2a3` (Daily only) | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
@@ -220,14 +219,14 @@ starts with `Compile` (AICore kernel sources), `Build` (anything cmake builds),
 `Run` or `Verify`, and says what it acts on; a job pinned to one platform ends
 every such name with that platform in parentheses. Scene-test and unit-test
 jobs of the same platform therefore read alike — `Compile scene-test kernels
-(a2a3)` / `Run pytest scene tests (a2a3)` against `Build C++ unit tests (a2a3)`
-/ `Run unit tests (a2a3)`. A step that invokes pytest says so in its name.
+(a2a3)` / `Run pytest scene tests (a2a3)` against `Build hardware C++ unit tests (a2a3)`
+/ `Run hardware unit tests (a2a3)`. A step that invokes pytest says so in its name.
 
-Exactly one step per job runs its suite. The scene suites are `Run pytest scene
-tests (<platform>)`; a job whose suite name is the point says so instead (`Run
-framework scene tests`, `Run network1 pytest scene tests`, `Run Qwen and DeepSeek pytest
-tests (a2a3)`), and a job whose suite is the unit-test runner is `Run unit
-tests (<platform>)` or `Run Python unit tests (sim)`.
+The scene-test jobs report their suite in a named step such as
+`Run pytest scene tests (<platform>)`. The A2/A3 and A5 UT jobs report SDK
+pytest, SDK CTest, device UT and CANN example smoke in separate steps. Once
+setup succeeds, a failed SDK test leaves the selected device UT and smoke
+enabled. Each failed step still contributes to the job result.
 
 Two orderings are load-bearing rather than cosmetic: `Validate manual mode`
 runs before anything is installed, so a typo costs seconds instead of a
@@ -531,11 +530,11 @@ not need `--max-parallel` manually.
 
 - PR simulation and no-hardware unit tests run on the self-hosted CPU pool; Daily retains GitHub-hosted coverage.
 - Change detection and pre-commit start with 100 commits of checkout history. They use the admitted PR base SHA when available, fetching only a missing base commit. If the merge-base is outside the shallow history, they deepen the head and base histories in two bounded rounds of 100 and 400 commits, without fetching every branch or tag. Unresolved history makes the detector run the full matrix; pre-commit fails with an explicit error rather than emitting an empty base SHA.
-- `detect-changes` is implemented once in [`.github/workflows/_detect-changes.yml`](../.github/workflows/_detect-changes.yml) and computes four axes from the PR diff — non-code (`non_code_only`), architecture (`a2a3_changed` / `a5_changed` / `wse_changed`), test category (`st_affected` / `ut_affected`), and corpus (`examples_only` / `tests_only`) — **all of them derived from one `NON_CODE` set**: `docs/`, `.docs/`, `.claude/`, `mkdocs.yml`, `.github/workflows/docs.yml`, `.gitignore`, `.pre-commit-config.yaml`, and any `*.md` file anywhere. Membership follows a file's *effect*, not its path — `mkdocs.yml` and `docs.yml` are docs tooling that happens to live outside `docs/`. An arch flag is `false` only when every changed file is in the other platforms' trees (`src/{arch}/`, `examples/{arch}/`, `tests/{st,ut/cpp}/{arch}/`) or in `NON_CODE`. Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), shared test infra (`tests/ut/py/`, `tests/lint/`), tooling (`tools/`), or any CI implementation workflow (`.github/workflows/ci.yml`, `.github/workflows/_*.yml`) — flips all three architecture flags to `true`. CI implementation workflows are deliberately excluded from `NON_CODE`: a change to the gates or reusable job bodies must run the complete automatic matrix. The full A5 onboard sweep still requires `/run-a5`.
-- **Test-category axis:** `ST_ONLY='^(tests/st/|examples/)'` and `UT_ONLY='^tests/ut/'`, applied in the same shape as the arch patterns — a category is unaffected only when *every* changed file is exclusively the other's. `st_affected` gates automatic scene-test jobs; `ut_affected` gates automatic `ut`, `ut-a2a3` and `ut-a5`. `ut-a5` also requires `a5_changed`. Explicit `/run-a5` requests run A5 UT and onboard scene tests without change detection. Anything belonging to neither (root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/`) flips both, so shared infrastructure always runs both suites.
+- `detect-changes` is implemented once in [`.github/workflows/_detect-changes.yml`](../.github/workflows/_detect-changes.yml) and computes four axes from the PR diff — non-code (`non_code_only`), architecture (`a2a3_changed` / `a5_changed` / `wse_changed`), test category (`st_affected` / `ut_affected`), and corpus (`examples_only` / `tests_only`) — **all of them derived from one `NON_CODE` set**: `docs/`, `.docs/`, `.claude/`, `mkdocs.yml`, `.github/workflows/docs.yml`, `.gitignore`, `.pre-commit-config.yaml`, and any `*.md` file anywhere. Membership follows a file's *effect*, not its path — `mkdocs.yml` and `docs.yml` are docs tooling that happens to live outside `docs/`. An arch flag is `false` only when every changed file is in the other platforms' trees (`src/{arch}/`, `examples/{arch}/`, `tests/{st,ut/cpp}/{arch}/`) or in `NON_CODE`. Each platform also owns its `tests/ut/py/{arch}/` directory. Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), shared test infra (top-level `tests/ut/py/` modules, `tests/lint/`), tooling (`tools/`), or any CI implementation workflow (`.github/workflows/ci.yml`, `.github/workflows/_*.yml`) — flips all three architecture flags to `true`. CI implementation workflows are deliberately excluded from `NON_CODE`: a change to the gates or reusable job bodies must run the complete automatic matrix. The full A5 onboard sweep still requires `/run-a5`.
+- **Suite and UT selection.** The detector sets `st_affected=false` when all code changes match `UT_ONLY='^(tests/ut/|tools/)'`. For each UT-affecting path the detector accumulates architectures in `ut_arches` and sets the device and SDK flags for the applicable architectures. Ordinary UT modules select CPU tests. A device or SDK module selects the matching environment. Shared infrastructure and an unavailable diff select all supported environments. An explicit `/run-a5` runs the full A5 selection.
 - **Corpus axis:** `EXAMPLES_ONLY='^examples/'` and `TESTS_ONLY='^(tests/)'`, same shape again, one per side of the product jobs' payload. `packaging-matrix` and `profiling-flags-smoke` build and install the product and then exercise it with a fixed, tiny payload — one entry-point script (a `tests/st/` file) and one `vector_example` — so neither reads either suite as a corpus, and a diff confined to `examples/` or to `tests/` cannot reach them: `wheel.packages` is `["simpler_setup", "python/simpler"]`, so both partitions are provably absent from the product. A payload file changed under either is still exercised by the scene-test job that reads the same corpus.
 - **Gated jobs (scene tests):** automatic `st-sim-{a2a3,a5,wse}`, `st-onboard-a2a3` and `st-framework-{a2a3,a5}` run iff their platform's flag **and** `st_affected` are `true`. Explicit `/run-a5` requests are not filtered by these gates.
-- **Platform-independent jobs (UT + packaging):** automatic `ut`, `ut-a2a3` and `packaging-matrix` ignore the *platform* flags — unit tests exercise shared contracts (nanobind bindings, RuntimeBuilder, ring buffers, etc.) and the risk of silently skipping a regression outweighs the CI minutes saved. The `tests/ut/cpp/{arch}/` entry in the gating regex only *attributes* an arch-specific C++ UT change to that platform (so it does not spuriously flip the other platforms' scene-test flags); it does not gate the UT jobs themselves. The gated UT jobs do respect `ut_affected`, which is a statement about test category rather than silicon. `packaging-matrix` respects the corpus axis, which is a statement about which corpus a job reads: neither `examples/` nor `tests/` is in `wheel.packages`, so a diff confined to either partition cannot change what the packaging job builds.
+- **CPU UT and packaging.** `ut` retains the common CPU coverage on every UT-affecting diff and also runs the selected architectures. `packaging-matrix` checks the corpus flags because its wheel inputs exclude both `examples/` and `tests/`.
 - **`non_code_only` is the same `NON_CODE` set, not a narrower one.** It is `true` when no changed file falls outside it. Nothing in the set can change what the code does, and no workflow consumes any of it beyond its own gate: `pre-commit` is ungated so it always exercises `.pre-commit-config.yaml`, `docs.yml` is unconditional on every PR so it always exercises `mkdocs.yml` / `docs/`, and **no workflow invokes anything under `.claude/`** (`grep -rn '\.claude' .github/workflows/` finds only comments). An **empty diff short-circuits the whole step**: attribution is impossible, so a single guard sets `non_code_only=false`, every arch and category flag `true`, and both corpus flags (`examples_only`, `tests_only`) `false`, then returns — running the full matrix, packaging and the profiling smoke included. That guard is deliberately one place; testing emptiness per flag is what previously left `non_code_only` false while the arch flags also came out false, running UT and packaging but skipping every scene test.
 
   The arch flags subtract `NON_CODE` before deciding, so a non-code-only change already makes all three `false`. An arch-gated job therefore needs no separate non-code check. See [`.claude/rules/ci-change-detection.md`](../.claude/rules/ci-change-detection.md) for the invariants these gates must keep.
@@ -995,23 +994,18 @@ environment and reuses its local hook cache; it does not download the
 
 ### `tests/ut/` — Python unit tests (ut-py)
 
-Python unit tests. Run via pytest, filtered by `--platform` + `requires_hardware` marker.
-
-| File | Content | Hardware? |
-| ---- | ------- | --------- |
-| `test_task_interface.py` | nanobind extension API tests | No |
-| `test_runtime_builder.py` (mocked classes) | RuntimeBuilder discovery, error handling, build logic | No |
-| `test_runtime_builder.py::TestRuntimeBuilderIntegration` | Real compilation across platform × runtime | Yes (`@pytest.mark.requires_hardware`) |
+Python UTs run with the architecture and resource selectors described in
+[unit-test classification](testing/environments.md#unit-tests).
+`test_runtime_builder.py` exercises mocked build and discovery contracts.
+`toolkit/test_runtime_builder_integration.py` verifies real compiler artifacts.
+The simulated platforms compile on the CPU runner and onboard platforms compile
+on their SDK-enabled hosts before device-backed tests start.
 
 ### `tests/ut/cpp/` — C++ unit tests (ut-cpp)
 
-GoogleTest-based tests for pure C++ modules. Run via ctest, filtered by label `-LE` exclusion.
-
-| Runner | Command |
-| ------ | ------- |
-| No hardware | `ctest --test-dir tests/ut/cpp/build -LE requires_hardware` |
-| a2a3 | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$"` |
-| a5 | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a5)?$"` |
+CTest applies architecture and execution labels. The CPU sweep includes
+`ut_common` and each affected architecture. Currently A2/A3 has a device-backed
+CTest and A5 has a host-side SDK CTest.
 
 The no-hardware job follows ctest with two checks that read the build rather
 than run it, catching what ctest structurally cannot.
@@ -1066,46 +1060,12 @@ Cases are discovered by pytest via `test_*.py` files. Each test module ends with
 
 ## Selection Scheme
 
-A single `--platform` flag controls hardware/non-hardware splitting across all three categories.
+### UT (pytest and CTest)
 
-### ut-py (pytest marker)
-
-```python
-@pytest.mark.requires_hardware                  # any hardware
-class TestRuntimeBuilderIntegration:
-    ...
-
-@pytest.mark.requires_hardware("a2a3")          # a2a3 specifically
-class TestA2A3Feature:
-    ...
-```
-
-Selection:
-
-```bash
-# No hardware (no-hw tests run, requires_hardware tests skip)
-pytest tests/ut
-
-# Hardware (no-hw tests skip, hw + platform-specific tests run)
-pytest tests/ut --platform a2a3
-```
-
-### ut-cpp (ctest label)
-
-```cmake
-# any hardware
-set_tests_properties(test_runtime_integration PROPERTIES LABELS "requires_hardware")
-# a2a3-specific
-set_tests_properties(test_a2a3_feature PROPERTIES LABELS "requires_hardware_a2a3")
-```
-
-Selection uses `-LE` (label exclude) on no-hw runner and `-L` (label include) on device runners:
-
-```bash
-ctest -LE requires_hardware                # no-hardware runner: unlabeled and no_hardware
-ctest -L "^requires_hardware(_a2a3)?$"      # a2a3 runner: hw + a2a3-specific
-ctest -L "^requires_hardware(_a5)?$"        # a5 runner: hw + a5-specific
-```
+The CPU job includes common cases and the affected architecture scopes.
+SDK checks execute on a matching host. Device checks use the matching device
+queue. See [unit-test classification](testing/environments.md#unit-tests) for
+case declarations and the corresponding pytest and CTest commands.
 
 ### st (`@scene_test`)
 

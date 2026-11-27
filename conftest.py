@@ -58,6 +58,7 @@ from simpler_setup import parallel_scheduler as _ps  # noqa: E402
 from simpler_setup import test_coverage as _test_coverage  # noqa: E402
 from simpler_setup import test_environments as _test_environments  # noqa: E402
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, configure_logging  # noqa: E402
+from simpler_setup.platform_info import ARCHS  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
 from simpler_setup.scene_test import SceneTestLevel, clear_compile_cache, is_manual_for_platform  # noqa: E402
 
@@ -228,8 +229,20 @@ def drain_host_log(tmp_path_factory):
     return _drain
 
 
+def _parse_ut_arches(value):
+    arches = frozenset(arch.strip() for arch in value.split(","))
+    if not arches.issubset(ARCHS):
+        raise argparse.ArgumentTypeError("--ut-arches expects a comma-separated subset of " + ", ".join(ARCHS))
+    return arches
+
+
 def pytest_addoption(parser):
     """Register CLI options."""
+    parser.addoption(
+        "--ut-arches",
+        type=_parse_ut_arches,
+        help="Run shared Python unit tests plus tests for these comma-separated architectures (default: all).",
+    )
     parser.addoption(
         "--environment-receipts", action="store_true", help="Verify default-environment execution receipts"
     )
@@ -636,8 +649,10 @@ def _configure_ascend_logs(config) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     """Register custom markers and apply global config."""
-    config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
-    config.addinivalue_line("markers", "requires_hardware: test needs Ascend toolchain and real device")
+    config.addinivalue_line("markers", "platforms(list): supported execution platforms")
+    config.addinivalue_line("markers", "ut_arches(*arches): architectures a Python unit test covers")
+    config.addinivalue_line("markers", "requires_hardware: test needs a real Ascend device")
+    config.addinivalue_line("markers", "requires_toolkit: host unit test needs the Ascend SDK without a device")
     config.addinivalue_line("markers", "device_count(n): number of NPU devices needed")
     config.addinivalue_line(
         "markers", "manual(platforms=None): test runs only when --manual is include or only on selected platforms"
@@ -874,9 +889,16 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
             continue
 
         if platforms_marker and not platform:
-            item.add_marker(pytest.mark.skip(reason="--platform required"))
-            keep.append(item)
-            continue
+            ut_arches = config.getoption("--ut-arches")
+            sdk_selected = (
+                item.get_closest_marker("requires_toolkit")
+                and ut_arches
+                and not ut_arches.isdisjoint(platforms_marker.args[0])
+            )
+            if not sdk_selected:
+                item.add_marker(pytest.mark.skip(reason="--platform required"))
+                keep.append(item)
+                continue
 
         # runtime-isolation filter for non-@scene_test tests: if the item
         # declares ``@pytest.mark.runtime("X")`` and a runtime filter is

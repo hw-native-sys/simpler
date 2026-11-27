@@ -76,6 +76,7 @@ print(json.dumps(outputs))
 
 
 @pytest.mark.parametrize("core_type", ["aic", "aiv"])
+@pytest.mark.ut_arches("a2a3", "a5")
 def test_compiled_sim_targets_keep_semantics_on_reused_worker(tmp_path, core_type):
     isa_root = ensure_pto_isa_root()
     source = tmp_path / "target.cpp"

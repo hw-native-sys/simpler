@@ -83,19 +83,9 @@ set(HBG_ORCH_SHARED_SOURCES
 )
 list(REMOVE_DUPLICATES HBG_ORCH_SHARED_SOURCES)
 
-# Gate for tests that may need CANN headers/libs at build time or that only
-# make sense on Ascend hardware runners.  Default OFF so no-hw runners
-# (ubuntu-24.04 / macos-latest, no CANN installed) can build the tree
-# without touching anything CANN-adjacent.  CI's hw jobs
-# (ut-a2a3 / ut-a5) pass -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.
-#
-# Rule of thumb: any new test that either
-#   (a) links against CANN libs (libascendcl, libhcomm, libruntime), or
-#   (b) needs to dlopen an onboard libhost_runtime.so to be meaningful,
-# goes under `if(SIMPLER_ENABLE_HARDWARE_TESTS)` below.
-option(SIMPLER_ENABLE_HARDWARE_TESTS
-       "Build tests that require Ascend hardware toolchain to build or run"
-       OFF)
+# Default CPU builds use the host toolchain only. Standalone hardware builds include SDK tests by default.
+option(SIMPLER_ENABLE_HARDWARE_TESTS "Build tests that use real Ascend devices" OFF)
+option(SIMPLER_ENABLE_TOOLKIT_TESTS "Build CPU tests that link against the Ascend SDK" ${SIMPLER_ENABLE_HARDWARE_TESTS})
 
 # ---------------------------------------------------------------------------
 # GoogleTest — fast path uses the system install (apt libgtest-dev / brew
@@ -146,21 +136,15 @@ enable_testing()
 # Read by common/platform (the tmr half) and a2a3 (the hbg half), which build
 # the same test source against their own runtime.
 
-# Hardware-gated tests.  Only resolved when the project is configured with
-# -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.  CI's no-hw `ut` job does not pass this
-# flag, so nothing gated on it is compiled there — this is the structural
-# invariant that lets hw tests link against CANN libraries freely without
-# breaking the no-hw build.  The lookups sit here rather than beside the one
-# gated directory (common/platform_comm/) because that directory is reached
-# through common/, which is descended into below.
-if(SIMPLER_ENABLE_HARDWARE_TESTS)
+# Both environments use the SDK. Only the hardware cases require devices at run time.
+if(SIMPLER_ENABLE_HARDWARE_TESTS OR SIMPLER_ENABLE_TOOLKIT_TESTS)
     set(PROJECT_ROOT "${SIMPLER_REPO_ROOT}")
     set(HOST_RUNTIME_LIB
         "${PROJECT_ROOT}/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so"
     )
     if(NOT DEFINED ENV{ASCEND_HOME_PATH})
         message(FATAL_ERROR
-            "SIMPLER_ENABLE_HARDWARE_TESTS=ON requires ASCEND_HOME_PATH to be set "
+            "Ascend hardware/toolkit tests require ASCEND_HOME_PATH to be set "
             "(usually via `source $ASCEND_HOME_PATH/bin/setenv.bash`)")
     endif()
     set(ASCEND_HOME_PATH "$ENV{ASCEND_HOME_PATH}")

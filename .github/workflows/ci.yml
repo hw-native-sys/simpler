@@ -45,6 +45,7 @@ jobs:
     with:
       runs_on: '["self-hosted","cpu"]'
       setup_variant: self-cpu
+      ut_arches: ${{ needs.detect-changes.outputs.ut_arches }}
 
   st-sim-a2a3:
     needs: [detect-changes, pre-commit]
@@ -82,19 +83,23 @@ jobs:
 
   ut-a2a3:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.ut_affected == 'true'
+    if: needs.detect-changes.outputs.ut_hardware_a2a3 == 'true' || needs.detect-changes.outputs.ut_sdk_a2a3 == 'true'
     uses: ./.github/workflows/_ut-npu-a2a3.yml
     with:
       runs_on: '["self-hosted","a2a3"]'
       include_cann_examples: true
+      run_hardware: ${{ needs.detect-changes.outputs.ut_hardware_a2a3 == 'true' }}
+      run_sdk: ${{ needs.detect-changes.outputs.ut_sdk_a2a3 == 'true' }}
 
   ut-a5:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.ut_affected == 'true'
+    if: needs.detect-changes.outputs.ut_hardware_a5 == 'true' || needs.detect-changes.outputs.ut_sdk_a5 == 'true'
     uses: ./.github/workflows/_ut-npu-a5.yml
     with:
       runs_on: '["self-hosted","a5"]'
       include_cann_examples: true
+      run_hardware: ${{ needs.detect-changes.outputs.ut_hardware_a5 == 'true' }}
+      run_sdk: ${{ needs.detect-changes.outputs.ut_sdk_a5 == 'true' }}
 
   st-framework-a2a3:
     needs: [detect-changes, pre-commit]

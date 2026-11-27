@@ -12,8 +12,8 @@ run.
 
 ## Test Types
 
-1. **Python unit tests (ut-py)** (`tests/ut/`): Standard pytest tests for the Python compilation pipeline and nanobind bindings. Run with `pytest tests/ut`. Tests declaring `@pytest.mark.requires_hardware[("<platform>")]` auto-skip unless `--platform` points to a matching device.
-2. **C++ unit tests (ut-cpp)** (`tests/ut/cpp/`): GoogleTest-based tests for pure C++ modules. Run with `cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build && ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure`. Hardware-required tests carry a `requires_hardware` or `requires_hardware_<platform>` ctest label and are filtered via `-LE`.
+1. **Python unit tests (ut-py)** (`tests/ut/py/`) select common and platform-specific CPU cases with `--ut-arches`. SDK-only and device cases use `requires_toolkit` or `requires_hardware` with an explicit onboard `platforms` marker.
+2. **C++ unit tests (ut-cpp)** (`tests/ut/cpp/`) use CTest architecture labels and separate execution labels for CPU, toolkit and device cases.
 3. **Scene tests** (`examples/{arch}/*/`, `tests/st/{arch}/*/`): End-to-end `@scene_test` classes declared inside `test_*.py`. Sim variants run cross-platform (Linux/macOS); hardware variants require the CANN toolkit and an Ascend device. Discovery is by pytest (batch) or `python test_*.py` (standalone); `#591`'s parallel orchestrator handles device bin-packing and ChipWorker reuse automatically.
 
 ## Running Tests
@@ -62,17 +62,17 @@ In CI, `pip install .` pre-builds all runtimes before tests run.
 
 ```bash
 # Python unit tests (no hardware)
-pytest tests/ut
+pytest tests/ut -m 'not requires_hardware and not requires_toolkit'
 
 # Python unit tests (a2a3 hardware)
-pytest tests/ut --platform a2a3
+pytest tests/ut -m requires_hardware --platform a2a3
 
 # C++ unit tests (no hardware)
 cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build
-ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
+ctest --test-dir tests/ut/cpp/build -L '^no_hardware$' --output-on-failure
 
 # C++ unit tests (a2a3 hardware)
-ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$" --output-on-failure
+ctest --test-dir tests/ut/cpp/build -L "^requires_hardware_a2a3$" --output-on-failure
 
 # All simulation scene tests (extract --pto-session-timeout from ci.yml)
 pytest examples tests/st --platform a2a3sim \

@@ -152,7 +152,7 @@ hbg_case(test_hbg_graph_cache.cpp
 
 # TaskId is arch-agnostic (src/common/host_build_graph/task_id.h) and
 # header-only, so one arch's include path exercises the whole handle.
-hbg_case(test_hbg_task_id.cpp ARCHS a2a3)
+hbg_case(test_hbg_task_id.cpp ARCHS a2a3 SCOPE common)
 
 # Drives the real hbg bind/validate against a fake HostApi. bind takes the
 # resolved host-orch entry points as a parameter, so this needs no orchestration

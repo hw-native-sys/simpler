@@ -85,6 +85,7 @@ def test_onboard_cache_maintenance_codegen(tmp_path, arch, needs_maintenance):
         ),
     ],
 )
+@pytest.mark.ut_arches("a5")
 def test_a5_callers_use_only_protocol_ordering(tmp_path, operation, body, instruction, count):
     source = tmp_path / f"{operation}.cpp"
     source.write_text(

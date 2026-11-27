@@ -49,14 +49,15 @@ endfunction()
 #   LINK             libraries beyond gtest and pthread
 #   LINK_OPTIONS     extra link flags
 #   DEPENDS          targets that must be built first, for a case that dlopens one
-#   LABEL            ctest label
+#   LABEL            CTest execution environment (no_hardware, requires_toolkit, requires_hardware_<arch>)
+#   SCOPE            Coverage axis when it differs from ARCH or the directory under tests/ut/cpp
 #   TIMEOUT          ctest timeout in seconds
 #   RESOURCES        ctest RESOURCE_GROUPS, for a case that claims a device
 #   PRIVATE_WORKDIR  register through simpler_ut_add_test, which every target
 #                    built more than once from the same source needs so their
 #                    relative-path writes cannot reach each other
 function(simpler_ut_add_target)
-    cmake_parse_arguments(T "PRIVATE_WORKDIR" "NAME;ARCH;RUNTIME;TIER;LABEL;TIMEOUT;RESOURCES"
+    cmake_parse_arguments(T "PRIVATE_WORKDIR" "NAME;ARCH;RUNTIME;TIER;LABEL;SCOPE;TIMEOUT;RESOURCES"
                             "SOURCES;OBJS;INCLUDES;INCLUDES_BEFORE;DEFINES;COMPILE_OPTIONS;LINK;LINK_OPTIONS;DEPENDS" ${ARGN})
     if(NOT T_NAME OR NOT T_SOURCES)
         message(FATAL_ERROR "simpler_ut_add_target needs NAME and SOURCES")
@@ -117,9 +118,44 @@ function(simpler_ut_add_target)
     else()
         add_test(NAME ${T_NAME} COMMAND ${T_NAME})
     endif()
-    if(T_LABEL)
-        set_tests_properties(${T_NAME} PROPERTIES LABELS "${T_LABEL}")
+    file(RELATIVE_PATH mirror "${PROJECT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
+    string(REGEX MATCH "^[^/]+" owner "${mirror}")
+    if(T_SCOPE)
+        set(scope "${T_SCOPE}")
+    elseif(T_ARCH)
+        set(scope "${T_ARCH}")
+    else()
+        set(scope "${owner}")
     endif()
+    if(NOT scope MATCHES "^(common|a2a3|a5|wse)$")
+        message(FATAL_ERROR "${T_NAME}: unknown CTest coverage scope '${scope}'")
+    endif()
+    if(NOT T_LABEL)
+        set(T_LABEL no_hardware)
+    endif()
+    # Change detection can identify device-dependent cases without configuring CMake.
+    # Check the path and label together so a case cannot silently miss its runner.
+    set(suite "")
+    if(T_LABEL MATCHES "^requires_hardware" OR mirror MATCHES "^[^/]+/hardware(/|$)")
+        if(NOT scope MATCHES "^(a2a3|a5)$" OR NOT mirror MATCHES "^${scope}/hardware(/|$)"
+           OR NOT T_LABEL STREQUAL "requires_hardware_${scope}")
+            message(FATAL_ERROR "${T_NAME}: hardware cases belong in <arch>/hardware with requires_hardware_<arch>")
+        endif()
+        set(suite ut_hardware_${scope})
+    elseif(T_LABEL STREQUAL "requires_toolkit" OR mirror MATCHES "^[^/]+/toolkit(/|$)")
+        if(NOT scope MATCHES "^(a2a3|a5)$" OR NOT mirror MATCHES "^${scope}/toolkit(/|$)"
+           OR NOT T_LABEL STREQUAL "requires_toolkit")
+            message(FATAL_ERROR "${T_NAME}: SDK-only cases belong in <arch>/toolkit with requires_toolkit")
+        endif()
+        set(suite ut_toolkit_${scope})
+    endif()
+    if(suite)
+        if(NOT TARGET ${suite})
+            add_custom_target(${suite})
+        endif()
+        add_dependencies(${suite} ${T_NAME})
+    endif()
+    set_tests_properties(${T_NAME} PROPERTIES LABELS "ut_${scope};${T_LABEL}")
     if(T_TIMEOUT)
         set_tests_properties(${T_NAME} PROPERTIES TIMEOUT ${T_TIMEOUT})
     endif()
@@ -161,7 +197,7 @@ endfunction()
 function(simpler_ut_runtime_case runtime src)
     # The include contract keys off the full directory name, not the short tag.
     simpler_runtime_from_tag("${runtime}" runtime_full)
-    cmake_parse_arguments(C "ORCH;NO_OBJS" "TIMEOUT"
+    cmake_parse_arguments(C "ORCH;NO_OBJS" "TIMEOUT;SCOPE"
                             "SOURCES;A2A3_SOURCES;A5_SOURCES;ARCHS;INCLUDES;INCLUDES_BEFORE;LINK;DEFINES;COMPILE_OPTIONS;LINK_OPTIONS" ${ARGN})
     if(C_UNPARSED_ARGUMENTS)
         message(FATAL_ERROR "simpler_ut_runtime_case(${src}): unknown arguments: ${C_UNPARSED_ARGUMENTS}")
@@ -190,7 +226,11 @@ function(simpler_ut_runtime_case runtime src)
             set(contract_arch ${arch})
             set(contract_rt ${runtime_full})
         endif()
-        simpler_ut_add_target(NAME test_${arch}_${runtime}_${stem}
+        set(scope ${arch})
+        if(C_SCOPE)
+            set(scope ${C_SCOPE})
+        endif()
+        simpler_ut_add_target(NAME test_${arch}_${runtime}_${stem} SCOPE ${scope}
             SOURCES ${src} ${sources}
             ARCH ${contract_arch} RUNTIME ${contract_rt}
             OBJS ${objs}
@@ -332,7 +372,11 @@ function(simpler_ut_platform_case src)
             set(isolate "")
         endif()
 
-        simpler_ut_add_target(NAME ${name}
+        set(scope_args "")
+        if(C_PER_ARCH)
+            set(scope_args SCOPE ${arch})
+        endif()
+        simpler_ut_add_target(NAME ${name} ${scope_args}
             SOURCES ${src} ${sources} ${extra}
             INCLUDES ${contract} ${includes}
             INCLUDES_BEFORE ${includes_before}
@@ -394,17 +438,15 @@ function(simpler_ut_cases declare)
     endforeach()
 endfunction()
 
-# Record a directory's cases as accounted for without building them, for one
-# the configuration did not descend into.
-#
-# A directory left out by an option still holds case files, and they are not
-# orphans: the tree knows about them and a configuration that turns the option
-# on builds them. Registering them here keeps that distinction — the guard
-# below reports files nothing knows about, not files this configuration chose
-# to skip.
-function(simpler_ut_skip_dir dir)
-    file(GLOB _skipped CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${dir}/test_*.cpp)
-    set_property(GLOBAL APPEND PROPERTY SIMPLER_UT_SKIPPED_CASES ${_skipped})
+# A disabled environment can carry nested suite directories. Account for their
+# cases so the orphan check still catches missing registration when enabled.
+function(simpler_ut_add_environment dir enabled)
+    if(${enabled})
+        add_subdirectory(${dir})
+    else()
+        file(GLOB_RECURSE cases CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${dir}/test_*.cpp")
+        set_property(GLOBAL APPEND PROPERTY SIMPLER_UT_SKIPPED_CASES ${cases})
+    endif()
 endfunction()
 
 # A case file whose declaration above is itself conditional — e.g. on

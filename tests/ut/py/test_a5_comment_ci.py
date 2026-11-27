@@ -121,7 +121,7 @@ def test_a5_ut_and_framework_run_automatically_only_for_affected_changes():
     job = ci["ut-a5"]
     assert job["needs"] == ["detect-changes", "pre-commit"]
     assert job["if"] == (
-        "needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.ut_affected == 'true'"
+        "needs.detect-changes.outputs.ut_hardware_a5 == 'true' || needs.detect-changes.outputs.ut_sdk_a5 == 'true'"
     )
     assert job["uses"] == "./.github/workflows/_ut-npu-a5.yml"
     assert json.loads(job["with"]["runs_on"]) == ["self-hosted", "a5"]

@@ -31,6 +31,7 @@ from simpler_setup.runtime_builder import RuntimeBuilder
 from simpler_setup.runtime_compiler import RuntimeCompiler
 
 
+@pytest.mark.ut_arches("wse")
 def test_wse_supports_only_sim_hbg():
     assert parse_platform("wsesim") == ("wse", "sim")
     assert to_platform("wse", "sim") == "wsesim"
@@ -43,6 +44,7 @@ def test_wse_supports_only_sim_hbg():
     assert builder._resolve_build_pto_isa_commit() == read_pto_isa_pin()
 
 
+@pytest.mark.ut_arches("a5", "wse")
 def test_wse_orchestration_uses_own_headers_and_identity():
     wse = KernelCompiler("wsesim")
     a5 = KernelCompiler("a5sim")
@@ -56,6 +58,7 @@ def test_wse_orchestration_uses_own_headers_and_identity():
     ) != build_chip_callable_descriptor(target=chip, platform="a5sim", runtime="host_build_graph")
 
 
+@pytest.mark.ut_arches("wse")
 def test_source_manifest_matches_copied_files():
     root = Path(__file__).resolve().parents[3]
     for filename, entries in (("source-copy-manifest.json", "files"), ("host-source-provenance.json", "copies")):
@@ -64,6 +67,7 @@ def test_source_manifest_matches_copied_files():
             assert hashlib.sha256((root / entry["destination"]).read_bytes()).hexdigest() == entry["sha256"]
 
 
+@pytest.mark.ut_arches("a5", "wse")
 def test_real_scene_cache_keeps_wse_and_a5_separate(tmp_path, monkeypatch):
     from simpler_setup import SceneTestCase, scene_test  # noqa: PLC0415
     from simpler_setup.scene_test import clear_compile_cache  # noqa: PLC0415
@@ -118,6 +122,7 @@ def test_runtime_components_follow_platform_targets():
         assert all(getattr(compiler, name + "_target") is not None for name in ("host", "aicpu", "aicore"))
 
 
+@pytest.mark.ut_arches("wse")
 def test_wse_binary_lookup_uses_two_components(tmp_path, monkeypatch):
     builder = RuntimeBuilder("wsesim")
     monkeypatch.setattr(builder, "_requires_pto_isa_metadata_validation", lambda: False)
@@ -130,6 +135,7 @@ def test_wse_binary_lookup_uses_two_components(tmp_path, monkeypatch):
     assert bins.host_path.is_file() and bins.aicore_path.is_file()
 
 
+@pytest.mark.ut_arches("a5")
 def test_a5_binary_lookup_still_requires_aicpu(tmp_path, monkeypatch):
     builder = RuntimeBuilder("a5sim")
     monkeypatch.setattr(builder, "_requires_pto_isa_metadata_validation", lambda: False)
@@ -139,6 +145,7 @@ def test_a5_binary_lookup_still_requires_aicpu(tmp_path, monkeypatch):
         builder._lookup_binaries("host_build_graph", tmp_path)
 
 
+@pytest.mark.ut_arches("wse")
 def test_wse_cache_keeps_runtime_and_pto_identity(monkeypatch):
     monkeypatch.setattr(runtime_builder, "_runtime_source_stamp", lambda _: "source-content")
     builder = RuntimeBuilder("wsesim")

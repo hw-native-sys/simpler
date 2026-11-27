@@ -96,14 +96,15 @@ python tests/lint/check_ut_cpp_stub_linkage.py
 Tests for the nanobind extension and the Python build pipeline:
 
 - `test_task_interface.py` — DataType, Tensor, ChipStorageTaskArgs, torch integration
-- `test_runtime_builder.py` — RuntimeBuilder discovery, error handling, build logic (mocked), and real compilation integration tests
+- `test_runtime_builder.py` — RuntimeBuilder discovery, error handling, build logic (mocked)
+- `toolkit/test_runtime_builder_integration.py` — simulator and SDK compilation without a device
 
 ```bash
 # No-hardware runner (hw tests auto-skip, no-hw tests run)
-pytest tests/ut
+pytest tests/ut -m 'not requires_hardware and not requires_toolkit'
 
 # a2a3 hardware runner (no-hw tests skip, hw + a2a3-specific tests run)
-pytest tests/ut --platform a2a3
+pytest tests/ut -m requires_hardware --platform a2a3
 ```
 
 ### Examples (`examples/{arch}/`)
@@ -161,7 +162,7 @@ json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
 
 # Run with resource allocation — CTest assigns devices, no oversubscription
 ctest --test-dir tests/ut/cpp/build \
-    -L "^requires_hardware(_a2a3)?$" \
+    -L "^requires_hardware_a2a3$" \
     --resource-spec-file "$(pwd)/resources.json" \
     -j$(nproc) --output-on-failure
 ```

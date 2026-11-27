@@ -22,15 +22,6 @@ macro(a5_platform_case src)
         LABEL no_hardware ${ARGN})
 endmacro()
 
-# Host logger silent/off behavior — no runtime deps, just compile the same
-# self-contained host logger sources used by production consumers. It carries no
-# arch token: the logger is arch-agnostic and this is where the case happens to
-# live.
-simpler_ut_add_target(NAME test_host_log_off
-    SOURCES test_host_log_off.cpp ${HOST_LOG_TEST_SOURCES}
-    INCLUDES ${SIMPLER_SRC}/common/task_interface ${SIMPLER_LOG_DIR} ${SIMPLER_LOG_DIR}/include
-    LABEL no_hardware)
-
 # a5 CPU_TOPO fallback and affinity selection. Pure logic; packaged fallback
 # entries enforce their own verified SoC, host-architecture and OCCUPY constraints.
 a5_platform_case(test_aicpu_topology_fallback.cpp

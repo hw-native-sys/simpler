@@ -39,7 +39,7 @@ cmake --build tests/ut/cpp/build -j 4
 ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
 ```
 
-The Python model lives in `tests/ut/py/hbg_spmd_contracts/`. It abstracts ownership
+The Python model lives in `tests/ut/py/a5/nohardware/hbg_spmd_contracts/`. It abstracts ownership
 and admission publication as atomic transitions; it does not establish hardware
 cache behavior, arbitrary kernel progress or physical fault recovery. Native
 fixture tests ensure the probes exercise the intended protocol rather than

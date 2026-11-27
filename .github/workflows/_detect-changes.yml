@@ -55,6 +55,21 @@ on:
       ut_affected:
         description: "Whether unit tests can be affected."
         value: ${{ jobs.detect.outputs.ut_affected }}
+      ut_arches:
+        description: "Architecture-specific CPU UT suites to run alongside shared tests (comma-separated)."
+        value: ${{ jobs.detect.outputs.ut_arches }}
+      ut_hardware_a2a3:
+        description: "Whether a change can affect A2/A3 hardware unit tests."
+        value: ${{ jobs.detect.outputs.ut_hardware_a2a3 }}
+      ut_hardware_a5:
+        description: "Whether a change can affect A5 hardware unit tests."
+        value: ${{ jobs.detect.outputs.ut_hardware_a5 }}
+      ut_sdk_a2a3:
+        description: "Whether a change can affect A2/A3 toolkit-only unit tests."
+        value: ${{ jobs.detect.outputs.ut_sdk_a2a3 }}
+      ut_sdk_a5:
+        description: "Whether a change can affect A5 toolkit-only unit tests."
+        value: ${{ jobs.detect.outputs.ut_sdk_a5 }}
       examples_only:
         description: "Whether every code change is under examples/."
         value: ${{ jobs.detect.outputs.examples_only }}
@@ -73,6 +88,11 @@ jobs:
       non_code_only: ${{ steps.check.outputs.non_code_only }}
       st_affected: ${{ steps.check.outputs.st_affected }}
       ut_affected: ${{ steps.check.outputs.ut_affected }}
+      ut_arches: ${{ steps.check.outputs.ut_arches }}
+      ut_hardware_a2a3: ${{ steps.check.outputs.ut_hardware_a2a3 }}
+      ut_hardware_a5: ${{ steps.check.outputs.ut_hardware_a5 }}
+      ut_sdk_a2a3: ${{ steps.check.outputs.ut_sdk_a2a3 }}
+      ut_sdk_a5: ${{ steps.check.outputs.ut_sdk_a5 }}
       examples_only: ${{ steps.check.outputs.examples_only }}
       tests_only: ${{ steps.check.outputs.tests_only }}
     steps:
@@ -129,11 +149,12 @@ jobs:
           # `run:` is `bash -e`, so a failing git diff would abort the step
           # before the guard below and take every output with it. Let only the
           # exit status decide, and turn a failure into an empty list so the
-          # fail-open guard handles both cases identically.
+          # fail-open guard handles both cases identically. Get both paths of a
+          # rename because the source and destination can own different tests.
           if [ -z "$BASE" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
             echo "No usable base commit: cannot attribute changes"
             FILES=""
-          elif ! FILES=$(git diff --name-only "${BASE}...${HEAD_REV}"); then
+          elif ! FILES=$(git diff --no-renames --name-only "${BASE}...${HEAD_REV}"); then
             echo "git diff failed (unresolved base/head SHA?); treating as unattributable"
             FILES=""
           fi
@@ -148,6 +169,11 @@ jobs:
             echo "wse_changed=true" >> "$GITHUB_OUTPUT"
             echo "st_affected=true" >> "$GITHUB_OUTPUT"
             echo "ut_affected=true" >> "$GITHUB_OUTPUT"
+            echo "ut_arches=a2a3,a5,wse" >> "$GITHUB_OUTPUT"
+            echo "ut_hardware_a2a3=true" >> "$GITHUB_OUTPUT"
+            echo "ut_hardware_a5=true" >> "$GITHUB_OUTPUT"
+            echo "ut_sdk_a2a3=true" >> "$GITHUB_OUTPUT"
+            echo "ut_sdk_a5=true" >> "$GITHUB_OUTPUT"
             echo "examples_only=false" >> "$GITHUB_OUTPUT"
             echo "tests_only=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -178,8 +204,8 @@ jobs:
 
           # Architecture axis: skip a partition only when every changed file is
           # in the sibling partition or non-code.
-          WSE_ONLY='^(src/wse/|examples/wse/|tests/(st|ut/cpp)/wse/)'
-          A5_ONLY='^(src/a5/|examples/a5/|tests/(st|ut/cpp)/a5/)'
+          WSE_ONLY='^(src/wse/|examples/wse/|tests/(st|ut/cpp|ut/py)/wse/)'
+          A5_ONLY='^(src/a5/|examples/a5/|tests/(st|ut/cpp|ut/py)/a5/)'
           A2A3_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$A5_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$A2A3_REMAINING" ]; then
             echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
@@ -190,7 +216,7 @@ jobs:
             echo "All changes are confined to other architectures or non-code; skipping a2a3"
           fi
 
-          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|ut/cpp)/a2a3/)'
+          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|ut/cpp|ut/py)/a2a3/)'
           A5_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$A2A3_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$A5_REMAINING" ]; then
             echo "a5_changed=true" >> "$GITHUB_OUTPUT"
@@ -230,6 +256,37 @@ jobs:
             echo "ut_affected=false" >> "$GITHUB_OUTPUT"
             echo "All changes are scene-test/example-only or non-code; skipping unit tests"
           fi
+
+          # Use only paths that can affect UT. A scene from another platform in
+          # the same PR must not select that platform's CPU suite or devices.
+          declare -A siblings=([a2a3]="$A5_ONLY|$WSE_ONLY" [a5]="$A2A3_ONLY|$WSE_ONLY" [wse]="$A2A3_ONLY|$A5_ONLY")
+          ut_arches=()
+          for arch in a2a3 a5 wse; do
+            arch_ut=$(printf '%s\n' "$UT_REMAINING" | grep -vE "${siblings[$arch]}" || true)
+            if [ -n "$arch_ut" ]; then
+              ut_arches+=("$arch")
+            fi
+            if [ "$arch" = wse ]; then continue; fi
+
+            # Hardware and toolkit tests have exclusive directories enforced
+            # during collection/registration. Helpers and build inputs may be
+            # used by either suite, even within one architecture's UT tree.
+            printf '%s\n' "$arch_ut" | awk -v arch="$arch" '
+              !NF { next }
+              /^tests\/ut\/(py|cpp)\/(.*\/)?toolkit\// { sdk = 1; next }
+              /^tests\/ut\/(py|cpp)\/(.*\/)?hardware\// { hardware = 1; next }
+              /^tests\/ut\/(py|cpp)\/(.*\/)?nohardware\// { next }
+              /\/(conftest\.py|CMakeLists\.txt)$/ || /\.cmake$/ { hardware = sdk = 1; next }
+              /^tests\/ut\/(py|cpp)\/(.*\/)?(support|fixtures)\// { hardware = sdk = 1; next }
+              /^tests\/ut\/(py\/(.*\/)?test_[^/]+\.py|cpp\/(common|a2a3|a5|wse)\/(.*\/)?test_[^/]+\.cpp)$/ { next }
+              { hardware = sdk = 1 }
+              END {
+                print "ut_hardware_" arch "=" (hardware ? "true" : "false")
+                print "ut_sdk_" arch "=" (sdk ? "true" : "false")
+              }
+            ' >> "$GITHUB_OUTPUT"
+          done
+          (IFS=,; echo "ut_arches=${ut_arches[*]}") >> "$GITHUB_OUTPUT"
 
           # Corpus axis: product-build jobs read neither examples/ nor tests/
           # as a corpus, so a diff confined to either partition cannot reach

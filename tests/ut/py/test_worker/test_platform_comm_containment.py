@@ -22,7 +22,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from . import test_platform_comm as comm_test
+from .hardware import test_platform_comm as comm_test
 
 
 class _RankProcessCase:

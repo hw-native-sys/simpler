@@ -11,3 +11,6 @@
 
 add_subdirectory(runtime)
 add_subdirectory(platform)
+
+simpler_ut_add_environment(hardware SIMPLER_ENABLE_HARDWARE_TESTS)
+simpler_ut_add_environment(toolkit SIMPLER_ENABLE_TOOLKIT_TESTS)

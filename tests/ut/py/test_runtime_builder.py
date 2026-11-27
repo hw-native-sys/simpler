@@ -983,45 +983,6 @@ class TestPlaceBinary:
         assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
 
 
-# --- Full integration tests (real compilation) ---
-
-
-@pytest.mark.requires_hardware
-class TestRuntimeBuilderIntegration:
-    """Integration tests that actually compile all platform x runtime combinations.
-
-    Test parametrization is handled dynamically by conftest.py based on:
-    - Available platforms discovered from src/*/platform/{onboard,sim}/
-    - Available runtimes per architecture from src/{arch}/runtime/*/build_config.py
-    - --platform filter if specified on command line
-    """
-
-    @pytest.fixture(autouse=True)
-    def _reset_compiler_singleton(self):
-        """Reset RuntimeCompiler singleton-per-platform cache so each test gets fresh instances."""
-        from simpler_setup.runtime_compiler import RuntimeCompiler  # noqa: PLC0415
-
-        yield
-        RuntimeCompiler._instances.clear()
-
-    def test_get_binaries_returns_valid_paths(self, platform, runtime_name):
-        """get_binaries(build=True) produces RuntimeBinaries with existing files."""
-        from simpler_setup.runtime_builder import RuntimeBinaries, RuntimeBuilder  # noqa: PLC0415
-
-        builder = RuntimeBuilder(platform=platform)
-        result = builder.get_binaries(runtime_name, build=True)
-
-        assert isinstance(result, RuntimeBinaries)
-        targets = _execution_targets(platform)
-        if "aicpu" not in targets:
-            assert result.aicpu_path is None
-        for label in targets:
-            path = getattr(result, f"{label}_path")
-            assert path is not None
-            assert path.is_file(), f"{label} binary not found: {path}"
-            assert path.stat().st_size > 0, f"{label} binary is empty: {path}"
-
-
 @pytest.mark.parametrize("platform", ["a5", "a5sim"])
 @pytest.mark.parametrize("target", ["host", "aicpu", "aicore"])
 def test_a5_tmr_targets_use_pinned_isa_headers(tmp_path, monkeypatch, platform, target):

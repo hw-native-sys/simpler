@@ -30,6 +30,7 @@ from simpler.task_interface import CommDomainHandle
 from simpler.worker import Worker
 
 
+@pytest.mark.ut_arches("a5")
 def test_standalone_prepare_uses_scene_cache_without_pytest(monkeypatch):
     from examples.a5.tensormap_and_ringbuffer.host_comm_domain.test_host_comm_domain import (  # noqa: PLC0415
         TestHostCommDomain,
@@ -51,6 +52,7 @@ def test_standalone_prepare_uses_scene_cache_without_pytest(monkeypatch):
         compile_chip.assert_called_once_with(*args)
 
 
+@pytest.mark.ut_arches("a5")
 def test_standalone_driver_prefers_checkout_over_installed_setup(tmp_path, monkeypatch):
     driver = Path(__file__).resolve().parents[3] / "examples/a5/tensormap_and_ringbuffer/host_comm_domain/run.py"
     installed_setup = tmp_path / "simpler_setup"
@@ -61,6 +63,7 @@ def test_standalone_driver_prefers_checkout_over_installed_setup(tmp_path, monke
 
 
 @pytest.mark.parametrize(("rc", "link"), [(107001, -1), (0, 9)], ids=["query_failure", "unknown_link"])
+@pytest.mark.ut_arches("a5")
 def test_pcie_first_device_does_not_mask_second_device_error(monkeypatch, rc, link):
     probe = (
         Path(__file__).resolve().parents[3] / "examples/a5/tensormap_and_ringbuffer/host_comm_domain/probe_host_link.py"

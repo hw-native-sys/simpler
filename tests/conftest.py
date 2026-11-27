@@ -64,13 +64,16 @@ def discover_runtimes_for_arch(arch: str) -> list[str]:
 def default_test_platform(request):
     """Provide the default platform for discovery tests.
 
-    Returns the platform specified via --platform, or defaults to a2a3sim.
+    Honor --platform, then use a selected UT simulator. The default is a2a3sim.
     """
     platform = request.config.getoption("--platform")
     if platform:
         return platform
 
-    # Default to a2a3sim for backward compatibility
+    arches = request.config.getoption("--ut-arches")
+    if arches:
+        # Match the stable discovery order when more than one architecture is selected.
+        return next(p for p in discover_platforms() if p.endswith("sim") and arch_from_platform(p) in arches)
     return "a2a3sim"
 
 
@@ -103,15 +106,18 @@ def pytest_generate_tests(metafunc):
             runtimes = discover_runtimes_for_arch(arch)
 
             for runtime in runtimes:
-                # Mark hardware platforms (non-sim) as requiring Ascend
+                # These integration cases compile binaries. Onboard targets need
+                # CANN on the host, while simulator targets use a host compiler.
                 marks = []
                 if not platform.endswith("sim"):
-                    marks.append(
+                    marks = [
+                        pytest.mark.requires_toolkit,
+                        pytest.mark.platforms([platform]),
                         pytest.mark.skipif(
                             not os.getenv("ASCEND_HOME_PATH"),
                             reason=f"ASCEND_HOME_PATH not set; Ascend toolkit required for {platform}",
-                        )
-                    )
+                        ),
+                    ]
 
                 test_params.append(pytest.param(platform, runtime, marks=marks, id=f"{platform}-{runtime}"))
 
