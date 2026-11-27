@@ -56,12 +56,21 @@ def _run_scene(arch, runtime, library):
     base = "tests/st" if runtime == "host_build_graph" else "examples"
     scene = _ROOT / base / arch / runtime / "vector_example/test_vector_example.py"
     env = dict(os.environ)
+    pytest_entry = ["-m", "pytest"]
     if library is not None:
-        env["LD_PRELOAD"] = (env["LD_PRELOAD"] + ":" if env.get("LD_PRELOAD") else "") + str(library)
+        preload = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
+        env[preload] = os.pathsep.join(filter(None, (env.get(preload), str(library))))
+        if sys.platform == "darwin":
+            # dyld already injected this process. Its compiler children can have a different Mach-O subtype.
+            pytest_entry = [
+                "-c",
+                "import os, runpy, sys; os.environ['DYLD_INSERT_LIBRARIES'] = sys.argv.pop(1); "
+                "runpy.run_module('pytest', run_name='__main__', alter_sys=True)",
+                os.environ.get(preload, ""),
+            ]
     command = [
         sys.executable,
-        "-m",
-        "pytest",
+        *pytest_entry,
         str(scene),
         "--platform",
         arch + "sim",

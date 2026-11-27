@@ -39,11 +39,10 @@ void *start(void *arg) {
     creator = saved.parent;
     return saved.entry(saved.arg);
 }
-}  // namespace
+using Set = decltype(&pthread_setspecific);
+using Create = decltype(&pthread_create);
 
-extern "C" int pthread_setspecific(pthread_key_t key, const void *value) noexcept {
-    using Set = int (*)(pthread_key_t, const void *);
-    static auto real = reinterpret_cast<Set>(dlsym(RTLD_NEXT, "pthread_setspecific"));
+int fault_setspecific(Set real, pthread_key_t key, const void *value) {
     char name[16]{};
     pthread_getname_np(pthread_self(), name, sizeof(name));
     if (std::strcmp(name, trigger) == 0 && matching_bindings.fetch_add(1) >= skip_bindings &&
@@ -61,10 +60,7 @@ extern "C" int pthread_setspecific(pthread_key_t key, const void *value) noexcep
     return real(key, value);
 }
 
-extern "C" int
-pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*entry)(void *), void *arg) noexcept {
-    using Create = int (*)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
-    static auto real = reinterpret_cast<Create>(dlsym(RTLD_NEXT, "pthread_create"));
+int fault_create(Create real, pthread_t *thread, const pthread_attr_t *attr, void *(*entry)(void *), void *arg) {
     if (reject_next_create.load() && pthread_equal(pthread_self(), target_creator) &&
         reject_next_create.exchange(false)) {
         const char message[] = "SIM_STARTUP_CREATE_EAGAIN\n";
@@ -77,3 +73,31 @@ pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*entry)(voi
     if (rc != 0) delete payload;
     return rc;
 }
+
+#ifdef __APPLE__
+int interposed_set(pthread_key_t key, const void *value) { return fault_setspecific(pthread_setspecific, key, value); }
+int interposed_create(pthread_t *thread, const pthread_attr_t *attr, void *(*entry)(void *), void *arg) {
+    return fault_create(pthread_create, thread, attr, entry, arg);
+}
+// dyld binds calls from the interposing image to the original libSystem functions.
+__attribute__((used, section("__DATA,__interpose,interposing"))) const struct {
+    const void *replacement;
+    const void *original;
+} interpositions[] = {
+    {reinterpret_cast<const void *>(interposed_set), reinterpret_cast<const void *>(pthread_setspecific)},
+    {reinterpret_cast<const void *>(interposed_create), reinterpret_cast<const void *>(pthread_create)}
+};
+#endif
+}  // namespace
+
+#ifndef __APPLE__
+extern "C" int pthread_setspecific(pthread_key_t key, const void *value) noexcept {
+    static auto real = reinterpret_cast<Set>(dlsym(RTLD_NEXT, "pthread_setspecific"));
+    return fault_setspecific(real, key, value);
+}
+extern "C" int
+pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*entry)(void *), void *arg) noexcept {
+    static auto real = reinterpret_cast<Create>(dlsym(RTLD_NEXT, "pthread_create"));
+    return fault_create(real, thread, attr, entry, arg);
+}
+#endif

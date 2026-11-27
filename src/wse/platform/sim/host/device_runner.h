@@ -29,7 +29,7 @@ public:
     int copy_to_device(void *ptr, const void *host, size_t bytes) override;
     int copy_from_device(void *host, const void *ptr, size_t bytes) override;
     ~DeviceRunner() override;
-    const char *cpu_sim_target_family() const override { return "wsesim"; }
+    const char *cpu_sim_target_family() const override { return "wsesim-v2"; }
     int prepare_launch_shape(Runtime &, const CallConfig &) override;
     int prepare_execution(
         Runtime &, const CallConfig &, uint32_t, const NativeRunIdentity &, std::unique_ptr<PreparedExecution> *

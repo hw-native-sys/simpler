@@ -14,34 +14,52 @@
 #include <cstdint>
 #include <mutex>
 #include <memory>
-#include <condition_variable>
+#include <pthread.h>
+#include <system_error>
+#include <type_traits>
 #include <stdexcept>
 
 namespace wse::temporary {
 // Shared operation storage belongs to one Core's active Block, never to the process-global PTO table.
 class BlockOperationStorage {
 public:
+    // Host and kernel DSOs may use different C++ standard libraries.
     struct Slot {
         explicit Slot(size_t size) :
-            data(std::calloc(1, size), &std::free),
+            data(std::calloc(1, size)),
             bytes(size) {
             if (!data) throw std::bad_alloc();
         }
-        std::unique_ptr<void, decltype(&std::free)> data;
+        Slot(const Slot &) = delete;
+        Slot &operator=(const Slot &) = delete;
+        ~Slot() {
+            pthread_cond_destroy(&changed);
+            pthread_mutex_destroy(&mutex);
+            std::free(data);
+        }
+        void lock() {
+            if (int error = pthread_mutex_lock(&mutex)) throw std::system_error(error, std::generic_category());
+        }
+        void unlock() noexcept { pthread_mutex_unlock(&mutex); }
+        void notify_all() noexcept { pthread_cond_broadcast(&changed); }
+
+        void *data;
         size_t bytes;
-        std::mutex mutex;
-        std::condition_variable changed;
+        pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+        pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
         bool initialized{false};
         bool cancelled{false};
 
         template <class Predicate>
-        void wait(std::unique_lock<std::mutex> &lock, Predicate ready) {
-            changed.wait(lock, [&] {
-                return cancelled || ready();
-            });
+        void wait(Predicate ready) {
+            while (!cancelled && !ready()) {
+                if (int error = pthread_cond_wait(&changed, &mutex))
+                    throw std::system_error(error, std::generic_category());
+            }
             if (cancelled) throw std::runtime_error("WSE shared operation cancelled");
         }
     };
+    static_assert(std::is_standard_layout_v<Slot>);
     static void *get(void *context, uint32_t slot, size_t bytes) {
         auto &storage = *static_cast<BlockOperationStorage *>(context);
         std::lock_guard lock(storage.mutex_);
@@ -70,9 +88,9 @@ public:
         // Keep the slots alive without holding the storage mutex while waking participants.
         for (const auto &slot : slots) {
             if (!slot) continue;
-            std::lock_guard slot_lock(slot->mutex);
+            std::lock_guard slot_lock(*slot);
             slot->cancelled = true;
-            slot->changed.notify_all();
+            slot->notify_all();
         }
     }
 

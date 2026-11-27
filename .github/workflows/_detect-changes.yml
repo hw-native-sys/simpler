@@ -253,10 +253,14 @@ jobs:
 
           # Use only paths that can affect UT. A scene from another platform in
           # the same PR must not select that platform's CPU suite or devices.
-          declare -A siblings=([a2a3]="$A5_ONLY|$WSE_ONLY" [a5]="$A2A3_ONLY|$WSE_ONLY" [wse]="$A2A3_ONLY|$A5_ONLY")
           ut_arches=()
           for arch in a2a3 a5 wse; do
-            arch_ut=$(printf '%s\n' "$UT_REMAINING" | grep -vE "${siblings[$arch]}" || true)
+            case "$arch" in
+              a2a3) other_arch_paths="$A5_ONLY|$WSE_ONLY" ;;
+              a5)   other_arch_paths="$A2A3_ONLY|$WSE_ONLY" ;;
+              wse)  other_arch_paths="$A2A3_ONLY|$A5_ONLY" ;;
+            esac
+            arch_ut=$(printf '%s\n' "$UT_REMAINING" | grep -vE "$other_arch_paths" || true)
             if [ -n "$arch_ut" ]; then
               ut_arches+=("$arch")
             fi
@@ -272,7 +276,7 @@ jobs:
               /^tests\/ut\/(py|cpp)\/(.*\/)?nohardware\// { next }
               /\/(conftest\.py|CMakeLists\.txt)$/ || /\.cmake$/ { hardware = sdk = 1; next }
               /^tests\/ut\/(py|cpp)\/(.*\/)?(support|fixtures)\// { hardware = sdk = 1; next }
-              /^tests\/ut\/(py\/(.*\/)?test_[^/]+\.py|cpp\/(common|a2a3|a5|wse)\/(.*\/)?test_[^/]+\.cpp)$/ { next }
+              /^tests\/ut\/(py\/(.*\/)?test_[^\/]+\.py|cpp\/(common|a2a3|a5|wse)\/(.*\/)?test_[^\/]+\.cpp)$/ { next }
               { hardware = sdk = 1 }
               END {
                 print "ut_hardware_" arch "=" (hardware ? "true" : "false")
