@@ -157,7 +157,7 @@ public:
             generation != state_->generation + 1)
             throw std::invalid_argument("WSE shared tile publication order or producer mismatch");
         if (state_->generation && state_->consumed != state_->consumers) trace(OperationEvent::WAIT, generation);
-        storage_->changed.wait(lock, [&] {
+        storage_->wait(lock, [&] {
             return !state_->generation || state_->consumed == state_->consumers;
         });
         std::copy(value.values.begin(), value.values.end(), state_->values);
@@ -174,7 +174,7 @@ public:
             (generation > state_->generation && generation - state_->generation != 1))
             throw std::invalid_argument("WSE shared tile read order or consumer mismatch");
         if (state_->generation < generation) trace(OperationEvent::WAIT, generation);
-        storage_->changed.wait(lock, [&] {
+        storage_->wait(lock, [&] {
             return state_->generation >= generation;
         });
         if (state_->generation != generation || (state_->consumed & bit))

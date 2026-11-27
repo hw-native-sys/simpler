@@ -10,14 +10,15 @@
  */
 #include <cstdio>
 #include "launch.h"
+#include "calendar_plan.h"
 
 namespace {
 struct Wire {
     WseGraphDescriptor descriptor{};
     WseNodePlan node{};
-    WseBlockPlan placement{};
+    WseBlockPlan placements[2]{};
     uint32_t indices[3]{0, 1, 1};
-    wse::CalendarRow row{0, 0, 0};
+    wse::CalendarRow rows[2]{{0, 0, 0}, {0, 1, 0}};
 };
 
 void kernel(int64_t *) {}
@@ -40,16 +41,16 @@ int main() {
     descriptor.expected_tasks = descriptor.calendar_row_count = 1;
     descriptor.calendar_core_count = 2;
     descriptor.calendar_indices_offset = offsetof(Wire, indices);
-    descriptor.calendar_rows_offset = offsetof(Wire, row);
+    descriptor.calendar_rows_offset = offsetof(Wire, rows);
     wire.node.entry = reinterpret_cast<uintptr_t>(kernel);
     wire.node.blocks = wire.node.block_plan_count = 1;
-    wire.node.block_plans_offset = offsetof(Wire, placement);
-    wire.placement.core_id = 0;
-    wire.placement.thread_num = 1;
+    wire.node.block_plans_offset = offsetof(Wire, placements);
+    wire.placements[0].core_id = 0;
+    wire.placements[0].thread_num = 1;
 
     const auto admit = [&](const char *name) {
         char error[256]{};
-        auto *run = wse_create_run(&descriptor, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
+        auto *run = wse_create_run_v2(&descriptor, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
         std::printf("%s %s\n", name, run ? "accepted" : "rejected");
         if (!run) std::fprintf(stderr, "%s\n", error);
         wse_destroy_run(run);
@@ -61,4 +62,27 @@ int main() {
     wire.node.block_plan_count = 0;
     wire.node.block_plans_offset = 0;
     admit("missing_placement");
+
+    descriptor.calendar_row_count = wire.indices[2] = 2;
+    wire.node.blocks = wire.node.block_plan_count = 2;
+    wire.node.block_plans_offset = offsetof(Wire, placements);
+    wire.placements[1].core_id = 1;
+    wire.placements[1].thread_num = 1;
+    wire.node.sync_start = 1;
+    admit("synchronous_pair");
+    wire.rows[1].tick = 1;
+    admit("split_sync_ticks");
+
+    // Both synchronous tasks need the same two Cores in opposite placement order.
+    // A task-by-task choice must yield one common tick per pair and the same
+    // order on both Cores even with another ready SS on just one of the Cores.
+    const std::vector<wse::CalendarTask> tasks_to_schedule{{{0}, {}}, {{1, 0}, {}, true}, {{0, 1}, {}, true}};
+    wse::CoreCalendar calendar;
+    if (!wse::build_core_calendar(tasks_to_schedule, 2, calendar) || calendar.indices != std::vector<uint32_t>{0, 3, 5})
+        return 1;
+    for (uint32_t i = 1; i <= 2; ++i) {
+        const auto &left = calendar.rows[i];
+        const auto &right = calendar.rows[i + 2];
+        if (left.task != i || right.task != i || left.tick != right.tick || left.block == right.block) return 1;
+    }
 }

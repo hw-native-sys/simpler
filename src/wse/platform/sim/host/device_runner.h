@@ -48,7 +48,7 @@ private:
     struct ActiveRun;
     std::unique_ptr<ActiveRun> active_run_;
     simpler::common::sim_host::SimRunCompletion completion_;
-    decltype(&wse_create_run) create_run_{nullptr};
+    decltype(&wse_create_run_v2) create_run_{nullptr};
     decltype(&wse_destroy_run) destroy_run_{nullptr};
     decltype(&wse_execute_pe) execute_pe_{nullptr};
     decltype(&wse_run_events) run_events_{nullptr};

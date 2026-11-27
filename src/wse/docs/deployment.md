@@ -26,6 +26,21 @@ within the configured device. Missing, extra or invalid placements fail during
 Host submission. Graph enter and exit nodes carry dependencies and execute no
 Blocks.
 
+An orchestration can submit a synchronously starting SPMD task directly on
+the outer task list. Set `task.launch_spec.set_require_sync_start(true)`
+and provide at least two Blocks with distinct Core IDs. The Host places all
+members at the same planned tick. At execution, each member's Core must have
+finished its previous Block and reached the task at its queue head. Only after
+all members are ready does the runtime release the task's PEs to enter the
+kernel. Completion still waits for every Block. For ordinary SPMD, the default
+`require_sync_start=false` lets each Core begin independently. Native Graph
+recording rejects synchronized SPMD in this version.
+
+In `wse_events.jsonl`, each synchronized member records `BLOCK_READY`
+(kind 18) once. The last arrival records one task-wide `SYNC_RELEASE`
+(kind 19). Every `BLOCK_BEGIN` for that task follows the release. Compare
+event sequence numbers to verify this ordering across Cores.
+
 A placement such as `{6}` runs on Core 6 with one Thread on PE 0 by default.
 Setting `launch.thread_num` selects the first one to four PEs on each Core.
 An explicit local PE list, such as `{6, {2, 0}}`, selects the Threads for that

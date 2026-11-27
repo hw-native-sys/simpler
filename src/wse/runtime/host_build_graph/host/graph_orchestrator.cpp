@@ -729,6 +729,7 @@ TaskOutputTensors wse::submit_placed_task(
     // The shared Graph image carries the single SS kernel entry in its first slot.
     const auto active_mask = LaneMask::aic();
     TaskAttrs task_attrs;
+    if (args.launch_spec.require_sync_start()) task_attrs.set_sync_start();
     task_attrs.set_early_resolve(args.allow_early_resolve());
     task_attrs.set_timing_slot(args.task_timing_slot());
     if (args.predicate().op != PredicateOp::NONE) {
