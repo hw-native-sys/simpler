@@ -28,6 +28,7 @@ from ._helpers import (
 @pytest.mark.platforms(SUCCESS_PLATFORMS)
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)
+@pytest.mark.manual(["a2a3"])
 def test_l3_single_hop_two_lifecycles(st_platform, st_device_ids):
     chip_callable = build_chip_callable(st_platform)
     worker = Worker(

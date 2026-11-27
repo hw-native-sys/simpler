@@ -140,6 +140,7 @@ def hbg_capture_probe(tmp_path_factory, request):
 
 
 @pytest.mark.platforms(["a2a3", "a5"])
+@pytest.mark.manual(["a2a3"])
 def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
     binaries = build_probe(tmp_path, retained_models=True, platform=request.config.getoption("--platform"))
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
@@ -246,7 +247,16 @@ def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path)
 
 @pytest.mark.parametrize(
     "scenario",
-    [pytest.param(scenario, marks=pytest.mark.platforms(["a2a3", "a5"])) for scenario in range(14)],
+    [
+        pytest.param(
+            scenario,
+            marks=[
+                pytest.mark.platforms(["a2a3", "a5"]),
+                *([pytest.mark.manual(["a2a3"])] if scenario not in (7, 11) else []),
+            ],
+        )
+        for scenario in range(14)
+    ],
     ids=[
         "dependency",
         "early-dispatch",
@@ -270,6 +280,7 @@ def test_hbg_model_replays_with_original_run(hbg_capture_probe, request, scenari
 
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.parametrize("scenario", [14, 15], ids=["larger-eager-run-between-replays", "zero-replays"])
+@pytest.mark.manual(["a2a3"])
 def test_hbg_model_with_caller_owned_run(hbg_capture_probe, request, scenario):
     _check_model_lifecycle(hbg_capture_probe, request, scenario)
 

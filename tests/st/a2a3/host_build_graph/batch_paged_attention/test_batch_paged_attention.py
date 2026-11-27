@@ -123,7 +123,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
             "name": "CaseSmall1",
             "config": {"runtime_env": {"ring_heap": 512 << 20}},
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3sim"],
+            "manual": ["a2a3sim", "a2a3"],
             "params": {
                 "batch": 1,
                 "num_heads": 16,

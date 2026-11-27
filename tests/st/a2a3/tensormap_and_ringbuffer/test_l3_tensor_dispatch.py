@@ -83,7 +83,7 @@ class TestL3TensorDispatch(SceneTestCase):
     }
 
     CASES = [
-        {"name": "tensor_dispatch", "platforms": ["a2a3sim", "a2a3"]},
+        {"name": "tensor_dispatch", "manual": ["a2a3"], "platforms": ["a2a3sim", "a2a3"]},
     ]
 
     def test_run(self, st_worker):

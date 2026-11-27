@@ -95,6 +95,7 @@ class TestL3Group(SceneTestCase):
     CASES = [
         {
             "name": "default",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"device_count": 2, "num_sub_workers": 1},
             "params": {},

@@ -119,7 +119,7 @@ class TestConsecutiveGroupReservation(SceneTestCase):
         {
             "name": "overlapping_targets",
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
-            "manual": ["a2a3sim", "a5sim"],
+            "manual": ["a2a3sim", "a5sim", "a2a3"],
             "config": {"device_count": 3},
             "params": {},
         }

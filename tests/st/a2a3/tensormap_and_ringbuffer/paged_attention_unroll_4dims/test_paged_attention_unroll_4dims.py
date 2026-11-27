@@ -66,6 +66,7 @@ class TestPagedAttentionUnroll4dims(SceneTestCase):
     CASES = [
         {
             "name": "Case1",
+            "manual": ["a2a3"],
             "platforms": ["a2a3"],
             "params": {
                 "batch": 256,

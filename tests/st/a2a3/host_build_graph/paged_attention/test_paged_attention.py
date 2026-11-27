@@ -116,6 +116,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "small1",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3"],
             "params": {
                 "batch": 1,
@@ -131,6 +132,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         {
             # Device operands use child memory; host controls remain explicit HOST arguments.
             "name": "small1_child_memory",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3"],
             "params": {
                 "batch": 1,

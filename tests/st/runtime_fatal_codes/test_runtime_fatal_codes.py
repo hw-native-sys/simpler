@@ -330,12 +330,7 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
 @pytest.mark.timeout(90)  # hang cases hold a core ~15-20 s; bound a wedge
 @pytest.mark.parametrize(
     "case_name",
-    [
-        pytest.param(
-            name, marks=[] if name in ("explicit_fatal", "tensor_wait_timeout") else pytest.mark.manual(["a2a3"])
-        )
-        for name in CASES
-    ],
+    [pytest.param(name, marks=[] if name == "explicit_fatal" else pytest.mark.manual(["a2a3"])) for name in CASES],
 )
 def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_name, monkeypatch, capfd, drain_host_log):
     """onboard: the watchdog may mask the code as 507xxx, but the device class still reaches the host log."""

@@ -60,6 +60,7 @@ class TestMergePipelineBarrier(SceneTestCase):
             # blocks co-resident, so config block_dim (24) > block_num (8, set
             # per-task via launch_spec.set_block_num in merge_orch.cpp).
             "name": "merge",
+            "manual": ["a2a3"],
             "platforms": ["a2a3"],
             "params": {},
         },

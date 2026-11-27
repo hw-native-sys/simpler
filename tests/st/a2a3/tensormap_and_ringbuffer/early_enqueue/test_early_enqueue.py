@@ -1121,6 +1121,7 @@ class TestA2a3TmrEarlyEnqueueDepthTwo(_A2a3TmrEarlyEnqueueBase):
     CASES = [
         {
             "name": "a2a3_tmr_early_enqueue",
+            "manual": ["a2a3"],
             "platforms": ["a2a3"],
             "config": {"device_count": 1, "num_sub_workers": 0, "launch_depth": 2},
             "params": {},

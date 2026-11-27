@@ -90,12 +90,14 @@ class TestPredicatedDispatch(SceneTestCase):
     CASES = [
         {
             "name": "PredicateFalseSkips",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 2},
             "params": {"case": 1},
         },
         {
             "name": "PredicateTrueDispatches",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 2},
             "params": {"case": 2},

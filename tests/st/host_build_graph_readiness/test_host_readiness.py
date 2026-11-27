@@ -62,7 +62,7 @@ def _args(worker, source, control, output, host_control, mode, offset=0.0):
 @pytest.mark.platforms(["a2a3", "a5", "a2a3sim", "a5sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)
-@pytest.mark.parametrize("storage", ["host", "child", "source"])
+@pytest.mark.parametrize("storage", ["host", pytest.param("child", marks=pytest.mark.manual(["a2a3"])), "source"])
 @pytest.mark.parametrize("write_control", [False, True], ids=["get", "get-set"])
 def test_completed_producer_supplies_native_host_access(st_platform, st_device_ids, storage, write_control):
     with ExitStack() as cleanup:

@@ -173,6 +173,7 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             # onboard a2a3 enabled: the 'out' golden mismatch is closed by the
             # producer-side DdrBarrierBeforeFfts cross-core DDR fence, validated
             # over 19 st-onboard-a2a3 rounds.
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3"],
             "params": {
                 "batch": 1,

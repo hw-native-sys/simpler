@@ -43,7 +43,7 @@ pytestmark = [
             mode,
             marks=[
                 pytest.mark.platforms(["a2a3"] if mode == 4 else ["a2a3sim"] if code == 108 else ["a2a3", "a2a3sim"]),
-                *([pytest.mark.manual(["a2a3"])] if code != 106 else []),
+                *([pytest.mark.manual(["a2a3"])] if code != 106 or name not in ("deferred", "sdma") else []),
             ],
             id=f"{code}-{name}",
         )

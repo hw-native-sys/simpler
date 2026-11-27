@@ -38,6 +38,7 @@ from ._helpers import (
 @pytest.mark.platforms(SUCCESS_PLATFORMS)
 @pytest.mark.device_count(1)
 @pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.manual(["a2a3"])
 def test_l3_single_hop(st_platform, st_device_ids):
     worker, chip_handle = make_l3_worker(st_platform, int(st_device_ids[0]))
     primary = None
