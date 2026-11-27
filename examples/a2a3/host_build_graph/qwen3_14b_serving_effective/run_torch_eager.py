@@ -139,10 +139,11 @@ def main():
                 )
                 receipt["caller_stream_after_close"] = True
             except BaseException as error:
-                receipt["cleanup_error"] = f"{type(error).__name__}: {error}"
+                cleanup_error = backend.cleanup_error or error
+                receipt["cleanup_error"] = f"{type(cleanup_error).__name__}: {cleanup_error}"
                 if failure is None:
                     failure = error
-                    receipt["error"] = receipt["cleanup_error"]
+                    receipt["error"] = f"{type(error).__name__}: {error}"
         receipt.update(
             status="passed" if failure is None else "failed",
             closed=backend.closed if backend else False,
