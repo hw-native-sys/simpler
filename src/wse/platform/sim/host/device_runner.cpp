@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "device_runner.h"
-#include "pe_swimlane.h"
+#include "swimlane_records.h"
 #include "common/dma_workspace.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
@@ -364,11 +364,11 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         memory << "]}";
         memory.close();
         if (!memory) return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
-        if (config.enable_chip_swimlane && !wse::write_pe_swimlane(
+        if (config.enable_chip_swimlane && !wse::write_swimlane_records(
                                                config.output_prefix, *descriptor, active_run_->epoch,
-                                               sram_.core_count(), active_run_->state, run_events_
+                                               config.enable_chip_swimlane, active_run_->state, run_events_
                                            )) {
-            LOG_ERROR("WSE PE swimlane export failed in %s", config.output_prefix);
+            LOG_ERROR("Failed to write WSE swimlane records in %s", config.output_prefix);
             return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
         }
     }

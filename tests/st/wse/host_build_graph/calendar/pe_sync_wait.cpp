@@ -11,7 +11,7 @@
 #include <array>
 #include <chrono>
 #include <thread>
-#include "pe_swimlane.h"
+#include "swimlane_records.h"
 #include "pe_executor.cpp"  // NOLINT(bugprone-suspicious-include): inspect the live gate under its owning mutex.
 
 namespace {
@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
                                  sync_start ? 4u :
                                               0u) &&
                        release == (sync_start && !fail ? 1u : 0u) && begin == (fail ? 0u : 2u);
-    const bool captured = fail || wse::write_pe_swimlane(argv[2], d, 1, core_count, execution, wse_run_events_v8);
+    const bool captured = fail || wse::write_swimlane_records(argv[2], d, 1, 1, execution, wse_run_events_v8);
     wse_destroy_run(execution);
     if (!valid) std::fprintf(stderr, "witness=%d, READY=%u, RELEASE=%u, BEGIN=%u\n", witnessed, ready, release, begin);
     return valid && captured ? 0 : 1;

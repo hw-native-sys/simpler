@@ -128,9 +128,16 @@ statistics and argument dumping are unsupported.
 ### PE swimlane
 
 Set `CallConfig.enable_chip_swimlane = 1` and give `output_prefix` a directory
-before submission. After a successful run, open `wse_swimlane.pftrace` from
-that directory in Perfetto. All enabled levels (1 through 4) select the WSE
-PE trace. To retain several captures, give each run its own output directory.
+before submission. All enabled levels (1 through 4) capture physical PE execution
+in `chip_swimlane_records.json`. Give each run its own output directory to keep
+several captures. To convert a capture offline, run
+
+```bash
+python -m simpler_setup.tools.swimlane_converter path/to/chip_swimlane_records.json
+```
+
+Open the resulting `merged_swimlane.json` in Perfetto. The records file contains
+the placement, timing and dependencies needed for conversion.
 
 Tracks follow physical placement: Core 0 contains PE 0 through PE 3, followed
 by Core 1 and its four PEs, in numeric order for every configured Core. Select a

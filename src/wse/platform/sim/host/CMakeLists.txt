@@ -45,7 +45,7 @@ set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES ${SIMPLER_HOST_LOG_SOURCES})
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/pe_swimlane.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/swimlane_records.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/sram_storage.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../a5/platform/sim/host/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime_c_api.cpp"

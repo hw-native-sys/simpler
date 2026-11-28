@@ -20,7 +20,7 @@ from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
-from tests.st.wse.host_build_graph.scene_helpers import build_callable
+from tests.st.wse.host_build_graph.scene_helpers import build_callable, convert_swimlane
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
 
@@ -61,6 +61,7 @@ def test_predicate_fixed_sram(tmp_path, st_platform, enabled):
             windows.append(window)
         args.add_scalar(2 if enabled else 1)
         config = CallConfig()
+        config.enable_chip_swimlane = 1
         config.output_prefix = str(tmp_path)
         worker.run(handle, args, config)
         for value, window in zip(values, windows, strict=True):
@@ -75,6 +76,13 @@ def test_predicate_fixed_sram(tmp_path, st_platform, enabled):
         assert len(done) == rows[0]["expected_tasks"] == 4
         skipped = [e for e in events if e["kind"] == 11]
         assert len(skipped) == (0 if enabled else 1)
+        intervals = [e for e in convert_swimlane(tmp_path)["traceEvents"] if e["ph"] == "X"]
+        skipped_lanes = {(e["task"], e["core"], e["pe"]) for e in skipped}
+        assert len(intervals) == 4
+        for event in intervals:
+            args = event["args"]
+            lane = (args["task"], args["core_id"], args["pe_id"])
+            assert event["cat"] == ("wse.skipped" if lane in skipped_lanes else "wse.kernel")
         assert done[0] < done[2] < done[3]
         assert done[1] < done[2]
         for window in windows:
