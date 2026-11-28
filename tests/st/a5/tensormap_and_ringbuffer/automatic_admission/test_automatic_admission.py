@@ -31,6 +31,14 @@ class TestAutomaticAdmission(AutomaticAdmissionScene):
         }
     ]
 
+    def test_terminal_close_after_direct_l2(self, request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
+        with _l2_worker_pool.isolated(st_platform, self._st_runtime, device_pool, _l2_poisoned):
+            pass
+        # Construct L3 only after the direct L2 context has closed.
+        worker = request.getfixturevalue("st_worker")
+        assert worker._exec_chip
+        self.test_run(st_platform, worker)
+
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer", automatic_admission=True)
 class TestAutomaticDeviceDemand(AutomaticDeviceDemandScene):
