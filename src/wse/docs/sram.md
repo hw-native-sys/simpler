@@ -1,74 +1,64 @@
-# Fixed SRAM layout and ownership
+# Fixed device memory
 
-WSE configuration fixes each Core's SRAM capacity and runtime reservation before
-the device is initialized. The configuration file is a build input; there is no
-runtime Python configuration or per-Core allocation API.
+WSE establishes its memory windows when the Worker initializes. The platform
+provides one local application window per Core and an optional global memory
+window per chip. Addresses and lengths belong to the
+device context and stay valid until it closes.
 
-For Core `i`, define:
+The simulation configures each Core's total SRAM capacity and runtime
+reservation in bytes. In the simulated address space each Core occupies one
+contiguous block, starting with Core 0. Its application area starts at the
+beginning of the block and its private runtime area occupies the tail.
+A Core's block starts after the **full capacities** of preceding Cores.
+Applications query each window so their layouts also work on platforms that
+map the windows at different device addresses.
 
-- `capacity[i]`: total modeled SRAM bytes;
-- `reserve[i]`: bytes reserved for runtime state;
-- `application[i] = capacity[i] - reserve[i]`;
-- `offset[i] = sum(application[0:i])`.
+The simulation spec sets the chip-global window capacity with
+`hardware.global_memory_bytes`. A zero capacity disables this window.
+Host copies can populate both local and global windows. Moving data from
+global memory to a Core during execution requires a separate transfer.
 
-The simulator creates one backing allocation. All application windows are
-contiguous at its beginning; the private runtime windows follow. Each Core still
-owns exactly `application[i] + reserve[i]` bytes. The two windows of one Core need
-not be adjacent in the simulator's Host virtual address space. Runtime descriptors
-therefore contain separate application and runtime bases.
-
-## Ordinary Worker usage
+## Worker usage
 
 ```python
-import json
 import torch
 from simpler import Worker
 from simpler.task_interface import DataType
-from simpler_setup.environment import PROJECT_ROOT
-
-spec = json.loads((PROJECT_ROOT / "src/wse/platform/config/default_simulation.json").read_text())
-cores = spec["hardware"]["core_count"]
-def expand(value):
-    return [value] * cores if isinstance(value, int) else value
-capacities = expand(spec["hardware"]["sram_bytes_per_core"])
-reserves = expand(spec["runtime"]["sram_reserve_bytes_per_core"])
-application = [capacity - reserve for capacity, reserve in zip(capacities, reserves)]
 
 worker = Worker(level=2, platform="wsesim", runtime="host_build_graph", device_id=0)
 worker.init()
 try:
-    sram = worker.malloc(sum(application))
-    offset = sum(application[:3])  # Core 3's application window
+    core3 = worker.get_base_addr(coreid=3)
     data = torch.arange(16, dtype=torch.float32)
-    worker.copy_to(sram, data, dst_offset=offset)
-    tensor = sram.tensor(shapes=(16,), dtype=DataType.FLOAT32, byte_offset=offset)
-    # Add tensor to ordinary TaskArgs and submit a registered callable.
-    # Wait for every run that borrows this Buffer before releasing it.
-    worker.free(sram)
+    address = core3 + 128
+    worker.copy_to(address, data)
+    tensor = address.tensor(shapes=(16,), dtype=DataType.FLOAT32)
+
+    global_memory = worker.get_base_addr(memory="global")
+    worker.copy_to(global_memory + 128, data)
 finally:
     worker.close()
 ```
 
-`malloc` accepts exactly the complete application size and permits one live
-Buffer claim per device context. It returns the existing fixed backing; it does
-not choose a Core or allocate individual objects. A duplicate claim or a request
-for another size fails through the existing Worker allocation error path.
+`get_base_addr(coreid=0)` also selects local SRAM. The explicit form is
+`get_base_addr(memory="local", coreid=0)`. Global memory has chip scope and
+takes no Core ID. When global memory is disabled, querying it reports that
+the window is unavailable.
 
-Tensor offsets describe the workload's fixed data layout. Each Tensor must fit
-inside one Core's application window, although any execution Core may access
-that Tensor. Host bulk copies may span adjacent application windows. Copies and
-kernel arguments cannot expose runtime-reserved storage.
+Address arithmetic and copy offsets are in bytes. A derived address retains
+its original window identity and available length. Copies must fit in that
+window, including when the adjacent address belongs to another Core.
+Application copies cannot write the runtime reservation. Layouts that need
+object-level overlap checks must also track the offset and length of each
+object placed within a window.
 
 ## Lifetime
 
-The Buffer has the same identity, provenance and run-borrowing rules as other
-Worker allocations. `free` refuses an in-flight or retained borrow. A successful
-free invalidates that Buffer claim; old handles remain invalid even if a later
-claim receives the same address. Free does not zero or release the device's
-physical backing. Device shutdown releases the backing after execution drains.
-
-Independent device contexts own independent backings. An address or view from
-one Worker cannot be substituted into another Worker's ownership registry.
+The Worker owns the fixed windows. `malloc` and `free` are unsupported on
+this platform. Window identity and the existing run-borrowing rules protect
+in-flight device work. Closing the Worker invalidates its addresses after
+execution drains. Device contexts have independent windows and ownership
+registries.
 
 ## Runtime reservation
 
@@ -92,6 +82,11 @@ Set `CallConfig.output_prefix` to obtain `wse_sram.json`. In `sections`, each
 entry gives its `name`, numeric `kind`, owning Core, address and byte length.
 In `cores`, compare each `runtime_used` with its `reserve`. The valid runtime
 address interval is `[runtime_base, runtime_base + reserve)`.
+The `global_memory` entry gives the chip-global base and capacity. The simulator reserves
+virtual memory at init and the OS backs pages as they are touched. The
+committed-memory count describes modeled capacity, and `application_used`
+includes the whole registered local application window. Tracking written bytes
+requires observing individual transfers and stores.
 
 As an example, place one SS on Core 6, its synchronized Group on Cores 2 and
 6, and a final SS on Core 3. Each of the three participating Cores holds its

@@ -245,7 +245,7 @@ public:
     int attach_current_thread(int device_id);
 
     virtual void *allocate_tensor(size_t bytes);
-    virtual void *allocate_caller_storage(size_t bytes) { return allocate_tensor(bytes); }
+    virtual void initialize_fixed_memory() = 0;
     virtual void *allocate_graph_storage(size_t bytes) { return allocate_tensor(bytes); }
     virtual void free_graph_storage(void *ptr) { free_tensor(ptr); }
     /** Total physical device backing committed by this runner. */
@@ -253,15 +253,6 @@ public:
     virtual void free_tensor(void *dev_ptr);
     virtual int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     virtual int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
-
-    /**
-     * Allocate for a caller and record the allocation as theirs; release it unless a run may still
-     * be using it. Same contract as the onboard runner's pair — see
-     * host/caller_device_buffers.h. A run's arguments may name only what a caller minted, so this
-     * runner's own regions keep going through `allocate_tensor` and stay unrecorded.
-     */
-    void *allocate_caller_buffer(size_t bytes);
-    int free_caller_buffer(void *dev_ptr);
 
     bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count);
     void release_caller_buffers(uint64_t identity, bool keep);
@@ -671,7 +662,7 @@ protected:
     uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
 
     MemoryAllocator mem_alloc_;
-    // The device allocations a caller minted through this context, and which runs still hold them
+    // The fixed application windows this context exposes to callers, and which runs still hold them
     // — see host/caller_device_buffers.h.
     CallerDeviceBuffers caller_device_buffers_;
     RunResourceSlots<void *> retained_temp_addrs_;

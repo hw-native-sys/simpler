@@ -48,12 +48,11 @@ The default has 40 Cores, four PEs per Core, and 100 MiB SRAM per Core, includin
 a 256 KiB runtime reservation. Change this build input and rebuild to use another
 fixed device model. Configuration is not changed through Python during execution.
 
-The device owns its SRAM backing for its lifetime. One call to ordinary
-`worker.malloc(application_bytes)` acquires a Buffer covering the complete,
-contiguous application area. Its per-Core windows have fixed offsets. There is
-no individual tensor or per-Core allocation operation. Use Tensor views and the
-existing copy offsets to place data, including intermediates, in those windows.
-See [SRAM layout and ownership](sram.md) for the exact address and lifetime contract.
+Worker initialization establishes a local SRAM window per Core and an optional
+global memory window per chip. Use `worker.get_base_addr(coreid=...)` for local
+SRAM and `worker.get_base_addr(memory="global")` for chip-global memory. Both support
+byte offsets and ordinary Worker copies. See [device memory layout and ownership](sram.md)
+for the address and lifetime contract.
 
 ## Execution
 
@@ -126,13 +125,10 @@ WSE implements the existing runtime C ABI in its own Host sources. The explicit
 Graph submit units retain complete Block access sets while reusing unchanged
 common HBG declarations and other graph algorithms.
 
-`host-source-provenance.json` records these derived sources and their maintenance
-boundary. `source-copy-manifest.json` records derived files and `reused_sources`.
-WSE directly compiles unchanged A5 PMU, profiling-copy and compiler-info sources;
-small include entries reference unchanged argument and mailbox definitions.
-Those source dependencies do not load an A5 runtime binary. Recorded source hashes
-identify the reviewed revision, not a pin: normal include dependencies and the
-runtime source stamp invalidate caches when shared inputs change.
+WSE compiles the A5 PMU, profiling-copy and compiler-info sources into its own
+runtime. Its headers also reference shared argument and mailbox definitions.
+Include dependencies and the runtime source stamp invalidate caches when shared
+inputs change.
 
 WSE predicate scenes reuse four A5 kernel fixtures. The WSE orchestration supplies
 the execution Core for each task.
@@ -157,6 +153,4 @@ scope remain unchanged.
 This is CPU functional simulation, not instruction timing, physical register
 allocation or hardware execution. Communication engines, execution-fault
 recovery and forced kernel interruption are outside this backend. The supported
-user path is direct L2 WSE execution with `host_build_graph`. Whole-device SRAM
-ownership does not imply support for arbitrary Host-pointer task inputs; supply
-fixed device Tensor views through the ordinary Buffer API.
+user path is direct L2 WSE execution with `host_build_graph`. Supply local device Tensor views from the owning Worker for kernel arguments.

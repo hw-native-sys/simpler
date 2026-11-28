@@ -20,25 +20,25 @@ from __future__ import annotations
 import pytest
 
 
-def _sim_binaries():
-    """Resolve pre-built a2a3sim runtime binaries, or skip if unavailable."""
+def _sim_binaries(platform):
+    """Resolve pre-built sim runtime binaries, or skip if unavailable."""
     from simpler_setup.runtime_builder import RuntimeBuilder
 
     try:
-        bins = RuntimeBuilder(platform="a2a3sim").get_binaries("tensormap_and_ringbuffer")
+        bins = RuntimeBuilder(platform=platform).get_binaries("tensormap_and_ringbuffer")
     except FileNotFoundError as e:
-        pytest.skip(f"a2a3sim runtime binaries unavailable: {e}")
+        pytest.skip(f"{platform} runtime binaries unavailable: {e}")
     return bins
 
 
-def _make_l2_worker():
+def _make_l2_worker(platform="a2a3sim"):
     from simpler.worker import Worker
 
-    _sim_binaries()  # trigger the skip on absence
+    _sim_binaries(platform)  # trigger the skip on absence
     return Worker(
         level=2,
         device_id=0,
-        platform="a2a3sim",
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
     )
 
@@ -55,17 +55,27 @@ class TestCommittedDeviceMemory:
         finally:
             worker.close()
 
-    def test_rises_on_malloc_and_falls_on_free(self):
-        worker = _make_l2_worker()
+    @pytest.mark.parametrize("platform", ["a2a3sim", "a5sim"])
+    def test_rises_on_malloc_and_falls_on_free(self, platform):
+        worker = _make_l2_worker(platform)
         worker.init()
         try:
             baseline = worker.committed_device_memory()
             assert isinstance(baseline, int)
             assert baseline >= 0  # arenas lazily committed on sim (>=0); device path verified in serving (43.44 GB)
 
+            with pytest.raises(NotImplementedError):
+                worker.get_base_addr(coreid=0)
+            with pytest.raises(NotImplementedError):
+                worker.get_base_addr(memory="global")
+
             size = 1 << 20  # 1 MiB
             handle = worker.malloc(size)
             assert handle.base != 0
+            worker.copy_to(handle, bytearray(b"data"), dst_offset=4)
+            out = bytearray(4)
+            worker.copy_from(out, handle, src_offset=4)
+            assert out == b"data"
             after_alloc = worker.committed_device_memory()
             # The allocator tracks the requested size, so the total must have
             # grown by at least the malloc'd bytes on top of the init baseline.

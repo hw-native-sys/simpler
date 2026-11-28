@@ -293,8 +293,8 @@ def test_deployment_timeout_ownership_and_close(tmp_path, st_platform):
         with pytest.raises(TimeoutError):
             run.wait(timeout=0.01)
         for buffer in buffers:
-            with pytest.raises(RuntimeError, match="in.flight"):
-                worker.free(buffer.root)
+            with pytest.raises(NotImplementedError):
+                worker.free(buffer.address)
         gate.release_probe()
         run.wait()
         placements = [[1, 1], [1, 2], [0, 3], [0, 0]]

@@ -692,6 +692,14 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx);
 int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info);
 
 /**
+ * Optional for platforms whose caller memory is fixed for the device context's lifetime.
+ * A nonnegative core_id selects its application window; -1 selects device-global storage.
+ * On success publish a device address and extent in bytes. A configured device without the
+ * selected memory kind returns PTO_RUNTIME_ERR_UNSUPPORTED.
+ */
+int get_fixed_memory_window_ctx(DeviceContextHandle ctx, int32_t core_id, uint64_t *base, uint64_t *bytes);
+
+/**
  * Let the swimlane collector hold a run past its own boundary. Latched once at
  * device init.
  *

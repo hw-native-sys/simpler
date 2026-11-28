@@ -4361,6 +4361,19 @@ NB_MODULE(_task_interface, m) {
             },
             "Return the ACL_HBM_MEM free/total byte snapshot for this worker's device."
         )
+        .def_prop_ro("has_fixed_memory_windows", &ChipWorker::has_fixed_memory_windows)
+        .def(
+            "get_fixed_memory_window",
+            [](const ChipWorker &self, int32_t core_id) {
+                try {
+                    return self.get_fixed_memory_window(core_id);
+                } catch (const UnsupportedRuntimeOperation &e) {
+                    PyErr_SetString(PyExc_NotImplementedError, e.what());
+                    throw nb::python_error();
+                }
+            },
+            nb::arg("core_id")
+        )
         .def("_malloc_shareable", &allocate_shared_buffer, nb::arg("nbytes"))
         .def(
             "_vmm_borrow",

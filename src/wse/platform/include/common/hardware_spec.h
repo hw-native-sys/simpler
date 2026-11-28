@@ -18,6 +18,11 @@ inline constexpr uint32_t MAX_CORE_COUNT = 64;
 inline constexpr uint32_t PE_PER_CORE = 4;
 inline constexpr uint64_t SRAM_ALIGNMENT = 128;
 
+// Host-visible range of a fixed application memory window on this chip.
+struct MemoryWindow {
+    uint64_t base;
+    uint64_t bytes;
+};
 struct SramRegion {
     uint64_t base;
     uint64_t capacity;

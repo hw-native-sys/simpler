@@ -2242,6 +2242,15 @@ class ChipWorker:
         """Retained temporary-buffer address for one slot, or 0 when unheld."""
         return int(self._impl.retained_temp_addr(int(slot_id)))
 
+    @property
+    def has_fixed_memory_windows(self) -> bool:
+        """Whether this runtime exposes platform-owned device address windows."""
+        return self._impl.has_fixed_memory_windows
+
+    def get_fixed_memory_window(self, core_id: int) -> tuple[int, int]:
+        """Return (device address, size in bytes) for local SRAM or global memory (-1)."""
+        return self._impl.get_fixed_memory_window(core_id)
+
     def malloc(self, size):
         """Allocate memory. Returns a pointer (uint64)."""
         return int(self._impl.malloc(int(size)))

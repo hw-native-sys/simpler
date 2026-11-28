@@ -132,6 +132,7 @@ from .buffer import (
     BufferDescriptor,
     BufferLocation,
     CanonicalIdentity,
+    FixedMemoryAddress,
     ImportContext,
     ImportRegistry,
     LocalEndpointBufferIdentityAllocator,
@@ -404,6 +405,7 @@ _CFG_FMT = struct.Struct("=iiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "
 # Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
 _PIPELINE_LEASE_FMT = struct.Struct("=IIQ")
+_CHIP_FIXED_MEMORY_WINDOWS = 1
 _OFF_PIPELINE_LEASE = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
 _OFF_ARGS = (_OFF_PIPELINE_LEASE + _PIPELINE_LEASE_FMT.size + 7) & ~7
 assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for Tensor.data"
@@ -937,6 +939,11 @@ _CCU_DOMAIN_REQUEST = struct.Struct("<QQI32si")
 _CCU_CONFIRM_PRODUCERS_STOPPED = 11
 _CCU_STOP_MISSIONS = 12
 _CTRL_BUFFER_EXPORT = 30
+_CTRL_FIXED_MEMORY_WINDOW = 31
+_CTRL_OP_NAMES[_CTRL_FIXED_MEMORY_WINDOW] = "fixed_memory_window"
+_FIXED_WINDOW_FRAME = struct.Struct("<qQQ")  # request: core, 0, 0; reply: status, base, size
+_FIXED_WINDOW_UNAVAILABLE = 1
+_FIXED_WINDOW_INVALID_CORE = 2
 _CTRL_OP_NAMES[_CTRL_DFX_FLUSH] = "flush_diagnostics"
 # The native flush wait takes a millisecond count in a C `int`. The wire field
 # is 64-bit, so a malformed frame is clamped here rather than left to fail
@@ -3702,6 +3709,21 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     view[:] = _buffer_export._handle_command(cw, view)
                 finally:
                     _release_ctrl_payload(staged, payload, view)
+            elif sub_cmd == _CTRL_FIXED_MEMORY_WINDOW:
+                staged, payload, size = _open_ctrl_payload(buf, what="fixed memory window")
+                try:
+                    if size != _FIXED_WINDOW_FRAME.size:
+                        raise ValueError("invalid fixed memory window request size")
+                    core_id, _, _ = _FIXED_WINDOW_FRAME.unpack_from(payload)
+                    try:
+                        _FIXED_WINDOW_FRAME.pack_into(payload, 0, 0, *cw.get_fixed_memory_window(core_id))
+                    except NotImplementedError:
+                        _FIXED_WINDOW_FRAME.pack_into(payload, 0, _FIXED_WINDOW_UNAVAILABLE, 0, 0)
+                    except ValueError:
+                        _FIXED_WINDOW_FRAME.pack_into(payload, 0, _FIXED_WINDOW_INVALID_CORE, 0, 0)
+                finally:
+                    payload.release()
+                    staged.close()
             elif sub_cmd == _CTRL_MALLOC:
                 size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                 ptr = cw.malloc(size)
@@ -4816,7 +4838,8 @@ def _chip_process_loop(  # noqa: PLR0913 -- chip-child entry receives binaries, 
     # The child publishes the resolved runtime depth and the grant that sizes
     # its run-state entries. Request frames have a fixed, independent count.
     granted_sets = _local_run_resource_set_count(int(cw.pipeline_depth))
-    _PIPELINE_LEASE_FMT.pack_into(buf, _OFF_PIPELINE_LEASE, int(cw.pipeline_depth), granted_sets, 0)
+    capabilities = _CHIP_FIXED_MEMORY_WINDOWS if getattr(cw, "has_fixed_memory_windows", False) is True else 0
+    _PIPELINE_LEASE_FMT.pack_into(buf, _OFF_PIPELINE_LEASE, int(cw.pipeline_depth), granted_sets, capabilities)
     _mailbox_store_i32(state_addr, _INIT_READY)
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
@@ -10390,7 +10413,7 @@ class Worker:
             # documented in issue #897.  A chip that fails or dies during init
             # raises here rather than spinning forever.
             self._await_children_ready(self._chip_shms, self._chip_pids, "chip", deadline)
-            chip_depths, chip_grants = self._read_chip_startup_grants()
+            chip_depths, chip_grants, self._fixed_memory_chips = self._read_chip_startup_grants()
             direct_chip_pipeline_depth = self._granted_chip_pipeline_depth(chip_depths)
             self._chip_run_resource_set_counts = self._granted_chip_run_resource_sets(chip_grants, chip_depths)
 
@@ -13394,6 +13417,8 @@ class Worker:
         # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
         # op never leaves an identity resolving to memory that is already gone. Cleared on close().
         self._child_alloc = _DeviceAllocations()
+        self._fixed_windows: dict[tuple[int, int], Buffer] = {}
+        self._fixed_memory_chips: set[int] = set()
         self._vmm_buffers: dict[CanonicalIdentity, _buffer_export._AllocationInfo] = {}
         self._buffer_exports: dict[int, _buffer_export._ExportLease] = {}
         self._export_sequence = _buffer_export._EXTERNAL_BORROW_TOKEN_BASE
@@ -13832,6 +13857,9 @@ class Worker:
         teardown is already reaping.
         """
         with self._child_prov_lock:
+            for window in self._fixed_windows.values():
+                window.closed = True
+            self._fixed_windows.clear()
             self._child_alloc.clear()
             self._source_attachments.clear()
             self._domain_members.clear()
@@ -13849,6 +13877,85 @@ class Worker:
         if worker_id < 0 or worker_id >= len(self._chip_shms):
             raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
 
+    def _has_fixed_memory_windows(self, worker_id: int) -> bool:
+        if self.level == 2:
+            return getattr(self._chip_worker, "has_fixed_memory_windows", False) is True
+        return worker_id in self._fixed_memory_chips
+
+    def _query_fixed_memory_window(self, worker_id: int, core: int) -> tuple[int, int]:
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.get_fixed_memory_window(core)
+        assert self._worker is not None
+        reply = self._worker.control_payload(
+            WorkerType.NEXT_LEVEL,
+            worker_id,
+            _CTRL_FIXED_MEMORY_WINDOW,
+            _FIXED_WINDOW_FRAME.pack(core, 0, 0),
+            self._py_control_timeout_s,
+        )
+        status, base, nbytes = _FIXED_WINDOW_FRAME.unpack(reply)
+        if status == _FIXED_WINDOW_UNAVAILABLE:
+            raise NotImplementedError("device has no requested memory window")
+        if status == _FIXED_WINDOW_INVALID_CORE:
+            raise ValueError(f"invalid memory window Core ID {core}")
+        if status:
+            raise RuntimeError(f"unknown fixed memory window query status {status}")
+        return base, nbytes
+
+    def get_base_addr(
+        self, memory: str | None = None, *, coreid: int | None = None, worker_id: int = 0
+    ) -> FixedMemoryAddress:
+        """Return the start of an initialized WSE memory window.
+
+        Specify a Core ID for local application SRAM or `memory="global"` for
+        configured global memory. At L3, `worker_id` selects the chip. Adding
+        a byte offset produces an address usable with copy_to, copy_from and tensor().
+        """
+        if memory is None:
+            memory = "local" if coreid is not None else "global"
+        if memory == "local" and coreid is not None:
+            core = operator.index(coreid)
+            if isinstance(coreid, bool) or not 0 <= core < 1 << 31:
+                raise ValueError("local memory requires a non-negative Core ID")
+        elif memory == "global" and coreid is None:
+            core = -1
+        else:
+            raise ValueError('specify memory="local" with coreid, or memory="global" without coreid')
+        worker_id = operator.index(worker_id)
+        with self._operation_lease("get_base_addr"), self._device_control_admission("get_base_addr"):
+            if self.level == 2:
+                if worker_id != 0:
+                    raise IndexError("L2 has only chip worker 0")
+            elif self.level == 3:
+                self._check_chip_worker_id(worker_id)
+            else:
+                raise NotImplementedError("get_base_addr requires an L2 or L3 chip owner")
+            if not self._has_fixed_memory_windows(worker_id):
+                raise NotImplementedError("chip runtime does not expose fixed memory windows")
+            with self._child_prov_worker_lock(worker_id):
+                key = (worker_id, core)
+                with self._child_prov_lock:
+                    window = self._fixed_windows.get(key)
+                if window is None:
+                    base, nbytes = self._query_fixed_memory_window(worker_id, core)
+                    if not base or not nbytes:
+                        raise ValueError(f"WSE {memory} memory window is unavailable")
+                    identity = self._burn_buffer_identity()
+                    window = wrap_vmm_window(
+                        base,
+                        nbytes,
+                        bytes(identity.owner_instance_id),
+                        int(identity.buffer_id),
+                        f"L{self.level}",
+                        generation=int(identity.generation),
+                        owner_worker_id=worker_id,
+                    )
+                    with self._child_prov_lock:
+                        self._record_device_alloc(window)
+                        self._fixed_windows[key] = window
+        return FixedMemoryAddress(window)
+
     def malloc(self, size: int, *, exportable: bool = False) -> Buffer:
         """Allocate device memory on this L2 worker's own chip; returns a DEVICE_MALLOC ``Buffer``.
 
@@ -13862,6 +13969,8 @@ class Worker:
         if self.level != 2:
             raise TypeError("worker.malloc is L2-only; at L3+ use worker.alloc_child_tensor(worker_id, ...)")
         with self._operation_lease("malloc"):
+            if self._has_fixed_memory_windows(0):
+                raise NotImplementedError("WSE uses fixed memory windows; use get_base_addr instead of malloc")
             assert self._chip_worker is not None
             # Burned before native malloc. A failed malloc leaves that id unused.
             identity = self._burn_buffer_identity()
@@ -13908,6 +14017,10 @@ class Worker:
             self._operation_lease("alloc_child_tensor"),
             self._device_control_admission("alloc_child_tensor"),
         ):
+            if self._has_fixed_memory_windows(int(worker_id)):
+                raise NotImplementedError(
+                    "chip uses fixed memory windows; use get_base_addr instead of alloc_child_tensor"
+                )
             identity = self._burn_buffer_identity()
             with self._child_prov_worker_lock(int(worker_id)):
                 ptr = (
@@ -13965,7 +14078,7 @@ class Worker:
         self._vmm_buffers[identity] = allocation
         return allocation.base
 
-    def export_buffer(self, buffer: Buffer) -> BufferExport:
+    def export_buffer(self, buffer: Buffer | FixedMemoryAddress) -> BufferExport:
         """Retain one consumer lease over a live, exportable allocation.
 
         The controller holds this Worker alive and arranges computation/consumer ordering.
@@ -13977,6 +14090,8 @@ class Worker:
         Returns:
             Same-host VMM metadata; the consumer maps its own device VA from the shareable handle.
         """
+        if isinstance(buffer, FixedMemoryAddress):
+            raise ValueError("fixed memory windows cannot be exported")
         worker_id = self._device_worker_for(buffer.identity, api="export_buffer")
         with self._operation_lease("export_buffer"), self._child_prov_worker_lock(worker_id):
             with self._child_prov_lock:
@@ -14109,7 +14224,7 @@ class Worker:
                 if identity in touched:
                     raise RuntimeError(f"Worker.free: {identity} is still referenced by an in-flight L2 run")
 
-    def free(self, handle: Buffer) -> None:
+    def free(self, handle: Buffer | FixedMemoryAddress) -> None:
         """Free a device ``Buffer`` allocated by ``malloc`` / ``alloc_child_tensor``.
 
         Refuses while any in-flight run still names this allocation, on the same terms as
@@ -14123,6 +14238,8 @@ class Worker:
         Failed VMM cleanup revokes use but retains a private cleanup target. Retry free with
         the same Buffer identity, or close the Worker; do not submit/copy/export it again.
         """
+        if isinstance(handle, FixedMemoryAddress):
+            raise NotImplementedError("fixed memory windows belong to the Worker and cannot be freed")
         if handle._source_registration is not None:
             raise ValueError("Worker.free: borrowed storage is released by its allocator, never Worker.free")
         self._refuse_free_while_in_flight(handle)
@@ -14370,7 +14487,15 @@ class Worker:
             )
         return host
 
-    def copy_to(self, dst: Buffer, src, *, dst_offset: int = 0, src_offset: int = 0, nbytes: int | None = None) -> None:
+    def copy_to(
+        self,
+        dst: Buffer | FixedMemoryAddress,
+        src,
+        *,
+        dst_offset: int = 0,
+        src_offset: int = 0,
+        nbytes: int | None = None,
+    ) -> None:
         """H2D: copy ``nbytes`` from ``src_offset`` in host ``src`` to ``dst_offset`` in device ``dst``.
 
         ``src`` is a host ``Buffer``; the chip child resolves both handles through its
@@ -14382,6 +14507,9 @@ class Worker:
         allocation ``dst`` already names; there is no way to name a sub-range with a handle built at
         an interior address, because such a handle names no allocation at all.
         """
+        if isinstance(dst, FixedMemoryAddress):
+            dst_offset = dst._relative_offset(dst_offset)
+            dst = dst._window
         host, src_addr, host_nbytes = self._host_side_of_copy(src, writing=False, api="copy_to")
         dst_offset, src_offset, nbytes = self._copy_extent(
             host_nbytes, dst_offset, src_offset, nbytes, host_side="src", api="copy_to"
@@ -14431,7 +14559,13 @@ class Worker:
                     )
 
     def copy_from(
-        self, dst, src: Buffer, *, dst_offset: int = 0, src_offset: int = 0, nbytes: int | None = None
+        self,
+        dst,
+        src: Buffer | FixedMemoryAddress,
+        *,
+        dst_offset: int = 0,
+        src_offset: int = 0,
+        nbytes: int | None = None,
     ) -> None:
         """D2H: copy ``nbytes`` from ``src_offset`` in device ``src`` to ``dst_offset`` in host ``dst``.
 
@@ -14442,6 +14576,9 @@ class Worker:
         ``nbytes`` defaults to the rest of the host side after ``dst_offset``, so a plain
         ``copy_from(dst, src)`` still transfers a whole host backing's worth.
         """
+        if isinstance(src, FixedMemoryAddress):
+            src_offset = src._relative_offset(src_offset)
+            src = src._window
         host, dst_addr, host_nbytes = self._host_side_of_copy(dst, writing=True, api="copy_from")
         src_offset, dst_offset, nbytes = self._copy_extent(
             host_nbytes, src_offset, dst_offset, nbytes, host_side="dst", api="copy_from"
@@ -15185,22 +15322,25 @@ class Worker:
             )
         return granted
 
-    def _read_chip_startup_grants(self) -> tuple[list[int], list[int]]:
-        """Read each chip child's resolved depth and run-resource grant.
+    def _read_chip_startup_grants(self) -> tuple[list[int], list[int], set[int]]:
+        """Read each chip child's depth, run-resource grant and memory capability.
 
         INIT_READY repurposes the base frame's lease word as startup metadata — slot_id carries the
-        child's depth advertisement; the reserved field carries its resource-set grant. Request
-        frames are separate regions, so a dispatch lease keeps its own meaning.
+        child's depth, the reserved field carries its resource-set grant, and the generation
+        field carries capability flags. Request frames have independent dispatch leases.
         """
         depths: list[int] = []
         grants: list[int] = []
-        for shm in self._chip_shms:
+        fixed_memory_chips: set[int] = set()
+        for worker_id, shm in enumerate(self._chip_shms):
             buf = shm.buf
             assert buf is not None
-            granted_depth, granted_sets, _spare = _PIPELINE_LEASE_FMT.unpack_from(buf, _OFF_PIPELINE_LEASE)
+            granted_depth, granted_sets, capabilities = _PIPELINE_LEASE_FMT.unpack_from(buf, _OFF_PIPELINE_LEASE)
             depths.append(granted_depth)
             grants.append(granted_sets)
-        return depths, grants
+            if capabilities & _CHIP_FIXED_MEMORY_WINDOWS:
+                fixed_memory_chips.add(worker_id)
+        return depths, grants, fixed_memory_chips
 
     def _granted_chip_run_resource_sets(self, per_child: list[int], depths: list[int]) -> list[int]:
         """Validate each child grant against its resolved depth and mailbox allocation."""

@@ -72,6 +72,7 @@ __all__ = [
     "BackendKind",
     "Buffer",
     "BufferLocation",
+    "FixedMemoryAddress",
     "BufferCapability",
     "BufferDescriptor",
     "CanonicalIdentity",
@@ -524,6 +525,56 @@ def create_host_shared_buffer(
     buffer_ref = weakref.ref(buffer)
     shm._release_guard = lambda: _owned_host_release(buffer_ref)
     return buffer
+
+
+@dataclass(frozen=True)
+class FixedMemoryAddress:
+    """Byte address within a platform-owned window. The owning Worker retains its backing."""
+
+    _window: Buffer = field(repr=False)
+    _offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self._window.closed:
+            raise ValueError("fixed memory window is closed")
+        if not 0 <= self._offset <= self._window.nbytes:
+            raise ValueError("address exceeds the fixed memory window")
+
+    @property
+    def identity(self) -> CanonicalIdentity:
+        """The window's registered identity, shared by every byte offset."""
+        return self._window.identity
+
+    @property
+    def base(self) -> int:
+        """The address on the owning device."""
+        return self._window.base + self._relative_offset(0)
+
+    @property
+    def nbytes(self) -> int:
+        """Number of bytes from this address to the end of the window."""
+        return self._window.nbytes - self._relative_offset(0)
+
+    def _relative_offset(self, byte_offset: int) -> int:
+        if self._window.closed:
+            raise ValueError("fixed memory window is closed")
+        offset = operator.index(byte_offset)
+        if offset < 0 or offset > self._window.nbytes - self._offset:
+            raise ValueError("byte offset exceeds the fixed memory window")
+        return self._offset + offset
+
+    def __add__(self, byte_offset: int) -> FixedMemoryAddress:
+        return FixedMemoryAddress(self._window, self._relative_offset(byte_offset))
+
+    def tensor(
+        self,
+        shapes: Iterable[int],
+        dtype: int | DataType,
+        strides: Iterable[int] | None = None,
+        byte_offset: int = 0,
+    ) -> Tensor:
+        """Construct a Tensor with the whole backing descriptor and the accumulated byte offset."""
+        return self._window.tensor(shapes, dtype, strides, self._relative_offset(byte_offset))
 
 
 def re_export(source: BufferDescriptor) -> Buffer:

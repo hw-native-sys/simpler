@@ -1,4 +1,4 @@
 {
-  "hardware": {"core_count": 40, "pe_per_core": 4, "sram_bytes_per_core": 104857600},
+  "hardware": {"core_count": 40, "pe_per_core": 4, "sram_bytes_per_core": 104857600, "global_memory_bytes": 68719476736},
   "runtime": {"sram_reserve_bytes_per_core": 262144}
 }

@@ -130,12 +130,18 @@ def test_counter_graph_rebind_and_reuse(tmp_path, st_platform, cores, split):
                 epochs.append(check(worker, buffers, tensors, base, cores or 40, path, split))
             for buffer in buffers:
                 release_view(worker, buffer)
-            with pytest.raises((ValueError, RuntimeError), match="released|closed|stale|freed"):
-                worker.submit(handle, args)
+            # Clearing the case's placement cursors leaves the Worker's SRAM windows alive.
+            counter_address = buffers[0].address
+            assert counter_address.identity == worker.get_base_addr(coreid=0).identity
+            persisted = torch.empty_like(tensors[0])
+            worker.copy_from(persisted, counter_address)
+            torch.testing.assert_close(persisted, tensors[0])
         assert len(set(epochs)) == 4
         worker.unregister(handle)
     finally:
         worker.close()
+    with pytest.raises((ValueError, RuntimeError)):
+        worker.copy_from(persisted, counter_address)
 
 
 def prepare_values(base):
@@ -159,8 +165,8 @@ def test_counter_wait_timeout_and_close(tmp_path, st_platform):
         with pytest.raises(TimeoutError):
             run.wait(timeout=0.01)
         for buffer in buffers:
-            with pytest.raises(RuntimeError, match="in.flight"):
-                worker.free(buffer.root)
+            with pytest.raises(NotImplementedError):
+                worker.free(buffer.address)
         gate.release_probe()
         run.wait()
         check(worker, buffers, tensors, 29, 40, path, True)

@@ -6,10 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Fixed SRAM configuration, whole-device claims and alias boundaries."""
+"""Fixed memory configuration, window ownership and access boundaries."""
 
 import json
 import subprocess
+
+import pytest
 
 from simpler_setup.kernel_compiler import KernelCompiler
 
@@ -68,7 +70,8 @@ int main() {
     subprocess.run([str(binary)], check=True, timeout=20)
 
 
-def test_sram_native_contracts(tmp_path):
+@pytest.mark.parametrize("global_bytes", [0, 4096])
+def test_sram_native_contracts(tmp_path, global_bytes):
     compiler = KernelCompiler("wsesim")
     root = compiler.project_root
     cores = 40
@@ -78,12 +81,14 @@ def test_sram_native_contracts(tmp_path):
         "#pragma once\n#include <cstdint>\nnamespace wse {\n"
         f"constexpr unsigned DEFAULT_CORES = {cores};\n"
         "constexpr unsigned DEFAULT_PES = 4;\n"
+        f"constexpr uint64_t DEFAULT_GLOBAL_MEMORY_BYTES = {global_bytes}ULL;\n"
         f"constexpr uint64_t DEFAULT_CAPACITIES[] = {{{capacities}}};\n"
         f"constexpr uint64_t DEFAULT_RESERVES[] = {{{reserves}}};\n}}\n"
     )
     source = tmp_path / "contract.cpp"
     source.write_text(r"""
 #include "sram_storage.h"
+#include "hardware_defaults.h"
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -94,25 +99,34 @@ template <class F> void rejected(F f) {
 }
 int main() {
     wse::SramStorage storage;
-    constexpr size_t app_bytes=41*768;
     assert(storage.core_count()==40 && storage.committed_bytes()==0);
-    rejected([&]{storage.claim(app_bytes-1);});
-    auto *whole=storage.claim(app_bytes);
-    rejected([&]{storage.claim(app_bytes);});
-    auto regions=storage.regions();
-    assert(regions.size()==40 && regions[0].base==reinterpret_cast<uint64_t>(whole));
-    assert(regions[1].base==regions[0].base+768);
-    assert(regions[2].base==regions[1].base+1536);
-    assert(storage.committed_bytes()==41*1024);
-    assert(regions[0].runtime_base==regions[0].base+app_bytes);
-    assert(regions[1].runtime_base==regions[0].runtime_base+256);
-    storage.check_application(regions[0].base+app_bytes-1,1);
-    rejected([&]{storage.check_application(regions[0].base+app_bytes-1,2);});
+    storage.initialize();
+    const auto regions=storage.regions();
+    assert(regions.size()==40);
+    assert(regions[1].base==regions[0].base+1024);
+    assert(regions[2].base==regions[1].base+2048);
+    assert(regions[0].runtime_base==regions[0].base+768);
+    assert(regions[1].runtime_base==regions[1].base+1536);
+    assert(storage.committed_bytes()==41*1024+wse::DEFAULT_GLOBAL_MEMORY_BYTES);
+    const auto local=storage.window(0);
+    assert(local.base==regions[0].base && local.bytes==768);
+    storage.check_application(local.base+local.bytes-1,1);
+    rejected([&]{storage.check_application(local.base+local.bytes-1,2);});
     rejected([&]{storage.check_application(regions[0].runtime_base,1);});
-    rejected([&]{storage.release(static_cast<char *>(whole)+8);});
-    std::memset(whole,37,768);
+    const auto global=storage.window(-1);
+    assert(global.bytes==wse::DEFAULT_GLOBAL_MEMORY_BYTES);
+    if (global.bytes) {
+        assert(global.base);
+        storage.check_application(global.base+global.bytes-1,1);
+        rejected([&]{storage.check_application(global.base+global.bytes-1,2);});
+    } else {
+        assert(!global.base);
+    }
+    auto *data=reinterpret_cast<unsigned char *>(local.base);
+    std::memset(data,37,768);
     std::memset(reinterpret_cast<void *>(regions[1].base),19,1536);
-    assert(static_cast<unsigned char *>(whole)[0]==37);
+    storage.initialize();
+    assert(storage.window(0).base==local.base && data[0]==37);
     auto allocations=storage.allocations();
     assert(allocations.size()==40 && allocations[1].owner==1 && allocations[1].bytes==1536);
     storage.set_runtime_used(std::vector<uint64_t>(40,128));
@@ -121,14 +135,10 @@ int main() {
     rejected([&]{storage.set_runtime_used(excess);});
     assert(storage.info(0)[6]==128);
     storage.reset_runtime_used();assert(storage.info(0)[6]==0);
-    storage.release(whole);
-    assert(storage.allocations().empty() && storage.committed_bytes()==41*1024);
-    rejected([&]{storage.check_application(reinterpret_cast<uint64_t>(whole),1);});
-    rejected([&]{storage.release(whole);});
-    assert(storage.claim(app_bytes)==whole);
-    wse::SramStorage other;other.freeze();
-    assert(other.regions()[0].base!=regions[0].base);
-    storage.clear();assert(storage.committed_bytes()==0);
+    wse::SramStorage other;other.initialize();
+    assert(other.window(0).base!=local.base);
+    storage.clear();
+    assert(storage.committed_bytes()==0 && storage.regions().empty() && storage.allocations().empty());
 
 }
 """)
@@ -181,6 +191,11 @@ def test_sram_default_config_generation(tmp_path):
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
     header = (tmp_path / "build/generated/hardware_defaults.h").read_text()
     assert "4096ULL,8192ULL," in header and "1024ULL,1024ULL," in header
+    assert "DEFAULT_GLOBAL_MEMORY_BYTES = 0ULL" in header
+    config["hardware"]["global_memory_bytes"] = 4096
+    path.write_text(json.dumps(config))
+    subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
+    assert "DEFAULT_GLOBAL_MEMORY_BYTES = 4096ULL" in (tmp_path / "build/generated/hardware_defaults.h").read_text()
     config["hardware"]["unknown"] = 1
     path.write_text(json.dumps(config))
     rejected = subprocess.run(command, check=False, capture_output=True, text=True, timeout=60)
