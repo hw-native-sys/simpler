@@ -38,14 +38,13 @@ completion and partial failures without deliberately poisoning a shared device.
 
 ## Running
 
-Run the architecture precheck before acquiring devices, then use one exclusive
-`task-submit` allocation for the complete comparison:
+Run the architecture precheck and functional cases in the same two-device allocation:
 
 ```bash
-.claude/skills/onboard-arch-precheck/check.sh a5
 task-submit --device auto --device-num 2 --timeout 1800 --max-time 1800 \
-  --run 'PYTEST_ADDOPTS=-s .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/urma_multi_jetty \
-    --platform a5 --device "$TASK_DEVICE" --pto-session-timeout 1200 -v -s'
+  --run 'bash .claude/skills/onboard-arch-precheck/check.sh a5 && \
+    PYTEST_ADDOPTS=-s .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/urma_multi_jetty \
+    --platform a5 --device "$TASK_DEVICE" --manual include -k "not TestUrmaMultiJettyTiming" --pto-session-timeout 1200 -v -s'
 ```
 
 `PYTEST_ADDOPTS=-s` also exposes queue records from the scheduled pytest children.

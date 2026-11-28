@@ -81,6 +81,8 @@ from simpler.worker import (
 from simpler_setup import SceneTestCase, scene_test
 from simpler_setup.tools.strace_timing import parse_spans
 
+pytestmark = pytest.mark.manual(["a5"])
+
 #: The point-in-time host span one joined launch publishes, carrying both run identities and
 #: carrying `observed` separately from `unfired` so a failed query reads as a failed query.
 _JOIN_SPAN = "chip.run.joined_launch"
@@ -2451,6 +2453,7 @@ class TestA5WorkedCapacityExample(_A5EarlyEnqueueBase):
         {
             "name": "a5_worked_capacity_example",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,

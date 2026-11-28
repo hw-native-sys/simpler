@@ -29,8 +29,12 @@ class TestHostCommDomain(SceneTestCase):
     CASES = [{"name": "host_comm_domain", "platforms": ["a5"], "config": {"device_count": 2}}]
 
     @pytest.mark.device_count(2)
-    @pytest.mark.parametrize("staged", [False, True], ids=["serial", "staged"])
-    @pytest.mark.parametrize("aiv_blocks", [1, 4], ids=["single_aiv", "multi_aiv"])
+    @pytest.mark.parametrize(
+        "staged", [pytest.param(False, marks=pytest.mark.manual(["a5"])), True], ids=["serial", "staged"]
+    )
+    @pytest.mark.parametrize(
+        "aiv_blocks", [pytest.param(1, marks=pytest.mark.manual(["a5"])), 4], ids=["single_aiv", "multi_aiv"]
+    )
     def test_run(self, st_platform, st_device_ids, staged, aiv_blocks, request):
         if not self._matching_cases(st_platform, request):
             pytest.skip("Host communication domain case was not selected")

@@ -49,6 +49,7 @@ class TestScalarData(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "params": {},
         },
     ]

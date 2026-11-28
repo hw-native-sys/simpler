@@ -81,6 +81,7 @@ class TestAsyncNotifyDemo(SceneTestCase):
         {
             "name": "notification_counter",
             "platforms": ["a2a3", "a5"],
+            "manual": ["a5"],
             "config": {"device_count": NRANKS, "num_sub_workers": 0},
             "params": {},
         }

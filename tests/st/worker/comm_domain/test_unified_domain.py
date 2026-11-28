@@ -26,7 +26,7 @@ _NBYTES = _NUMEL * 4
 @pytest.mark.platforms(["a2a3sim", "a5sim", "a2a3", "a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(1)
-@pytest.mark.parametrize("cached", [pytest.param(False, marks=pytest.mark.manual(["a2a3"])), True])
+@pytest.mark.parametrize("cached", [pytest.param(False, marks=pytest.mark.manual(["a2a3", "a5"])), True])
 def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids, cached):
     worker = Worker(
         level=3, platform=st_platform, runtime=_RUNTIME, device_ids=[int(st_device_ids[0])], num_sub_workers=0

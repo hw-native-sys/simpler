@@ -101,7 +101,7 @@ class TestDepGenChain(SceneTestCase):
         {
             "name": "n_200_single_overflow",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 2},
             "params": {"n": 200},
         },

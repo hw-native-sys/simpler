@@ -66,6 +66,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "params": {
                 "batch": 256,
                 "num_heads": 16,

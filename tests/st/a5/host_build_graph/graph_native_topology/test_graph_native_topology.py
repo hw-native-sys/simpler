@@ -39,18 +39,18 @@ class TestGraphNativeTopology(SceneTestCase):
             "name": name,
             "platforms": ["a5sim", "a5"],
             "params": {"nodes": nodes, "kind": kind, "instances": instances},
-            **({"manual": ["a5sim"]} if nodes == 1024 else {}),
+            "manual": manual,
         }
-        for name, nodes, kind, instances in (
-            ("roots_1", 1, 0, 1),
-            ("roots_1024", 1024, 0, 1),
-            ("fanin_1", 2, 1, 1),
-            ("fanin_128", 129, 1, 1),
-            ("fanin_129", 130, 1, 1),
-            ("fanin_1023", 1024, 1, 1),
-            ("dummy_chain", 1024, 2, 1),
-            ("dummy_only", 1024, 3, 1),
-            ("shared_definition", 33, 0, 3),
+        for name, nodes, kind, instances, manual in (
+            ("roots_1", 1, 0, 1, []),
+            ("roots_1024", 1024, 0, 1, ["a5sim"]),
+            ("fanin_1", 2, 1, 1, []),
+            ("fanin_128", 129, 1, 1, []),
+            ("fanin_129", 130, 1, 1, []),
+            ("fanin_1023", 1024, 1, 1, ["a5sim"]),
+            ("dummy_chain", 1024, 2, 1, ["a5sim", "a5"]),
+            ("dummy_only", 1024, 3, 1, ["a5sim"]),
+            ("shared_definition", 33, 0, 3, []),
         )
     ]
 

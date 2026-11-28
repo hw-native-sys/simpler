@@ -198,6 +198,7 @@ def run_worker_chip_message_queue_example(platform: str, device_id: int) -> None
         worker.close()
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime("tensormap_and_ringbuffer")

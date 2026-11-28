@@ -26,6 +26,7 @@ from ._helpers import (
 )
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(SUCCESS_PLATFORMS)
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)

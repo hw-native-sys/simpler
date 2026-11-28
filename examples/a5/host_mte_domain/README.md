@@ -55,7 +55,7 @@ architecture, example sources and PTO-ISA pin; prepare on each target machine.
 Execution loads those inputs without a generation fallback. Missing, stale or
 corrupt inputs require rerunning the precompiler.
 
-The shared A5 comment/daily job discovers these classes through its existing
+The A5 onboard job in PR CI and Daily discovers these classes through its existing
 `examples tests/st` precompile and pytest commands. No example-specific workflow
 step is needed. Runtime and manual filters use the normal scene-test selection.
 

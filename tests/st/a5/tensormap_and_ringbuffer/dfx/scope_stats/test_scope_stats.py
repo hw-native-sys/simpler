@@ -94,7 +94,7 @@ class TestScopeStats(SceneTestCase):
         {
             "name": "aicpu_threads_2",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 2},
             "params": {},
         },

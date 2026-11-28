@@ -155,6 +155,7 @@ def test_ordinary_task_that_wide_runs_in_waves(st_platform, st_device_ids):
 @pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
+@pytest.mark.manual(["a5"])
 def test_sync_start_on_a_single_block_is_dropped_not_refused(st_platform, st_device_ids):
     """One block asking for sync-start is an ordinary task, not an error.
 

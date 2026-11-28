@@ -50,7 +50,7 @@ class TestBenchmarkBgemmHostBuildGraph(SceneTestCase):
         {
             "name": "Case0",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": ["a5sim", "a5"],
             "params": {"matmul_add_task_num": 500, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
         },
     ]

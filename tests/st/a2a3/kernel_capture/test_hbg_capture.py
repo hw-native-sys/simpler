@@ -140,7 +140,7 @@ def hbg_capture_probe(tmp_path_factory, request):
 
 
 @pytest.mark.platforms(["a2a3", "a5"])
-@pytest.mark.manual(["a2a3"])
+@pytest.mark.manual(["a2a3", "a5"])
 def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
     binaries = build_probe(tmp_path, retained_models=True, platform=request.config.getoption("--platform"))
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
@@ -245,33 +245,27 @@ def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path)
     assert "stage=finalize-after-destroy rc=0" in stdout
 
 
+@pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.parametrize(
     "scenario",
     [
+        pytest.param(0, id="dependency", marks=pytest.mark.manual(["a2a3", "a5"])),
+        pytest.param(1, id="early-dispatch", marks=pytest.mark.manual(["a2a3"])),
+        pytest.param(2, id="nested-graph", marks=pytest.mark.manual(["a2a3", "a5"])),
+        pytest.param(3, id="destroy-unexecuted", marks=pytest.mark.manual(["a2a3", "a5"])),
+        pytest.param(4, id="reject-duplicate", marks=pytest.mark.manual(["a2a3", "a5"])),
+        pytest.param(5, id="reject-predecessor", marks=pytest.mark.manual(["a2a3", "a5"])),
+        pytest.param(6, id="readonly-host-snapshot", marks=pytest.mark.manual(["a2a3", "a5"])),
+        pytest.param(7, id="cancel-active-capture-and-recover"),
+        pytest.param(8, id="capture-end-rejection-and-recover", marks=pytest.mark.manual(["a2a3", "a5"])),
+        pytest.param(9, id="unjoined-capture-end-and-recover", marks=pytest.mark.manual(["a2a3", "a5"])),
+        pytest.param(10, id="invalidated-capture-and-recover", marks=pytest.mark.manual(["a2a3", "a5"])),
+        pytest.param(11, id="injected-partial-capture-and-recover"),
+        # A5 second-replay stream timeouts in these two fault scenarios are tracked in #3254.
+        pytest.param(12, id="two-device-timeouts-and-same-model-recovery", marks=pytest.mark.manual(["a2a3", "a5"])),
         pytest.param(
-            scenario,
-            marks=[
-                pytest.mark.platforms(["a2a3", "a5"]),
-                *([pytest.mark.manual(["a2a3"])] if scenario not in (7, 11) else []),
-            ],
-        )
-        for scenario in range(14)
-    ],
-    ids=[
-        "dependency",
-        "early-dispatch",
-        "nested-graph",
-        "destroy-unexecuted",
-        "reject-duplicate",
-        "reject-predecessor",
-        "readonly-host-snapshot",
-        "cancel-active-capture-and-recover",
-        "capture-end-rejection-and-recover",
-        "unjoined-capture-end-and-recover",
-        "invalidated-capture-and-recover",
-        "injected-partial-capture-and-recover",
-        "two-device-timeouts-and-same-model-recovery",
-        "post-handshake-boot-failure-and-same-model-recovery",
+            13, id="post-handshake-boot-failure-and-same-model-recovery", marks=pytest.mark.manual(["a2a3", "a5"])
+        ),
     ],
 )
 def test_hbg_model_replays_with_original_run(hbg_capture_probe, request, scenario):
@@ -279,8 +273,14 @@ def test_hbg_model_replays_with_original_run(hbg_capture_probe, request, scenari
 
 
 @pytest.mark.platforms(["a2a3", "a5"])
-@pytest.mark.parametrize("scenario", [14, 15], ids=["larger-eager-run-between-replays", "zero-replays"])
-@pytest.mark.manual(["a2a3"])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param(14, id="larger-eager-run-between-replays"),
+        pytest.param(15, id="zero-replays", marks=pytest.mark.manual(["a5"])),
+    ],
+)
+@pytest.mark.manual(["a2a3", "a5"])
 def test_hbg_model_with_caller_owned_run(hbg_capture_probe, request, scenario):
     _check_model_lifecycle(hbg_capture_probe, request, scenario)
 
@@ -353,7 +353,9 @@ if __name__ == "__main__":
 
 
 @pytest.mark.manual(["a2a3"])
-@pytest.mark.parametrize("replay", [0, 1], ids=["zero", "interleaved-models"])
+@pytest.mark.parametrize(
+    "replay", [pytest.param(0, marks=pytest.mark.manual(["a5"])), 1], ids=["zero", "interleaved-models"]
+)
 @pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
     from collections import Counter  # noqa: PLC0415
@@ -387,7 +389,9 @@ def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
 
 
 @pytest.mark.manual(["a2a3"])
-@pytest.mark.parametrize("replay", [0, 1], ids=["zero", "interleaved-models"])
+@pytest.mark.parametrize(
+    "replay", [pytest.param(0, marks=pytest.mark.manual(["a5"])), 1], ids=["zero", "interleaved-models"]
+)
 @pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_retained_models_publish_swimlane_observations(tmp_path, request, replay):
     import sys  # noqa: PLC0415
@@ -565,7 +569,7 @@ def hbg_args_dump_probe(tmp_path_factory, request):
 
 
 @pytest.mark.manual(["a2a3"])
-@pytest.mark.parametrize("replays", [0, 3])
+@pytest.mark.parametrize("replays", [pytest.param(0, marks=pytest.mark.manual(["a5"])), 3])
 @pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_args_dump_capture_exports_task_time_values(hbg_args_dump_probe, tmp_path, request, replays):
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]

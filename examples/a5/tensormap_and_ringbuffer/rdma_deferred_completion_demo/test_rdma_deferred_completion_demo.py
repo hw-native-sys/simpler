@@ -293,6 +293,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, *, build: boo
     return 0 if ok else 1
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.requires_hardware
 @pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(2)

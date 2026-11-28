@@ -42,8 +42,8 @@ _TICKET_SHAPES = ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2))
 # holds a device for its own process because a failed run poisons it. A
 # simulator covers standalone Vector and the full MIX.
 _SIM_SHAPES = frozenset({(4, 2), (7, 0)})
-# On silicon, Per-PR keeps one shape per failed-lane position for every timeout
-# mode. The remaining mask/lane combinations run in Daily.
+# The nonreturning kernel exercises the watchdog on each failed lane in PR CI.
+# Other timeout modes select their own representative shapes below.
 _PER_PR_SHAPES = frozenset({(1, 0), (4, 2), (7, 1)})
 
 
@@ -55,14 +55,14 @@ def _onboard_shape_params(shapes):
     ]
 
 
-def _shape_params(shapes):
+def _shape_params(shapes, per_pr):
     params = []
     for mask, lane in shapes:
         marks = [] if (mask, lane) in _SIM_SHAPES else [pytest.mark.platforms(["a5"])]
         manual_platforms = []
         if (mask, lane) == (7, 0):
             manual_platforms.append("a5sim")
-        if (mask, lane) not in _PER_PR_SHAPES:
+        if (mask, lane) not in per_pr:
             manual_platforms.append("a5")
         if manual_platforms:
             marks.append(pytest.mark.manual(manual_platforms))
@@ -205,7 +205,7 @@ def _check_failed_capture(raw, root_id, blocks, mask, lane, *, nonreturning=Fals
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.parametrize("mask,lane", _shape_params(_SHAPES))
+@pytest.mark.parametrize("mask,lane", _shape_params(_SHAPES, {(7, 1)}))
 @pytest.mark.parametrize("blocks", (1, 2))
 def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, blocks, monkeypatch):
     _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatch, _STALL_MS)
@@ -269,7 +269,7 @@ def test_nonreturning_kernel_timeout_keeps_failed_run_contained(st_platform, st_
     _exercise_failure(st_platform, st_device_ids, mask, lane, 2, monkeypatch, -1)
 
 
-@pytest.mark.parametrize("mask,lane", _shape_params(_TICKET_SHAPES))
+@pytest.mark.parametrize("mask,lane", _shape_params(_TICKET_SHAPES, {(7, 1)}))
 def test_large_ticket_claim_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, monkeypatch):
     # 257 exceeds twice every supported single-chip claimant population.
     _exercise_failure(st_platform, st_device_ids, mask, lane, 257, monkeypatch, _STALL_MS)
@@ -309,7 +309,7 @@ def _check_two_wave_topology(raw, blocks, mask, required):
     assert blocks == len(clusters) * _lane_positions_per_cluster(mask) * 2
 
 
-@pytest.mark.parametrize("mask,lane", _shape_params(_TICKET_SHAPES))
+@pytest.mark.parametrize("mask,lane", _shape_params(_TICKET_SHAPES, {(4, 2), (7, 1)}))
 def test_two_wave_ticket_claim_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, monkeypatch):
     _exercise_failure(
         st_platform,

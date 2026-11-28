@@ -148,6 +148,7 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
     )
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)

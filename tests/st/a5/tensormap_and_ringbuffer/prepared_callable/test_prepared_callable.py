@@ -185,6 +185,7 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
         config = self._build_config(case.get("config", {}))
         return callable_obj, config, case
 
+    @pytest.mark.manual(["a5"])
     def test_dlopen_count_same_slot_repeated_runs(self, st_platform, st_worker):
         """Case A: prepare(primary) prewarms once; run x5 adds no dlopens."""
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
@@ -234,6 +235,7 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
             if primary_prepared:
                 chip_worker.unregister_callable(_SLOT_PRIMARY)
 
+    @pytest.mark.manual(["a5"])
     def test_dlopen_count_double_prepare_raises(self, st_platform, st_worker):
         """Case C: prepare(primary) + prepare(primary) -> second call raises RuntimeError."""
         callable_obj, _config, _case = self._setup_dlopen_count_test(st_worker, st_platform)
@@ -248,6 +250,7 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
             if prepared:
                 chip_worker.unregister_callable(_SLOT_PRIMARY)
 
+    @pytest.mark.manual(["a5"])
     def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
         """Case D: prepare+unregister+prepare prewarms twice -> delta == 2.
 

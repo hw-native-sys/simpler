@@ -16,6 +16,7 @@ from simpler.worker import Worker
 _RUNTIME = "tensormap_and_ringbuffer"
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)

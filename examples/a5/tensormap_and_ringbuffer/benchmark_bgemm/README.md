@@ -18,7 +18,7 @@ views, so their callable signatures contain only the data tensors.
 pytest examples/a5/tensormap_and_ringbuffer/benchmark_bgemm --platform a5sim
 
 pytest examples/a5/tensormap_and_ringbuffer/benchmark_bgemm \
-  --platform a5 --device 0
+  --platform a5 --device 0 --manual include
 ```
 
 The host-build-graph counterpart references the same orchestration and incore

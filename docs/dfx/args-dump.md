@@ -202,8 +202,8 @@ unsettled rather than reading or closing a possibly active producer.
 
 `tests/st/a5/host_build_graph/dump_args` checks intermediate values, native child
 identities, a 73-block Mix child and empty views in FULL, HYBRID and PARTIAL.
-The A5 DFX smoke action explicitly selects these cases when `/run-a5` or a
-scheduled sweep requests its DFX jobs; default PR CI does not acquire an A5.
+The A5 onboard DFX smoke action selects these cases on PRs that affect A5
+scene tests and in the Daily sweep.
 See [the boundary and storage contract](../investigations/2026-10-a5-resident-per-task-args-capture.md)
 for memory ownership and failure details.
 

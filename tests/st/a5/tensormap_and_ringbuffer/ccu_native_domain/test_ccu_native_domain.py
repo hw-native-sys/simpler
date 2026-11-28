@@ -139,6 +139,7 @@ def test_registration_isolated_across_two_live_domains(st_platform, st_device_id
         worker.close()
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
@@ -171,6 +172,7 @@ def test_unenabled_domain_rejects_ccu_registration(st_platform, st_device_ids, t
         worker.close()
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
@@ -250,6 +252,7 @@ def test_two_missions_b_before_a(st_platform, st_device_ids, tmp_path, request, 
         worker.close()
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
@@ -467,6 +470,7 @@ def test_mission_failure_allows_terminal_cleanup(st_platform, st_device_ids, tmp
     print(f"CCU {fault}: same-device transfer passed in new chip processes {sorted(replacement_pids)}", flush=True)
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
@@ -483,6 +487,7 @@ def test_multidomain_chip_finite_missions_reuse(st_platform, st_device_ids, tmp_
     _exercise_multidomain_chip(st_platform, st_device_ids, tmp_path, request, capfd, finite=True)
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
@@ -594,6 +599,7 @@ def _exercise_multidomain_chip(st_platform, st_device_ids, tmp_path, request, ca
     assert sum("completed mission abort confirmed " in line for line in ccu_lines) == 6 * resident_runs
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)

@@ -26,6 +26,7 @@ class TestAutomaticAdmission(AutomaticAdmissionScene):
         {
             "name": "automatic_admission",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "config": {"device_count": 1, "num_sub_workers": 1},
             "params": {},
         }
@@ -39,6 +40,7 @@ class TestAutomaticDeviceDemand(AutomaticDeviceDemandScene):
         {
             "name": "automatic_devicedemand",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "config": {"device_count": 1, "num_sub_workers": 1},
             "params": {},
         }
@@ -52,6 +54,7 @@ class TestAutomaticOutstandingClose(AutomaticOutstandingCloseScene):
         {
             "name": "automatic_outstandingclose",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "config": {"device_count": 1, "num_sub_workers": 1},
             "params": {},
         }

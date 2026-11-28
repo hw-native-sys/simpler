@@ -50,7 +50,7 @@ under [`tests/st/worker/comm_domain/`](../../../tests/st/worker/comm_domain/).
 pytest examples/a5/tensormap_and_ringbuffer --platform a5sim
 
 # One example, on hardware
-pytest examples/a5/tensormap_and_ringbuffer/bgemm --platform a5 --device 0
+pytest examples/a5/tensormap_and_ringbuffer/bgemm --platform a5 --device 0 --manual include
 ```
 
 `vector_example`, `bgemm`, and `paged_attention_manual_scope` run under

@@ -60,7 +60,12 @@ from simpler_setup import test_environments as _test_environments  # noqa: E402
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, configure_logging  # noqa: E402
 from simpler_setup.platform_info import ARCHS  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
-from simpler_setup.scene_test import SceneTestLevel, clear_compile_cache, is_manual_for_platform  # noqa: E402
+from simpler_setup.scene_test import (  # noqa: E402
+    SceneTestLevel,
+    clear_compile_cache,
+    is_manual_item,
+    is_manual_scene_case,
+)
 
 # Exit code used when the session watchdog fires. Matches the GNU `timeout`
 # convention so shell wrappers (e.g. CI) can distinguish timeout from other
@@ -774,30 +779,6 @@ def _manual_mode_matches(is_manual: bool, manual_mode: str) -> bool:
     return manual_mode == "include" or is_manual == (manual_mode == "only")
 
 
-def _manual_marker_applies(marker, platform: str | None) -> bool:
-    if marker is None:
-        return False
-
-    unknown_kwargs = set(marker.kwargs) - {"platforms"}
-    if unknown_kwargs:
-        names = ", ".join(sorted(unknown_kwargs))
-        raise pytest.UsageError(f"@pytest.mark.manual got unsupported keyword argument(s): {names}")
-    if marker.args and "platforms" in marker.kwargs:
-        raise pytest.UsageError(
-            "@pytest.mark.manual platforms must be passed either positionally or by keyword, not both"
-        )
-
-    if "platforms" in marker.kwargs:
-        platforms = marker.kwargs["platforms"]
-    elif marker.args:
-        platforms = marker.args[0] if len(marker.args) == 1 else marker.args
-    else:
-        return True
-    if platforms is None or platform is None:
-        return True
-    return is_manual_for_platform(platforms, platform)
-
-
 def pytest_itemcollected(item):
     try:
         _test_environments.environment_for_item(item)
@@ -865,7 +846,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
                 continue
             if not any(
                 platform in case.get("platforms", [])
-                and _manual_mode_matches(is_manual_for_platform(case.get("manual"), platform), manual_mode)
+                and _manual_mode_matches(is_manual_scene_case(item, case, platform), manual_mode)
                 for case in cls.CASES
             ):
                 deselected.append(item)
@@ -883,7 +864,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
             continue
 
         # Standalone pytest test (resource functions and ordinary tests).
-        is_manual = _manual_marker_applies(item.get_closest_marker("manual"), platform)
+        is_manual = is_manual_item(item, platform)
         if not _manual_mode_matches(is_manual, manual_mode):
             deselected.append(item)
             continue
@@ -1037,7 +1018,7 @@ def _collect_resource_jobs(items, platform, manual_mode="exclude"):
         for case in getattr(cls, "CASES", []):
             if platform and platform not in case.get("platforms", []):
                 continue
-            if not _manual_mode_matches(is_manual_for_platform(case.get("manual"), platform), manual_mode):
+            if not _manual_mode_matches(is_manual_scene_case(item, case, platform), manual_mode):
                 continue
             saw_case = True
             max_dev = max(max_dev, int(case.get("config", {}).get("device_count", 1)))

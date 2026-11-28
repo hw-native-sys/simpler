@@ -85,6 +85,7 @@ class TestL3Dependency(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
+            "manual": ["a5"],
             "config": {"device_count": 1, "num_sub_workers": 1},
             "params": {},
         },

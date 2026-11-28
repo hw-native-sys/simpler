@@ -144,14 +144,14 @@ class _UrmaRegression(SceneTestCase):
             getattr(args, f"result_{rank}").copy_(expected + 1.0)
 
 
-def _case(name, mode=0, repeats=1, elems=SMALL_ELEMS):
+def _case(name, mode=0, repeats=1, elems=SMALL_ELEMS, *, manual=True):
     if elems <= 0 or elems % CONSUMER_TILE_ELEMS:
         raise ValueError("URMA regression consumer requires a positive multiple of 8192 elements")
     return [
         {
             "name": name,
             "platforms": ["a5"],
-            "manual": True,
+            "manual": manual,
             "config": {"device_count": 3 if mode == MULTI_PEER_MODE else NRANKS, "num_sub_workers": 0},
             "params": {"mode": mode, "repeats": repeats, "elems": elems},
         }
@@ -170,7 +170,7 @@ class TestUrmaPut(_UrmaRegression):
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestUrmaGatherScatter(_UrmaRegression):
-    CASES = _case("gather_put_scatter_get", mode=GATHER_SCATTER_MODE, repeats=2)
+    CASES = _case("gather_put_scatter_get", mode=GATHER_SCATTER_MODE, repeats=2, manual=False)
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
