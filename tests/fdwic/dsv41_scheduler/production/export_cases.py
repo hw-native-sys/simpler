@@ -25,7 +25,7 @@ def link(source, target):
         shutil.copyfile(source, target)
 
 
-def _export_native(destination, root, tools, native_moe_bundle):
+def _export_native(destination, root, native_build, native_moe_bundle):
     command = [
         sys.executable,
         str(root / "production/moe.py"),
@@ -33,22 +33,25 @@ def _export_native(destination, root, tools, native_moe_bundle):
         str(destination / "compile"),
         "--compile-only",
         "--build-dir",
-        str(tools.parent / "native-moe"),
+        str(native_build),
     ]
     if native_moe_bundle is not None:
         command += ["--reuse-bundle", str(native_moe_bundle)]
     subprocess.run(command, check=True)
 
 
-def export(bundle, capture, flavor, output, tools, native_moe_bundle=None):
+def export(bundle, capture, flavor, output, tools=None, native_moe_bundle=None):
     if flavor != "pypto_lib_latest":
         raise ValueError(f"Unknown workload: {flavor}")
     root = Path(__file__).resolve().parents[1]
+    build = bundle.parents[1]
+    if tools is None:
+        tools = build / "host"
     cases = json.loads((root / "workloads" / flavor / "source.json").read_text())["cases"]
     for name, case in cases.items():
         destination = output / flavor / name
         if case.get("execution") == "native_moe_host_control":
-            _export_native(destination, root, tools, native_moe_bundle)
+            _export_native(destination, root, build / "native-moe", native_moe_bundle)
             continue
         destination.mkdir(parents=True, exist_ok=False)
         first, last = str(case["first_source_task"]), str(case["last_source_task"])
@@ -140,7 +143,7 @@ if __name__ == "__main__":
     parser.add_argument("capture", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--flavor", choices=["pypto_lib_latest"], default="pypto_lib_latest")
-    parser.add_argument("--tools", type=Path, default=Path(__file__).resolve().parents[1] / "build/portable/host")
+    parser.add_argument("--tools", type=Path, help="Override the forward build's Host tools directory")
     parser.add_argument("--native-moe-bundle", type=Path, help="Reuse an existing compatible native MoE bundle")
     args = parser.parse_args()
     export(
@@ -148,6 +151,6 @@ if __name__ == "__main__":
         args.capture.resolve(),
         args.flavor,
         args.output.resolve(),
-        args.tools.resolve(),
+        args.tools.resolve() if args.tools is not None else None,
         args.native_moe_bundle,
     )

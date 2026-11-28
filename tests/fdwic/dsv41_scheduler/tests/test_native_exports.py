@@ -22,12 +22,16 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-def test_export_keeps_native_plans_and_uses_host_entry_for_moe(monkeypatch, tmp_path):
+@pytest.mark.parametrize("override_tools", [False, True])
+def test_export_keeps_native_plans_and_uses_host_entry_for_moe(monkeypatch, tmp_path, override_tools):
     flavor = "pypto_lib_latest"
     cases = json.loads((PRODUCTION.parent / "workloads" / flavor / "source.json").read_text())["cases"]
     by_first = {case["first_source_task"]: case for case in cases.values() if "first_source_task" in case}
-    bundle, capture, output = (tmp_path / name for name in ("bundle", "capture", "output"))
-    bundle.mkdir()
+    build = tmp_path / "percounter-build"
+    bundle = build / "forward" / flavor
+    capture, output = tmp_path / "capture", tmp_path / "output"
+    tools = tmp_path / "alternate-tools" if override_tools else None
+    bundle.mkdir(parents=True)
     for rank in range(2):
         path = capture / f"rank{rank}"
         path.mkdir(parents=True)
@@ -35,6 +39,7 @@ def test_export_keeps_native_plans_and_uses_host_entry_for_moe(monkeypatch, tmp_
         (bundle / f"rank{rank}.txt").write_text("DSV41_NATIVE_V1\n2 0\n0\n0\nVALIDATE_ZERO 0\n")
 
     def record_detail(command, **kwargs):
+        assert Path(command[0]).parent == (tools or build / "host")
         case = by_first[command[-2]]
         assert command[-1] == case["last_source_task"]
         return json.dumps(
@@ -44,10 +49,14 @@ def test_export_keeps_native_plans_and_uses_host_entry_for_moe(monkeypatch, tmp_
     native = []
     monkeypatch.setattr(MODULE.subprocess, "check_output", record_detail)
     monkeypatch.setattr(MODULE.subprocess, "run", lambda *args, **kwargs: None)
-    monkeypatch.setattr(MODULE, "_export_native", lambda destination, *args: native.append(destination))
-    paths = MODULE.export(bundle, capture, flavor, output, tmp_path / "tools")
+
+    def record_native(destination, root, native_build, reuse):
+        native.append((destination, native_build))
+
+    monkeypatch.setattr(MODULE, "_export_native", record_native)
+    paths = MODULE.export(bundle, capture, flavor, output, tools)
     assert {p.name for p in paths} == set(cases)
-    assert native == [output / flavor / "moe"]
+    assert native == [(output / flavor / "moe", build / "native-moe")]
     for case in (p for p in paths if p.name != "moe"):
         for rank in range(2):
             captured = (capture / f"rank{rank}/submissions.bin").read_bytes()

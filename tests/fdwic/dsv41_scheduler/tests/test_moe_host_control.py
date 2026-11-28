@@ -93,3 +93,13 @@ def test_native_audit_rejects_compile_only_and_missing_count_case(tmp_path):
     path.write_text(json.dumps(report))
     with pytest.raises(ValueError, match="performance-only run"):
         audit.native_moe_reports(tmp_path, case)
+
+
+def test_native_moe_reuse_rejects_a_different_build(monkeypatch, tmp_path):
+    bundle = load("moe_bundle")
+    build = tmp_path / "percounter"
+    build.mkdir()
+    (build / "callable.bin").write_bytes(b"percounter callable")
+    monkeypatch.setattr(bundle, "validate_bundle", lambda _: {"callable_sha256": "different callable"})
+    with pytest.raises(ValueError, match="does not match the selected build"):
+        bundle.prepare_bundle(tmp_path / "output", build, tmp_path / "hbg")
