@@ -18,7 +18,6 @@ from simpler_setup.goldens.mx_fp_gemm import (
     convert_x1_scale_format,
     convert_x2_scale_format,
     decode_e2m1,
-    decode_e4m3fn,
     decode_e8m0,
     fp4_e2m1_x2_to_float32,
     fp4_matmul_golden,
@@ -45,10 +44,10 @@ class TestFp8E4m3Numeric:
         assert torch.allclose(ref[finite], got[finite], rtol=0, atol=0)
         assert torch.equal(torch.isnan(ref), torch.isnan(got))
 
-    def test_all_bytes_finite_or_nan(self):
-        for b in range(256):
-            v = decode_e4m3fn(b)
-            assert math.isnan(v) or math.isfinite(v)
+    def test_all_bytes_match_torch(self):
+        bits = torch.arange(256, dtype=torch.uint8)
+        fp8 = bits.view(torch.float8_e4m3fn)
+        torch.testing.assert_close(fp8_e4m3fn_to_float32(fp8), fp8.float(), rtol=0, atol=0, equal_nan=True)
 
     def test_matmul_matches_torch(self):
         torch.manual_seed(1)
@@ -78,6 +77,7 @@ class TestFp8E8m0Numeric:
         assert decode_e8m0(127) == 1.0
         assert decode_e8m0(128) == 2.0
         assert decode_e8m0(126) == 0.5
+        assert math.isnan(decode_e8m0(255))
 
     def test_scale_mul_matches_torch(self):
         data = torch.tensor([1.0, -2.0, 0.5, 3.0], dtype=torch.float32)
@@ -103,6 +103,15 @@ class TestFp8E8m0Numeric:
     reason="torch float8_e4m3fn + float8_e8m0fnu required",
 )
 class TestMxFp8MatmulGolden:
+    def test_nan_scale_propagates(self):
+        a, _, b, _, _, _ = make_mx_fp8_case()
+        a_scale = torch.full((128, 2), 127, dtype=torch.uint8)
+        b_scale = torch.full((2, 64), 127, dtype=torch.uint8)
+        a_scale[0, 0] = 255
+        output = mx_fp8_matmul_golden(a, b, a_scale, b_scale)
+        assert output[0].isnan().all()
+        assert output[1:].isfinite().all()
+
     def test_make_case_shapes_and_finite(self):
         a, a_s, b, b_s, c, expected = make_mx_fp8_case(128, 64, 64)
         assert a.shape == (128, 64) and a.dtype == torch.float8_e4m3fn
@@ -136,6 +145,15 @@ class TestMxFp8MatmulGolden:
     reason="torch float4_e2m1fn_x2 + float8_e8m0fnu required",
 )
 class TestMxFp4MatmulGolden:
+    def test_nan_scale_propagates(self):
+        a, _, b, _, _, _ = make_mx_fp4_case()
+        a_scale = torch.full((128, 2), 127, dtype=torch.uint8)
+        b_scale = torch.full((2, 64), 127, dtype=torch.uint8)
+        a_scale[0, 0] = 255
+        output = mx_fp4_matmul_golden(a, b, a_scale, b_scale)
+        assert output[0].isnan().all()
+        assert output[1:].isfinite().all()
+
     def test_pack_two_fp4_lo_hi(self):
         # [0.5=0b0001, 1.0=0b0010] → byte 0x21
         packed = pack_two_fp4(torch.tensor([[1, 2]], dtype=torch.uint8))
