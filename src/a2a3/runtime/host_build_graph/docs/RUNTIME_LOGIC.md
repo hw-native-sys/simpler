@@ -20,6 +20,13 @@ The device has no orchestration thread. Every launched AICPU thread participates
 in scheduling its assigned AICore workers; the highest-index thread first
 attaches the prebuilt runtime and publishes the boot barrier.
 
+Each scheduling turn materializes at most one Graph slice and still services
+completion, drain and dispatch. An externally ready Graph making materialization
+progress may stay with that scheduler for up to four consecutive slices, then
+returns to the tagged prepare queue behind waiting peers. BUSY, zero progress
+and an unopened external-input gate yield immediately. The selection belongs
+to one scheduler invocation; it holds no cross-run execution state.
+
 This ordering is the defining constraint of the runtime. The host constructs the
 whole graph before any device task can complete.
 

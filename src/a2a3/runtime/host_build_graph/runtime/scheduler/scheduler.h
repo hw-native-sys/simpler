@@ -591,6 +591,39 @@ static_assert(sizeof(ChipReadyQueueSlot) == 24);
 static_assert(sizeof(ChipReadyQueue) == 192 && alignof(ChipReadyQueue) == 64);
 static_assert(offsetof(ChipReadyQueue, enqueue_pos) == 64 && offsetof(ChipReadyQueue, dequeue_pos) == 128);
 
+// One scheduler invocation owns a dequeued Graph until it yields or completes.
+// A burst spans at most four scheduler turns, each with normal completion,
+// drain and dispatch work. Run abort discards this private selection.
+class GraphPrepareBurst {
+public:
+    ChipTaskSlotState *next(ChipReadyQueue &queue, TaskId &id) {
+        if (retained_ != nullptr) {
+            id = retained_id_;
+            auto *slot = retained_;
+            retained_ = nullptr;
+            return slot;
+        }
+        slices_ = 0;
+        return queue.pop_tagged(&id);
+    }
+
+    bool retain(ChipTaskSlotState *slot, TaskId id, GraphMaterializeResult result, int32_t progress) {
+        if (result != GraphMaterializeResult::PENDING || progress <= 0 || ++slices_ >= kSliceBudget ||
+            !graph_execution_external_ready(*graph_execution_from_outer_slot(*slot))) {
+            return false;
+        }
+        retained_ = slot;
+        retained_id_ = id;
+        return true;
+    }
+
+private:
+    static constexpr int32_t kSliceBudget = 4;
+    ChipTaskSlotState *retained_ = nullptr;
+    TaskId retained_id_ = TaskId::invalid();
+    int32_t slices_ = 0;
+};
+
 // Cold-path ready queue operations (defined in scheduler.cpp). Declared
 // as non-member so ChipReadyQueue stays a POD-like struct with cache-line
 // alignment. Storage is owned by the caller-supplied arena.
