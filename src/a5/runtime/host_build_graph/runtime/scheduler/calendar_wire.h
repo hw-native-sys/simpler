@@ -126,14 +126,6 @@ enum : uint16_t {
     CALENDAR_EXEC_PACED_WAIT = 1 << 13,
 };
 
-inline constexpr uint32_t CALENDAR_TASK_TIMING_SHIFT = 10;
-inline constexpr uint16_t CALENDAR_TASK_TIMING_MASK = 0x1f;
-static_assert(NUM_TASK_TIMING_SLOTS <= CALENDAR_TASK_TIMING_MASK);
-
-inline constexpr uint16_t calendar_task_timing_flag(int32_t slot) {
-    return static_cast<uint16_t>((slot + 1) << CALENDAR_TASK_TIMING_SHIFT);
-}
-
 struct alignas(16) CalendarExecutionRow {
     uint32_t dispatch_offset;
     uint32_t mix_delta;  // Join delta, helper begin, or a follower's input owner ordinal.
@@ -155,6 +147,7 @@ struct CalendarExecutionExtra {
     uint32_t task_id;
     uint32_t local_task_id;
     int32_t shell_task_id;
+    int32_t timing_slot{TASK_TIMING_SLOT_NONE};
     uint64_t shell_add_cmd;
     uint64_t predicate_address;
 };

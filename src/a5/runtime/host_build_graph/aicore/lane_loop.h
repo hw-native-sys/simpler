@@ -222,7 +222,7 @@ inline __aicore__ __gm__ pto2::resident::AsyncGroupData *percounter_init_async_r
 inline __aicore__ bool percounter_run_task(
     const LaneConfig &cfg, const __gm__ CalendarDispatch &dispatch, const __gm__ CalendarExecutionExtra *extra,
     uint32_t block, uint32_t blocks, uint32_t role, uint64_t entry, __gm__ CalendarTiming *calendar_timing,
-    __gm__ CalendarPmuCell *pmu, uint16_t row_flags = 0
+    __gm__ CalendarPmuCell *pmu
 ) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Run, entry);
     const bool timing_enabled = cfg.profile != nullptr || cfg.profile_buffer != nullptr;
@@ -264,8 +264,7 @@ inline __aicore__ bool percounter_run_task(
     const bool first_kernel = cfg.work_window.start_cycle == 0;
     __gm__ TaskTimingRecord *slot = nullptr;
     if (__builtin_expect(cfg.task_timing_slots != nullptr, false)) {
-        const int32_t timing_slot =
-            static_cast<int32_t>((row_flags >> CALENDAR_TASK_TIMING_SHIFT) & CALENDAR_TASK_TIMING_MASK) - 1;
+        const int32_t timing_slot = extra->timing_slot;
         if (timing_slot >= 0 && timing_slot < NUM_TASK_TIMING_SLOTS) slot = cfg.task_timing_slots + timing_slot;
     }
     const uint64_t start_time =

@@ -35,6 +35,39 @@ std::vector<TaskInput> cube_tasks(const std::vector<std::vector<int32_t>> &fanin
     return tasks;
 }
 
+TEST(CalendarPhases, PeerDispatchPreservesTaskTimingSlots) {
+    const std::vector<std::vector<int32_t>> fanins{{}, {0}};
+    auto tasks = cube_tasks(fanins);
+    for (auto &task : tasks) {
+        task.active_mask = 2;
+        task.core_type_index = 1;
+    }
+    tasks[0].timing_slot = 0;
+    tasks[1].timing_slot = 1;
+
+    constexpr uint32_t clusters = 4;
+    std::vector<CalendarPhase> phases;
+    ASSERT_TRUE(plan_calendar_phases(tasks, {}, &phases));
+    auto plan = std::make_shared<CalendarPlan>();
+    ASSERT_TRUE(build_static_calendar(phases[0].tasks, clusters, {}, plan.get()));
+    RangeCalendarImage image;
+    ASSERT_TRUE(build_range_calendar({{&phases[0], plan, false}}, {}, tasks.size(), clusters, &image));
+    ASSERT_EQ(image.peer_single_waits, 1U);
+    ASSERT_TRUE(image.has_task_timing);
+    const auto header = image.load<CalendarRangeHeader>(0);
+    ASSERT_EQ(header.range_count, 2U);
+    for (uint32_t i = 0; i < header.range_count; ++i) {
+        const auto range = image.load<CalendarRange>(header.range_offset + i * sizeof(CalendarRange));
+        ASSERT_EQ(range.row_count, 1U);
+        const auto row = image.load<CalendarExecutionRow>(range.rows_offset);
+        EXPECT_EQ(row.flags & ~CALENDAR_EXEC_ROLE_MASK, CALENDAR_EXEC_PEER);
+        const auto dispatch = image.load<CalendarDispatch>(range.binding_offset + row.dispatch_offset);
+        const auto extra = image.load<CalendarExecutionExtra>(range.binding_offset + dispatch.extra_offset);
+        ASSERT_LT(extra.task_id, tasks.size());
+        EXPECT_EQ(extra.timing_slot, tasks[extra.task_id].timing_slot);
+    }
+}
+
 TEST(CalendarPhases, PeerDiamondPreservesBothOriginalJoinWaits) {
     const std::vector<std::vector<int32_t>> fanins{{}, {0}, {0}, {1, 2}};
     auto tasks = cube_tasks(fanins);
