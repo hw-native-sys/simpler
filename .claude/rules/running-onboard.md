@@ -79,10 +79,17 @@ box genuinely cannot run the work as requested.
 
 ## Rule
 
-**Any hardware (onboard) work on this box — stress repro, perf benchmarks,
-flaky-test investigation, ChipWorker scripts that take NPU exclusively —
-must be wrapped in `task-submit --device <list> --run "..."` when the
-command is available on `PATH`.**
+**Each task-submit allocation must run one independent onboard case or
+workload configuration.** Compile and prepare its inputs before submission;
+aggregate results after the task exits. Use `--no-device` for queued CPU-only
+work. Submit distinct cases/configurations separately and request only the
+cards required by one case. Repeated runtime rounds for that one measurement
+may stay together. The scheduler holds cards until the submitted process exits;
+closing a Worker or runtime handle does not return them early.
+
+All onboard execution must still use `task-submit` when available. A helper
+that launches multiple cases must submit each case separately, not wrap its
+whole loop in one card allocation.
 
 ```bash
 # Check once at the top of any onboard investigation:
@@ -99,14 +106,13 @@ Use it for **every** invocation that touches an NPU. Bare `pytest --device 8`
 in a shell loop is forbidden.
 
 ```bash
-# Single-shot
-task-submit --timeout 1800 --max-time 1800 --device 8,9 \
-    --run "python -m pytest tests/st/... --platform a2a3 --device 8-9 ..."
+# Single scene-test case
+task-submit --timeout 1800 --max-time 1800 --device 8 \
+    --run "python tests/st/a2a3/test_case.py --platform a2a3 --case TestFoo::Case1"
 
-# Long-running stress harness — let task-submit own the whole loop so the
-# lock is held for the whole duration, not re-acquired per iter:
-task-submit --timeout 7200 --max-time 7200 --device 10,11 \
-    --run "/tmp/my_stress.sh 50 10 11"
+# Each invocation is one case; submit each case as a separate task.
+task-submit --timeout 7200 --max-time 7200 --device auto \
+    --run "python tests/st/a2a3/test_case.py --platform a2a3 --case TestFoo::Case1"
 ```
 
 `--device auto` picks free devices automatically — preferable for one-off
@@ -114,7 +120,7 @@ runs that don't care which die:
 
 ```bash
 task-submit --timeout 1800 --max-time 1800 --device auto --device-num 2 \
-    --run "python -m pytest ..."
+    --run "python tests/st/a2a3/test_multi_device.py --platform a2a3 --case TestBar::Case1"
 ```
 
 Before submitting, sanity-check what's currently held to know whether the
