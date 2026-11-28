@@ -1464,6 +1464,8 @@ void ChipRun::bind_peer_cancel(const int32_t *request) {
         throw std::runtime_error("invalid peer cancel binding");
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
+    // Eager successor preparation can finish with an error before submit returns its handle.
+    if (run_->phase == ChipRunState::Phase::TERMINAL && !run_->crossed_launch_fence) lane_->rethrow_run_error(run_);
     if (run_->phase != ChipRunState::Phase::QUEUED && run_->phase != ChipRunState::Phase::PREPARED)
         throw std::runtime_error("peer cancellation must bind before launch");
     if (run_->peer_cancel_request != nullptr && run_->peer_cancel_request != request)

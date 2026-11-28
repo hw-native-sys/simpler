@@ -463,6 +463,8 @@ def test_failed_import_retains_cleanup_record_without_native_unmap(group, monkey
     [
         ("accepted", None),
         ("refused", None),
+        ("bind-refused", None),
+        ("bind-unknown", None),
         ("unknown", None),
         ("materialization-failed", None),
         ("activation-safe", "immediate"),
@@ -507,6 +509,9 @@ def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(g
             raise worker_module.RunPreparationRefused("refused safely")
         if outcome == "unknown":
             raise RuntimeError("native admission unknown")
+        if outcome in ("bind-refused", "bind-unknown"):
+            error = worker_module.RunPreparationRefused if outcome == "bind-refused" else RuntimeError
+            return SimpleNamespace(bind_peer_cancel=Mock(side_effect=error("early preparation failed")))
         if activation is not None:
             return SimpleNamespace(
                 preparation_disposition=worker_module._VALIDATED_ONLY,
@@ -538,7 +543,7 @@ def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(g
             namespace["submit_run"](staged)
             if activation == "delayed":
                 namespace["activate_run"](staged)
-    assert (key in child._uses) == (outcome in ("accepted", "unknown", "activation-unproven"))
+    assert (key in child._uses) == (outcome in ("accepted", "unknown", "bind-unknown", "activation-unproven"))
     assert child.holds_resources
     if outcome == "materialization-failed":
         native.assert_not_called()
