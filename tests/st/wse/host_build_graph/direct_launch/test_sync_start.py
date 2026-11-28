@@ -76,6 +76,12 @@ def audit(path, worker, buffers, *, sync, second_core):
 
     starts = matching(1, BLOCK_BEGIN)
     assert sorted((e["block"], e["core"]) for e in starts) == [(0, 2), (1, second_core)]
+    for kind in (16, 17):
+        pe_events = matching(1, kind)
+        assert all(e["value"] == e["pe"] for e in pe_events)
+        assert sorted((e["block"], e["core"], e["pe"]) for e in pe_events) == [
+            (block, core, pe) for block, core in ((0, 2), (1, second_core)) for pe in (0, 1)
+        ]
     start_by_block = {e["block"]: e["seq"] for e in starts}
     (busy_end_event,) = matching(0, BLOCK_END)
     assert busy_end_event["core"] == 2

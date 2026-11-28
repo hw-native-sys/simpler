@@ -27,16 +27,16 @@ void trace(void *opaque, wse::OperationEvent event, uint32_t slot, uint64_t gene
     }
 }
 extern "C" void kernel_entry(int64_t *args) {
-    const uint32_t b = get_block_idx(args), t = get_thread_idx(args), pe = get_pe_id(args);
+    const uint32_t b = get_block_idx(args), pe = get_pe_id();
     auto &tensor = *reinterpret_cast<Tensor *>(args[0]);
-    auto *record = reinterpret_cast<uint64_t *>(tensor.buffer.addr) + tensor.start_offset + (b * 4 + t) * 4;
-    Trace observer{get_wse_operation_trace(args), static_cast<uint32_t>(get_core_id(args)), pe};
+    auto *record = reinterpret_cast<uint64_t *>(tensor.buffer.addr) + tensor.start_offset + (b * 4 + pe) * 4;
+    Trace observer{get_wse_operation_trace(args), static_cast<uint32_t>(get_core_id()), pe};
     auto hook = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "wse_scope_probe"));
     if (!hook) throw std::runtime_error("missing scope probe");
     static thread_local std::optional<wse::SharedTile<wse::Tile<2, 2>>> previous;
     if (b < 2) {
         wse::SharedTile<wse::Tile<2, 2>> shared(pe, 5, 0, 15, get_wse_block_scope(args), {&observer, trace});
-        if (t == 0) {
+        if (pe == 0) {
             if (b == 1) hook(0);
             else hook(5);
             wse::Tile<2, 2> value;
@@ -55,15 +55,15 @@ extern "C" void kernel_entry(int64_t *args) {
         }
         if (!rejected) throw std::runtime_error("old Block SharedTile remained valid");
         wse::SharedTile<wse::Tile<1, 4>> shared(pe, 5, 0, 15, get_wse_block_scope(args), {&observer, trace});
-        if (t == 0) {
+        if (pe == 0) {
             wse::Tile<1, 4> value;
             value.at(0, 0) = 102;
             shared.publish(1, value);
         }
         record[0] = shared.read(1).at(0, 0);
         record[1] = 1;
-        if (t == 0) hook(4);
+        if (pe == 0) hook(4);
     }
-    record[2] = t;
+    record[2] = observer.core;
     record[3] = pe;
 }

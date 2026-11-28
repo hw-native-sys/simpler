@@ -25,14 +25,14 @@ inline bool await_counter(wse::CounterView view, size_t index, uint64_t target) 
 }
 
 inline void counter_protocol(int64_t *args, int role) {
-    const int b = role == 1 ? 2 + get_thread_idx(args) :
-                  role == 0 ? get_thread_idx(args) :
-                              get_block_idx(args) * get_thread_num(args) + get_thread_idx(args);
+    const bool producer = role == 0 || (role < 0 && get_block_idx(args) == 0);
+    const int pe = get_pe_id();
     const int producers = args[3], consumers = args[4], rounds = args[5];
     const uint64_t base = args[6];
-    if ((role == 0 && b >= producers) || (role == 1 && b < producers)) return;
+    // Producers and consumers each own one result row per physical PE.
+    const size_t result_row = producer ? pe : wse::PE_PER_CORE + pe;
     auto &out = *reinterpret_cast<Tensor *>(args[2]);
-    auto *record = reinterpret_cast<uint64_t *>(out.buffer.addr) + out.start_offset + b * rounds * 6;
+    auto *record = reinterpret_cast<uint64_t *>(out.buffer.addr) + out.start_offset + result_row * rounds * 6;
     if (uint64_t(rounds) > (UINT64_MAX - base) / producers) {
         record[0] = UINT64_MAX - 3;
         return;
@@ -49,31 +49,31 @@ inline void counter_protocol(int64_t *args, int role) {
         record[0] = UINT64_MAX - 2;
         return;
     }
-    if (b >= producers) {
+    if (!producer) {
         record[2] = wse::counter_poll(counters, 0, base + producers).status == wse::CounterStatus::NOT_READY;
-        if (hook) hook(b);
+        if (hook) hook(1 + pe);
         if (wse::counter_signal(counters, 2).status != wse::CounterStatus::OK) return;
     } else {
-        if (hook && b == 0) hook(0);
+        if (hook) hook(0);
         if (!await_counter(counters, 2, consumers)) return;
     }
     for (int g = 1; g <= rounds; ++g) {
         auto *row = record + (g - 1) * 6;
-        row[0] = get_core_id(args);
-        row[1] = get_pe_id(args);
-        if (b < producers) {
+        row[0] = get_core_id();
+        row[1] = pe;
+        if (producer) {
             if (!await_counter(counters, 1, (g - 1) * consumers)) return;
-            payload[b] = base + g * 100 + b;
+            payload[pe] = base + g * 100 + pe;
             auto signal = wse::counter_signal(counters, 0);
             if (signal.status != wse::CounterStatus::OK) return;
             row[3] = signal.old_value;
             row[4] = signal.new_value;
-            row[5] = payload[b];
+            row[5] = payload[pe];
             if (!await_counter(counters, 1, g * consumers)) return;
         } else {
             if (!await_counter(counters, 0, base + g * producers)) return;
             uint64_t sum = 0;
-            for (int p = 0; p < producers; ++p)
+            for (uint32_t p = 0; p < wse::PE_PER_CORE; ++p)
                 sum += payload[p];
             row[5] = sum;
             auto signal = wse::counter_signal(counters, 1);

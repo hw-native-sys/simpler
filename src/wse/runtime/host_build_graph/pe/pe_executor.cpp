@@ -12,10 +12,12 @@
 #include "sram_layout.h"
 #include "wse/block_lifecycle.h"
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <new>
 #include <string>
 #include "cpu_sim_context.h"
+#include "host/raii_scope_guard.h"
 #include "host_build_graph/submit_types.h"
 #include "scheduler/scheduler_graph_binding.h"
 
@@ -262,6 +264,12 @@ struct WseRun {
         const auto *rows = descriptor_table<wse::CalendarRow>(*d, d->calendar_rows_offset, d->calendar_row_count);
         if (indices[0] != 0 || indices[cores] != d->calendar_row_count)
             throw std::invalid_argument("invalid WSE calendar boundaries");
+        const auto *pe_indices =
+            descriptor_table<uint32_t>(*d, d->pe_calendar_indices_offset, cores * WSE_PE_PER_CORE + 1);
+        const auto *pe_rows = descriptor_table<uint32_t>(*d, d->pe_calendar_rows_offset, d->pe_calendar_row_count);
+        if (pe_indices[0] || pe_indices[cores * WSE_PE_PER_CORE] != d->pe_calendar_row_count ||
+            !std::is_sorted(pe_indices, pe_indices + cores * WSE_PE_PER_CORE + 1))
+            throw std::invalid_argument("invalid WSE PE calendar boundaries");
         uint64_t expected_rows = 0;
         for (uint32_t ref = 0; ref < count; ++ref) {
             const auto &plan = source_plans[ref];
@@ -284,6 +292,9 @@ struct WseRun {
         std::vector<TaskCalendar> calendar(count);
         for (uint32_t core = 0; core < cores; ++core) {
             const uint32_t begin = indices[core], end = indices[core + 1];
+            const auto *pe_ranges = pe_indices + core * WSE_PE_PER_CORE;
+            std::array<uint32_t, WSE_PE_PER_CORE> cursor;
+            std::copy_n(pe_ranges, WSE_PE_PER_CORE, cursor.begin());
             if (begin > end || end > d->calendar_row_count)
                 throw std::invalid_argument("invalid WSE Core calendar range");
             auto *c = image.objects<wse::CoreControl>(core, 1, WseSectionKind::CORE_CONTROL);
@@ -306,6 +317,20 @@ struct WseRun {
                 const auto &plan = source_plans[row.task];
                 if (!plan.entry || plan.host_done || plan.blocks > INT16_MAX || row.block >= plan.blocks)
                     throw std::invalid_argument("invalid WSE calendar Block");
+                const auto *blocks = descriptor_table<WseBlockPlan>(*d, plan.block_plans_offset, plan.block_plan_count);
+                const auto &placement = blocks[row.block];
+                if (!placement.thread_num || placement.thread_num > WSE_PE_PER_CORE || placement.core_id != core)
+                    throw std::invalid_argument("invalid WSE calendar Block placement");
+                uint32_t occupied = 0;
+                for (uint32_t t = 0; t < placement.thread_num; ++t) {
+                    const uint32_t pe = placement.thread_pes[t];
+                    if (pe >= WSE_PE_PER_CORE || (occupied & (1u << pe)))
+                        throw std::invalid_argument("WSE Block Threads must map to distinct local PEs");
+                    occupied |= 1u << pe;
+                    if (cursor[pe] == pe_ranges[pe + 1]) throw std::invalid_argument("missing WSE PE calendar row");
+                    if (pe_rows[cursor[pe]++] != i)
+                        throw std::invalid_argument("WSE PE calendar row disagrees with Block placement or order");
+                }
                 auto &task = calendar[row.task];
                 if (task.row_by_block.empty()) task.row_by_block.resize(plan.blocks, UINT32_MAX);
                 if (task.row_by_block[row.block] != UINT32_MAX)
@@ -314,6 +339,8 @@ struct WseRun {
                 task.first_tick = std::min(task.first_tick, uint64_t{row.tick});
                 task.finish_tick = std::max(task.finish_tick, uint64_t{row.tick} + 1);
             }
+            if (!std::equal(cursor.begin(), cursor.end(), pe_ranges + 1))
+                throw std::invalid_argument("extra WSE PE calendar row");
         }
         std::vector<wse::SramAllocation> used_allocations;
         auto validate_storage = [&](uint64_t address, uint64_t bytes) {
@@ -420,18 +447,10 @@ struct WseRun {
             for (uint32_t b = 0; b < source.blocks; ++b) {
                 const auto &placement = block_plans[b];
                 const uint32_t core = placement.core_id;
-                if (core >= cores || !placement.thread_num || placement.thread_num > WSE_PE_PER_CORE ||
-                    placement.tensor_count > CORE_MAX_TENSOR_ARGS || placement.scalar_count > CORE_MAX_SCALAR_ARGS)
-                    throw std::invalid_argument("invalid WSE Block Core, Threads or arguments");
-                uint32_t mask = 0;
-                for (uint32_t t = 0; t < placement.thread_num; ++t) {
-                    const uint32_t pe = placement.thread_pes[t];
-                    if (pe >= WSE_PE_PER_CORE || (mask & (1u << pe)))
-                        throw std::invalid_argument("WSE Block Threads must map to distinct local PEs");
-                    mask |= 1u << pe;
-                }
+                if (placement.tensor_count > CORE_MAX_TENSOR_ARGS || placement.scalar_count > CORE_MAX_SCALAR_ARGS)
+                    throw std::invalid_argument("invalid WSE Block argument count");
                 const uint32_t row = task_calendar.row_by_block[b];
-                if (row < indices[core] || row >= indices[core + 1])
+                if (core >= cores || row < indices[core] || row >= indices[core + 1])
                     throw std::invalid_argument("WSE calendar Block missing or assigned to the wrong Core");
                 auto &work = image.at<wse::Work>(core, local(core).queue.work_offset)[row - indices[core]];
                 if (!local_tasks[core]) local_tasks[core] = make_local_task(core);
@@ -528,13 +547,17 @@ static_assert(static_cast<uint32_t>(wse::OperationEvent::PUBLISH) == static_cast
 static_assert(static_cast<uint32_t>(wse::OperationEvent::CONSUMED) == static_cast<uint32_t>(WseEventKind::OP_CONSUMED));
 }  // namespace
 
-extern "C" WseRun *wse_create_run_v3(
+extern "C" WseRun *wse_create_run_v6(
     const WseGraphDescriptor *d, uint32_t cores, uint64_t epoch, const wse::SramRegion *regions, uint32_t region_count,
     const wse::SramAllocation *allocations, uint32_t allocation_count, char *error, size_t error_size
 ) {
     try {
         if (!d || !cores || cores > region_count || region_count > wse::MAX_CORE_COUNT || !epoch || !regions)
             throw std::invalid_argument("invalid WSE SRAM run descriptor");
+        if (d->descriptor_bytes < sizeof(*d) || d->nodes_address - reinterpret_cast<uintptr_t>(d) < sizeof(*d))
+            throw std::invalid_argument("WSE descriptor lacks per-PE calendar header");
+        if (d->pe_calendar_version != wse::PE_CALENDAR_VERSION)
+            throw std::invalid_argument("incompatible WSE PE calendar version");
         return new WseRun(d, cores, epoch, regions, region_count, allocations, allocation_count);
     } catch (const std::exception &e) {
         if (error && error_size) std::snprintf(error, error_size, "%s", e.what());
@@ -560,7 +583,10 @@ extern "C" const WseEvent *wse_run_events(const WseRun *run, uint32_t worker, ui
     return stream.data();
 }
 
-static void execute_pe(WseRun *run, uint32_t worker) {
+static void execute_pe(WseRun *run) {
+    const int32_t physical_worker = wse::current_worker_id();
+    if (physical_worker < 0) throw std::runtime_error("WSE PE has no bound physical identity");
+    const auto worker = static_cast<uint32_t>(physical_worker);
     const uint32_t core = worker / WSE_PE_PER_CORE;
     const uint32_t pe = worker % WSE_PE_PER_CORE;
     std::unique_lock lock(run->mutex);
@@ -599,7 +625,7 @@ static void execute_pe(WseRun *run, uint32_t worker) {
         const uint64_t block_epoch = local.block_epoch;
         lock.unlock();
         const auto &plan = *work.task;
-        run->record(worker, WseEventKind::THREAD_BEGIN, plan.ref, work.block, thread);
+        run->record(worker, WseEventKind::THREAD_BEGIN, plan.ref, work.block, pe);
         if (execute) {
             int64_t args[SPMD_GLOBAL_CONTEXT_INDEX + 1]{};
             int index = 0;
@@ -612,7 +638,7 @@ static void execute_pe(WseRun *run, uint32_t worker) {
             LocalContext context{};
             context.block_idx = work.block;
             context.block_num = plan.blocks;
-            context.thread_idx = thread;
+            context.legacy_abi_slot = thread;
             context.thread_num = work.thread_num;
             context.block_scope = {
                 &local.block_epoch,
@@ -633,7 +659,7 @@ static void execute_pe(WseRun *run, uint32_t worker) {
             args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&global);
             reinterpret_cast<void (*)(int64_t *)>(plan.entry)(args);
         }
-        run->record(worker, WseEventKind::THREAD_END, plan.ref, work.block, thread);
+        run->record(worker, WseEventKind::THREAD_END, plan.ref, work.block, pe);
         lock.lock();
         if (run->failed) throw RunAborted{};
         local.finished |= 1u << thread;
@@ -662,8 +688,16 @@ static void execute_pe(WseRun *run, uint32_t worker) {
 }
 
 extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
+    if (!run || worker >= run->events.size()) return -1;
     try {
-        execute_pe(run, worker);
+        void *previous = sim_context_get_invocation_context();
+        auto *encoded = reinterpret_cast<void *>(static_cast<uintptr_t>(worker) + 1);
+        if (sim_context_bind_invocation_context(encoded) != 0)
+            throw std::runtime_error("WSE physical PE identity binding failed");
+        auto restore = RAIIScopeGuard([previous] {
+            if (sim_context_bind_invocation_context(previous) != 0) std::terminate();
+        });
+        execute_pe(run);
         return 0;
     } catch (const RunAborted &) {
         // The failing PE already published the error and woke the run.

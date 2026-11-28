@@ -281,7 +281,9 @@ def test_deployment_sram_counter(tmp_path, st_platform):
 
 
 def test_deployment_timeout_ownership_and_close(tmp_path, st_platform):
-    gate = counter.load_gate(tmp_path, "wse_counter_probe", 12)
+    # The rotated consumer Block runs on PE 3 and PE 0. The gate reserves bit 0 for producers.
+    consumer_mask = (1 << (1 + 3)) | (1 << (1 + 0))
+    gate = counter.load_gate(tmp_path, "wse_counter_probe", consumer_mask)
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
         worker.init()

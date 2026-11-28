@@ -51,7 +51,8 @@ def audit_ffn(path):
     for task in (1, 2, 3):
         for kind in (16, 17):
             actual = [e for e in events if e["kind"] == kind and e["task"] == task]
-            assert sorted(e["value"] * 40 + e["block"] for e in actual) == list(range(160))
+            assert all(e["value"] == e["pe"] for e in actual)
+            assert sorted(e["pe"] * 40 + e["block"] for e in actual) == list(range(160))
             assert {(e["core"], e["pe"]) for e in actual} == {(c, p) for c in range(40) for p in range(4)}
     for previous, following in ((1, 2), (2, 3)):
         completed = next(e["seq"] for e in done if e["task"] == previous)

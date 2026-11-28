@@ -18,7 +18,7 @@ rt_submit_wse_task(kernel_id, task, launch);
 This needs no Python binding or `CallConfig` extension. Python registers the
 callable and submits ordinary `TaskArgs` through `Worker`.
 
-## Placement and Threads
+## Core and PE placement
 
 A single SS task supplies one placement. An SPMD task supplies exactly `B`
 placements, indexed by logical Block ID. Core IDs may repeat. Each ID must be
@@ -43,16 +43,16 @@ event sequence numbers to verify this ordering across Cores. GO is recorded by
 the PE that completes device readiness. RUN_DONE is recorded by the PE that
 retires the last Core.
 
-A placement such as `{6}` runs on Core 6 with one Thread on PE 0 by default.
+A placement such as `{6}` runs on PE 0 of Core 6 by default.
 Setting `launch.thread_num` selects the first one to four PEs on each Core.
-An explicit local PE list, such as `{6, {2, 0}}`, selects the Threads for that
+An explicit local PE list, such as `{6, {2, 0}}`, selects the physical PEs for that
 Block. Duplicate or out-of-range PEs and unsupported synchronization requirements
 reject before launch.
 
 If `B < C`, some Cores have no task Blocks. If `B > C`, each Core executes
 its assigned Blocks in Host calendar order. Device initialization and run
 completion include all Cores and PEs. One Core runs at most one active Block.
-All participating Threads must finish before that Core advances. The task
+All participating PEs must finish before that Core advances. The task
 reports completion exactly once, after all its Blocks finish.
 
 ## Fixed data ownership
@@ -82,7 +82,7 @@ dependency nodes retires in topological order during Host preparation. Its
 Predicate-false
 tasks retire without executing their kernel body and still satisfy dependents.
 
-SharedTile slots belong to the active Block. The last participating Thread
+SharedTile slots belong to the active Block. The last participating PE
 invalidates the Block scope before its storage is released. An old scope cannot
 read or publish into a later Block, and finishing a Block on one Core does not
 clear another Core's live slots.
@@ -92,7 +92,7 @@ clear another Core's live slots.
 The WSE scene tests cover:
 
 - Block counts below, equal to and above the configured Core count;
-- explicit Core/PE placement and one to four Threads;
+- explicit Core placement and one to four participating PEs;
 - independent per-Block Tensor arguments, cross-Core access and fixed data owners;
 - Graph recording, rebinding, predicates and reverse-order waits;
 - an `SS → SPMD(4) → SS` Graph on Cores `7 → [6, 2, 6, 1] → 3`, with actual

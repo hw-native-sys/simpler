@@ -30,8 +30,8 @@ extern "C" void kernel_entry(int64_t *args) {
     wse::TSTORE({destination, 1024, 32, 32, 32, 1}, result);
     auto *log = reinterpret_cast<uint64_t *>(records.address) + index * 8;
     log[0] = block;
-    log[1] = get_core_id(args);
-    log[2] = get_pe_id(args);
+    log[1] = get_core_id();
+    log[2] = get_pe_id();
     log[3] = input.owner;
     log[4] = output.owner;
     log[5] = input.address;

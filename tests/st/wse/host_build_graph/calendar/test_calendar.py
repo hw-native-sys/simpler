@@ -187,3 +187,66 @@ def test_native_graph_and_top_level_dependency_only_tasks(tmp_path, st_platform)
         worker.unregister(handle)
     finally:
         worker.close()
+
+
+def test_pe_calendar_matches_kernel_identity_and_waits(tmp_path, st_platform, st_device_ids):
+    kernel = build_callable(
+        st_platform, Path(__file__).parent / "kernels", "pe_calendar.cpp", [D.OUT] * 4, [("pe_identity.cpp", [D.OUT])]
+    )
+    worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=st_device_ids[0])
+    worker.init()
+    try:
+        handle = worker.register(kernel)
+        args = TaskArgs()
+        # Separate SRAM windows ensure only the two explicit dependencies are present.
+        outputs = [torch.full((4, 2), -1, dtype=torch.int32) for _ in range(4)]
+        for owner, output in enumerate(outputs):
+            address = worker.get_base_addr(coreid=owner)
+            worker.copy_to(address, output)
+            args.add_tensor(address.tensor(shapes=(4, 2), dtype=DataType.INT32), TensorArgType.OUTPUT_EXISTING)
+        config = CallConfig()
+        config.output_prefix = str(tmp_path)
+        worker.run(handle, args, config)
+        for owner, output in enumerate(outputs):
+            worker.copy_from(output, worker.get_base_addr(coreid=owner))
+    finally:
+        worker.close()
+
+    unused = [-1, -1]
+    assert [output.tolist() for output in outputs] == [
+        [[0, 0], unused, unused, unused],
+        [[1, 0], unused, unused, unused],
+        [unused, unused, [2, 2], [2, 3]],
+        [unused, unused, unused, [2, 3]],
+    ]
+    calendar = json.loads((tmp_path / "calendar.json").read_text())
+    assert calendar["waits"] == [[], [], [0], [1]]
+    ticks = {
+        (core, row["task"], row["block"]): row["tick"] for core, queue in enumerate(calendar["cores"]) for row in queue
+    }
+    planned = []
+    assert len(calendar["pes"]) == len(calendar["cores"])
+    for core, queues in enumerate(calendar["pes"]):
+        assert len(queues) == 4
+        for pe, queue in enumerate(queues):
+            assert [row["tick"] for row in queue] == sorted(row["tick"] for row in queue)
+            for row in queue:
+                assert set(row) == {"core_id", "pe_id", "task", "block", "tick", "waits"}
+                assert (row["core_id"], row["pe_id"]) == (core, pe)
+                assert row["tick"] == ticks[core, row["task"], row["block"]]
+                planned.append((row["task"], row["block"], core, pe, row["waits"]))
+    assert sorted(planned) == [
+        (0, 0, 0, 0, []),
+        (1, 0, 1, 0, []),
+        (2, 0, 2, 2, [0]),
+        (2, 0, 2, 3, [0]),
+        (3, 0, 2, 3, [1]),
+    ]
+    header, *events = map(json.loads, (tmp_path / "wse_events.jsonl").read_text().splitlines())
+    assert calendar["epoch"] == header["epoch"]
+    completed = {e["task"]: e["seq"] for e in events if e["kind"] == TASK_DONE}
+    starts = [e for e in events if e["kind"] == 16]
+    actual = [(e["task"], e["block"], e["core"], e["pe"]) for e in starts]
+    assert sorted(actual) == sorted(row[:4] for row in planned)
+    for event in starts:
+        assert all(completed[parent] < event["seq"] for parent in calendar["waits"][event["task"]])

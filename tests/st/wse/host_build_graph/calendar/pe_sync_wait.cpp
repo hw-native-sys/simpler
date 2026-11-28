@@ -41,6 +41,8 @@ struct Wire {
     WseBlockPlan placements[3]{};
     uint32_t indices[3]{0, 2, 3};
     wse::CalendarRow rows[3]{{0, 0, 0}, {1, 0, 1}, {1, 1, 1}};
+    uint32_t pe_indices[9]{0, 2, 2, 2, 2, 3, 3, 3, 3};
+    uint32_t pe_rows[3]{0, 1, 2};
 };
 }  // namespace
 
@@ -61,6 +63,10 @@ int main(int argc, char **) {
     d.calendar_row_count = 3;
     d.calendar_indices_offset = offsetof(Wire, indices);
     d.calendar_rows_offset = offsetof(Wire, rows);
+    d.pe_calendar_indices_offset = offsetof(Wire, pe_indices);
+    d.pe_calendar_rows_offset = offsetof(Wire, pe_rows);
+    d.pe_calendar_row_count = 3;
+    d.pe_calendar_version = wse::PE_CALENDAR_VERSION;
     for (uint32_t task = 0; task < 2; ++task) {
         auto &node = wire.nodes[task];
         node.entry = reinterpret_cast<uintptr_t>(task ? member : busy);
@@ -72,7 +78,7 @@ int main(int argc, char **) {
         placement.thread_num = 1;
     wire.placements[2].core_id = 1;
     char error[256]{};
-    execution = wse_create_run_v3(&d, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
+    execution = wse_create_run_v6(&d, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
     if (!execution) {
         std::fprintf(stderr, "%s\n", error);
         return 1;

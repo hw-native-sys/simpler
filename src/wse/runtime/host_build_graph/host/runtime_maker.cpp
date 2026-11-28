@@ -800,13 +800,18 @@ bool create_scheduler_state(
         expected += !plan.host_done;
     }
     wse::CoreCalendar calendar;
-    if (!wse::build_core_calendar(tasks, core_count, calendar)) {
-        LOG_ERROR("WSE failed to plan the Core calendars");
+    wse::PeCalendar pe_calendar;
+    if (!wse::build_core_calendar(tasks, core_count, calendar) ||
+        !wse::build_pe_calendar(calendar, block_plans, pe_calendar)) {
+        LOG_ERROR("WSE failed to plan the Core and PE calendars");
         return false;
     }
     const uint64_t indices_offset = reserve(calendar.indices.size() * sizeof(uint32_t), alignof(uint32_t));
     const uint64_t rows_offset =
         calendar.rows.empty() ? 0 : reserve(calendar.rows.size() * sizeof(wse::CalendarRow), alignof(wse::CalendarRow));
+    const uint64_t pe_indices_offset = reserve(pe_calendar.indices.size() * sizeof(uint32_t), alignof(uint32_t));
+    const uint64_t pe_rows_offset =
+        pe_calendar.rows.empty() ? 0 : reserve(pe_calendar.rows.size() * sizeof(uint32_t), alignof(uint32_t));
     void *device = nullptr;
     void *host = nullptr;
     if (api->acquire_scheduler_state_storage(bytes, SCHEDULER_STATE_ALIGNMENT, &device, &host) != 0 || !device || !host)
@@ -819,6 +824,13 @@ bool create_scheduler_state(
     if (!calendar.rows.empty())
         std::memcpy(
             descriptor_bytes + rows_offset, calendar.rows.data(), calendar.rows.size() * sizeof(wse::CalendarRow)
+        );
+    std::memcpy(
+        descriptor_bytes + pe_indices_offset, pe_calendar.indices.data(), pe_calendar.indices.size() * sizeof(uint32_t)
+    );
+    if (!pe_calendar.rows.empty())
+        std::memcpy(
+            descriptor_bytes + pe_rows_offset, pe_calendar.rows.data(), pe_calendar.rows.size() * sizeof(uint32_t)
         );
     for (uint64_t ref = 0; ref < count; ++ref) {
         const auto &plan = plans[ref];
@@ -864,6 +876,10 @@ bool create_scheduler_state(
     descriptor->calendar_row_count = calendar.rows.size();
     descriptor->calendar_indices_offset = indices_offset;
     descriptor->calendar_rows_offset = rows_offset;
+    descriptor->pe_calendar_indices_offset = pe_indices_offset;
+    descriptor->pe_calendar_rows_offset = pe_rows_offset;
+    descriptor->pe_calendar_row_count = pe_calendar.rows.size();
+    descriptor->pe_calendar_version = wse::PE_CALENDAR_VERSION;
     runtime->publish_scheduler_bootstrap(
         SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(device) + descriptor_offset
     );
