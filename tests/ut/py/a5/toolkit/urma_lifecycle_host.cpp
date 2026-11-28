@@ -13,11 +13,26 @@
 #include <cassert>
 #include <cstring>
 #include <fstream>
+#include <future>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "comm_hccl.cpp"
+#include "../../../cpp/a5/runtime/urma_queue_fixture.h"
+
+// Fail allocations on the calling thread only. The worker keeps its normal allocator.
+static thread_local int allocations_before_failure = -1;
+extern "C" void *__real__Znwm(size_t);
+extern "C" void *__wrap__Znwm(size_t size) {
+    if (allocations_before_failure == 0) {
+        allocations_before_failure = -1;
+        throw std::bad_alloc();
+    }
+    if (allocations_before_failure > 0) --allocations_before_failure;
+    return __real__Znwm(size);
+}
 
 namespace simpler::ccu {
 // URMA owns no CCU resources; retained host teardown paths still reference these APIs.
@@ -64,7 +79,7 @@ struct ChannelState {
     RegedBufferEntity remote_buffers[2]{};
     CommMem remote_mems[2]{};
     uint32_t sq_head = 0, sq_tail = 0, cq_head = 0, cq_tail = 0, sq_db = 0, cq_db = 0;
-    char sq_buffer[64]{}, cq_buffer[64]{};
+    char sq_buffer[64]{}, cq_buffer[3 * 64]{};
 };
 struct ChannelDeleter {
     void operator()(ChannelState *state) const {
@@ -81,6 +96,62 @@ std::unordered_map<aclrtDrvMemHandle, std::shared_ptr<PhysicalAllocation>> physi
 std::unordered_map<uint64_t, std::weak_ptr<PhysicalAllocation>> exported_resources;
 uint64_t last_exported = 0;
 bool fail_context_upload = false;
+const void *fail_queue_read = nullptr;
+void *fail_queue_write = nullptr;
+constexpr uint64_t aiv_alias = uint64_t{1} << 61;
+int blocked_control_waits = 0;
+int control_launches = 0;
+int control_images = 0;
+int control_syncs = 0;
+int allowed_control_completions = -1;
+const auto run_context = reinterpret_cast<aclrtContext>(0x501);
+thread_local aclrtContext thread_context = nullptr;
+thread_local bool inside_poll = false;
+std::atomic<bool> refuse_scan_context{false};
+std::atomic<unsigned> rejected_scan_contexts{0};
+auto fixture_launch_gate = std::make_shared<UrmaLaunchGate>();
+int control_queries = 0;
+
+// Suspend the host copy while the polling thread keeps checking the same Run.
+struct ScanProbe {
+    std::mutex mutex;
+    std::condition_variable changed;
+    const void *header{};
+    const void *late_cqe{};
+    bool hold{};
+    bool entered{};
+    unsigned copies{};
+    unsigned poll_copies{};
+    std::thread::id scanner;
+    std::atomic<uint32_t> word{0};
+    std::atomic<unsigned> pending_reads{0};
+} scan_probe;
+struct ControlStream {
+    std::optional<simpler::urma::QueueCommand> pending;
+};
+std::unordered_set<ControlStream *> control_streams;
+
+struct FixtureAivMemory {
+    static bool read(uint64_t address, uint32_t &word) {
+        assert(address & aiv_alias);
+        const auto *source = reinterpret_cast<const void *>(address ^ aiv_alias);
+        if (source == scan_probe.late_cqe) {
+            word = scan_probe.word.load();
+            if (word == 0) ++scan_probe.pending_reads;
+            return true;
+        }
+        if (source == fail_queue_read) return false;
+        std::memcpy(&word, source, sizeof(word));
+        return true;
+    }
+    static bool write(uint64_t address, uint32_t word) {
+        assert(address & aiv_alias);
+        auto *destination = reinterpret_cast<void *>(address ^ aiv_alias);
+        if (destination == fail_queue_write) return false;
+        std::memcpy(destination, &word, sizeof(word));
+        return true;
+    }
+};
 enum class PeerFailure { NONE, IMPORT, RESERVE, MAP };
 PeerFailure peer_failure = PeerFailure::NONE;
 bool peer_reserve_pending = false;
@@ -128,12 +199,146 @@ extern "C" aclError aclrtGetDevice(int32_t *id) {
     *id = 0;
     return ACL_SUCCESS;
 }
+extern "C" aclError aclrtGetCurrentContext(aclrtContext *context) {
+    *context = thread_context;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtSetCurrentContext(aclrtContext context) {
+    if (refuse_scan_context) {
+        ++rejected_scan_contexts;
+        return ACL_ERROR_FAILURE;
+    }
+    thread_context = context;
+    return ACL_SUCCESS;
+}
 extern "C" aclError aclrtMalloc(void **out, size_t bytes, aclrtMemMallocPolicy) { return map_buffer(out, bytes); }
 extern "C" aclError aclrtFree(void *p) { return unmap_buffer(p); }
-extern "C" aclError aclrtMemcpy(void *out, size_t, const void *in, size_t bytes, aclrtMemcpyKind) {
+extern "C" aclError aclrtMemcpy(void *out, size_t, const void *in, size_t bytes, aclrtMemcpyKind kind) {
+    assert(!((reinterpret_cast<uint64_t>(out) | reinterpret_cast<uint64_t>(in)) & aiv_alias));
+    if (scan_probe.header && kind == ACL_MEMCPY_DEVICE_TO_HOST) {
+        std::unique_lock lock(scan_probe.mutex);
+        if (inside_poll) {
+            ++scan_probe.poll_copies;
+            return ACL_ERROR_FAILURE;
+        }
+        assert(thread_context == run_context);
+        if (scan_probe.scanner == std::thread::id{}) scan_probe.scanner = std::this_thread::get_id();
+        assert(scan_probe.scanner == std::this_thread::get_id());
+        ++scan_probe.copies;
+        if (in == scan_probe.header && scan_probe.hold) {
+            scan_probe.entered = true;
+            scan_probe.changed.notify_all();
+            assert(scan_probe.changed.wait_for(lock, std::chrono::seconds(4), [] {
+                return !scan_probe.hold;
+            }));
+        }
+    }
     if (fail_context_upload && bytes == sizeof(CommContext)) return 1;
+    if (fail_queue_read != nullptr && kind == ACL_MEMCPY_DEVICE_TO_HOST && in == fail_queue_read) return 1;
+    if (fail_queue_write != nullptr && kind == ACL_MEMCPY_HOST_TO_DEVICE && out == fail_queue_write) return 1;
     std::memcpy(out, in, bytes);
     return ACL_SUCCESS;
+}
+extern "C" aclError aclrtBinaryLoadFromFile(const char *path, aclrtBinaryLoadOptions *, aclrtBinHandle *binary) {
+    assert(std::filesystem::path(path).filename() == "ccu_event_trigger.o");
+    ++control_images;
+    *binary = reinterpret_cast<aclrtBinHandle>(1);
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtBinaryGetFunction(aclrtBinHandle, const char *name, aclrtFuncHandle *function) {
+    assert(std::strcmp(name, "simpler_urma_queue_control") == 0);
+    *function = reinterpret_cast<aclrtFuncHandle>(1);
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtBinaryUnLoad(aclrtBinHandle) {
+    assert(control_images > 0);
+    --control_images;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtCreateStream(aclrtStream *stream) {
+    auto *state = new ControlStream;
+    control_streams.insert(state);
+    *stream = reinterpret_cast<aclrtStream>(state);
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtDestroyStream(aclrtStream stream) {
+    auto *state = reinterpret_cast<ControlStream *>(stream);
+    assert(!state->pending && control_streams.erase(state));
+    delete state;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtLaunchKernelWithHostArgs(
+    aclrtFuncHandle, uint32_t blocks, aclrtStream stream, aclrtLaunchKernelCfg *config, void *args, size_t bytes,
+    aclrtPlaceHolderInfo *, size_t
+) {
+    auto *state = reinterpret_cast<ControlStream *>(stream);
+    assert(control_streams.count(state) && !state->pending && blocks == 1);
+    assert(config->attrs[0].value.engineType == ACL_RT_ENGINE_TYPE_AIV);
+    assert(bytes == sizeof(simpler::urma::QueueCommand));
+    state->pending = *static_cast<const simpler::urma::QueueCommand *>(args);
+    ++control_launches;
+    return ACL_SUCCESS;
+}
+static void finish_control_command(ControlStream &stream) {
+    if (!stream.pending) return;
+    const auto &command = *stream.pending;
+    *reinterpret_cast<uint32_t *>(command.result_address) =
+        static_cast<uint32_t>(simpler::urma::execute_queue_command(FixtureAivMemory{}, command));
+    stream.pending.reset();
+}
+extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t) {
+    auto *state = reinterpret_cast<ControlStream *>(stream);
+    if (!control_streams.count(state)) return ACL_SUCCESS;
+    ++control_syncs;
+    if (blocked_control_waits > 0) {
+        --blocked_control_waits;
+        return 1;
+    }
+    finish_control_command(*state);
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtStreamQuery(aclrtStream stream, aclrtStreamStatus *status) {
+    auto *state = reinterpret_cast<ControlStream *>(stream);
+    assert(control_streams.count(state));
+    ++control_queries;
+    if (state->pending && allowed_control_completions == 0) {
+        *status = ACL_STREAM_STATUS_NOT_READY;
+        return ACL_SUCCESS;
+    }
+    if (state->pending && allowed_control_completions > 0) --allowed_control_completions;
+    finish_control_command(*state);
+    *status = ACL_STREAM_STATUS_COMPLETE;
+    return ACL_SUCCESS;
+}
+
+static int acquire_test_run(CommHandle handle, const uint64_t *scalars, int32_t count, UrmaRunLease *use) {
+    const int rc = acquire_hbg_urma_run(handle, scalars, count, use);
+    if (rc == 0 && use->stopped_scan) {
+        fixture_launch_gate->track(use->stopped_scan->thread);
+        use->launch_permission = fixture_launch_gate;
+    }
+    return rc;
+}
+
+static bool drained(UrmaRunLease &lease, bool device_usable = true) {
+    auto saved = lease.launch_permission;
+    if (!device_usable) lease.launch_permission.reset();
+    const auto status = lease.check_stopped_queues(UrmaWait::Wait);
+    lease.launch_permission = saved;
+    return status == UrmaQueueState::READY;
+}
+
+static UrmaQueueState poll(UrmaRunLease &lease) {
+    inside_poll = true;
+    const auto result = lease.check_stopped_queues(UrmaWait::Poll);
+    inside_poll = false;
+    return result;
+}
+
+// Fetch one worker scan submitted in Poll mode before the test edits its queue.
+static UrmaQueueState poll_scan(UrmaRunLease &lease) {
+    assert(poll(lease) == UrmaQueueState::PENDING);
+    return lease.check_stopped_queues(UrmaWait::Wait);
 }
 extern "C" aclError aclrtMemset(void *out, size_t, int32_t value, size_t bytes) {
     std::memset(out, value, bytes);
@@ -292,10 +497,10 @@ HcclChannelAcquire(HcclComm comm, CommEngine, const HcclChannelDesc *desc, uint3
     sq.sqDepth = 256;
     sq.wqeSize = 64;
     auto &cq = c->cq.contextInfo.ubJfc;
-    cq.scqVa = reinterpret_cast<uint64_t>(c->cq_buffer);
+    cq.scqVa = reinterpret_cast<uint64_t>(c->cq_buffer) | aiv_alias;
     cq.headAddr = reinterpret_cast<uint64_t>(&c->cq_head);
     cq.tailAddr = reinterpret_cast<uint64_t>(&c->cq_tail);
-    cq.dbVa = reinterpret_cast<uint64_t>(&c->cq_db);
+    cq.dbVa = reinterpret_cast<uint64_t>(&c->cq_db) | aiv_alias;
     cq.cqDepth = 256;
     cq.cqeSize = 64;
     *out = reinterpret_cast<ChannelHandle>(&c->entity);
@@ -377,6 +582,38 @@ static void test_overlapping_domains(CommHandle h, const std::vector<uint32_t> &
     fail_channels = false;
     assert(allocate(3, bc, bc_rank) == 0);
     check_domain(3, bc, bc_rank);
+    if constexpr (hbg_urma) {
+        const auto &first = *h->domain_allocations.at(1);
+        const auto &second = *h->domain_allocations.at(3);
+        const uint64_t both[] = {
+            reinterpret_cast<uint64_t>(first.device_ctx), reinterpret_cast<uint64_t>(second.device_ctx),
+            reinterpret_cast<uint64_t>(first.device_ctx)
+        };
+        UrmaRunLease held, next;
+        assert(acquire_test_run(h, both + 1, 1, &held) == 0 && held.domains.size() == 1);
+        assert(acquire_test_run(h, both, 3, &next) == COMM_DOMAIN_ADMISSION_STOPPED && next.domains.empty());
+        assert(acquire_test_run(h, both, 1, &next) == 0 && next.domains.size() == 1);
+        next = {};
+        held = {};
+        assert(acquire_test_run(h, both, 3, &next) == 0 && next.domains.size() == 2);
+        assert(next.domains[0].binding.workspace == reinterpret_cast<uint64_t>(first.urma_workspace.addr));
+        assert(next.domains[1].binding.workspace == reinterpret_cast<uint64_t>(second.urma_workspace.addr));
+        assert(next.domains[0].binding.local_rank == 1 && next.domains[1].binding.local_rank == bc_rank);
+        assert(next.domains[0].binding.row_owner != next.domains[1].binding.row_owner && drained(next));
+        auto &channel = *channels.at(second.urma_comm);
+        ++channel.sq_head;
+        assert(!drained(next) && comm_release_domain_windows(h, 3, 2, bc_rank) == COMM_DOMAIN_ADMISSION_STOPPED);
+        ++channel.sq_tail;
+        assert(drained(next));
+        next.retire_queues();
+        assert(acquire_test_run(h, both + 1, 1, &held) == 0);
+        ++channel.sq_head;
+        assert(drained(next) && !drained(held));  // The successor owns these submissions.
+        ++channel.sq_tail;
+        assert(drained(held));
+        held = {};
+        assert(comm_release_domain_windows(h, 3, 2, bc_rank) == COMM_DOMAIN_ADMISSION_STOPPED);
+    }
     if (fail_release) {
         fail_destroy = true;
         const auto held = mappings.size();
@@ -396,9 +633,215 @@ static void test_overlapping_domains(CommHandle h, const std::vector<uint32_t> &
     delete h;
 }
 
+static void test_background_poll(const std::string &scenario) {
+    const bool abandon = scenario == "abandon_poll";
+    const bool foreground_only = scenario == "foreground_d2h";
+    const bool revoke_during_scan = scenario == "revoke_poll";
+    using State = UrmaQueueState;
+    using namespace std::chrono_literals;
+    simpler::test::UrmaQueueFixture queues;
+    queues.info.rankCount = 4;
+    queues.info.rowsPerPeer = 2;
+    constexpr unsigned last = simpler::test::kRows - 1;
+    for (auto &cq : queues.cq) {
+        cq.bufAddr |= aiv_alias;
+        cq.dbAddr |= aiv_alias;
+    }
+    queues.sq_head[last] = queues.sq[last].submittedWqeCount = 1;
+    CommContext device_ctx{};
+    CommHandle_ h{};
+    auto allocation = std::make_shared<DomainAllocation>();
+    h.domain_allocations.emplace(1, allocation);
+    allocation->nranks = queues.info.rankCount;
+    allocation->initialized = true;
+    allocation->device_ctx = &device_ctx;
+    allocation->urma_row_owner = 1;
+    allocation->urma_aiv_count = 1;
+    allocation->workspace_config.urma_jetties_per_aiv = 2;
+    allocation->urma_workspace.addr = &queues.info;
+    allocation->urma_workspace.bytes = sizeof(queues);
+    allocation->urma_workspace.impl = reinterpret_cast<decltype(allocation->urma_workspace.impl)>(&queues);
+    const uint64_t context = reinterpret_cast<uint64_t>(&device_ctx);
+    UrmaRunLease use, other;
+    if (!foreground_only) {
+        thread_context = nullptr;
+        assert(acquire_test_run(&h, &context, 1, &use) == COMM_DOMAIN_URMA_CONFIG_INVALID);
+        assert(!allocation->urma_run_active && use.domains.empty());
+    }
+    thread_context = run_context;
+    assert(acquire_test_run(&h, &context, 1, &use) == 0);
+    if (scenario == "reset_active_poll" || scenario == "reset_idle_poll" || scenario == "reset_unstarted_poll") {
+        const bool active = scenario == "reset_active_poll";
+        auto scan = use.stopped_scan->thread;
+        scan_probe.header = &queues.info;
+        if (active) {
+            scan_probe.hold = true;
+            assert(poll(use) == State::PENDING);
+            std::unique_lock lock(scan_probe.mutex);
+            assert(scan_probe.changed.wait_for(lock, 4s, [] {
+                return scan_probe.entered;
+            }));
+        } else if (scenario == "reset_idle_poll") {
+            queues.sq_head[last] = queues.sq[last].submittedWqeCount = 0;
+            assert(use.check_stopped_queues(UrmaWait::Wait) == State::READY);
+            assert(scan->worker.joinable());
+        } else {
+            assert(!scan->worker.joinable());
+        }
+        fixture_launch_gate->revoke();
+        auto resetting = std::async(std::launch::async, [] {
+            fixture_launch_gate->stop_scans();
+        });
+        if (active) {
+            {
+                std::unique_lock lock(scan->mutex);
+                assert(scan->changed.wait_for(lock, 4s, [&] {
+                    return scan->stopping;
+                }));
+            }
+            assert(resetting.wait_for(10ms) == std::future_status::timeout);
+            std::lock_guard lock(scan_probe.mutex);
+            scan_probe.hold = false;
+            scan_probe.changed.notify_all();
+        }
+        resetting.get();
+        assert(!scan->worker.joinable() && !control_launches);
+        const auto copies_before = scan_probe.copies;
+        fixture_launch_gate = std::make_shared<UrmaLaunchGate>();
+        assert(use.launch_permission.expired());
+        for (int retry = 0; retry < 3; ++retry)
+            assert(poll(use) == State::PENDING);
+        assert(scan_probe.copies == copies_before && !control_queries && !control_launches);
+        return;
+    }
+    if (foreground_only) {
+        queues.sq_head[last] = queues.sq[last].submittedWqeCount = 0;
+        scan_probe.header = &queues.info;
+        const auto first = poll(use);
+        std::fprintf(stderr, "foreground D2H copies in the first poll: %u\n", scan_probe.poll_copies);
+        assert(scan_probe.poll_copies == 0);
+        assert(first == State::PENDING);
+        assert(use.check_stopped_queues(UrmaWait::Wait) == State::READY);
+        assert(scan_probe.copies == 1 + 5 * 6);
+        return;
+    }
+    thread_context = reinterpret_cast<aclrtContext>(0x502);
+    scan_probe.header = &queues.info;
+    scan_probe.late_cqe = queues.entries[last][0].words.data();
+    auto poll_until = [&](State expected) {
+        const auto deadline = std::chrono::steady_clock::now() + 4s;
+        State observed;
+        do {
+            assert(std::chrono::steady_clock::now() < deadline);
+            observed = poll(use);
+            if (observed == State::PENDING) std::this_thread::yield();
+        } while (observed == State::PENDING);
+        assert(observed == expected);
+    };
+    // First allocation copies the queue claims. When that succeeds, the next allocates the thread's state.
+    for (int fail_after : {0, 1}) {
+        allocations_before_failure = fail_after;
+        assert(poll(use) == State::PENDING && allocations_before_failure == -1);
+        assert(!scan_probe.copies && !control_launches && allocation->urma_run_active);
+    }
+    refuse_scan_context = true;
+    assert(poll_scan(use) == State::PENDING);
+    assert(rejected_scan_contexts == 1 && !scan_probe.copies && allocation->urma_run_active);
+    refuse_scan_context = false;
+    auto hold_scan = [&] {
+        {
+            std::lock_guard lock(scan_probe.mutex);
+            scan_probe.hold = true;
+            scan_probe.entered = false;
+        }
+        assert(poll(use) == State::PENDING);
+        std::unique_lock lock(scan_probe.mutex);
+        assert(scan_probe.changed.wait_for(lock, 4s, [] {
+            return scan_probe.entered;
+        }));
+    };
+    auto release_scan = [] {
+        std::lock_guard lock(scan_probe.mutex);
+        scan_probe.hold = false;
+        scan_probe.changed.notify_all();
+    };
+    if (abandon) allowed_control_completions = 0;
+    hold_scan();
+    std::future<State> waiter;
+    if (abandon) {
+        waiter = std::async(std::launch::async, [&] {
+            return use.check_stopped_queues(UrmaWait::Wait);
+        });
+        assert(waiter.wait_for(10ms) == std::future_status::timeout);
+    }
+    for (int retry = 0; retry < 32; ++retry)
+        assert(poll(use) == State::PENDING);
+    assert(acquire_test_run(&h, &context, 1, &other) == COMM_DOMAIN_ADMISSION_STOPPED);
+    assert(!scan_probe.poll_copies && scan_probe.scanner != std::this_thread::get_id());
+    if (revoke_during_scan) fixture_launch_gate->revoke();
+    release_scan();
+    if (revoke_during_scan) {
+        assert(use.check_stopped_queues(UrmaWait::Wait) == State::PENDING);
+        assert(!control_launches && !queues.cq_tail[last] && !queues.sq_tail[last]);
+        // An already drained row needs no new helper, even after quarantine.
+        queues.cq_tail[last] = queues.sq_tail[last] = queues.cq_doorbell[last] = 1;
+        poll_until(State::READY);
+        assert(!control_launches);
+        use.retire_queues();
+        return;
+    }
+    if (abandon) {
+        // The result belongs to the poll that launched the helper. Its AIV is still active.
+        assert(waiter.get() == State::PENDING);
+        assert(allocation->urma_queue_control.has_command() && control_launches == 1 && control_syncs == 0);
+        const int prior_queries = control_queries;
+        fixture_launch_gate->revoke();
+        assert(poll_scan(use) == State::PENDING);
+        assert(control_queries == prior_queries + 1 && control_launches == 1);
+        hold_scan();
+        auto destroying = std::async(std::launch::async, [&] {
+            use = {};
+        });
+        assert(destroying.wait_for(10ms) == std::future_status::timeout);
+        assert(acquire_test_run(&h, &context, 1, &other) == COMM_DOMAIN_ADMISSION_STOPPED);
+        release_scan();
+        destroying.get();
+        assert(acquire_test_run(&h, &context, 1, &other) == COMM_DOMAIN_ADMISSION_STOPPED);
+        assert(!domain_drained(*allocation) && !allocation->urma_queue_control.close());
+        assert(control_images == 1 && control_streams.size() == 1 && !queues.sq_tail[last]);
+        return;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + 4s;
+    while (!scan_probe.pending_reads) {
+        assert(std::chrono::steady_clock::now() < deadline && poll(use) == State::PENDING);
+        std::this_thread::yield();
+    }
+    scan_probe.word = (1u << 2) | (1u << 16);
+    poll_until(State::FAILED);
+    assert(!queues.cq_tail[last] && !queues.cq_doorbell[last] && !queues.sq_tail[last]);
+    scan_probe.word = 1u << 2;
+    poll_until(State::READY);
+    assert(queues.cq_tail[last] == 1 && queues.cq_doorbell[last] == 1 && queues.sq_tail[last] == 1);
+    assert(scan_probe.copies >= 1 + 5 * 6 && scan_probe.poll_copies == 0 && control_syncs == 0);
+    assert(thread_context == reinterpret_cast<aclrtContext>(0x502));
+    assert(allocation->urma_run_active);
+    use.retire_queues();
+    assert(!allocation->urma_run_active);
+    use = {};
+    assert(allocation->urma_queue_control.close() && mappings.empty() && control_streams.empty());
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     const std::string scenario = argv[1];
+    thread_context = run_context;
+    if (scenario == "wide_poll" || scenario == "abandon_poll" || scenario == "foreground_d2h" ||
+        scenario == "revoke_poll" || scenario == "reset_active_poll" || scenario == "reset_idle_poll" ||
+        scenario == "reset_unstarted_poll") {
+        test_background_poll(scenario);
+        return 0;
+    }
     fail_registration = scenario == "notify_registration" ? 2 : 0;
     fail_destroy = scenario == "destroy_failure";
     fail_channels = scenario == "notify_registration" || scenario == "channel_acquire" || scenario == "destroy_failure";
@@ -491,6 +934,99 @@ int main(int argc, char **argv) {
         assert(comm_abort_domain_windows(h, id, 2, 0) == 0);
         assert(h->domain_allocations.empty() && registrations.empty() && mappings.empty());
         assert(destroy_calls == 1 && unsafe_frees == 0);
+        delete h;
+        std::filesystem::remove_all(folder);
+        return 0;
+    }
+    if (scenario == "hbg_lease") {
+        assert(rc == 0 && ctx);
+        UrmaRunLease use, other;
+        const uint64_t foreign = ctx + 1;
+        assert(acquire_test_run(h, &foreign, 1, &other) == 0 && other.domains.empty());
+        assert(acquire_test_run(h, &ctx, 1, &use) == 0 && use.domains.size() == 1 && drained(use));
+        const auto &binding = use.domains.front().binding;
+        assert(binding.workspace && binding.row_owner && binding.rows_per_peer == 1 && !binding.local_rank);
+        assert(binding.rank_count == 2 && binding.jetties_per_core == 1);
+        const auto rows = binding.rows_per_peer * binding.rank_count;
+        const auto *owners = reinterpret_cast<const UrmaRowOwner *>(binding.row_owner);
+        assert(binding.row_owner % alignof(UrmaRowOwner) == 0);
+        const auto end = reinterpret_cast<uint64_t>(owners + rows) - binding.workspace;
+        const auto bytes = mappings.at(reinterpret_cast<void *>(binding.workspace));
+        assert(end <= bytes && bytes - end < alignof(UrmaRowOwner));
+        for (uint32_t r = 0; r < rows; ++r)
+            assert(owners[r].value == 0);
+        assert(acquire_test_run(h, &ctx, 1, &other) == COMM_DOMAIN_ADMISSION_STOPPED);
+        assert(comm_release_domain_windows(h, id, 2, 0) == COMM_DOMAIN_ADMISSION_STOPPED);
+        auto &channel = *channels.begin()->second;
+        channel.sq_head = 3;
+        assert(!drained(use) && comm_destroy(h) == COMM_DOMAIN_ADMISSION_STOPPED);
+        assert(!h->cleanup_failed && !unsafe_frees && !destroy_calls);
+        using namespace pto::comm::urma;
+        const auto *info = reinterpret_cast<const UrmaInfo *>(binding.workspace);
+        auto &sq = reinterpret_cast<UrmaWQCtx *>(info->sqPtr)[binding.rows_per_peer];
+        sq.submittedWqeCount = 2;
+        const uint32_t ready = 1u << 2, bad_status = ready | (1u << 16);
+        std::memcpy(channel.cq_buffer, &ready, sizeof(ready));
+        auto *second_cqe = channel.cq_buffer + 64;
+        assert(poll_scan(use) == UrmaQueueState::PENDING);  // Only one CQE arrived.
+        std::memcpy(second_cqe, &bad_status, sizeof(bad_status));
+        assert(poll_scan(use) == UrmaQueueState::FAILED);
+        std::memcpy(second_cqe, &ready, sizeof(ready));
+        assert(!domain_drained(*h->domain_allocations.at(id)));  // Domain close only observes the tails.
+        const int launches = control_launches;
+        assert(!drained(use, false) && control_launches == launches);
+        blocked_control_waits = 2;
+        assert(!drained(use) && control_launches == launches + 1);
+        assert(!drained(use) && control_launches == launches + 1);
+        assert(comm_release_domain_windows(h, id, 2, 0) == COMM_DOMAIN_ADMISSION_STOPPED);
+        assert(acquire_test_run(h, &ctx, 1, &other) == COMM_DOMAIN_ADMISSION_STOPPED);
+        assert(control_images == 1 && control_streams.size() == 1);
+        const auto &pending = (*control_streams.begin())->pending;
+        assert(pending && mappings.count(reinterpret_cast<void *>(pending->result_address)) == 1);
+        assert(channel.cq_tail == 0 && channel.cq_db == 0 && channel.sq_tail == 0);
+        fail_queue_read = second_cqe;
+        assert(!drained(use));
+        assert(channel.cq_tail == 0 && channel.cq_db == 0 && channel.sq_tail == 0);
+        fail_queue_read = nullptr;
+        fail_queue_write = &channel.cq_db;
+        assert(!drained(use));
+        assert(channel.cq_tail == 2 && channel.cq_db == 0 && channel.sq_tail == 0);
+        // The retained, validated position survives a partial publication.
+        fail_queue_read = second_cqe;
+        fail_queue_write = &channel.sq_tail;
+        assert(!drained(use));
+        assert(channel.cq_tail == 2 && channel.cq_db == 2 && channel.sq_tail == 0);
+        fail_queue_write = nullptr;
+        assert(drained(use));
+        assert(channel.cq_tail == 2 && channel.cq_db == 2 && channel.sq_tail == 3);
+        // A poller alone delivers the next receipt. Hold the AIV first during its scan, then during the doorbell.
+        channel.sq_head = 4;
+        sq.submittedWqeCount = 3;
+        std::memcpy(channel.cq_buffer + 128, &ready, sizeof(ready));
+        const int start_syncs = control_syncs, start_launches = control_launches;
+        auto poll_once = [&] {
+            return poll_scan(use);
+        };
+        allowed_control_completions = 0;
+        assert(poll_once() == UrmaQueueState::PENDING && poll_once() == UrmaQueueState::PENDING);
+        assert(control_launches == start_launches + 1 && channel.cq_tail == 2 && channel.sq_tail == 3);
+        allowed_control_completions = 1;
+        assert(poll_once() == UrmaQueueState::PENDING);
+        assert(poll_once() == UrmaQueueState::PENDING && control_launches == start_launches + 2);
+        assert(channel.cq_tail == 3 && channel.cq_db == 2 && channel.sq_tail == 3);
+        // Quarantine still permits collecting this already submitted doorbell and publishing SQ tail.
+        fixture_launch_gate->revoke();
+        allowed_control_completions = 1;
+        assert(poll_once() == UrmaQueueState::READY && poll_once() == UrmaQueueState::READY);
+        assert(control_launches == start_launches + 2 && control_syncs == start_syncs);
+        assert(channel.cq_tail == 3 && channel.cq_db == 3 && channel.sq_tail == 4);
+
+        assert(acquire_test_run(h, &ctx, 1, &other) == COMM_DOMAIN_ADMISSION_STOPPED);
+        fail_queue_read = nullptr;
+        use = {};
+        assert(comm_release_domain_windows(h, id, 2, 0) == 0);
+        assert(control_images == 0 && control_streams.empty());
+        assert(child_comms.empty() && registrations.empty() && mappings.empty() && unsafe_frees == 0);
         delete h;
         std::filesystem::remove_all(folder);
         return 0;

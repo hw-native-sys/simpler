@@ -31,10 +31,10 @@ __attribute__((visibility("default"))) void urma_deferred_completion_orchestrati
         LOG_ERROR("urma_deferred_completion_demo: expected 4 tensors and 4 scalars");
         return;
     }
-    const simpler::tmr::Tensor &input = orch_args.tensor(0).ref();
-    const simpler::tmr::Tensor &receive = orch_args.tensor(1).ref();
-    const simpler::tmr::Tensor &out = orch_args.tensor(2).ref();
-    const simpler::tmr::Tensor &result = orch_args.tensor(3).ref();
+    const auto &input = orch_args.tensor(0).ref();
+    const auto &receive = orch_args.tensor(1).ref();
+    const auto &out = orch_args.tensor(2).ref();
+    const auto &result = orch_args.tensor(3).ref();
     const uint64_t comm_ctx = orch_args.scalar<uint64_t>(0);
     const uint32_t elems = orch_args.scalar<uint32_t>(1);
     const uint32_t mode = orch_args.scalar<uint32_t>(2);
@@ -50,7 +50,7 @@ __attribute__((visibility("default"))) void urma_deferred_completion_orchestrati
         }
         return rt_submit_aiv_task(0, args);
     };
-    simpler::tmr::Tensor gate = input;
+    auto gate = input;
     if (mode == 1 || mode == 2 || mode == 4) {
         uint32_t marker_shape[1] = {1};
         TensorCreateInfo marker(marker_shape, 1, DataType::INT32);

@@ -11328,16 +11328,17 @@ class Worker:
                 raise ValueError("A5 Host-source MTE requires tensormap_and_ringbuffer or host_build_graph")
             if any(engine != "urma" for engine in config.workspace_engines):
                 raise ValueError("Host-source domains support only the URMA workspace")
-            if config.workspace_engines and runtime != "tensormap_and_ringbuffer":
-                raise ValueError("Host-source URMA requires the A5 tensormap_and_ringbuffer runtime")
         if config.workspace_engines:
             if self.level != 3:
                 raise ValueError("workspace_engines selection is supported only on L3 domains")
             if self._config.get("platform") != "a5":
                 raise ValueError("domain workspace selection requires A5; A2/A3 SDMA uses enable_sdma")
             if "urma" in config.workspace_engines:
-                if self._config.get("runtime") != "tensormap_and_ringbuffer":
-                    raise ValueError("URMA domain workspaces require the A5 tensormap_and_ringbuffer runtime")
+                runtime = self._config.get("runtime")
+                if runtime not in ("tensormap_and_ringbuffer", "host_build_graph"):
+                    raise ValueError(
+                        "URMA domain workspaces require the A5 tensormap_and_ringbuffer or host_build_graph runtime"
+                    )
                 if config.memory_source == AddressSpace.HOST and config.members != tuple(range(len(config.members))):
                     raise ValueError("Host-source URMA requires ranks in dense prefix order")
         return config

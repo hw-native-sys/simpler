@@ -1114,6 +1114,8 @@ struct ChipRunLaneState {
         if (run->phase == ChipRunState::Phase::LAUNCHED) {
             try {
                 wait_for_execution(run);
+            } catch (const NativeRunWaitIncomplete &) {
+                throw;
             } catch (...) {
                 run->error = std::current_exception();
                 poison_with(run, run->error);
@@ -1243,6 +1245,8 @@ struct ChipRunLaneState {
         if (front->phase != ChipRunState::Phase::LAUNCHED) return false;
         try {
             wait_for_execution(front);
+        } catch (const NativeRunWaitIncomplete &) {
+            throw;
         } catch (...) {
             const std::exception_ptr wait_error = std::current_exception();
             if (front->error == nullptr) front->error = wait_error;
@@ -1323,6 +1327,8 @@ bool ChipRun::retire_framework(bool wait_for_own_completion, Deadline deadline) 
             if (deadline == Deadline::max()) {
                 try {
                     lane_->wait_for_execution(run_);
+                } catch (const NativeRunWaitIncomplete &) {
+                    throw;
                 } catch (...) {
                     run_->error = std::current_exception();
                     lane_->poison_with(run_, run_->error);

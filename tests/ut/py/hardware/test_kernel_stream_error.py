@@ -132,7 +132,7 @@ def _resident_timeout_profile(environment):
 
 def _observe_resident_entry(lib, ctx, run, caller, args, config, descriptor, budget):
     stages = []
-    assert lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor)) == 0
+    assert lib.simpler_prepare_run_v2(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor)) == 0
     stages.append("prepare")
     print("RESIDENT_STAGE " + json.dumps({"stage": "prepare", "rc": 0}), flush=True)
     mode = lib.get_last_scheduler_runtime_mode(ctx)
@@ -407,7 +407,7 @@ def test_resident_entry_observes_the_caller_without_a_native_drain(capsys):
 
     lib = SimpleNamespace(
         **{
-            "simpler_prepare_run": leaf("prepare"),
+            "simpler_prepare_run_v2": leaf("prepare"),
             "get_last_scheduler_runtime_mode": leaf("mode", 5),
             "get_scheduler_mode_publish_count": leaf("count", 1),
             "simpler_launch_run_on_stream": leaf("launch"),
@@ -832,7 +832,7 @@ def _bind_resident_sdk(lib):
         "aclrtMemcpy": [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int],
         "aclrtPeekAtLastError": [ctypes.c_int],
         "aclrtSynchronizeStreamWithTimeout": [ctypes.c_void_p, ctypes.c_int],
-        "simpler_prepare_run": [
+        "simpler_prepare_run_v2": [
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_int32,
@@ -1132,7 +1132,7 @@ def _probe(arch, runtime, error_origin, device, failure, output):
     lib.aclrtDestroyStream.argtypes = [ctypes.c_void_p]
     lib.aclrtPeekAtLastError.argtypes = [ctypes.c_int]
     lib.aclrtSynchronizeStreamWithTimeout.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    lib.simpler_prepare_run.argtypes = [
+    lib.simpler_prepare_run_v2.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
         ctypes.c_int32,
@@ -1169,7 +1169,7 @@ def _probe(arch, runtime, error_origin, device, failure, output):
     if device_tensor.value is not None:
         args.add_tensor(ChipTensor.make(device_tensor.value, (1,), DataType.INT32, address_space=AddressSpace.DEVICE))
     descriptor = NativeRunDescriptor(generation=1, run_epoch=1)
-    assert lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor)) == 0
+    assert lib.simpler_prepare_run_v2(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor)) == 0
     assert lib.simpler_launch_run_on_stream(ctx, run, caller, None) == 0
     # This is the first execution observer: neither native wait nor finalize ran.
     peek_before = lib.aclrtPeekAtLastError(0)

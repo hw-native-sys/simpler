@@ -25,7 +25,9 @@
  */
 
 #include "host/host_dependency_capture_scope.h"
+#include <chrono>
 #include <optional>
+#include <thread>
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
@@ -184,6 +186,7 @@ void runtime_collect_completion_feedback_impl(const Runtime *runtime, const Host
  */
 int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 extern "C" int set_run_ccu_workspace_impl(Runtime *, uint64_t) __attribute__((weak));
+extern "C" int acquire_hbg_urma_run(void *, const uint64_t *, int32_t, UrmaRunLease *) __attribute__((weak));
 __attribute__((weak)) int concurrent_native_prepare_supported_impl(void) { return 0; }
 /**
  * Whether this runtime publishes a device-teardown report.
@@ -2088,6 +2091,24 @@ static int prepare_native_run(
         // is still active and apply_call_config was skipped.
         runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(*config));
 
+        if (descriptor->base_comm_handle != 0 && args != nullptr && acquire_hbg_urma_run != nullptr) {
+            const auto generation = runner->device_health().generation();
+            const auto &call = *static_cast<const ChipStorageTaskArgs *>(args);
+            rc = acquire_hbg_urma_run(
+                reinterpret_cast<void *>(descriptor->base_comm_handle), call.scalar_data(), call.scalar_count(),
+                &state->host_api.urma
+            );
+            if (rc == COMM_DOMAIN_ADMISSION_STOPPED && overlaps_active_run) rc = PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE;
+            if (rc != 0) return cleanup_failed_prepare(state, rc, thread_attached);
+            auto &urma = state->host_api.urma;
+            if (!urma.domains.empty()) {
+                urma.launch_permission = runner->acquire_urma_launch_permission(
+                    generation, urma.stopped_scan ? urma.stopped_scan->thread : nullptr
+                );
+                if (urma.launch_permission.expired())
+                    return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INVALID_STATE, thread_attached);
+            }
+        }
         {
             STRACE("chip.run.bind");
             rc = runner->bind_callable_to_runtime(
@@ -2170,14 +2191,14 @@ static int prepare_native_run(
     }
 }
 
-int simpler_prepare_run(
+int simpler_prepare_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
     return prepare_native_run(ctx, runtime, callable_id, args, config, descriptor, false);
 }
 
-int simpler_prepare_caller_run(
+int simpler_prepare_caller_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
@@ -2543,9 +2564,32 @@ static void collect_completion_feedback(OnboardNativeRunContext *state) {
     runtime_collect_completion_feedback_impl(state->runtime.get(), &state->host_api);
 }
 
-static int retire_completed_native_run(OnboardNativeRunContext *state) {
+// The stopped chip cannot post again. Its exclusive queue claims last through physical retirement.
+static int stopped_urma_queue_status(OnboardNativeRunContext *state, UrmaWait mode) {
+    if (state->host_api.urma.domains.empty() || state->urma_drained_after_chip_stop.load(std::memory_order_acquire))
+        return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    const auto status = state->host_api.urma.check_stopped_queues(mode);
+    if (status == UrmaQueueState::PENDING) return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    if (status != UrmaQueueState::READY) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    state->urma_drained_after_chip_stop.store(true, std::memory_order_release);
+    return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+}
+
+static int retire_completed_native_run(OnboardNativeRunContext *state, UrmaWait mode) {
     if (state->execution_retired) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
     if (state->active_execution == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    if (!state->host_api.urma.domains.empty()) {
+        const auto &prepared = state->active_execution->prepared;
+        if (!prepared) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (prepared->resources_owned) {
+            const int rc = state->runner->poll_execution(*state->active_execution);
+            if (rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return rc;
+        } else if (!prepared->physical_complete) {
+            return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        }
+        const int queues = stopped_urma_queue_status(state, mode);
+        if (queues != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return queues;
+    }
     const int rc = state->runner->retire_completed_execution(*state->active_execution);
     if (rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return rc;
     note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
@@ -2592,6 +2636,7 @@ static int retire_completed_native_run(OnboardNativeRunContext *state) {
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
+    state->host_api.urma.retire_queues();
     state->physical_complete = true;
     state->execution_retired = true;
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
@@ -2610,11 +2655,15 @@ int simpler_query_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime)
         const auto &prepared = state->active_execution->prepared;
         // A failed drain also retires the progress slot. Once its boundaries
         // are gone, only the carrier's recorded physical evidence is usable.
-        if (!prepared || !prepared->resources_owned)
-            return prepared && prepared->physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE :
-                                                             SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (!prepared) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (!prepared->resources_owned) {
+            if (!prepared->physical_complete) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+            if (state->host_api.urma.domains.empty()) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        }
         if (state->runner->enter_run_thread() != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
-        return state->runner->poll_execution(*state->active_execution);
+        const int poll = prepared->resources_owned ? state->runner->poll_execution(*state->active_execution) :
+                                                     SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        return poll == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? stopped_urma_queue_status(state, UrmaWait::Poll) : poll;
     } catch (...) {
         return SIMPLER_NATIVE_RUN_POLL_ERROR;
     }
@@ -2644,7 +2693,7 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         const int attach_rc = state->runner->enter_run_thread();
         if (attach_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
         if (state->poll_peer_cancel() != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
-        return retire_completed_native_run(state);
+        return retire_completed_native_run(state, UrmaWait::Poll);
     } catch (...) {
         return SIMPLER_NATIVE_RUN_POLL_ERROR;
     }
@@ -2661,12 +2710,43 @@ int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) 
         if (state->active_execution == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
         const int progress_rc = state->await_peer_cancel_progress();
         if (progress_rc != 0) return progress_rc;
+        using Clock = std::chrono::steady_clock;
+        const bool has_urma = !state->host_api.urma.domains.empty();
+        const auto deadline = has_urma ?
+                                  Clock::now() + std::chrono::milliseconds(state->runner->stream_sync_timeout_ms()) :
+                                  Clock::time_point::max();
         const int rc = state->runner->wait_execution_completion(*state->active_execution);
         if (rc != 0) return rc;
-        return retire_completed_native_run(state) == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+        // Both chip boundaries have stopped. The last transfer may still be in flight.
+        // Poll the control stream so no individual helper wait can restart the time budget.
+        for (;;) {
+            const int status = retire_completed_native_run(state, UrmaWait::Poll);
+            if (status == SIMPLER_NATIVE_RUN_POLL_COMPLETE) return 0;
+            if (state->completion_rc != 0) return state->completion_rc;
+            if (!has_urma || status != SIMPLER_NATIVE_RUN_POLL_NOT_READY) return PTO_RUNTIME_ERR_INTERNAL;
+            if (Clock::now() >= deadline) return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+}
+
+// The chip's stream result is already recorded. Keep an unready engine retryable.
+static int finish_stopped_urma_wait(OnboardNativeRunContext *state) {
+    const int queues = stopped_urma_queue_status(state, UrmaWait::Wait);
+    if (queues != SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
+        if (state->completion_rc != 0) return state->completion_rc;
+        if (queues == SIMPLER_NATIVE_RUN_POLL_NOT_READY) return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+        state->completion_rc = PTO_RUNTIME_ERR_INTERNAL;
+        return state->completion_rc;
+    }
+    state->chip_complete_waiting_for_urma = false;
+    state->host_api.urma.retire_queues();
+    state->physical_complete = true;
+    note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
+    state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+    return state->completion_rc;
 }
 
 int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
@@ -2674,10 +2754,12 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     if (state->caller_owns_submission) return PTO_RUNTIME_ERR_UNSUPPORTED;
     if (state->phase.load(std::memory_order_acquire) == NativeRunPhase::Prepared) return PTO_RUNTIME_ERR_INTERNAL;
-    if (state->result_observed) return state->completion_rc;
+    if (state->result_observed && (!state->chip_complete_waiting_for_urma || state->completion_rc != 0))
+        return state->completion_rc;
     // Context refusal precedes observation and remains retryable.
     const int attach_rc = state->runner->enter_run_thread();
     if (attach_rc != 0) return attach_rc;
+    if (state->chip_complete_waiting_for_urma) return finish_stopped_urma_wait(state);
     DrainOutcome drain{};
     note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
     try {
@@ -2700,8 +2782,15 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     if (!drain.physical_complete) quarantine_undrained_run(*state->runner, drain.device_rc);
     if (state->completion_rc == 0) state->completion_rc = drain.combined();
     state->result_observed = true;
+    if (drain.physical_complete && !state->host_api.urma.domains.empty()) {
+        state->chip_complete_waiting_for_urma = true;
+        const int result = finish_stopped_urma_wait(state);
+        emit_native_run_runner_wall(state);
+        return result;
+    }
     state->physical_complete = state->physical_complete || drain.physical_complete;
     if (state->physical_complete) {
+        state->host_api.urma.retire_queues();
         note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     }
@@ -2794,7 +2883,10 @@ int simpler_probe_run_retention(
             // The device half alone, exactly as the ordinary wait decides it: a
             // diagnostics ownership failure still fails the run, and is not
             // evidence that the device finished.
-            if (successor_drain.device_rc == 0) {
+            const bool stopped =
+                successor_drain.physical_complete &&
+                stopped_urma_queue_status(successor, UrmaWait::Wait) == SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            if (successor_drain.device_rc == 0 && stopped) {
                 note_workspace_fact(successor, WorkspaceManager::RunFact::DrainProvedComplete);
             }
             // The fixture drained it, so it reaches finalize in the same phase an
@@ -2802,7 +2894,9 @@ int simpler_probe_run_retention(
             // a zero: a context starts at -1 so a run that never completed cannot
             // read as success, and the fixture performed this run's launch and
             // drain, so it is what decides.
-            successor->physical_complete = successor_drain.physical_complete;
+            successor->physical_complete = stopped;
+            if (stopped) successor->host_api.urma.retire_queues();
+            successor->chip_complete_waiting_for_urma = successor_drain.physical_complete && !stopped;
             successor->completion_rc = report->successor_drain_rc;
             successor->phase.store(NativeRunPhase::Complete, std::memory_order_release);
             emit_native_run_runner_wall(successor);
@@ -2881,10 +2975,14 @@ static int finalize_native_run(
         state->active_execution ? state->active_execution->prepared.get() : state->prepared_execution.get();
     const bool caller_submitted = state->caller_owns_submission && state->active_execution != nullptr;
     if (caller_submitted && !state->physical_complete) {
-        const int rc = state->runner->finish_caller_submission(*state->active_execution);
-        if (rc != 0) return rc;
-        state->physical_complete = true;
-        note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
+        if (!state->chip_complete_waiting_for_urma) {
+            const int rc = state->runner->finish_caller_submission(*state->active_execution);
+            if (rc != 0) return rc;
+            // Later work on the caller's stream does not belong to this submission.
+            state->chip_complete_waiting_for_urma = true;
+        }
+        const int rc = finish_stopped_urma_wait(state);
+        if (!state->physical_complete) return rc;
     }
     if (prepared && prepared->diagnostic_window_open) {
         const int rc = state->runner->close_caller_diagnostics(*prepared);
@@ -2899,6 +2997,10 @@ static int finalize_native_run(
         if (execution_rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE && !state->physical_complete) return execution_rc;
     }
     state->completion_rc = execution_rc;
+    if (state->chip_complete_waiting_for_urma) {
+        execution_rc = finish_stopped_urma_wait(state);
+        if (!state->physical_complete) return execution_rc;
+    }
     if (launched && !state->physical_complete) {
         // A cached error is not permission to release a live or unknown reader.
         // Keep the carrier, IO, actual streams and all unresolved cleanup debt.
@@ -3134,11 +3236,11 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return simpler_finalize_run_with_delivery(ctx, runtime, 1);
 }
 
-int simpler_run(
+int simpler_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
-    int rc = simpler_prepare_run(ctx, runtime, callable_id, args, config, descriptor);
+    int rc = simpler_prepare_run_v2(ctx, runtime, callable_id, args, config, descriptor);
     if (rc != 0) return rc;
     rc = simpler_launch_run(ctx, runtime);
     if (rc == 0) rc = simpler_wait_run(ctx, runtime);

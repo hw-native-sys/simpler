@@ -277,7 +277,7 @@ struct Attempt {
     }
     int prepare() {
         runner.note_result_epoch(descriptor.pipeline_slot, descriptor.run_epoch);
-        auto prepare_run = caller_owned ? simpler_prepare_caller_run : simpler_prepare_run;
+        auto prepare_run = caller_owned ? simpler_prepare_caller_run_v2 : simpler_prepare_run_v2;
         return prepare_run(&runner, storage, 1, &args, &config, &descriptor);
     }
     bool consume_release() { return consume_released_preparation(storage, get_runtime_size(), descriptor.run_epoch); }

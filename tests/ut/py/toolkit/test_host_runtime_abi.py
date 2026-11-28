@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.ut.py.hardware.test_kernel_mode_c_api import _load
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _NEWLY_REQUIRED_PIPELINE_SYMBOLS = {
     "get_arena_bank_gm_heap_base_ctx",
@@ -85,6 +87,19 @@ def test_host_runtime_exports_required_pipeline_symbols(arch: str, variant: str,
     assert _NEWLY_REQUIRED_PIPELINE_SYMBOLS <= symbols, sorted(_NEWLY_REQUIRED_PIPELINE_SYMBOLS - symbols)
     assert _KERNEL_MODE_SYMBOLS <= symbols, sorted(_KERNEL_MODE_SYMBOLS - symbols)
     assert symbols.isdisjoint(_REMOVED_AMBIENT_SELECTION_SYMBOLS), sorted(symbols & _REMOVED_AMBIENT_SELECTION_SYMBOLS)
+
+
+@pytest.mark.parametrize(
+    ("arch", "variant", "runtime"),
+    _SIM_CASES + _ONBOARD_CASES + [pytest.param("wse", "sim", "host_build_graph", id="wse-sim-host_build_graph")],
+)
+def test_native_run_descriptor_symbol_version(arch, variant, runtime):
+    lib = _load(arch, variant, runtime)
+    for old_entry in ("simpler_run", "simpler_prepare_run", "simpler_prepare_caller_run"):
+        # The 96-byte descriptor's caller looks up these exact unversioned C symbols.
+        with pytest.raises(AttributeError, match=old_entry):
+            getattr(lib, old_entry)
+        assert getattr(lib, f"{old_entry}_v2")
 
 
 @pytest.mark.parametrize(("language", "standard", "compiler_name"), [("c", "c11", "cc"), ("c++", "c++17", "c++")])

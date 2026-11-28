@@ -37,6 +37,8 @@
 
 #include <cstdint>
 
+#include "backend/urma/urma_completion.h"
+#include "scheduler/wire_types.h"
 #include "host_build_graph/completion_types.h"
 #include "host_build_graph/completion_token.h"
 #include "platform_comm/ccu/ccu_native_abi.h"
@@ -72,7 +74,15 @@ static inline __aicore__ void percounter_ccu_event_clear(__gm__ uint64_t *event)
 }
 
 /** Whether a token names a condition this runtime knows how to read. */
-inline __aicore__ bool percounter_completion_token_valid(const CompletionToken &token) {
+inline __aicore__ bool percounter_completion_token_valid(
+    const CompletionToken &token, const __gm__ simpler::percounter::PercounterControl *control = nullptr,
+    uint32_t sender_plus_one = 0
+) {
+    if (token.engine == COMPLETION_ENGINE_URMA) {
+        const auto *domain =
+            control ? simpler::percounter::find_urma_binding(control->urma, token.backend_cookie) : nullptr;
+        return domain && simpler::percounter::urma_token_valid(token, *domain, sender_plus_one);
+    }
     if (token.addr == 0) return false;
     if (token.engine == COMPLETION_ENGINE_CCU && token.completion_type == COMPLETION_TYPE_CCU)
         return token.addr % alignof(uint64_t) == 0 && token.expected_value == 0 &&
@@ -107,4 +117,16 @@ static inline __aicore__ CompletionPollResult percounter_poll_valid_completion(c
     const uint32_t value = percounter_gm_read(*counter);
     if (value > INT32_MAX) return {CompletionPollState::PENDING, 0};
     return {value >= token.expected_value ? CompletionPollState::READY : CompletionPollState::PENDING, 0};
+}
+
+static inline __aicore__ CompletionPollResult percounter_poll_valid_completion(
+    const CompletionToken &token, const __gm__ simpler::percounter::PercounterControl *control,
+    __gm__ simpler::percounter::PercounterAsyncCompletion &group
+) {
+    if (token.engine == COMPLETION_ENGINE_URMA) {
+        const auto *domain = simpler::percounter::find_urma_binding(control->urma, token.backend_cookie);
+        if (!domain) return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+        return simpler::percounter::poll_urma(token, *domain, percounter_gm_read(group.urma_sender_plus_one));
+    }
+    return percounter_poll_valid_completion(token);
 }

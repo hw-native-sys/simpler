@@ -11,6 +11,16 @@
 
 #include "inner_kernel.h"
 #include "runtime_types.h"
+#include "scheduler/profiling_record.h"
+
+namespace simpler::percounter {
+namespace {
+template <>
+struct TaskProfileCompilation<> {
+    static constexpr bool enabled = true;
+};
+}  // namespace
+}  // namespace simpler::percounter
 
 uint64_t get_aicore_report_epoch();
 #include "lane_loop.h"
@@ -284,6 +294,122 @@ TEST_F(CalendarDeferTest, RegistrationSetsFlagWithoutReleasingTheTaskOrGraph) {
     EXPECT_GE(sample.defer_completion, sample.defer_register);
 }
 
+TEST_F(CalendarDeferTest, LateNotifierWaitsForItsOwnInputAndUnblocksTheOriginalLaneOnce) {
+    struct Program {
+        CalendarRangeHeader header;
+        CalendarExecutionRow rows[4];
+        CalendarDispatch bindings[3];
+        CalendarWait waits[4];
+        CalendarExecutionExtra extra;
+        alignas(64) CalendarRowProgress progress[4];
+    } program{};
+    alignas(32) uint32_t prerequisite = 1, independent = 0, consumed = 0, entered = 1, exit_gate = 0, exited = 0;
+    const auto direct = [](uint32_t &word) {
+        return CalendarWait{reinterpret_cast<uint64_t>(&word) | CALENDAR_WAIT_NOTIFY, 1};
+    };
+    program.waits[0] = wait;
+    program.waits[1] = direct(prerequisite);
+    program.waits[2] = direct(entered);
+    program.waits[3] = direct(exit_gate);
+    const uint32_t waits_offset = offsetof(Program, waits) - offsetof(Program, bindings);
+    const uint32_t extra_offset = offsetof(Program, extra) - offsetof(Program, bindings);
+    program.rows[0] = program.rows[1] = {0, 0, 0, 1, 1, 1 | CALENDAR_EXEC_CONTROL};
+    program.rows[2] = {sizeof(CalendarDispatch), 0, 0, 1, 1, 1};
+    program.rows[3] = {2 * sizeof(CalendarDispatch), 0, 0, 1, 0, 1 | CALENDAR_EXEC_CONTROL};
+    program.bindings[0] = {
+        0, 0, percounter_soc_sram_add_address(reinterpret_cast<uint64_t>(&consumed)), waits_offset, extra_offset
+    };
+    DispatchPayload args{};
+    args.args[1] = reinterpret_cast<uint64_t>(&signal);
+    const PercounterKernelFunc notify = [](int64_t *args) {
+        args[2] = get_sys_cnt_aicore();
+        __atomic_fetch_add(args, INT64_C(1), __ATOMIC_RELAXED);
+        percounter_gm_store(*reinterpret_cast<uint32_t *>(args[1]), uint32_t{1});
+        args[3] = get_sys_cnt_aicore();
+    };
+    program.bindings[1] = {
+        reinterpret_cast<uint64_t>(notify), reinterpret_cast<uint64_t>(&args), 0, waits_offset + sizeof(CalendarWait),
+        extra_offset
+    };
+    program.bindings[2] = {
+        0, 0, percounter_soc_sram_add_address(reinterpret_cast<uint64_t>(&independent)), 0, extra_offset
+    };
+    CalendarRange range{};
+    range.rows_offset = offsetof(Program, rows);
+    range.row_count = 4;
+    range.binding_offset = offsetof(Program, bindings);
+    range.entry_wait_offset = offsetof(Program, waits) + 2 * sizeof(CalendarWait);
+    range.exit_wait_offset = offsetof(Program, waits) + 3 * sizeof(CalendarWait);
+    range.entry_wait_count = range.exit_wait_count = 1;
+    range.tail_add_cmd = percounter_soc_sram_add_address(reinterpret_cast<uint64_t>(&exited));
+
+    seal(sample);
+    PercounterSsbufRegion cluster{};
+    LaneConfig lane = producer;
+    lane.cluster_lane = 1;
+    lane.ssbuf = &cluster;
+    bool ok = false;
+    const auto run = [&] {
+        ok = percounter_calendar_execute_range(
+            lane, reinterpret_cast<const uint8_t *>(&program), sizeof(program), range, 0, 0, 0, lane.cluster_lane
+        );
+    };
+    const auto reached = [](auto &word, uint64_t target) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (percounter_gm_read(word) != target && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        return percounter_gm_read(word) == target;
+    };
+
+    // The fixed calendar can only poll its first consumer even though the notifier is ready.
+    std::thread fixed(run);
+    EXPECT_TRUE(reached(groups[0].calendar_defer_owner, 2));
+    EXPECT_EQ(percounter_gm_read(consumed), 0U);
+    EXPECT_EQ(percounter_gm_read(independent), 0U);
+    EXPECT_EQ(percounter_gm_read(signal), 0U);
+    percounter_gm_store(control.lane_error, uint64_t{1});
+    fixed.join();
+    EXPECT_FALSE(ok);
+
+    percounter_gm_store(control.lane_error, uint64_t{0});
+    range.progress_offset = offsetof(Program, progress);
+    std::array<PercounterTaskEvent, 96> events{};
+    lane.task_events = events.data();
+    lane.task_event_capacity = events.size();
+    prerequisite = 0;
+    entered = 0;
+    std::thread flexible(run);
+    percounter_gm_store(entered, uint32_t{1});
+    EXPECT_TRUE(reached(independent, 1));
+    EXPECT_EQ(percounter_gm_read(signal), 0U);
+    EXPECT_EQ(percounter_gm_read(consumed), 0U);
+    percounter_gm_store(prerequisite, uint32_t{1});
+    EXPECT_TRUE(reached(consumed, 2));
+    EXPECT_EQ(percounter_gm_read(exited), 0U);
+    percounter_gm_store(exit_gate, uint32_t{1});
+    if (!reached(exited, 1)) percounter_gm_store(control.lane_error, uint64_t{1});
+    flexible.join();
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(args.args[0], 1U);
+    EXPECT_EQ(independent, 1U);
+    EXPECT_EQ(consumed, 2U);
+    ASSERT_EQ(lane.task_event_dropped, 0U);
+    std::vector<PercounterTaskEvent> scans;
+    for (uint32_t i = 0; i < lane.task_event_count; ++i) {
+        if (events[i].kind == PercounterTaskEventKind::ReadyRowScan) scans.push_back(events[i]);
+    }
+    ASSERT_EQ(scans.size(), 4U);
+    for (size_t i = 0; i < scans.size(); ++i) {
+        EXPECT_GT(scans[i].detail, 0U);
+        EXPECT_LE(scans[i].detail, scans[i].cycles);
+        if (i != 0) EXPECT_LE(scans[i - 1].cycles, scans[i].detail);
+    }
+    EXPECT_LE(scans[1].cycles, static_cast<uint64_t>(args.args[2]));
+    EXPECT_GE(scans[2].detail, static_cast<uint64_t>(args.args[3]));
+    EXPECT_EQ(control.async_settled, 1U);
+    EXPECT_EQ(shell_done, 1U);
+}
+
 TEST_F(CalendarDeferTest, TwoSuccessorsSettleEveryDeferredGroupOnce) {
     CalendarTiming second_sample{100, 110, 0, 0};
     seal(sample);
@@ -418,6 +544,37 @@ TEST_F(CalendarDeferTest, PeerReturnHintDoesNotReplaceDeferredCompletion) {
     ASSERT_TRUE((percounter_wait_paced_inputs<1, true>(producer, &wait, 2, 0)));
     EXPECT_EQ(done, defer_bit | 1U);
     EXPECT_EQ(control.async_settled, 1U);
+}
+
+TEST_F(CalendarDeferTest, LastOf64ConditionsGatesItsTaskAndShellWhileASecondGroupSettles) {
+    std::array<DeferredCompletionEntry, MAX_COMPLETIONS_PER_TASK> conditions;
+    conditions.fill(entries[0]);
+    conditions.back().expected_value = 2;
+    producer.async_entries = conditions.data();
+    bool deferred = false;
+    scratch.count = conditions.size();
+    ASSERT_TRUE(percounter_calendar_seal(producer, &extra, true, &sample, 0, &deferred));
+    ASSERT_TRUE(deferred);
+    ASSERT_EQ(groups[0].pending_mask, UINT64_MAX);
+
+    CalendarTiming second_sample{};
+    scratch.count = 5;
+    ASSERT_TRUE(percounter_calendar_seal(producer, &extra, true, &second_sample, 1, &deferred));
+    conditions.fill({});  // The lane can reuse the scratch immediately after return.
+    signal = 1;
+    uint64_t cursor = 0;
+    ASSERT_TRUE(percounter_calendar_service_defer(producer, 0, &cursor));
+    ASSERT_TRUE(percounter_calendar_service_defer(producer, 0, &cursor));
+    EXPECT_EQ(groups[0].pending_mask, uint64_t{1} << 63);
+    EXPECT_EQ(groups[1].pending_mask, 0U);
+    EXPECT_EQ(done, defer_bit | 1);
+    EXPECT_EQ(shell_done, 1U);
+    signal = 2;
+    wait.target = (uint64_t{24} << 24) | 2;
+    ASSERT_TRUE(percounter_calendar_wait_list(producer, &wait, 1));
+    EXPECT_EQ(done, defer_bit | 2);
+    EXPECT_EQ(shell_done, 2U);
+    EXPECT_EQ(control.async_settled, 2U);
 }
 
 TEST_F(CalendarDeferTest, SharesADeferredCompletionOnlyAfterTheOwnerHasObservedIt) {

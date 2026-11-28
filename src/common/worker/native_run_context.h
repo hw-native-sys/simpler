@@ -95,6 +95,8 @@ struct NativeRunContext {
     int completion_rc{-1};
     bool result_observed{false};
     bool physical_complete{false};
+    bool chip_complete_waiting_for_urma{false};
+    std::atomic<bool> urma_drained_after_chip_stop{false};
     bool execution_retired{false};
     bool completion_feedback_attempted{false};
     const int32_t *peer_cancel_request{nullptr};

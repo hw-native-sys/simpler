@@ -162,7 +162,7 @@ public:
          * Every phase of the run reads its DFX configuration from here rather
          * than from the runner's members, so that one run answers for its whole
          * lifetime from a single value. A simulated device context takes the
-         * execution claim in simpler_prepare_run and therefore never prepares a
+         * execution claim in simpler_prepare_run_v2 and therefore never prepares a
          * successor against a live predecessor, so unlike onboard this carries
          * no correctness weight here — it keeps the two runner shapes the same.
          */

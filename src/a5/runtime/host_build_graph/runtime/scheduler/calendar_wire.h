@@ -107,8 +107,16 @@ struct alignas(32) CalendarRange {
     uint32_t exit_wait_offset;
     uint32_t exit_wait_count;
     uint32_t graph_shell_id;
-    uint32_t phase_row_offset;  // Rows on this worker before this range, within this phase.
-    uint32_t pmu_offset;        // Optional, per invocation, one cell per packed row.
+    uint32_t phase_row_offset;   // Rows on this worker before this range, within this phase.
+    uint32_t pmu_offset;         // Optional, per invocation, one cell per packed row.
+    uint32_t progress_offset{};  // Per-row state for an ordinary URMA range with work behind a wait.
+};
+
+// Only the assigned lane reads or writes this state. Its array starts on a private cache line.
+struct CalendarRowProgress {
+    uint64_t defer_cursor;
+    uint32_t next_input;
+    uint32_t retired;
 };
 
 enum : uint16_t {
@@ -235,6 +243,7 @@ struct CalendarDispatchPatch {
 
 static_assert(sizeof(CalendarRangeHeader) == 40 && sizeof(CalendarPeerFanout) == 16);
 static_assert(sizeof(CalendarRange) == 64);
+static_assert(sizeof(CalendarRowProgress) == 16);
 static_assert(sizeof(CalendarExecutionRow) == 16);
 static_assert(sizeof(CalendarDispatch) == 32);
 static_assert(sizeof(CalendarExecutionExtra) == 32);

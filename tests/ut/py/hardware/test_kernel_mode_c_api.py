@@ -679,7 +679,7 @@ def test_simulated_caller_owned_runs_are_unsupported(arch: str, runtime: str):
     lib = _load(arch, "sim", runtime)
     _native_run_storage(lib)
     lib.simpler_submit_run_on_stream.argtypes = [ctypes.c_void_p] * 3
-    assert lib.simpler_prepare_caller_run(None, None, 0, None, None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
+    assert lib.simpler_prepare_caller_run_v2(None, None, 0, None, None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
     assert lib.simpler_submit_run_on_stream(None, None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
 
 
@@ -1074,6 +1074,8 @@ def test_versioned_registration_allocates_ids_without_replacing_legacy_entries(a
 
 def _run_mode_isolation(arch, runtime, device, mode):
     lib = _load(arch, "onboard", runtime)
+    lib.simpler_get_init_error_ctx.argtypes = [ctypes.c_void_p]
+    lib.simpler_get_init_error_ctx.restype = ctypes.c_char_p
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
     if mode == "kernel":
@@ -1091,7 +1093,10 @@ def _run_mode_isolation(arch, runtime, device, mode):
 
     init, incompatible = (init_kernel, init_program) if mode == "kernel" else (init_program, init_kernel)
     try:
-        assert init() == 0
+        init_rc = init()
+        assert init_rc == 0, (
+            f"{runtime} {mode} init on device {device}, rc={init_rc}, detail={lib.simpler_get_init_error_ctx(ctx)!r}"
+        )
         committed = lib.committed_device_memory_ctx(ctx)
         assert incompatible() == PTO_RUNTIME_ERR_INVALID_STATE
         assert lib.committed_device_memory_ctx(ctx) == committed
@@ -1530,6 +1535,7 @@ class NativeRunDescriptor(ctypes.Structure):
         ("joinable_boundary", ctypes.c_uint32),
         ("provenance", NativeRunProvenance),
         ("ccu_workspace_addr", ctypes.c_uint64),
+        ("base_comm_handle", ctypes.c_uint64),
     ]
 
 
@@ -1598,7 +1604,7 @@ def _native_run_storage(lib):
     size, alignment = lib.get_runtime_size(), lib.get_runtime_alignment()
     storage = ctypes.create_string_buffer(size + alignment)
     run = (ctypes.addressof(storage) + alignment - 1) & -alignment
-    lib.simpler_prepare_run.argtypes = [
+    lib.simpler_prepare_run_v2.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
         ctypes.c_int32,
@@ -1606,7 +1612,7 @@ def _native_run_storage(lib):
         ctypes.POINTER(CallConfig),
         ctypes.POINTER(NativeRunDescriptor),
     ]
-    lib.simpler_prepare_caller_run.argtypes = lib.simpler_prepare_run.argtypes
+    lib.simpler_prepare_caller_run_v2.argtypes = lib.simpler_prepare_run_v2.argtypes
     for name in ("simpler_finalize_run", "simpler_launch_run"):
         getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     return storage, run
@@ -1691,7 +1697,9 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
         descriptor = NativeRunDescriptor(generation=1, run_epoch=1)
 
         def prepare(args):
-            return lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
+            return lib.simpler_prepare_run_v2(
+                ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor)
+            )
 
         def arguments(addr, space, transfer):
             args = ChipStorageTaskArgs()

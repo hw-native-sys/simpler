@@ -1381,7 +1381,7 @@ extern "C" bool runtime_uses_callable_entry_table_impl() { return true; }
  * is already populated by register_callable_impl.
  *
  * Splitting this from register_callable_impl matches the per-callable_id
- * design: register/simpler_run invokes this every call, while the prep
+ * design: register/simpler_run_v2 invokes this every call, while the prep
  * half runs only once per callable_id.
  *
  * @param runtime    Pointer to the per-run Runtime

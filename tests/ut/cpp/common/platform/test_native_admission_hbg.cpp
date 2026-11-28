@@ -263,7 +263,9 @@ TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunSta
         entered = true;
         const auto allocations = control().allocations;
         EXPECT_EQ(inner.prepare(), PTO_RUNTIME_ERR_INVALID_STATE);
-        EXPECT_EQ(simpler_prepare_run(nullptr, nullptr, 0, nullptr, nullptr, nullptr), PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_EQ(
+            simpler_prepare_run_v2(nullptr, nullptr, 0, nullptr, nullptr, nullptr), PTO_RUNTIME_ERR_INVALID_STATE
+        );
         EXPECT_EQ(std::memcmp(inner.storage, untouched.data(), untouched.size()), 0);
         EXPECT_EQ(accepted, 73);
         EXPECT_EQ(control().allocations, allocations);
@@ -303,7 +305,7 @@ TEST_F(NativeAdmissionTest, CallbackRejectsSameContextBeforeConstructingAnotherR
     callback_hook = [&] {
         entered = true;
         EXPECT_EQ(
-            simpler_run(&runner, inner.storage, 1, &inner.args, &inner.config, &inner.descriptor),
+            simpler_run_v2(&runner, inner.storage, 1, &inner.args, &inner.config, &inner.descriptor),
             PTO_RUNTIME_ERR_INVALID_STATE
         );
         EXPECT_EQ(std::memcmp(inner.storage, untouched.data(), untouched.size()), 0);
@@ -532,7 +534,7 @@ TEST_F(NativeAdmissionTest, UnsupportedArgsDumpReleasesExactAttemptBeforeValidRu
     EXPECT_FALSE(rejected.consume_release());
     EXPECT_TRUE(rejected.empty());
     Attempt next(runner, 0, 20);
-    ASSERT_EQ(simpler_run(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
+    ASSERT_EQ(simpler_run_v2(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
     EXPECT_EQ(callbacks, 1);
     EXPECT_TRUE(next.empty());
     EXPECT_FALSE(runner.holds_epoch(20));

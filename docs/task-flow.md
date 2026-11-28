@@ -226,7 +226,7 @@ Propagated by value throughout:
 5. Child reads `CallConfig` from mailbox by value, or the remote session
    runner reconstructs it from `CallConfigWire`
 6. `ChipWorker::run` receives `const CallConfig&`; passed on to
-   `simpler_run` at the L2 edge
+   `simpler_run_v2` at the L2 edge
 
 Same type at every level. Used directly at the L2 runtime ABI.
 
@@ -498,7 +498,7 @@ dispatches device work only for the run that holds the FIFO head and still owns
 its lease.
 
 The L2 host-runtime boundary exposes `prepare -> launch -> poll/wait ->
-finalize`, and the existing `simpler_run` / `ChipWorker.run` surface is the
+finalize`, and the existing `simpler_run_v2` / `ChipWorker.run` surface is the
 blocking composition of those phases. `prepare` constructs and binds the
 per-run `Runtime` without crossing the device launch fence; `launch` returns
 after the backend has actually submitted its execution; `finalize` owns
@@ -523,7 +523,7 @@ The supported entry paths establish this ownership as follows:
 | -------- | -------------- |
 | `Worker.submit` | The submission lock serializes the Python construction callback. |
 | `ChipWorker::prepare_native_run_on_slot` | A slot in `PREPARING` or `PREPARED` rejects another prepare; a successor may prepare only beside a `LAUNCHED` or `REAPED` predecessor. |
-| `simpler_prepare_run` | Onboard same-thread reentry within one loaded runtime module is refused before changing the nested request's state, even for another context. The runner reservation is acquired before bind and permits only one reserved successor beside the active owner. |
+| `simpler_prepare_run_v2` | Onboard same-thread reentry within one loaded runtime module is refused before changing the nested request's state, even for another context. The runner reservation is acquired before bind and permits only one reserved successor beside the active owner. |
 | Callable registration | Each registration materializes a unique temporary SO and loads it with `RTLD_LOCAL`; separate registrations do not intentionally share a binding global. |
 | Host orchestration entry | A scope guard drains the recorder pool on normal return and exception unwinding, before Graph commit or destruction of the local build state. |
 

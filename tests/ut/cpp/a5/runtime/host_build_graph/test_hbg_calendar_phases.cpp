@@ -614,6 +614,23 @@ TEST(CalendarPhases, SharesAivInputsWithAClusterSibling) {
     EXPECT_EQ(layout.mix_task_count, 0U);
 }
 
+TEST(CalendarPhases, CalendarImageReserves64ConditionsPerWorkerAndCompletionGroup) {
+    constexpr uint64_t records = 3;
+    PercounterLayout layout{};
+    ASSERT_TRUE(plan_layout(3, 3, &layout, 1, 0, {}, records, 2));
+    constexpr uint32_t conditions = 64;
+    static_assert(sizeof(PercounterAsyncCompletion::entries) == conditions * sizeof(DeferredCompletionEntry));
+    uint64_t first_record = 0;
+    ASSERT_TRUE(scheduler_layout_checked_align(
+        layout.async_entries_offset + SCHEDULER_WORKER_CAPACITY * conditions * sizeof(DeferredCompletionEntry),
+        alignof(PercounterAsyncCompletion), &first_record
+    ));
+    EXPECT_EQ(layout.async_completions_offset, first_record);
+    EXPECT_EQ(
+        layout.task_records_offset - layout.async_completions_offset, records * sizeof(PercounterAsyncCompletion)
+    );
+}
+
 TEST(CalendarPhases, SharesOnlyOrdinarySummaryFollowers) {
     const std::vector<std::vector<int32_t>> fanins{{}, {}, {0, 1}};
     auto tasks = cube_tasks(fanins);
@@ -772,6 +789,159 @@ TEST(CalendarPhases, ReusesACompletedWaitOnlyAfterAnUnconditionalRowOnThatLane) 
     CalendarPlan predicated;
     ASSERT_TRUE(build_static_calendar(tasks, 1, {}, &predicated));
     EXPECT_EQ(predicated.waits.row_waits, (std::vector<bool>{false, true, true}));
+}
+
+TEST(CalendarPhases, UrmaProgressKeepsEveryInputEvenWhenTheFixedLaneAlreadyWaitsForIt) {
+    // Two consumers need the same deferred transfer. The late notifier has a separate prerequisite.
+    const std::vector<std::vector<int32_t>> fanins{{}, {0}, {0}, {}, {3}, {0, 4}};
+    auto tasks = cube_tasks(fanins);
+    for (auto &t : tasks) {
+        t.core_type_index = 1;
+        t.active_mask = 2;
+    }
+    const GraphPlanInput graphs{};
+    std::vector<CalendarPhase> phases;
+    ASSERT_TRUE(plan_calendar_phases(tasks, graphs, &phases));
+    ASSERT_EQ(phases.size(), 1U);
+    calendar_detail::Shape shape;
+    ASSERT_TRUE(calendar_detail::describe(tasks, 1, {}, &shape));
+    calendar_detail::PlacementState placement;
+    placement.workers.resize(3);
+    placement.free_at.resize(3);
+    for (uint32_t id = 0; id < tasks.size(); ++id)
+        calendar_detail::append_block(&placement, 1, tasks[id], shape.tasks[id], id, 0, {0, 2, 0}, id, {});
+    auto plan = std::make_shared<CalendarPlan>();
+    ASSERT_TRUE(calendar_detail::pack(placement, tasks, shape.row_count, 0, plan.get()));
+    for (const bool has_urma : {false, true}) {
+        RangeCalendarImage image;
+        ASSERT_TRUE(
+            build_range_calendar({{&phases[0], plan, false}}, graphs, tasks.size(), 1, &image, nullptr, true, has_urma)
+        );
+        const auto header = image.load<CalendarRangeHeader>(0);
+        ASSERT_EQ(header.range_count, 1U);
+        const auto range = image.load<CalendarRange>(header.range_offset);
+        EXPECT_EQ(range.progress_offset != 0, has_urma);
+        EXPECT_EQ(range.entry_wait_count, 0U);
+        ASSERT_EQ(range.row_count, tasks.size());
+        if (!has_urma) {
+            // The previous consumer already established that input in the original serial lane order.
+            EXPECT_EQ(
+                image.load<CalendarExecutionRow>(range.rows_offset + 2 * sizeof(CalendarExecutionRow)).wait_count, 0U
+            );
+            continue;
+        }
+        EXPECT_EQ(range.progress_offset % 64, 0U);
+        for (uint32_t id = 0; id < tasks.size(); ++id) {
+            const auto row = image.load<CalendarExecutionRow>(range.rows_offset + id * sizeof(CalendarExecutionRow));
+            ASSERT_EQ(row.wait_count, fanins[id].size());
+            const auto binding = image.load<CalendarDispatch>(range.binding_offset + row.dispatch_offset);
+            for (uint32_t edge = 0; edge < row.wait_count; ++edge) {
+                const uint32_t offset = range.binding_offset + binding.waits_offset + edge * sizeof(CalendarWait);
+                const auto patch = std::find_if(image.waits.begin(), image.waits.end(), [offset](const auto &w) {
+                    return w.offset == offset;
+                });
+                ASSERT_NE(patch, image.waits.end());
+                EXPECT_EQ(patch->kind, RangeCalendarImage::WaitKind::COMPLETION);
+                EXPECT_EQ(patch->index, static_cast<uint32_t>(fanins[id][edge]));
+            }
+        }
+        EXPECT_EQ(range.exit_wait_count, 3U);  // Both early consumers and the final sink.
+    }
+}
+
+TEST(CalendarPhases, UrmaCalendarUsesPeerNotificationOnlyWithFixedLaneOrder) {
+    const std::vector<std::vector<int32_t>> fanins{{}, {0}, {}};
+    auto tasks = cube_tasks(fanins);
+    for (auto &task : tasks) {
+        task.core_type_index = 1;
+        task.active_mask = 2;
+    }
+    std::vector<CalendarPhase> phases;
+    ASSERT_TRUE(plan_calendar_phases(tasks, {}, &phases));
+    ASSERT_EQ(phases.size(), 1U);
+    calendar_detail::Shape shape;
+    ASSERT_TRUE(calendar_detail::describe(tasks, 1, {}, &shape));
+
+    for (bool after_consumer : {false, true}) {
+        SCOPED_TRACE(after_consumer);
+        // AIV1 publishes to AIV0. Only a later row on the consumer's lane permits reordering.
+        const std::array<uint32_t, 3> lanes{4, 2, after_consumer ? 2U : 4U};
+        calendar_detail::PlacementState placement;
+        placement.workers.resize(3);
+        placement.free_at.resize(3);
+        for (uint32_t id = 0; id < tasks.size(); ++id)
+            calendar_detail::append_block(&placement, 1, tasks[id], shape.tasks[id], id, 0, {0, lanes[id], 0}, id, {});
+        auto plan = std::make_shared<CalendarPlan>();
+        ASSERT_TRUE(calendar_detail::pack(placement, tasks, shape.row_count, 0, plan.get()));
+        for (const bool hints : {false, true}) {
+            SCOPED_TRACE(hints);
+            RangeCalendarImage image;
+            ASSERT_TRUE(
+                build_range_calendar({{&phases[0], plan, false}}, {}, tasks.size(), 1, &image, nullptr, hints, true)
+            );
+            const auto header = image.load<CalendarRangeHeader>(0);
+            ASSERT_EQ(header.range_count, 2U);
+            const auto consumer_range = image.load<CalendarRange>(header.range_offset);
+            const auto consumer = image.load<CalendarExecutionRow>(consumer_range.rows_offset);
+            EXPECT_EQ(consumer_range.progress_offset != 0, after_consumer);
+            EXPECT_EQ((consumer.flags & CALENDAR_EXEC_PEER) != 0, hints && !after_consumer);
+            EXPECT_EQ((consumer.flags & CALENDAR_EXEC_PACED_WAIT) != 0, !hints && !after_consumer);
+            EXPECT_EQ(image.peer_single_waits, hints && !after_consumer ? 1U : 0U);
+            EXPECT_EQ(consumer.wait_count, 1U);
+        }
+    }
+}
+
+TEST(CalendarPhases, OrdinaryUrmaRowsCanProgressOnBothSidesOfACollective) {
+    const std::vector<std::vector<int32_t>> fanins{{}, {0}, {}, {1}, {0}, {}};
+    for (const bool mixed : {false, true}) {
+        auto tasks = cube_tasks(fanins);
+        for (auto &task : tasks) {
+            task.core_type_index = 1;
+            task.active_mask = 2;
+        }
+        auto &collective = tasks[3];
+        collective.is_mix = mixed;
+        collective.sync_start = !mixed;
+        collective.active_mask = mixed ? 6 : 2;
+        collective.subtask_count = mixed ? 2 : 1;
+        collective.block_num = mixed ? 1 : 2;
+        const GraphPlanInput graphs{};
+        std::vector<CalendarPhase> phases;
+        ASSERT_TRUE(plan_calendar_phases(tasks, graphs, &phases));
+        ASSERT_EQ(phases.size(), 1U);
+        calendar_detail::Shape shape;
+        ASSERT_TRUE(calendar_detail::describe(tasks, 1, {}, &shape));
+        calendar_detail::PlacementState placement;
+        placement.workers.resize(3);
+        placement.free_at.resize(3);
+        for (uint32_t id = 0; id < tasks.size(); ++id) {
+            const uint32_t mask = tasks[id].active_mask;
+            calendar_detail::append_block(&placement, 1, tasks[id], shape.tasks[id], id, 0, {0, mask, 0}, id, {});
+            if (tasks[id].sync_start)
+                calendar_detail::append_block(&placement, 1, tasks[id], shape.tasks[id], id, 1, {0, 4, 0}, id, {});
+        }
+        auto plan = std::make_shared<CalendarPlan>();
+        ASSERT_TRUE(calendar_detail::pack(placement, tasks, shape.row_count, 0, plan.get()));
+        RangeCalendarImage image;
+        ASSERT_TRUE(
+            build_range_calendar({{&phases[0], plan, false}}, graphs, tasks.size(), 1, &image, nullptr, true, true)
+        );
+        const auto header = image.load<CalendarRangeHeader>(0);
+        ASSERT_EQ(header.range_count, 4U);
+        const auto range = [&](uint32_t i) {
+            return image.load<CalendarRange>(header.range_offset + i * sizeof(CalendarRange));
+        };
+        // AIV0 has a blocked consumer followed by a ready row on both sides. AIV1 only joins the collective.
+        EXPECT_EQ(range(0).row_count, 3U);
+        EXPECT_NE(range(0).progress_offset, 0U);
+        EXPECT_EQ(range(1).row_count, 1U);
+        EXPECT_EQ(range(1).progress_offset, 0U);
+        EXPECT_EQ(range(2).row_count, 2U);
+        EXPECT_NE(range(2).progress_offset, 0U);
+        EXPECT_EQ(range(3).row_count, 1U);
+        EXPECT_EQ(range(3).progress_offset, 0U);
+    }
 }
 
 TEST(CalendarPhases, ControlRetirementProofIsScopedToTheActualLane) {

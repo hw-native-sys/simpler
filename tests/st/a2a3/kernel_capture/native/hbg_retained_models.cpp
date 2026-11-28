@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
         NativeRunDescriptor descriptor{};
         descriptor.generation = descriptor.run_epoch = descriptor.dispatch_id = ++identity;
         require(descriptor.pipeline_slot == 0, "same-pipeline-slot");
-        const auto prepare_run = capture ? simpler_prepare_caller_run : simpler_prepare_run;
+        const auto prepare_run = capture ? simpler_prepare_caller_run_v2 : simpler_prepare_run_v2;
         const int rc = prepare_run(ctx, runs[tensor], callable_id, &args, &config, &descriptor);
         if (expected_rc != 0) require(rc == expected_rc, "expected-heap-capacity-refusal");
         else check(rc, "prepare");

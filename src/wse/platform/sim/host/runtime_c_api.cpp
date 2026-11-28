@@ -11,7 +11,7 @@
 /**
  * simpler host-runtime C API — WSE sim arch-specific entries.
  *
- * The WSE C API glue (simpler_init / simpler_register_callable / simpler_run /
+ * The WSE C API glue (simpler_init / simpler_register_callable / simpler_run_v2 /
  * device_*_ctx / etc.) lives in `runtime_api.cpp` and is linked into this
  * same libhost_runtime.so. This file keeps only the
  * entries that need the concrete WSE sim `DeviceRunner` subclass

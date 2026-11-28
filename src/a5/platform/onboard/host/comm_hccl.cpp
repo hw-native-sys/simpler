@@ -26,8 +26,11 @@
 #include "platform_comm/comm_context.h"
 #include "platform_comm/comm_domain_onboard.h"
 #include "platform_comm/urma_workspace_layout.h"
+#include "platform_comm/urma_run_lease.h"
 #include "platform_comm/ccu/ccu_domain_owner.h"
 #include "ccu_domain_backend_hcomm.h"
+#include "urma_queue_control.h"
+#include "urma_queue_drain.h"
 #include "task_interface/ccu_module_package.h"
 
 #include "common/unified_log.h"
@@ -38,8 +41,12 @@
 #include "host/runtime_timeout_config.h"
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <string_view>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <climits>
 #include <cerrno>
@@ -100,6 +107,12 @@ static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(
 // EnablePeerAccess routes are left to aclrtResetDevice at finalize: they are
 // process-global and per device-pair, so releasing them per allocation would
 // tear down a route a concurrent allocation still uses.
+#ifdef SIMPLER_RUNTIME_NAME
+static constexpr bool hbg_urma = std::string_view(SIMPLER_RUNTIME_NAME) == "host_build_graph";
+#else
+static constexpr bool hbg_urma = false;
+#endif
+
 struct DomainPeerWindow {
     void *address = nullptr;
     aclrtDrvMemHandle handle = nullptr;
@@ -153,6 +166,10 @@ struct DomainAllocation {
     HcclComm urma_comm = nullptr;
     pto::comm::Workspace urma_workspace{};
     void *urma_workspace_addr = nullptr;
+    simpler::urma::UrmaQueueControl urma_queue_control;
+    uint64_t urma_row_owner = 0;
+    std::atomic_bool urma_run_active{false};
+    std::atomic_bool urma_scan_abandoned{false};
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     pto::comm::Workspace rdma_workspace{};
     void *rdma_workspace_addr = nullptr;
@@ -182,6 +199,7 @@ struct CommHandle_ {
     file_marker_handshake::GenerationLease generation_lease;
     bool domain_admission_stopped = false;
     bool domain_release_failed = false;
+    std::mutex urma_domains_mutex;
     std::optional<uint64_t> last_allocation_id;
 
     // Caller-owned: supplied to comm_init, never created or destroyed here.
@@ -192,7 +210,7 @@ struct CommHandle_ {
     CommContext *device_ctx = nullptr;
     bool owns_device_ctx = false;
     std::vector<CommContext *> derived_contexts;
-    std::map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
+    std::map<uint64_t, std::shared_ptr<DomainAllocation>> domain_allocations;
     std::map<uint64_t, std::unique_ptr<CcuCallableRegistration>> ccu_registrations;
     uint64_t next_ccu_registration = 1;
     std::map<uint64_t, CcuRunSet> ccu_run_sets;
@@ -998,10 +1016,23 @@ static int init_urma_workspace(
         LOG_ERROR("[comm rank %d] URMA GetWorkspaceSize rejected configuration", h->rank);
         return COMM_DOMAIN_URMA_INIT_FAILED;
     }
-    const uint64_t allocation_size = simpler::urma::sender_view_offset(workspace_size, alloc.urma_aiv_count);
+    const uint64_t views_end = simpler::urma::sender_view_offset(workspace_size, alloc.urma_aiv_count);
+    uint64_t allocation_size = views_end;
+    if constexpr (hbg_urma) {
+        constexpr uint64_t line = alignof(UrmaRowOwner);
+        const uint64_t rows = uint64_t{rank_count} * alloc.urma_aiv_count * alloc.workspace_config.urma_jetties_per_aiv;
+        if (views_end > UINT64_MAX - (line - 1) || rows > (UINT64_MAX - views_end - (line - 1)) / sizeof(UrmaRowOwner))
+            return COMM_DOMAIN_URMA_INIT_FAILED;
+        allocation_size = views_end + (line - 1) + rows * sizeof(UrmaRowOwner);
+    }
     if (allocation_size == UINT64_MAX ||
         aclrtMalloc(&alloc.urma_workspace_addr, allocation_size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
         return COMM_DOMAIN_URMA_INIT_FAILED;
+    }
+    if constexpr (hbg_urma) {
+        constexpr uint64_t mask = alignof(UrmaRowOwner) - 1;
+        const uint64_t after_views = reinterpret_cast<uint64_t>(alloc.urma_workspace_addr) + views_end;
+        alloc.urma_row_owner = (after_views + mask) & ~mask;
     }
     pto::comm::Workspace workspace{};
     const aclError status = pto::comm::CreateWorkspace(
@@ -1037,49 +1068,226 @@ static int init_urma_workspace(
     return COMM_DOMAIN_URMA_INIT_FAILED;
 }
 
-template <typename T>
-static bool read_urma_device(uint64_t address, T &value) {
-    return address != 0 &&
-           aclrtMemcpy(
-               &value, sizeof(value), reinterpret_cast<const void *>(address), sizeof(value), ACL_MEMCPY_DEVICE_TO_HOST
-           ) == ACL_SUCCESS;
-}
+struct UrmaDeviceMemory {
+    simpler::urma::UrmaQueueControl *control;
+    UrmaWait mode;
+    const UrmaLaunchPermission &permission;
 
-static bool urma_domain_drained(const DomainAllocation &alloc) {
-    if (alloc.urma_workspace.impl == nullptr || alloc.urma_workspace.bytes == 0) return true;
-    using namespace pto::comm::urma;
-    UrmaInfo info{};
-    if (!read_urma_device(reinterpret_cast<uint64_t>(alloc.urma_workspace.addr), info) ||
-        info.layout != UrmaLayout::PER_PEER || info.rankCount != static_cast<uint32_t>(alloc.nranks) ||
-        info.rowsPerPeer == 0 || static_cast<uint64_t>(info.rankCount) * info.rowsPerPeer != info.jettyCount ||
-        info.sqPtr == 0 || info.scqPtr == 0)
-        return false;
-    for (uint32_t row = 0; row < info.jettyCount; ++row) {
-        if (row / info.rowsPerPeer == static_cast<uint32_t>(alloc.rank)) continue;
-        UrmaWQCtx sq{};
-        UrmaCqCtx cq{};
-        uint32_t submitted_bb = 0, completed_bb = 0, completed_cqe = 0;
-        if (!read_urma_device(info.sqPtr + sizeof(sq) * row, sq) ||
-            !read_urma_device(info.scqPtr + sizeof(cq) * row, cq) || !read_urma_device(sq.headAddr, submitted_bb) ||
-            !read_urma_device(sq.tailAddr, completed_bb) || !read_urma_device(cq.tailAddr, completed_cqe) ||
-            submitted_bb != completed_bb || sq.submittedWqeCount != completed_cqe)
-            return false;
+    template <typename T>
+    static bool read(uint64_t address, T &value) {
+        return address != 0 && aclrtMemcpy(
+                                   &value, sizeof(value), reinterpret_cast<const void *>(address), sizeof(value),
+                                   ACL_MEMCPY_DEVICE_TO_HOST
+                               ) == ACL_SUCCESS;
     }
-    return true;
+
+    static bool write(uint64_t address, uint32_t value) {
+        return aclrtMemcpy(
+                   reinterpret_cast<void *>(address), sizeof(value), &value, sizeof(value), ACL_MEMCPY_HOST_TO_DEVICE
+               ) == ACL_SUCCESS;
+    }
+
+    UrmaQueueState inspect_prefix(uint64_t address, uint32_t depth, uint32_t completed, uint32_t target) const {
+        if constexpr (hbg_urma)
+            if (control)
+                return control->run(
+                    {simpler::urma::QueueAction::CheckPrefix, address, depth, completed, target, 0}, mode, permission
+                );
+        return UrmaQueueState::FAILED;
+    }
+
+    UrmaQueueState ring_doorbell(uint64_t address, uint32_t target) const {
+        if constexpr (hbg_urma)
+            if (control)
+                return control->run(
+                    {simpler::urma::QueueAction::RingDoorbell, address, 0, 0, target, 0}, mode, permission
+                );
+        return UrmaQueueState::FAILED;
+    }
+};
+
+static UrmaQueueState check_urma_domain(
+    DomainAllocation &alloc, UrmaQueueReceipt *receipt, UrmaWait mode, const UrmaLaunchPermission &permission
+) {
+    using State = UrmaQueueState;
+    if (alloc.urma_workspace.impl == nullptr || alloc.urma_workspace.bytes == 0)
+        return receipt == nullptr ? State::READY : State::FAILED;
+    if (!receipt && alloc.urma_queue_control.has_command()) return State::PENDING;
+    const auto state = simpler::urma::check_urma_queues(
+        UrmaDeviceMemory{receipt ? &alloc.urma_queue_control : nullptr, mode, permission},
+        reinterpret_cast<uint64_t>(alloc.urma_workspace.addr), alloc.rank, alloc.nranks, receipt
+    );
+    if (state == State::READY && alloc.urma_queue_control.has_command()) return State::FAILED;
+    return state;
 }
 
-static bool domain_drained(const DomainAllocation &alloc) {
-    if (alloc.cleanup_failed) return false;
+// One thread serves all stopped-queue checks for this Run. Its scan owns the
+// domain handles, queue claims and partial receipts until the last row drains.
+class HbgStoppedQueueScan final : public UrmaStoppedQueueScan {
+public:
+    explicit HbgStoppedQueueScan(aclrtContext context) :
+        context_(context) {}
+
+    ~HbgStoppedQueueScan() override {
+        thread->stop_and_join();
+        // Native Run normally releases us after READY. If its owner abandons
+        // an unresolved check, no second sender may inherit the same rows.
+        for (auto &domain : held_.domains) {
+            if (domain.queue_claim) static_cast<DomainAllocation *>(domain.owner.get())->urma_scan_abandoned = true;
+        }
+    }
+
+    void retire() override {
+        // The Run has handed its drained queues back. Later checks must not inspect a successor's work.
+        std::lock_guard lock(thread->mutex);
+        retired_ = true;
+        thread->stopping = true;
+        thread->changed.notify_all();
+    }
+
+    UrmaQueueState
+    check(const std::vector<UrmaDomainLease> &domains, UrmaWait mode, const UrmaLaunchPermission &permission) override {
+        using State = UrmaQueueState;
+        std::unique_lock lock(thread->mutex, std::defer_lock);
+        if (!lock.try_lock()) {
+            if (mode == UrmaWait::Poll) return State::PENDING;
+            lock.lock();
+        }
+        if (thread->stopping) return retired_ ? State::READY : State::PENDING;
+        if (phase_ == Phase::Finished) {
+            phase_ = Phase::Idle;
+            return result_;
+        }
+        if (phase_ == Phase::Idle) {
+            if (held_.domains.empty()) {
+                if (std::none_of(domains.begin(), domains.end(), [](const auto &domain) {
+                        return domain.queue_claim != nullptr;
+                    }))
+                    return State::READY;
+                held_.domains = domains;
+            }
+            if (!thread->worker.joinable()) thread->worker = std::thread(&HbgStoppedQueueScan::run, this);
+            mode_ = mode;
+            held_.launch_permission = permission;
+            phase_ = Phase::Scanning;
+            thread->changed.notify_all();
+        }
+        if (mode == UrmaWait::Poll) return State::PENDING;
+        const auto before = completed_;
+        if (!thread->changed.wait_for(lock, std::chrono::milliseconds(PLATFORM_STREAM_SYNC_TIMEOUT_MS), [&] {
+                return thread->stopping || completed_ != before;
+            }))
+            return State::PENDING;
+        if (thread->stopping) return retired_ ? State::READY : State::PENDING;
+        if (phase_ == Phase::Finished) phase_ = Phase::Idle;
+        return result_;
+    }
+
+private:
+    enum class Phase { Idle, Scanning, Finished };
+
+    void run() {
+        std::unique_lock lock(thread->mutex);
+        for (;;) {
+            thread->changed.wait(lock, [&] {
+                return thread->stopping || phase_ == Phase::Scanning;
+            });
+            if (thread->stopping) return;
+            const auto mode = mode_;
+            lock.unlock();
+            auto result = UrmaQueueState::PENDING;
+            try {
+                const aclError rc = aclrtSetCurrentContext(context_);
+                if (rc == ACL_SUCCESS) result = held_.check_stopped_queues(mode);
+                else LOG_ERROR("URMA stopped-queue thread could not bind the Run context: %d", static_cast<int>(rc));
+            } catch (...) {
+                LOG_ERROR("URMA stopped-queue check threw while retaining domain ownership");
+            }
+            if (result == UrmaQueueState::READY) held_.domains.clear();
+            lock.lock();
+            result_ = result;
+            phase_ = Phase::Finished;
+            ++completed_;
+            thread->changed.notify_all();
+        }
+    }
+
+    const aclrtContext context_;
+    UrmaRunLease held_;
+    UrmaWait mode_ = UrmaWait::Poll;
+    bool retired_ = false;
+    Phase phase_ = Phase::Idle;
+    UrmaQueueState result_ = UrmaQueueState::PENDING;
+    uint64_t completed_ = 0;
+};
+
+// Only published CommContext addresses of this Worker can authorize queue access.
+extern "C" int acquire_hbg_urma_run(void *handle, const uint64_t *scalars, int32_t count, UrmaRunLease *use) {
+    if constexpr (!hbg_urma) return 0;
+    if (count == 0) return 0;
+    if (!handle || !scalars || count < 0 || !use || !use->domains.empty() || use->stopped_scan)
+        return COMM_DOMAIN_URMA_CONFIG_INVALID;
+    auto *h = static_cast<CommHandle_ *>(handle);
+    std::lock_guard guard(h->urma_domains_mutex);
+    UrmaRunLease acquired;
+    for (auto &[id, allocation] : h->domain_allocations) {
+        auto &a = *allocation;
+        if (a.urma_row_owner == 0 ||
+            std::find(scalars, scalars + count, reinterpret_cast<uint64_t>(a.device_ctx)) == scalars + count)
+            continue;
+        if (!a.initialized || a.cleanup_failed || h->domain_admission_stopped || h->cleanup_failed)
+            return COMM_DOMAIN_URMA_CONFIG_INVALID;
+        if (a.urma_run_active.exchange(true)) return COMM_DOMAIN_ADMISSION_STOPPED;
+        // Roll back every earlier acquisition as well if a later domain is busy or allocation throws.
+        std::shared_ptr<void> queue_claim(&a, [](void *value) {
+            static_cast<DomainAllocation *>(value)->urma_run_active.store(false);
+        });
+        if (a.urma_scan_abandoned) return COMM_DOMAIN_ADMISSION_STOPPED;
+        const uint32_t jetties = a.workspace_config.urma_jetties_per_aiv;
+        const UrmaRunBinding binding{
+            reinterpret_cast<uint64_t>(a.urma_workspace.addr),
+            a.urma_workspace.bytes,
+            a.urma_row_owner,
+            static_cast<uint32_t>(a.rank),
+            a.urma_aiv_count * jetties,
+            static_cast<uint32_t>(a.nranks),
+            jetties
+        };
+        acquired.domains.push_back(
+            {binding, allocation, std::move(queue_claim),
+             [](void *value, UrmaQueueReceipt &receipt, UrmaWait mode, const UrmaLaunchPermission &permission) {
+                 return check_urma_domain(*static_cast<DomainAllocation *>(value), &receipt, mode, permission);
+             }}
+        );
+    }
+    if (!acquired.domains.empty()) {
+        aclrtContext context = nullptr;
+        const aclError rc = aclrtGetCurrentContext(&context);
+        if (rc != ACL_SUCCESS || !context) {
+            LOG_ERROR("URMA Run could not capture its ACL context: %d", static_cast<int>(rc));
+            return COMM_DOMAIN_URMA_CONFIG_INVALID;
+        }
+        acquired.stopped_scan = std::make_shared<HbgStoppedQueueScan>(context);
+    }
+    *use = std::move(acquired);
+    return 0;
+}
+
+static bool domain_drained(DomainAllocation &alloc) {
+    if (alloc.cleanup_failed || alloc.urma_scan_abandoned) return false;
     if (!alloc.initialized) return true;  // Failed initialization never publishes device users.
     for (const auto &[id, registration] : alloc.registrations)
         if (!registration->prepared_allocations.empty() || !registration->owner->drained()) return false;
-    return alloc.active_ccu_run == 0 && (!alloc.ccu || alloc.ccu->owner->drained()) && urma_domain_drained(alloc);
+    return alloc.active_ccu_run == 0 && (!alloc.ccu || alloc.ccu->owner->drained()) &&
+           check_urma_domain(alloc, nullptr, UrmaWait::Poll, {}) == UrmaQueueState::READY;
 }
 
 // Callers establish local/peer quiescence before closing a published domain.
 // Unpublished Init rollback has no device users and needs no release collective.
 static bool close_domain_resources(DomainAllocation &alloc) {
     if (alloc.cleanup_failed) return false;
+    if constexpr (hbg_urma)
+        if (!alloc.urma_queue_control.close()) return false;
     alloc.cleanup_failed = true;
     if (alloc.ccu) {
         if (!alloc.ccu->owner || !alloc.ccu->owner->drained()) return false;
@@ -2297,6 +2505,8 @@ static int allocate_domain_windows(
     uint64_t *local_window_base_out, size_t *actual_window_size_out, const CommWorkspaceConfig *workspace_config
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
+    std::unique_lock domain_lock(h->urma_domains_mutex, std::defer_lock);
+    if constexpr (hbg_urma) domain_lock.lock();
     if (host_shm_name != nullptr) {
         if (!comm_domain_onboard::valid_host_shm_name(host_shm_name)) return -1;
         if ((workspace_mask & ~comm_workspace_bit(CommWorkspaceKind::URMA)) != 0)
@@ -2384,7 +2594,7 @@ static int allocate_domain_windows(
     }
     h->last_allocation_id = allocation_id;
     h->domain_admission_stopped = true;
-    auto entry = h->domain_allocations.emplace(allocation_id, std::make_unique<DomainAllocation>()).first;
+    auto entry = h->domain_allocations.emplace(allocation_id, std::make_shared<DomainAllocation>()).first;
     auto &alloc = entry->second;
     alloc->workspace_config = config;
     alloc->urma_aiv_count = aiv_count;
@@ -2945,6 +3155,8 @@ static int release_domain_windows(
     CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool collective
 ) try {
     if (!h) return -1;
+    std::unique_lock domain_lock(h->urma_domains_mutex, std::defer_lock);
+    if constexpr (hbg_urma) domain_lock.lock();
     auto it = h->domain_allocations.find(allocation_id);
     if (it == h->domain_allocations.end()) {
         LOG_ERROR(
@@ -2968,6 +3180,7 @@ static int release_domain_windows(
     }
     if (!h->ccu_abort_pending_registrations.empty()) return COMM_RECLAMATION_UNCONFIRMED;
     if (collective && !alloc->initialized) return COMM_INITIALIZATION_ABORT_REQUIRED;
+    if (alloc.use_count() != 1) return COMM_DOMAIN_ADMISSION_STOPPED;
     const bool prior_admission_stopped = h->domain_admission_stopped;
     h->domain_admission_stopped = true;
     if (!domain_drained(*alloc) ||
@@ -3046,6 +3259,12 @@ extern "C" int comm_global_domain_release(uint64_t) {
 
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
+    std::unique_lock domain_lock(h->urma_domains_mutex, std::defer_lock);
+    if constexpr (hbg_urma) {
+        domain_lock.lock();
+        for (const auto &entry : h->domain_allocations)
+            if (entry.second.use_count() != 1) return COMM_DOMAIN_ADMISSION_STOPPED;
+    }
 
     if (h->cleanup_failed) {
         publish_host_cleanup_failure(h);
@@ -3125,6 +3344,7 @@ extern "C" int comm_destroy(CommHandle h) try {
         }
     }
 
+    if constexpr (hbg_urma) domain_lock.unlock();
     delete h;
     return rc;
 } catch (const std::exception &e) {

@@ -1000,7 +1000,6 @@ platform_case(test_chip_swimlane_aicore.cpp PER_ARCH PER_RUNTIME BARE
 file(GLOB NATIVE_ADMISSION_SHARED_HOST CONFIGURE_DEPENDS
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/*.cpp)
 set(NATIVE_ADMISSION_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_entry_cache_qualification.cpp
     ${SIMPLER_SRC}/common/worker/chip_run_lane.cpp
     ${SIMPLER_SRC}/common/worker/chip_worker.cpp
     ${SIMPLER_SRC}/common/worker/native_submission_state.cpp
@@ -1032,16 +1031,21 @@ set(NATIVE_ADMISSION_INCLUDES
     ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context
     ${SIMPLER_SRC}/common/log
     ${SIMPLER_SRC}/common/worker)
+set(HBG_NATIVE_ADMISSION_SOURCES
+    ${NATIVE_ADMISSION_SOURCES}
+    ${CMAKE_SOURCE_DIR}/support/native_admission/hbg_preparation.cpp
+    ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/host/runtime_maker.cpp
+    ${_hbg_orch_host_sources}
+    ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+    ${HBG_HOST_DIR}/host_phase_trace.cpp
+    ${HBG_SHARED_RUNTIME_SOURCES}
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp)
+set(A5_HBG_NATIVE_ADMISSION_SOURCES
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/graph_validation.cpp
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/profiling.cpp)
 hbg_case(test_native_admission.cpp
-    SOURCES ${NATIVE_ADMISSION_SOURCES}
-        ${CMAKE_SOURCE_DIR}/support/native_admission/hbg_preparation.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_admission_hbg.cpp
-        ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/host/runtime_maker.cpp
-        ${_hbg_orch_host_sources}
-        ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
-        ${HBG_HOST_DIR}/host_phase_trace.cpp
-        ${HBG_SHARED_RUNTIME_SOURCES}
-        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+    SOURCES ${HBG_NATIVE_ADMISSION_SOURCES} test_entry_cache_qualification.cpp test_native_admission_hbg.cpp
+    A5_SOURCES ${A5_HBG_NATIVE_ADMISSION_SOURCES}
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
@@ -1054,19 +1058,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             "-Wl,--wrap=publish_run_image_impl" "-Wl,--wrap=release_run_bindings_impl")
     endforeach()
 endif()
-if(TARGET test_a5_hbg_native_admission)
-    target_sources(test_a5_hbg_native_admission PRIVATE
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/graph_validation.cpp
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/profiling.cpp)
-endif()
 tmr_case(test_native_admission.cpp
-    SOURCES ${NATIVE_ADMISSION_SOURCES}
+    SOURCES ${NATIVE_ADMISSION_SOURCES} test_entry_cache_qualification.cpp
         ${CMAKE_SOURCE_DIR}/support/native_admission/tmr_preparation.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
+
+hbg_case(test_urma_native_run.cpp ARCHS a5 TIMEOUT 30
+    SOURCES ${HBG_NATIVE_ADMISSION_SOURCES} ${A5_HBG_NATIVE_ADMISSION_SOURCES}
+        ${CMAKE_SOURCE_DIR}/a5/runtime/host_build_graph/urma_fault_kernel.cpp
+    INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES SIMPLER_RUNTIME_NAME="host_build_graph" CONTEXT_ARCH_A5=1
+    LINK a5_ut_support ${CMAKE_DL_LIBS})
 
 add_library(native_observation_orch MODULE
     ${CMAKE_SOURCE_DIR}/support/native_admission/framework_observation_orch.cpp)
@@ -1241,6 +1248,8 @@ foreach(arch a2a3 a5)
         simpler_runtime_from_tag("${tag}" runtime)
         set(aicore_dir ${SIMPLER_SRC}/${arch}/runtime/${runtime}/aicore)
         if(arch STREQUAL "a5" AND tag STREQUAL "hbg")
+            simpler_ut_includes(${arch} ${runtime} host aicore_includes)
+            target_include_directories(test_a5_hbg_abort_aicore_startup PRIVATE ${aicore_includes})
             target_sources(test_a5_hbg_abort_aicore_startup PRIVATE
                 ${aicore_dir}/entry.cpp
                 ${aicore_dir}/unprofiled.cpp

@@ -207,8 +207,8 @@ def kernel_symbol_runtime(tmp_path_factory):
         device_malloc_ctx device_free_ctx device_free_caller_buffer_ctx
         device_borrow_caller_buffers_ctx device_release_caller_buffers_ctx
         committed_device_memory_ctx device_memory_info_ctx
-        copy_to_device_ctx copy_from_device_ctx simpler_register_callable simpler_run
-        simpler_prepare_run simpler_launch_run simpler_launch_run_joined simpler_poll_run simpler_wait_run
+        copy_to_device_ctx copy_from_device_ctx simpler_register_callable simpler_run_v2
+        simpler_prepare_run_v2 simpler_launch_run simpler_launch_run_joined simpler_poll_run simpler_wait_run
         simpler_wait_run_completion
         simpler_finalize_run simpler_finalize_run_with_delivery
         supports_concurrent_native_prepare_ctx supports_joined_native_launch_ctx
@@ -239,6 +239,7 @@ def kernel_symbol_runtime(tmp_path_factory):
         progress=False,
         shared_storage=False,
         comm_admission=False,
+        legacy_run_api=False,
     ):
         nonlocal next_library_id
         key = (
@@ -257,6 +258,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             progress,
             shared_storage,
             comm_admission,
+            legacy_run_api,
         )
         # Fault scripts retain their consumed failure budget in the loaded DSO.
         if finalize_failures == 0 and not init_gate and key in cache:
@@ -474,7 +476,7 @@ def kernel_symbol_runtime(tmp_path_factory):
                 )
 
         progress_symbols = {
-            "simpler_prepare_run",
+            "simpler_prepare_run_v2",
             "simpler_launch_run",
             "simpler_launch_run_joined",
             "simpler_poll_run",
@@ -537,7 +539,7 @@ def kernel_symbol_runtime(tmp_path_factory):
                         int observed_rc = 0;
                     };
                     static_assert(sizeof(ProgressRun) <= sizeof(NativeRunDescriptor) + 16);
-                    int simpler_prepare_run(DeviceContextHandle, RuntimeHandle storage, int32_t,
+                    int simpler_prepare_run_v2(DeviceContextHandle, RuntimeHandle storage, int32_t,
                                             const void *, const CallConfig *, const NativeRunDescriptor *descriptor) {
                         auto *run = new (storage) ProgressRun{UINT64_C(0x534d504c52554e31), *descriptor, increment(0)};
                         test_progress_set(5, static_cast<int>(getpid()));
@@ -670,12 +672,18 @@ def kernel_symbol_runtime(tmp_path_factory):
 
         # These symbols are only resolved during init; any invocation is a test failure.
         # A separate TU keeps the sentinels independent of the C ABI parameter lists.
+        run_symbols = unused_symbols
+        if legacy_run_api:
+            run_symbols = [
+                symbol.removesuffix("_v2") if symbol in {"simpler_run_v2", "simpler_prepare_run_v2"} else symbol
+                for symbol in unused_symbols
+            ] + ["simpler_prepare_caller_run"]
         sentinels.write_text(
             "#include <cstdlib>\n#include <cstdio>\n"
             + "".join(
                 f'extern "C" void {symbol}() {{ '
                 f'std::fprintf(stderr, "unexpected runtime leaf: {symbol}\\n"); std::abort(); }}\n'
-                for symbol in (*unused_symbols, *_KERNEL_LIFECYCLE_SYMBOLS)
+                for symbol in (*run_symbols, *_KERNEL_LIFECYCLE_SYMBOLS)
                 if symbol not in missing
                 and not (comm_admission and symbol in comm_symbols)
                 and not (memory and symbol in memory_symbols)
@@ -958,6 +966,15 @@ class TestChipWorkerKernelSymbols:
         finally:
             worker.finalize()
 
+    def test_old_native_run_descriptor_module_is_rejected_before_context_creation(self, kernel_symbol_runtime):
+        library = kernel_symbol_runtime(legacy_run_api=True)
+        observer = ctypes.CDLL(str(library))
+        assert observer.simpler_run and observer.simpler_prepare_run and observer.simpler_prepare_caller_run
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="dlsym failed for 'simpler_run_v2'"):
+            worker.init(str(library), os.devnull, os.devnull, "", device_id=0)
+        assert not worker.initialized and observer.test_creates() == 0
+
     @pytest.mark.parametrize(
         "missing",
         (
@@ -965,6 +982,8 @@ class TestChipWorkerKernelSymbols:
             "simpler_kernel_mode_supported",
             "simpler_execution_environment_releasable_ctx",
             "simpler_get_init_error_ctx",
+            "simpler_run_v2",
+            "simpler_prepare_run_v2",
             "simpler_finalize_run_with_delivery",
         ),
     )

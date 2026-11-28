@@ -22,7 +22,7 @@
  *
  * The start-of-execution half of a run's tensor IO. Recording a lease settles
  * which device buffer a caller tensor gets; this settles what is in it. The
- * current adapter calls it during `simpler_prepare_run`, after the bind.
+ * current adapter calls it during `simpler_prepare_run_v2`, after the bind.
  *
  * An input-bearing lease with a size and no usable endpoint is an error, not a
  * transfer to skip: its device buffer is real and the kernel will read it, so

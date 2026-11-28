@@ -78,6 +78,7 @@
 #include "host/diagnostic_credit_signal.h"
 #include "host/device_fault_monitor.h"
 #include "host/device_health_state.h"
+#include "platform_comm/urma_launch_permission.h"
 #include "host/dfx_run_config.h"
 #include "host/caller_device_buffers.h"
 #include "host/child_memory_host_view.h"
@@ -1161,7 +1162,7 @@ public:
      * max(end) - min(start). Returns 0 for a phase that was never stamped
      * (e.g. a platform whose AICPU does not emit that phase).
      * AicpuPhase::RunWall aliases last_device_wall_ns(). Used by the host to
-     * emit device-phase trace markers; see simpler_run in c_api_shared.
+     * emit device-phase trace markers; see simpler_run_v2 in c_api_shared.
      */
     uint64_t last_device_phase_ns(uint32_t pipeline_slot, AicpuPhase phase) const {
         return device_run_timing(pipeline_slot).phase_ns[static_cast<int>(phase)];
@@ -1271,7 +1272,8 @@ public:
      */
     RunRecordRead device_run_result_read_status(uint32_t pipeline_slot, uint64_t run_epoch) const;
     int request_peer_cancel(uint32_t pipeline_slot, uint64_t run_epoch);
-    int peer_cancel_wait_timeout_ms() const { return timeout_config_.stream_sync_timeout_ms; }
+    int stream_sync_timeout_ms() const { return timeout_config_.stream_sync_timeout_ms; }
+    int peer_cancel_wait_timeout_ms() const { return stream_sync_timeout_ms(); }
 
     /**
      * The boundary completion this run's own drain or poll observed, or
@@ -1400,7 +1402,7 @@ public:
 
     /**
      * True iff `callable_id` has registered state staged via
-     * `record_device_orch_callable*`. Lets the c_api layer reject `simpler_run`
+     * `record_device_orch_callable*`. Lets the c_api layer reject `simpler_run_v2`
      * calls without a matching `simpler_register_callable`.
      */
     bool has_callable(int32_t callable_id) const;
@@ -1559,6 +1561,8 @@ public:
      * enqueue fail-fast guard.
      */
     virtual bool can_accept_run() const = 0;
+    UrmaLaunchPermission
+    acquire_urma_launch_permission(uint64_t generation, const std::shared_ptr<UrmaScanThread> &scan);
 
     /**
      * Whether the shared c_api may admit a new run on this runner.
@@ -2203,6 +2207,14 @@ protected:
     // base pointer safely.
     DeviceRunnerBase();
 
+    // Publish quarantine after fencing every in-progress enqueue. Admission takes the same lock.
+    template <typename MarkUnusable>
+    void revoke_urma_launches_and_mark(MarkUnusable mark) {
+        std::lock_guard lock(urma_scans_mutex_);
+        if (urma_launch_gate_) urma_launch_gate_->revoke();
+        mark();
+    }
+    void stop_urma_scans();
     virtual int finalize_impl() = 0;
     // A failed device bind can still leave a process-level SDK reference.
     virtual int finalize_unbound() { return 0; }
@@ -2985,6 +2997,9 @@ protected:
         NativeRunPreparationState preparation_state{NativeRunPreparationState::Preparing};
         NativeRunIdentity identity{};
     };
+    int finalize_after_urma_scans();
+    std::mutex urma_scans_mutex_;
+    std::shared_ptr<UrmaLaunchGate> urma_launch_gate_;
     mutable std::mutex native_run_mu_;
     RunResourceSlots<NativeRunReservation> native_run_reservations_;
     struct NativeRunObservation {

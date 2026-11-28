@@ -61,7 +61,7 @@ inline __aicore__ void submit_repeated(
     }
     if (entries_per_request == 0 || ctx.completion_count == nullptr ||
         static_cast<uint64_t>(*ctx.completion_count - before) != static_cast<uint64_t>(entries_per_request) * repeats) {
-        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         pto2::detail::defer_flush(ctx);
     }
 }
@@ -221,7 +221,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             );
         }
         if (!ok) {
-            pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            if (ctx.completion_error_code && *ctx.completion_error_code == SIMPLER_ERROR_NONE)
+                pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
             pto2::detail::defer_flush(ctx);
         }
 #else

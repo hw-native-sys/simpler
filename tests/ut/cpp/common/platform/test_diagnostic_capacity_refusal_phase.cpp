@@ -123,7 +123,7 @@ void *operator new(std::size_t bytes) {
 /* ===========================================================================
  * The runtime-maker half, which this target does not link.
  *
- * `simpler_prepare_run` and `simpler_finalize_run` name these unconditionally
+ * `simpler_prepare_run_v2` and `simpler_finalize_run` name these unconditionally
  * and a real preparation runs through all of them; the production definitions
  * live in each runtime's `runtime_maker.cpp`, which only the production
  * host_runtime.so builds. The weak placeholders in
@@ -205,7 +205,7 @@ class RetryRunner : public SimDeviceRunnerBase {
 public:
     enum class ProgressException { None, Allocation, Other };
     RetryRunner() {
-        // The two registration facts a real `simpler_prepare_run` checks: the
+        // The two registration facts a real `simpler_prepare_run_v2` checks: the
         // callable is registered, and the retained block its hash names exists.
         // Standing them up directly keeps the case off the dlopen/image path,
         // which is covered by its own suite and is not what this is about. The
@@ -339,7 +339,7 @@ private:
     }
 };
 
-/** Runtime storage with the alignment and zeroing `simpler_prepare_run` requires. */
+/** Runtime storage with the alignment and zeroing `simpler_prepare_run_v2` requires. */
 struct RuntimeStorage {
     std::vector<unsigned char> bytes;
 
@@ -368,7 +368,7 @@ struct PreparedRun {
     /** The caller's acceptance sink, which only a matching receipt may write. */
     volatile int32_t accepted{kUnaccepted};
 
-    /** Drive the real `simpler_prepare_run` to a real PREPARED carrier. */
+    /** Drive the real `simpler_prepare_run_v2` to a real PREPARED carrier. */
     int prepare(const CallConfig &config = diagnostic_config()) {
         NativeRunDescriptor descriptor{};
         descriptor.pipeline_slot = 0;
@@ -379,7 +379,7 @@ struct PreparedRun {
         descriptor.run_epoch = 9100;
         descriptor.accepted_state = &accepted;
         descriptor.accepted_value = kAccepted;
-        return simpler_prepare_run(
+        return simpler_prepare_run_v2(
             static_cast<DeviceContextHandle>(&runner), storage.handle(), kCallableId, nullptr, &config, &descriptor
         );
     }
@@ -835,7 +835,9 @@ TEST(DiagnosticCapacityRefusalPhaseTest, RetiredResultsAndOutputSurviveTheSucces
         descriptor.generation++;
         descriptor.dispatch_id++;
         CallConfig config{};
-        ASSERT_EQ(simpler_prepare_run(&run.runner, successor.handle(), kCallableId, nullptr, &config, &descriptor), 0);
+        ASSERT_EQ(
+            simpler_prepare_run_v2(&run.runner, successor.handle(), kCallableId, nullptr, &config, &descriptor), 0
+        );
         run.runner.drain_rc = -6543;
         ASSERT_EQ(simpler_launch_run(&run.runner, successor.handle()), 0);
         ASSERT_EQ(simpler_wait_run_completion(&run.runner, successor.handle()), 0);
@@ -992,7 +994,7 @@ TEST(DiagnosticCapacityRefusalPhaseTest, ClockExportFollowsItsRootAfterSlotReuse
     descriptor.generation++;
     descriptor.dispatch_id++;
     CallConfig ordinary{};
-    ASSERT_EQ(simpler_prepare_run(&run.runner, successor.handle(), kCallableId, nullptr, &ordinary, &descriptor), 0);
+    ASSERT_EQ(simpler_prepare_run_v2(&run.runner, successor.handle(), kCallableId, nullptr, &ordinary, &descriptor), 0);
     ASSERT_FALSE(run.runner.host_clock_alignment_log_required(0));
     const uint64_t successor_invocation =
         static_cast<NativeRunContext<SimDeviceRunnerBase> *>(successor.handle())->trace_inv;
@@ -1095,7 +1097,7 @@ void check_sim_finalize_prefix_allocation_failure(bool launched, bool delivery_e
     ++next.generation;
     ++next.dispatch_id;
     ++next.run_epoch;
-    ASSERT_EQ(simpler_prepare_run(&run.runner, successor.handle(), kCallableId, nullptr, &config, &next), 0);
+    ASSERT_EQ(simpler_prepare_run_v2(&run.runner, successor.handle(), kCallableId, nullptr, &config, &next), 0);
     run.runner.refuse_for_capacity = false;
     ASSERT_EQ(simpler_launch_run(&run.runner, successor.handle()), 0);
     EXPECT_EQ(simpler_finalize_run(&run.runner, successor.handle()), 0);

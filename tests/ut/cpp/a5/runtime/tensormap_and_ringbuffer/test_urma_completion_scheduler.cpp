@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "../urma_queue_fixture.h"
 #include "async_wait.h"
 #include "backend/urma/urma_completion_scheduler.h"
 #include "scheduler/scheduler.h"
@@ -27,56 +28,11 @@ using pto::comm::urma::UrmaInfo;
 using pto::comm::urma::UrmaWQCtx;
 using pto2::urma_backend::poll_urma_event_handle;
 
-constexpr uint32_t kRows = 8;
-constexpr uint32_t kDepth = 8;
-constexpr uint32_t kCqeWords = 16;
+using simpler::test::kDepth;
+using simpler::test::kRows;
+using simpler::test::TestCqe;
 
-struct alignas(64) TestCqe {
-    std::array<uint32_t, kCqeWords> words{};
-};
-
-struct WorkspaceFixture {
-    UrmaInfo info{};
-    std::array<UrmaWQCtx, kRows> sq{};
-    std::array<UrmaCqCtx, kRows> cq{};
-    std::array<uint32_t, kRows> sq_head{};
-    std::array<uint32_t, kRows> sq_tail{};
-    std::array<uint32_t, kRows> sq_doorbell{};
-    std::array<uint32_t, kRows> cq_tail{};
-    std::array<uint32_t, kRows> cq_doorbell{};
-    std::array<std::array<TestCqe, kDepth>, kRows> entries{};
-
-    WorkspaceFixture() {
-        info.rowsPerPeer = 4;
-        info.rankCount = 2;
-        info.sqPtr = reinterpret_cast<uint64_t>(sq.data());
-        info.scqPtr = reinterpret_cast<uint64_t>(cq.data());
-        info.layout = static_cast<decltype(info.layout)>(0);
-        info.jettyCount = kRows;
-        info.jettiesPerCore = 2;
-        for (uint32_t row = 0; row < kRows; ++row) {
-            sq[row].bufAddr = reinterpret_cast<uint64_t>(entries[row].data());
-            sq[row].wqeShiftSize = 6;
-            sq[row].depth = kDepth;
-            sq[row].headAddr = reinterpret_cast<uint64_t>(&sq_head[row]);
-            sq[row].tailAddr = reinterpret_cast<uint64_t>(&sq_tail[row]);
-            sq[row].dbAddr = reinterpret_cast<uint64_t>(&sq_doorbell[row]);
-            cq[row].bufAddr = reinterpret_cast<uint64_t>(entries[row].data());
-            cq[row].cqeShiftSize = 6;
-            cq[row].depth = kDepth;
-            cq[row].tailAddr = reinterpret_cast<uint64_t>(&cq_tail[row]);
-            cq[row].dbAddr = reinterpret_cast<uint64_t>(&cq_doorbell[row]);
-        }
-    }
-
-    uint64_t addr() { return reinterpret_cast<uint64_t>(&info); }
-
-    void set_cqe(uint32_t row, uint32_t sequence, bool ready, uint32_t status = 0, uint32_t substatus = 0) {
-        const uint32_t lap_owner = (sequence / kDepth) & 1u;
-        const uint32_t owner = ready ? lap_owner ^ 1u : lap_owner;
-        entries[row][sequence & (kDepth - 1)].words[0] = (owner << 2) | (substatus << 16) | (status << 24);
-    }
-
+struct WorkspaceFixture : simpler::test::UrmaQueueFixture {
     CompletionPollResult poll(uint32_t row, uint32_t target_bb, uint32_t target_cqe) {
         return poll_urma_event_handle(((static_cast<uint64_t>(row) << 32) | target_bb), addr(), target_cqe);
     }

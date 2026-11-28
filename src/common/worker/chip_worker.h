@@ -74,6 +74,12 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// The runtime wait budget elapsed while the active run still owns its buffers.
+class NativeRunWaitIncomplete : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 // This invocation enqueued no operator kernel, and its native input bindings and
 // preparation resources have all been released. It supplies no verdict about
 // any other run or about whether the execution environment accepts a retry.
@@ -671,8 +677,8 @@ private:
     // log level off HostLogger itself.
     using SimplerInitFn = decltype(&simpler_init);
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
-    using SimplerRunFn = decltype(&simpler_run);
-    using SimplerPrepareRunFn = decltype(&simpler_prepare_run);
+    using SimplerRunFn = decltype(&simpler_run_v2);
+    using SimplerPrepareRunFn = decltype(&simpler_prepare_run_v2);
     using SimplerNativeRunFn = decltype(&simpler_launch_run);
     using SimplerFinalizeRunFn = decltype(&simpler_finalize_run_with_delivery);
     using ObserveFrameworkSubmissionsFn = decltype(&simpler_observe_framework_submissions);

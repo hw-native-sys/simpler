@@ -212,7 +212,7 @@ capture are outside this collection contract.
 
 | When | API/action | ScopeStats lifetime |
 | ---- | ---------- | ------------------- |
-| Before capture | `simpler_prepare_caller_run` with ScopeStats enabled and a nonempty output prefix | Reserves the bounded collection window and arms stable device addresses |
+| Before capture | `simpler_prepare_caller_run_v2` with ScopeStats enabled and a nonempty output prefix | Reserves the bounded collection window and arms stable device addresses |
 | During capture | `simpler_submit_run_on_stream` | Records the device probes |
 | Replay | RTS model execution | Device probes append samples to this run's window |
 | After the last use | Destroy or cancel the model and call `simpler_finalize_run` | Drains the stream and readers and hands records to the writer |

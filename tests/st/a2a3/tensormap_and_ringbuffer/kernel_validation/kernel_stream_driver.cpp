@@ -77,7 +77,7 @@ int main(int argc, char **argv) {
     );
     NativeRunDescriptor descriptor{};
     descriptor.generation = descriptor.run_epoch = 1;
-    const auto prepare_run = capture ? simpler_prepare_caller_run : simpler_prepare_run;
+    const auto prepare_run = capture ? simpler_prepare_caller_run_v2 : simpler_prepare_run_v2;
     check(prepare_run(ctx, run, 0, &args, &config, &descriptor), "prepare");
     aclmdlRI model = nullptr;
     if (capture) {

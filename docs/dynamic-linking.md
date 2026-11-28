@@ -544,8 +544,8 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
     dlsym every required export declared in runtime_c_api.h, including:
            create_device_context, destroy_device_context, simpler_init,
            get_runtime_size, get_runtime_alignment, simpler_register_callable,
-           simpler_prepare_run, simpler_launch_run, simpler_poll_run,
-           simpler_wait_run, simpler_finalize_run, simpler_run,
+           simpler_prepare_run_v2, simpler_launch_run, simpler_poll_run,
+           simpler_wait_run, simpler_finalize_run, simpler_run_v2,
            simpler_unregister_callable, get_pipeline_contract,
            supports_concurrent_native_prepare_ctx,
            get_arena_bank_gm_heap_base_ctx, get_retained_temp_addr_ctx,
@@ -564,8 +564,8 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
       DeviceRunner::set_executors(aicpu, aicore)       binaries owned by runner
 
 ChipWorker.run(handle, args, config)                   # public wrapper path
-  simpler_run(ctx, buf, cid, args, config, &descriptor)
-    simpler_prepare_run(..., &descriptor)
+  simpler_run_v2(ctx, buf, cid, args, config, &descriptor)
+    simpler_prepare_run_v2(..., &descriptor)
       new (buf) NativeRunContext(..., descriptor, host_api)   owns Runtime + progress state
       DeviceRunner::bind_callable_to_runtime(r, cid, &host_api, args, rings)
       DeviceRunner::prepare_execution(r, config, slot, identity)
@@ -626,8 +626,8 @@ device_worker_main(device_id)
             upload child kernels, copy orch SO to device buffer
         for each launch with that handle:
           ChipWorker.run(handle, args, config)
-            simpler_run(ctx, buf, cid, args, config, &descriptor)
-              simpler_prepare_run(..., &descriptor)
+            simpler_run_v2(ctx, buf, cid, args, config, &descriptor)
+              simpler_prepare_run_v2(..., &descriptor)
                 new (buf) NativeRunContext(..., descriptor, host_api)   owns Runtime + progress state
                 bind_callable_to_runtime()     replay + rtMalloc, rtMemcpy to device
                 DeviceRunner::prepare_execution(..., slot, identity)

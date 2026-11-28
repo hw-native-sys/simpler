@@ -34,7 +34,7 @@ a5_hbg_case(test_hbg_calendar_execution.cpp NO_OBJS TIMEOUT 20
     DEFINES __CPU_SIM)
 
 a5_hbg_case(test_hbg_calendar_scalar_memory.cpp NO_OBJS TIMEOUT 20
-    SOURCES scalar_memory_unprofiled.cpp
+    SOURCES scalar_memory_unprofiled.cpp test_urma_completion.cpp test_urma_requests.cpp
     INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
     DEFINES __CPU_SIM)
 

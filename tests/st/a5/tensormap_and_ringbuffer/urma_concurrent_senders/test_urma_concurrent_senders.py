@@ -44,7 +44,7 @@ def concurrent_senders_orch(orch, callables, task_args, config):
                 domain[0].buffers[name].tensor((peers * count if name == "source" else count,), DataType.FLOAT32),
                 TensorArgType.INPUT,
             )
-        for name in ("out", "result", "records", "layout"):
+        for name in ("out", "result", "records"):
             args.add_tensor(_rehosted_ref_for(task_args, getattr(task_args, name)), TensorArgType.OUTPUT_EXISTING)
         args.add_scalar(domain.device_context(0, workspace_engines=("urma",)))
         for name in ("elems", "slots", "peers", "waves", "repeats", "independent"):
@@ -62,7 +62,7 @@ class _UrmaConcurrentSenders(SceneTestCase):
                 "orchestration": {
                     "source": "kernels/orchestration/concurrent_senders_orch.cpp",
                     "function_name": "aicpu_orchestration_entry",
-                    "signature": [D.IN, D.IN, D.OUT, D.OUT, D.OUT, D.OUT] + [D.IN] * 7,
+                    "signature": [D.IN, D.IN, D.OUT, D.OUT, D.OUT] + [D.IN] * 7,
                 },
                 "incores": [
                     {
@@ -101,7 +101,6 @@ class _UrmaConcurrentSenders(SceneTestCase):
             TensorArg("out", torch.zeros(peers * slots * elems)),
             TensorArg("result", torch.zeros(peers * slots * elems)),
             TensorArg("records", torch.zeros((waves + 1) * slots * RECORD_WORDS + marker_words, dtype=torch.int64)),
-            TensorArg("layout", torch.zeros(16, dtype=torch.int64)),
             Scalar("elems", elems),
             Scalar("slots", slots),
             Scalar("peers", peers),
@@ -114,22 +113,17 @@ class _UrmaConcurrentSenders(SceneTestCase):
         pass
 
     def compare_outputs(self, test_args, golden_args, output_names, params):
-        width = int(test_args.layout[0])
         slots, peers, waves = (params[key] for key in ("slots", "peers", "waves"))
         elems = params.get("elems", TILE_ELEMS)
-        assert 0 < width <= slots
-        expected = torch.zeros(peers, slots * elems)
-        expected[:, : width * elems] = test_args.source.reshape(peers, -1)[:, : width * elems]
+        expected = test_args.source.reshape(peers, slots * elems)
         assert torch.equal(test_args.out.reshape(peers, -1), expected), "PUT -> deferred GET data mismatch"
         assert torch.equal(test_args.result.reshape(peers, -1), expected + 1), "deferred GET consumer mismatch"
-        records = test_args.records[: (waves + 1) * slots * RECORD_WORDS].reshape(waves + 1, slots, RECORD_WORDS)[
-            :, :width
-        ]
+        records = test_args.records[: (waves + 1) * slots * RECORD_WORDS].reshape(waves + 1, slots, RECORD_WORDS)
         assert torch.all(records[:, :, 0] == 1), f"missing/failed transfer records: {records[:, :, :8]}"
         for wave in range(waves + 1):
             rows = records[wave]
             if wave in (0, waves) or params.get("independent", 0) not in (1, 3):
-                assert len(set(rows[:, 1].tolist())) == width, "concurrent senders reused one physical queue owner"
+                assert len(set(rows[:, 1].tolist())) == slots, "concurrent senders reused one physical queue owner"
             assert torch.all(rows[:, 6] == 1), "expected the default single jetty per AIV and peer"
             assert torch.all(rows[:, 23] > rows[:, 1] * rows[:, 6]), "sender exceeds the per-peer queue range"
             peer_one_rows = rows[:, 23] + rows[:, 1] * rows[:, 6]
@@ -152,7 +146,7 @@ class _UrmaConcurrentSenders(SceneTestCase):
             if params.get("independent") == 2 and wave < waves:
                 assert sorted(rows[:, 18].tolist()) == [0, 1], "MIX did not exercise both runtime AIV lanes"
                 assert len(set(rows[:, 1].tolist())) == 2, "MIX siblings shared a stable sender identity"
-        if width > 1:
+        if slots > 1:
             first = records[0]
             assert int(first[:, 8].max()) < int(first[:, 9].min()), "producer intervals did not overlap"
         if params.get("wrap"):
@@ -178,7 +172,7 @@ class _UrmaConcurrentSenders(SceneTestCase):
             pending = records[1, :, 12] - records[1, :, 19]
             print(f"URMA reuse observation, submitted-minus-completed at entry: {pending.tolist()}")
         print(
-            f"URMA PER_PEER acceptance: senders={width}, peers={peers}, waves={waves}, "
+            f"URMA PER_PEER acceptance: senders={slots}, peers={peers}, waves={waves}, "
             f"jetties={sorted(set(records[:, :, 6].flatten().tolist()))}, "
             f"sq_depth={int(records[0, 0, 10])}, cq_depth={int(records[0, 0, 11])}"
         )

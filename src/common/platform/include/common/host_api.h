@@ -19,6 +19,7 @@
 
 #include "common/chip_swimlane_extension.h"
 #include "common/launch_entry_args.h"
+#include "platform_comm/urma_run_lease.h"
 #include "host/scheduler_notifications.h"
 
 /**
@@ -315,6 +316,8 @@ struct HostApiOps {
  * through the bound members instead of a thread-local.
  */
 struct HostApi {
+    UrmaRunLease urma;
+
 public:
     bool launch_owns_execution_image() const { return ops_->launch_owns_execution_image; }
 

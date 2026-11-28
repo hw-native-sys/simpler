@@ -79,17 +79,38 @@ def _read_device(worker, buffer, scratch, *, slot=0):
 
 
 def run(devices=(0, 1), *, staged=False, aiv_blocks=1, compiled=None):
+    run_gathers(
+        devices,
+        staged=staged,
+        aiv_blocks=aiv_blocks,
+        compiled=compiled if compiled is not None else build_callable(),
+        runtime=RUNTIME,
+    )
+
+
+def _check_live_host_view(host, table_buffer, generation):
+    offset, size = host.buffer_range("table")
+    with table_buffer.shm.buf[offset : offset + size] as exported:
+        try:
+            host.release()
+        except BufferError:
+            pass
+        else:
+            raise AssertionError("Host domain released while a CPU reader still holds the table")
+        assert not host.released and not host.freed
+        assert bytes(exported) == _table(0, generation).tobytes()
+
+
+def run_gathers(devices, *, staged, aiv_blocks, compiled, runtime):
     if len(devices) != 2 or len(set(devices)) != 2:
         raise ValueError("this example requires two distinct A5 devices")
     if aiv_blocks not in (1, 4):
         raise ValueError("aiv_blocks must be 1 or 4")
     depth = 2 if staged else 1
-    if compiled is None:
-        compiled = build_callable()
     worker = Worker(
         level=3,
         platform="a5",
-        runtime=RUNTIME,
+        runtime=runtime,
         device_ids=list(devices),
         num_sub_workers=0,
         pipeline_depth=2 if staged else 1,
@@ -175,7 +196,15 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1, compiled=None):
             assert tuple(host.local_context(rank).local_window_base for rank in range(2)) == original_host_bases
 
         saved_buffer = host.member(0).buffers["table"]
-        host.release()
+        _check_live_host_view(host, saved_buffer, 2)
+
+        def last_host_read(orch, args, config):
+            submit(orch, args, config)
+            host.release()
+            assert host.released and not host.freed
+
+        worker.run(last_host_read)
+        verify(2)
         assert host.released and host.freed
         assert saved_buffer.shm.buf is None
 

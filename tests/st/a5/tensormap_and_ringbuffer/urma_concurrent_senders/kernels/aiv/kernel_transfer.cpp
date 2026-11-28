@@ -60,7 +60,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         logical >= slots) {
         record[0] = -1;
         flush(record);
-        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         pto2::detail::defer_flush(ctx);
         return;
     }
@@ -73,7 +73,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         static_cast<uint64_t>(info->rankCount) * info->rowsPerPeer != info->jettyCount) {
         record[0] = -2;
         flush(record);
-        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         pto2::detail::defer_flush(ctx);
         return;
     }
@@ -114,7 +114,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         if (!arrived) {
             record[0] = -3;
             flush(record);
-            pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
             pto2::detail::defer_flush(ctx);
             return;
         }
@@ -148,7 +148,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                     ctx.completion_entries[i].backend_cookie != reinterpret_cast<uint64_t>(workspace)) {
                     record[0] = -5;
                     flush(record);
-                    pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+                    pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
                     pto2::detail::defer_flush(ctx);
                     return;
                 }

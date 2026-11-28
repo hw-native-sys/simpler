@@ -80,14 +80,14 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
     return PTO_RUNTIME_ERR_INTERNAL;
 }
 
-int simpler_run(
+int simpler_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
     return PTO_RUNTIME_ERR_INTERNAL;
 }
 
-int simpler_prepare_run(
+int simpler_prepare_run_v2(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {

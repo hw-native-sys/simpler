@@ -103,7 +103,7 @@ class _Recording:
 
     def prepare(self, config, *, capture=True):
         self.capture = capture
-        prepare = self.lib.simpler_prepare_caller_run if capture else self.lib.simpler_prepare_run
+        prepare = self.lib.simpler_prepare_caller_run_v2 if capture else self.lib.simpler_prepare_run_v2
         rc = prepare(self.ctx, self.run, 0, self.args.__ptr__(), ctypes.byref(config), ctypes.byref(self.descriptor))
         assert rc == 0, f"native run preparation failed: {rc}"
         # Mutate the argument source after prepare, before recording the node.

@@ -398,6 +398,19 @@ def _scheduler_phase_streams(data):
         yield stream.get("producer"), records
 
 
+def calendar_event_cycles(section):
+    """Absolute device timestamps for positioning both task and lane events."""
+    for record in section.get("records", []):
+        yield record["cycles"]
+        for field in ("claim_start_cycles", "dispatch_cycles", "kernel_start_cycles", "finish_cycles"):
+            if field in record:
+                yield record[field]
+    for record in section.get("range_records", []):
+        yield record["cycles"]
+        if "scan_start_cycles" in record:
+            yield record["scan_start_cycles"]
+
+
 def capture_windows(data):
     """Read one ``chip_swimlane_records.json`` document's device-cycle extent.
 
@@ -422,8 +435,7 @@ def capture_windows(data):
     scheduler_tasks = data.get("scheduler_tasks") or {}
     for row in scheduler_tasks.get("records") or []:
         cycles.extend(int(value) for value in row[2:4])
-    for record in (data.get("calendar_task_events") or {}).get("records", []):
-        cycles.extend((record["cycles"], record.get("kernel_start_cycles", 0)))
+    cycles.extend(calendar_event_cycles(data.get("calendar_task_events") or {}))
     scheduler_streams = list(_scheduler_phase_streams(data))
     for _producer, records in scheduler_streams:
         for record in records:

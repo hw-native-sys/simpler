@@ -122,7 +122,7 @@ inline __aicore__ bool percounter_calendar_seal(
         const CompletionToken token{
             source.addr, source.expected_value, source.engine, source.completion_type, source.backend_cookie
         };
-        if (source._pad != 0 || !percounter_completion_token_valid(token)) {
+        if (source._pad != 0 || !percounter_completion_token_valid(token, cfg.control, cfg.urma_sender_plus_one)) {
             percounter_fail(cfg, SchedulerGraphResult::ASYNC_COMPLETION_INVALID, task);
             return false;
         }
@@ -151,6 +151,7 @@ inline __aicore__ bool percounter_calendar_seal(
     group->completion_add_cmd = percounter_soc_sram_add_address(address);
     group->calendar_sample = reinterpret_cast<uint64_t>(sample);
     group->calendar_shell_add_cmd = sink ? extra->shell_add_cmd : 0;
+    group->urma_sender_plus_one = cfg.urma_sender_plus_one;
     for (uint32_t i = 0; i < count; ++i) {
         const auto &source = cfg.async_entries[i];
         auto &target = group->entries[i];
@@ -240,7 +241,7 @@ inline __aicore__ bool percounter_calendar_service_defer(const LaneConfig &cfg, 
         const CompletionToken token{
             entry.addr, entry.expected_value, entry.engine, entry.completion_type, entry.backend_cookie
         };
-        const CompletionPollResult result = percounter_poll_valid_completion(token);
+        const CompletionPollResult result = percounter_poll_valid_completion(token, cfg.control, group);
         if (result.state == CompletionPollState::FAILED) {
             percounter_fail(cfg, SchedulerGraphResult::ASYNC_COMPLETION_INVALID, task);
             return false;
@@ -960,6 +961,57 @@ inline __aicore__ bool percounter_send_spmd_return_hint(
 
 #endif  // !__DAV_CUBE__
 
+inline __aicore__ bool percounter_calendar_next_ready_row(
+    const LaneConfig &cfg, const __gm__ CalendarExecutionRow *rows, const __gm__ uint8_t *binding,
+    __gm__ volatile CalendarRowProgress *progress, uint32_t first, uint32_t count, uint32_t &next, uint32_t &selected
+) {
+    bool failed = false;
+    const bool found = percounter_calendar_wait(cfg, [&]() __aicore__ {
+        for (uint32_t probe = 0; probe < count - first; ++probe) {
+            if (probe != 0 && probe % PERCOUNTER_SPIN_CHECK_INTERVAL == 0 && percounter_should_stop(cfg)) {
+                failed = true;
+                return true;
+            }
+            uint32_t i = first;
+            if (probe != 0) {
+                // Continue after the last candidate instead of revisiting the same retired prefix.
+                if (next <= first || next >= count) next = first + 1;
+                i = next++;
+            }
+            auto &state = progress[i];
+            if (state.retired) continue;
+            const auto &row = rows[i];
+            const auto *dispatch = reinterpret_cast<const __gm__ CalendarDispatch *>(binding + row.dispatch_offset);
+            const auto *inputs = reinterpret_cast<const __gm__ CalendarWait *>(binding + dispatch->waits_offset);
+            while (state.next_input < row.wait_count) {
+                const auto &input = inputs[state.next_input];
+                uint64_t cursor = state.defer_cursor;
+                const auto status = percounter_calendar_poll_completion(cfg, input.read_cmd, input.target, &cursor);
+                if (status == CompletionPollState::FAILED) {
+                    failed = true;
+                    return true;
+                }
+                if (status == CompletionPollState::PENDING) {
+                    state.defer_cursor = cursor;
+                    break;
+                }
+                state.defer_cursor = 0;
+                state.next_input = state.next_input + 1;
+            }
+            if (state.next_input == row.wait_count) {
+                selected = i;
+                return true;
+            }
+            // Preserve the assigned order unless a returned kernel still has an outstanding completion.
+            if (i == first &&
+                percounter_gm_read(cfg.control->async_registered) == percounter_gm_read(cfg.control->async_settled))
+                return false;
+        }
+        return false;
+    });
+    return found && !failed;
+}
+
 inline __aicore__ bool percounter_calendar_execute_range(
     const LaneConfig &cfg, const __gm__ uint8_t *image, uint64_t bytes, const __gm__ CalendarRange &range,
     uint32_t sample_offset, uint32_t worker_row_begin, uint32_t range_index, uint32_t worker
@@ -984,6 +1036,16 @@ inline __aicore__ bool percounter_calendar_execute_range(
         }
     }
     const __gm__ uint8_t *binding = image + binding_offset;
+    __gm__ volatile CalendarRowProgress *progress = nullptr;
+    if (range.progress_offset != 0) {
+        progress = const_cast<__gm__ CalendarRowProgress *>(
+            percounter_calendar_table<CalendarRowProgress>(image, bytes, range.progress_offset, row_count)
+        );
+        if (progress == nullptr) {
+            percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS);
+            return false;
+        }
+    }
     __gm__ CalendarTiming *samples = nullptr;
     if (sample_offset != 0) {
         samples = const_cast<__gm__ CalendarTiming *>(
@@ -1016,7 +1078,17 @@ inline __aicore__ bool percounter_calendar_execute_range(
         );
 
     const bool profile_tasks = cfg.profile != nullptr || cfg.profile_buffer != nullptr;
-    for (uint32_t i = 0; i < row_count; ++i) {
+    uint32_t next_candidate = 0;
+    for (uint32_t first = 0; first < row_count;) {
+        uint32_t i = first;
+        if (progress != nullptr) {
+            const uint64_t scan_begin = percounter_task_event_clock(cfg);
+            if (!percounter_calendar_next_ready_row(cfg, rows, binding, progress, first, row_count, next_candidate, i))
+                return false;
+            percounter_record_task_event(
+                cfg, PercounterTaskEventKind::ReadyRowScan, range_key, percounter_task_event_clock(cfg), scan_begin
+            );
+        }
         if (((worker_row_begin + i) % PERCOUNTER_SPIN_CHECK_INTERVAL) == 0 && percounter_should_stop(cfg)) return false;
         const uint64_t row_begin = percounter_task_event_clock(cfg);
         const auto *row = rows + i;
@@ -1075,7 +1147,8 @@ inline __aicore__ bool percounter_calendar_execute_range(
                 cfg, PercounterTaskEventKind::InputsReady, entry, percounter_task_event_clock(cfg)
             );
         } else if (!percounter_calendar_enter(
-                       cfg, join, waits, row->wait_count, sequence_base, blocks, sync, entry, flags, worker
+                       cfg, join, waits, progress == nullptr ? row->wait_count : 0, sequence_base, blocks, sync, entry,
+                       flags, worker
                    )) {
             return false;
         }
@@ -1161,6 +1234,13 @@ inline __aicore__ bool percounter_calendar_execute_range(
             cfg, PercounterTaskEventKind::LocalRetired, entry, percounter_task_event_clock(cfg)
         );
         percounter_commit_task_timing(cfg);
+        if (i != first) {
+            progress[i].retired = 1;
+        } else {
+            ++first;
+            while (progress != nullptr && first < row_count && progress[first].retired)
+                ++first;
+        }
     }
 
     {

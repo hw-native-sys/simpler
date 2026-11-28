@@ -352,9 +352,9 @@ void ChipWorker::init(
         // Optional: a runtime built before versioned registration exports
         // nothing, and a null pointer is the refusal.
         register_callable_v2_fn_ = module->optional<SimplerRegisterCallableV2Fn>("simpler_register_callable_v2");
-        run_fn_ = module->required<SimplerRunFn>("simpler_run");
-        prepare_caller_run_fn_ = module->optional<SimplerPrepareRunFn>("simpler_prepare_caller_run");
-        prepare_run_fn_ = module->required<SimplerPrepareRunFn>("simpler_prepare_run");
+        run_fn_ = module->required<SimplerRunFn>("simpler_run_v2");
+        prepare_caller_run_fn_ = module->optional<SimplerPrepareRunFn>("simpler_prepare_caller_run_v2");
+        prepare_run_fn_ = module->required<SimplerPrepareRunFn>("simpler_prepare_run_v2");
         launch_run_fn_ = module->required<SimplerNativeRunFn>("simpler_launch_run");
         validate_execution_context_fn_ =
             module->optional<ValidateExecutionContextFn>("simpler_validate_execution_context");
@@ -1428,17 +1428,20 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             const auto prepared = prepared_ccu_workspaces_.find(dispatch_id);
             if (prepared != prepared_ccu_workspaces_.end()) ccu_workspace = prepared->second;
         }
-        const NativeRunDescriptor descriptor{slot_id,
-                                             region_banks_for_slot(slot_id).image,
-                                             run_id,
-                                             generation,
-                                             dispatch_id,
-                                             run_epoch,
-                                             accepted_state,
-                                             accepted_value,
-                                             launch_depth_ > 1 ? 1u : 0u,
-                                             provenance,
-                                             ccu_workspace};
+        const NativeRunDescriptor descriptor{
+            slot_id,
+            region_banks_for_slot(slot_id).image,
+            run_id,
+            generation,
+            dispatch_id,
+            run_epoch,
+            accepted_state,
+            accepted_value,
+            launch_depth_ > 1 ? 1u : 0u,
+            provenance,
+            ccu_workspace,
+            base_comm_handle_
+        };
         rc = prepare(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
     } catch (...) {
         drop_preparing_native_run(run_epoch);
@@ -2031,6 +2034,9 @@ void ChipWorker::wait_native_run_completion(const ChipWorkerNativeRun &run) {
     if (lease == NativeRunLease::AlreadyComplete) return;
     if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "wait_native_run_completion");
     const int rc = wait_run_completion_fn_(device_ctx_, storage);
+    if (rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) {
+        throw NativeRunWaitIncomplete("native run completion wait incomplete; retry wait or finalize");
+    }
     if (rc != 0) {
         throw std::runtime_error("wait_native_run_completion failed with code " + std::to_string(rc));
     }

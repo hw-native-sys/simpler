@@ -40,8 +40,9 @@ inline __aicore__ void flush(__gm__ urma_test::TransferRecord *record) {
 
 inline __aicore__ void fail(AsyncCtx &ctx, __gm__ urma_test::TransferRecord *record, int64_t status) {
     record->status = status;
-    pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-    record->error = *ctx.completion_error_code;
+    if (ctx.completion_error_code && *ctx.completion_error_code == SIMPLER_ERROR_NONE)
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    record->error = ctx.completion_error_code ? *ctx.completion_error_code : SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
     flush(record);
     pto2::detail::defer_flush(ctx);
 }
@@ -49,11 +50,13 @@ inline __aicore__ void fail(AsyncCtx &ctx, __gm__ urma_test::TransferRecord *rec
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     AsyncCtx ctx = get_async_ctx(args);
-    const uint32_t logical = get_block_idx(args);
+    const bool fixed_senders = args[9] != 0;
+    const uint32_t logical = fixed_senders ? ctx.urma_sender_id : static_cast<uint32_t>(get_block_idx(args));
+    const uint32_t slots = args[6];
+    if (fixed_senders && logical >= slots) return;
     auto *record = reinterpret_cast<__gm__ urma_test::TransferRecord *>(ptr<int64_t>(args[3])) + logical;
     auto *comm = reinterpret_cast<__gm__ CommContext *>(args[4]);
     const uint32_t elems = args[5];
-    const uint32_t slots = args[6];
     const uint32_t repeats = args[7];
     const uint32_t mode = args[8];
     if (comm == nullptr || comm->rankId != 0 || comm->rankNum != 2 || logical >= slots || mode > 2) {
