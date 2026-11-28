@@ -168,8 +168,8 @@ def test_wait_timeout_retains_buffer_until_real_completion(tmp_path, st_platform
             (tmp_path / "loaded-modules.json").write_text(json.dumps(proof, indent=2))
         with pytest.raises(TimeoutError):
             run.wait(timeout=0.01)
-        with pytest.raises(RuntimeError, match="in.flight"):
-            worker.free(buffer.root)
+        with pytest.raises(NotImplementedError):
+            worker.free(buffer.address)
         if finish == "close":
             closed = threading.Event()
             errors = []

@@ -111,8 +111,8 @@ def test_block_end_invalidates_only_its_own_shared_tiles(tmp_path, st_platform):
         assert gate.wait_probe(), "Core 0's second Block and Core 1's waiting consumers must coexist"
         with pytest.raises(TimeoutError):
             run.wait(timeout=0.01)
-        with pytest.raises(RuntimeError, match="in.flight"):
-            worker.free(buffer.root)
+        with pytest.raises(NotImplementedError):
+            worker.free(buffer.address)
         gate.release_probe()
         run.wait()
         copy_from(worker, data, buffer)

@@ -507,8 +507,9 @@ static const HostApiOps g_host_api_ops = {
 
 void destroy_device_context(DeviceContextHandle ctx) {
     WseHostRunner *runner = static_cast<WseHostRunner *>(ctx);
-    if (runner != nullptr && runner->native_runs_outstanding()) {
-        LOG_ERROR("destroy_device_context: refusing to destroy a context with an unfinalized native run");
+    if (runner != nullptr && (runner->native_runs_outstanding() || runner->caller_buffer_borrow_count() ||
+                              runner->caller_buffer_retained_count())) {
+        LOG_ERROR("destroy_device_context: refusing to destroy a context with live run or buffer references");
         return;
     }
     if (runner != nullptr && runner->terminal_backing_retained()) {
@@ -522,27 +523,12 @@ size_t get_runtime_size(void) { return sizeof(SimNativeRunContext); }
 
 size_t get_runtime_alignment(void) { return alignof(SimNativeRunContext); }
 
-void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
-    if (ctx == NULL) return NULL;
-    return guarded_runner_call<&WseHostRunner::allocate_caller_buffer>(ctx, nullptr, size);
-}
-
-void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr) {
-    if (ctx == NULL || dev_ptr == NULL) return;
-    try {
-        // The same guarded release the recording mint pairs with, so this legacy entry cannot
-        // release an allocation a run may still reach, nor leave the table holding an address
-        // whose pages are gone. It returns void, so a refusal can only be logged — which is
-        // still the right outcome: not freeing is recoverable, freeing under a live borrow is
-        // not. `device_free_caller_buffer_ctx` is the entry that reports it.
-        (void)static_cast<WseHostRunner *>(ctx)->free_caller_buffer(dev_ptr);
-    } catch (...) {}
-}
-
+// WSE application memory is provisioned for the lifetime of the device context.
+void *device_malloc_ctx(DeviceContextHandle, size_t) { return nullptr; }
+void device_free_ctx(DeviceContextHandle, void *) {}
 int device_free_caller_buffer_ctx(DeviceContextHandle ctx, void *dev_ptr) {
-    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
-    if (dev_ptr == NULL) return 0;
-    return guarded_runner_call<&WseHostRunner::free_caller_buffer>(ctx, PTO_RUNTIME_ERR_INTERNAL, dev_ptr);
+    if (!ctx) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return dev_ptr ? PTO_RUNTIME_ERR_UNSUPPORTED : 0;
 }
 
 int device_borrow_caller_buffers_ctx(
@@ -555,8 +541,10 @@ int device_borrow_caller_buffers_ctx(
         for (uint32_t i = 0; i < count; ++i) {
             resolved[i] = CallerDeviceBuffers::Span{spans[i].addr, spans[i].bytes};
         }
-        const bool held =
-            static_cast<WseHostRunner *>(ctx)->borrow_caller_buffers(borrow_id, resolved.data(), resolved.size());
+        auto *runner = static_cast<WseHostRunner *>(ctx);
+        std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+        if (!runner->program_initialized()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        const bool held = runner->borrow_caller_buffers(borrow_id, resolved.data(), resolved.size());
         return held ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -585,8 +573,9 @@ int finalize_device(DeviceContextHandle ctx) {
         // Teardown clears the registry, so it is ordered against registration
         // and unregistration. Initialization still relies on the caller contract.
         std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
-        if (runner->native_runs_outstanding()) {
-            LOG_ERROR("finalize_device: native run must be finalized first");
+        if (runner->native_runs_outstanding() || runner->caller_buffer_borrow_count() ||
+            runner->caller_buffer_retained_count()) {
+            LOG_ERROR("finalize_device: outstanding runs or borrowed fixed memory");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         runner->set_program_initialized(false);
@@ -597,7 +586,7 @@ int finalize_device(DeviceContextHandle ctx) {
         // released. A no-op on a collector that retains no run.
         runner->finish_retained_runs();
         int rc = runner->finalize();
-        if (runner->terminal_backing_retained()) return rc;
+        if (rc != 0 || runner->terminal_backing_retained()) return rc;
         int dev = pto_cpu_sim_get_bound_device();
         if (dev >= 0) {
             pto_cpu_sim_release_device(dev);
@@ -696,6 +685,12 @@ int simpler_init(
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         if (rc != 0) return rc;
+    }
+    try {
+        runner->initialize_fixed_memory();
+    } catch (const std::exception &error) {
+        LOG_ERROR("WSE fixed memory initialization failed: %s", error.what());
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     runner->set_program_initialized(true);
     return 0;

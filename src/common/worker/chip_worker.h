@@ -647,6 +647,8 @@ public:
     uint64_t retained_temp_addr(uint32_t slot_id) const;
     size_t committed_device_memory() const;
     DeviceMemoryInfo device_memory_info() const;
+    bool has_fixed_memory_windows() const noexcept { return initialized_ && get_fixed_memory_window_fn_ != nullptr; }
+    std::pair<uint64_t, uint64_t> get_fixed_memory_window(int32_t core_id) const;
 
 private:
     using CreateDeviceContextFn = void *(*)();
@@ -662,6 +664,7 @@ private:
     using GetRuntimeAlignmentFn = size_t (*)();
     using GetCommittedDeviceMemoryFn = size_t (*)(void *);
     using GetDeviceMemoryInfoFn = decltype(&device_memory_info_ctx);
+    using GetFixedMemoryWindowFn = decltype(&get_fixed_memory_window_ctx);
     // From host_runtime.so. Single platform-side init that does (a) thread
     // attach + device-id record, (b) executor binary takeover, (c) onboard
     // CANN dlog sync, (d) async-DMA workspace provisioning. Reads the current
@@ -770,6 +773,7 @@ private:
     GetRuntimeAlignmentFn get_runtime_alignment_fn_ = nullptr;
     GetCommittedDeviceMemoryFn device_committed_memory_fn_ = nullptr;
     GetDeviceMemoryInfoFn device_memory_info_fn_ = nullptr;
+    GetFixedMemoryWindowFn get_fixed_memory_window_fn_ = nullptr;
     SimplerInitFn simpler_init_fn_ = nullptr;
     SimplerRegisterCallableFn register_callable_fn_ = nullptr;
     using SimplerRegisterCallableV2Fn = decltype(&simpler_register_callable_v2);

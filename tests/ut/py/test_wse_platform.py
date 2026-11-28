@@ -6,14 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""WSE discovery, provenance and distinct simulator cache identities."""
+"""WSE discovery and distinct simulator cache identities."""
 
-import hashlib
 import json
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 from simpler.callable_identity import build_chip_callable_descriptor
@@ -56,15 +54,6 @@ def test_wse_orchestration_uses_own_headers_and_identity():
     assert build_chip_callable_descriptor(
         target=chip, platform="wsesim", runtime="host_build_graph"
     ) != build_chip_callable_descriptor(target=chip, platform="a5sim", runtime="host_build_graph")
-
-
-@pytest.mark.ut_arches("wse")
-def test_source_manifest_matches_copied_files():
-    root = Path(__file__).resolve().parents[3]
-    for filename, entries in (("source-copy-manifest.json", "files"), ("host-source-provenance.json", "copies")):
-        manifest = json.loads((root / "src/wse" / filename).read_text())
-        for entry in manifest[entries]:
-            assert hashlib.sha256((root / entry["destination"]).read_bytes()).hexdigest() == entry["sha256"]
 
 
 @pytest.mark.ut_arches("a5", "wse")

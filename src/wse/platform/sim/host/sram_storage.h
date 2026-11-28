@@ -16,17 +16,15 @@
 #include <vector>
 
 namespace wse {
-// One device-owned backing: contiguous application windows followed by private runtime windows.
+// Each Core owns a contiguous local interval with a private runtime tail. The global memory window belongs to the chip.
 class SramStorage {
 public:
     SramStorage();
-    void freeze();
+    void initialize();
+    MemoryWindow window(int32_t core) const;
     uint32_t core_count() const;
     std::vector<uint64_t> configuration() const;
     std::vector<uint64_t> info(uint32_t core) const;
-    void *claim(size_t bytes);
-    bool owns(const void *ptr) const;
-    void release(void *ptr);
     void check_application(uint64_t address, uint64_t bytes) const;
     std::vector<SramAllocation> allocations() const;
     std::vector<SramRegion> regions() const;
@@ -36,15 +34,17 @@ public:
     size_t committed_bytes() const;
 
 private:
-    struct Free {
+    struct Unmap {
+        size_t bytes;
         void operator()(std::byte *p) const noexcept;
     };
     mutable std::mutex mutex_;
-    std::unique_ptr<std::byte, Free> backing_;
+    using Mapping = std::unique_ptr<std::byte, Unmap>;
+    static Mapping map(size_t bytes);
+    Mapping local_{nullptr, Unmap{0}}, global_{nullptr, Unmap{0}};
     std::vector<uint64_t> capacities_, reserves_, runtime_used_;
-    uint64_t application_bytes_{0};
+    std::vector<uint64_t> starts_;
     uint64_t total_bytes_{0};
-    bool claimed_{false};
-    void initialize_locked();
+    MemoryWindow local_window_locked(uint32_t core) const;
 };
 }  // namespace wse

@@ -27,36 +27,54 @@ pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build
 
 
 def test_fixed_sram_bounds_and_backing_lifetime(st_platform):
-    capacities, sizes, offsets = fixed_layout()
-    total = sum(sizes)
+    capacities, sizes, global_bytes = fixed_layout()
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     worker.init()
     try:
-        buffer = worker.malloc(total)
-        base = buffer.base
+        local = worker.get_base_addr(coreid=2)
+        assert worker.get_base_addr(memory="local", coreid=2).base == local.base
+        assert worker.get_base_addr(coreid=3).base == local.base + capacities[2]
+        global_mem = worker.get_base_addr(memory="global")
+        assert global_mem.nbytes == global_bytes
+        windows = (local, worker.get_base_addr(coreid=6), global_mem)
+        for value, window in enumerate(windows, 1):
+            worker.copy_to(window + 128, bytearray([value]))
+        for value, window in enumerate(windows, 1):
+            out = bytearray(1)
+            worker.copy_from(out, window + 128)
+            assert out == bytes([value])
         value = torch.tensor([123], dtype=torch.uint8)
-        worker.copy_to(buffer, value, dst_offset=total - 1)
         out = torch.zeros_like(value)
-        worker.copy_from(out, buffer, src_offset=total - 1)
-        assert out.item() == 123
-        for offset in (total, total + 1):
-            with pytest.raises((ValueError, RuntimeError)):
-                worker.copy_to(buffer, value, dst_offset=offset)
-            with pytest.raises(RuntimeError):
-                worker._chip_worker.copy_to(base + offset, value.data_ptr(), 1)
-            with pytest.raises(RuntimeError):
-                worker._chip_worker.copy_from(out.data_ptr(), base + offset, 1)
-        worker.free(buffer)
-        assert worker._chip_worker.committed_device_memory == sum(capacities)
-        with pytest.raises((ValueError, RuntimeError)):
-            worker.copy_from(out, buffer)
+        for window in windows:
+            assert (window + 128).identity == window.identity
+            worker.copy_to(window + (window.nbytes - 1), value)
+            worker.copy_from(out, window + (window.nbytes - 1))
+            assert out.item() == 123
+            with pytest.raises(ValueError):
+                worker.copy_to(window + (window.nbytes - 1), bytearray(2))
+            with pytest.raises(ValueError):
+                worker.copy_from(bytearray(2), window + (window.nbytes - 1))
+            with pytest.raises(NotImplementedError):
+                worker.free(window)
+        # The native path must also reject accesses extending into the Core's reserved SRAM.
+        last_byte = local.base + sizes[2] - 1
+        host_pair = torch.zeros(2, dtype=torch.uint8)
         with pytest.raises(RuntimeError):
-            worker._chip_worker.copy_to(base, value.data_ptr(), 1)
-        again = worker.malloc(total)
-        assert again.base == base and again.identity != buffer.identity
-        worker.free(again)
+            worker._chip_worker.copy_to(last_byte, host_pair.data_ptr(), 2)
+        with pytest.raises(RuntimeError):
+            worker._chip_worker.copy_from(host_pair.data_ptr(), last_byte, 2)
+        with pytest.raises(ValueError):
+            worker.get_base_addr(memory="local")
+        with pytest.raises(ValueError):
+            worker.get_base_addr(memory="global", coreid=0)
+        with pytest.raises(ValueError):
+            worker.get_base_addr(memory="unknown")
+        with pytest.raises((ValueError, IndexError)):
+            worker.get_base_addr(coreid=len(capacities))
     finally:
         worker.close()
+    with pytest.raises((ValueError, RuntimeError)):
+        worker.copy_from(out, local)
 
 
 def test_sram_counter_replay_and_residency(tmp_path, st_platform):

@@ -10,12 +10,20 @@
  */
 #include "sram_storage.h"
 #include "hardware_defaults.h"
-#include <cstdlib>
-#include <limits>
+#include <sys/mman.h>
+#include <algorithm>
 #include <stdexcept>
 
 namespace wse {
-void SramStorage::Free::operator()(std::byte *p) const noexcept { std::free(p); }
+void SramStorage::Unmap::operator()(std::byte *p) const noexcept { munmap(p, bytes); }
+
+SramStorage::Mapping SramStorage::map(size_t bytes) {
+    if (!bytes) return {nullptr, Unmap{0}};
+    void *base = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) throw std::bad_alloc();
+    return {static_cast<std::byte *>(base), Unmap{bytes}};
+}
+
 SramStorage::SramStorage() :
     capacities_(DEFAULT_CAPACITIES, DEFAULT_CAPACITIES + DEFAULT_CORES),
     reserves_(DEFAULT_RESERVES, DEFAULT_RESERVES + DEFAULT_CORES),
@@ -26,19 +34,29 @@ SramStorage::SramStorage() :
         if (!reserves_[i] || reserves_[i] >= capacities_[i] || capacities_[i] % SRAM_ALIGNMENT ||
             reserves_[i] % SRAM_ALIGNMENT || capacities_[i] > SIZE_MAX - total_bytes_)
             throw std::invalid_argument("invalid WSE SRAM capacity/reserve/alignment");
+        starts_.push_back(total_bytes_);
         total_bytes_ += capacities_[i];
-        application_bytes_ += capacities_[i] - reserves_[i];
     }
+    if (DEFAULT_GLOBAL_MEMORY_BYTES > SIZE_MAX - total_bytes_)
+        throw std::invalid_argument("invalid WSE global memory capacity");
 }
-void SramStorage::initialize_locked() {
-    if (backing_) return;
-    void *ptr = nullptr;
-    if (posix_memalign(&ptr, SRAM_ALIGNMENT, total_bytes_) != 0) throw std::bad_alloc();
-    backing_.reset(static_cast<std::byte *>(ptr));
-}
-void SramStorage::freeze() {
+void SramStorage::initialize() {
     std::scoped_lock lock(mutex_);
-    initialize_locked();
+    if (local_) return;
+    auto local = map(total_bytes_);
+    auto global = map(DEFAULT_GLOBAL_MEMORY_BYTES);
+    local_ = std::move(local);
+    global_ = std::move(global);
+}
+MemoryWindow SramStorage::local_window_locked(uint32_t core) const {
+    return {reinterpret_cast<uint64_t>(local_.get()) + starts_[core], capacities_[core] - reserves_[core]};
+}
+MemoryWindow SramStorage::window(int32_t core) const {
+    std::scoped_lock lock(mutex_);
+    if (!local_) throw std::logic_error("WSE fixed memory is not initialized");
+    if (core == -1) return {reinterpret_cast<uint64_t>(global_.get()), DEFAULT_GLOBAL_MEMORY_BYTES};
+    if (core < 0 || static_cast<size_t>(core) >= capacities_.size()) throw std::invalid_argument("invalid SRAM Core");
+    return local_window_locked(core);
 }
 uint32_t SramStorage::core_count() const { return capacities_.size(); }
 std::vector<uint64_t> SramStorage::configuration() const {
@@ -53,69 +71,52 @@ std::vector<uint64_t> SramStorage::configuration() const {
 std::vector<uint64_t> SramStorage::info(uint32_t core) const {
     std::scoped_lock lock(mutex_);
     if (core >= capacities_.size()) throw std::invalid_argument("invalid SRAM Core");
-    uint64_t base = reinterpret_cast<uint64_t>(backing_.get());
-    if (base)
-        for (uint32_t i = 0; i < core; ++i)
-            base += capacities_[i] - reserves_[i];
+    const uint64_t base = local_ ? local_window_locked(core).base : 0;
     const uint64_t available = capacities_[core] - reserves_[core];
     return {
         base,
         capacities_[core],
         reserves_[core],
-        claimed_ ? available : 0,
-        claimed_ ? 0 : available,
-        claimed_ ? 0 : available,
+        local_ ? available : 0,
+        local_ ? 0 : available,
+        local_ ? 0 : available,
         runtime_used_[core]
     };
 }
-void *SramStorage::claim(size_t bytes) {
-    std::scoped_lock lock(mutex_);
-    if (bytes != application_bytes_)
-        throw std::invalid_argument("WSE malloc requires the complete application SRAM size");
-    if (claimed_) throw std::invalid_argument("WSE application SRAM already has a live Buffer");
-    initialize_locked();
-    claimed_ = true;
-    return backing_.get();
-}
-bool SramStorage::owns(const void *ptr) const {
-    std::scoped_lock lock(mutex_);
-    return ptr && ptr == backing_.get();
-}
-void SramStorage::release(void *ptr) {
-    std::scoped_lock lock(mutex_);
-    if (!claimed_ || ptr != backing_.get())
-        throw std::invalid_argument("WSE free requires its live application Buffer");
-    claimed_ = false;
-}
 void SramStorage::check_application(uint64_t address, uint64_t bytes) const {
     std::scoped_lock lock(mutex_);
-    const auto base = reinterpret_cast<uint64_t>(backing_.get());
-    if (!claimed_ || address < base || address - base > application_bytes_ ||
-        bytes > application_bytes_ - (address - base))
-        throw std::invalid_argument("SRAM access is outside the live application Buffer");
+    const auto contains = [&](MemoryWindow window) {
+        return window.base && address >= window.base && address - window.base <= window.bytes &&
+               bytes <= window.bytes - (address - window.base);
+    };
+    if (local_) {
+        if (contains({reinterpret_cast<uint64_t>(global_.get()), DEFAULT_GLOBAL_MEMORY_BYTES})) return;
+        const auto base = reinterpret_cast<uint64_t>(local_.get());
+        if (address >= base && address - base < total_bytes_) {
+            const auto next = std::upper_bound(starts_.begin(), starts_.end(), address - base);
+            const auto core = static_cast<uint32_t>(next - starts_.begin() - 1);
+            if (contains(local_window_locked(core))) return;
+        }
+    }
+    throw std::invalid_argument("WSE copy range exceeds a fixed application memory window");
 }
 std::vector<SramAllocation> SramStorage::allocations() const {
     std::scoped_lock lock(mutex_);
     std::vector<SramAllocation> result;
-    if (!claimed_) return result;
-    uint64_t base = reinterpret_cast<uint64_t>(backing_.get());
+    if (!local_) return result;
     for (uint32_t core = 0; core < capacities_.size(); ++core) {
-        const auto bytes = capacities_[core] - reserves_[core];
-        result.push_back({base, bytes, core, 0});
-        base += bytes;
+        const auto application = local_window_locked(core);
+        result.push_back({application.base, application.bytes, core, 0});
     }
     return result;
 }
 std::vector<SramRegion> SramStorage::regions() const {
     std::scoped_lock lock(mutex_);
     std::vector<SramRegion> result;
-    if (!backing_) return result;
-    uint64_t base = reinterpret_cast<uint64_t>(backing_.get());
-    uint64_t runtime = base + application_bytes_;
-    for (size_t core = 0; core < capacities_.size(); ++core) {
-        result.push_back({base, capacities_[core], reserves_[core], runtime});
-        base += capacities_[core] - reserves_[core];
-        runtime += reserves_[core];
+    if (!local_) return result;
+    for (uint32_t core = 0; core < capacities_.size(); ++core) {
+        const auto application = local_window_locked(core);
+        result.push_back({application.base, capacities_[core], reserves_[core], application.base + application.bytes});
     }
     return result;
 }
@@ -133,12 +134,12 @@ void SramStorage::reset_runtime_used() noexcept {
 }
 size_t SramStorage::committed_bytes() const {
     std::scoped_lock lock(mutex_);
-    return backing_ ? total_bytes_ : 0;
+    return local_ ? total_bytes_ + DEFAULT_GLOBAL_MEMORY_BYTES : 0;
 }
 void SramStorage::clear() {
     std::scoped_lock lock(mutex_);
-    claimed_ = false;
-    backing_.reset();
+    global_.reset();
+    local_.reset();
     for (auto &used : runtime_used_)
         used = 0;
 }

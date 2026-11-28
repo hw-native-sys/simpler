@@ -18,7 +18,8 @@ class DeviceRunner : public WseHostRunner {
 public:
     DeviceRunner();
     void *allocate_tensor(size_t bytes) override;
-    void *allocate_caller_storage(size_t bytes) override;
+    void initialize_fixed_memory() override;
+    wse::MemoryWindow fixed_memory_window(int32_t core) const { return sram_.window(core); }
     void *allocate_graph_storage(size_t bytes) override;
     void free_graph_storage(void *ptr) override;
     size_t committed_device_memory() const override;
@@ -42,6 +43,7 @@ private:
     WseLaunchTransactionResult launch_execution_impl(PreparedExecution &, WseLaunchPermit) override;
     int ensure_binaries_loaded() override;
     void cleanup_run() noexcept;
+    void clear_fixed_memory();
     void unload_executor();
     wse::SramStorage sram_;
     MemoryAllocator host_graph_storage_;

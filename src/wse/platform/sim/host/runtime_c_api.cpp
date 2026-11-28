@@ -30,6 +30,26 @@ extern "C" {
 
 int requires_aicpu_executor(void) { return 0; }
 
+int get_fixed_memory_window_ctx(DeviceContextHandle ctx, int32_t core_id, uint64_t *base, uint64_t *bytes) {
+    if (!base || !bytes) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *base = *bytes = 0;
+    if (!ctx) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    auto *runner = static_cast<DeviceRunner *>(ctx);
+    try {
+        std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+        if (!runner->program_initialized()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        const auto window = runner->fixed_memory_window(core_id);
+        if (!window.bytes) return PTO_RUNTIME_ERR_UNSUPPORTED;
+        *base = window.base;
+        *bytes = window.bytes;
+        return 0;
+    } catch (const std::invalid_argument &) {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 DeviceContextHandle create_device_context(void) {
     try {
         return static_cast<DeviceContextHandle>(new DeviceRunner());

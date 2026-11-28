@@ -35,8 +35,7 @@ def fixed_layout():
     capacities = expand(spec["hardware"]["sram_bytes_per_core"])
     reserves = expand(spec["runtime"]["sram_reserve_bytes_per_core"])
     sizes = [capacity - reserve for capacity, reserve in zip(capacities, reserves, strict=True)]
-    offsets = [sum(sizes[:core]) for core in range(cores)]
-    return capacities, sizes, offsets
+    return capacities, sizes, spec["hardware"]["global_memory_bytes"]
 
 
 def test_standard_worker_fixed_sram_and_empty_run(st_platform):
@@ -44,23 +43,24 @@ def test_standard_worker_fixed_sram_and_empty_run(st_platform):
         hasattr(_task_interface, name) for name in ("_wse_malloc", "_wse_submit", "_wse_query", "_wse_configure")
     )
     assert RuntimeBuilder(st_platform).get_binaries("host_build_graph").aicpu_path is None
-    capacities, sizes, offsets = fixed_layout()
+    capacities, sizes, global_bytes = fixed_layout()
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     worker.init()
     try:
-        with pytest.raises(RuntimeError, match="malloc failed"):
+        with pytest.raises(NotImplementedError):
             worker.malloc(128)
-        buffer = worker.malloc(sum(sizes))
-        with pytest.raises(RuntimeError, match="malloc failed"):
+        with pytest.raises(NotImplementedError):
             worker.malloc(sum(sizes))
-        for core, offset in enumerate(offsets):
-            value = torch.tensor([core, core + 1], dtype=torch.int32)
-            worker.copy_to(buffer, value, dst_offset=offset)
-        for core, offset in enumerate(offsets):
-            value = torch.empty(2, dtype=torch.int32)
-            worker.copy_from(value, buffer, src_offset=offset)
-            assert value.tolist() == [core, core + 1]
-        assert worker._chip_worker.committed_device_memory == sum(capacities)
+        for core, size in enumerate(sizes):
+            local = worker.get_base_addr(coreid=core)
+            assert local.nbytes == size
+            worker.copy_to(local, torch.tensor([core, core + 1], dtype=torch.int32))
+        for core in range(len(sizes)):
+            local = worker.get_base_addr(memory="local", coreid=core)
+            out = torch.empty(2, dtype=torch.int32)
+            worker.copy_from(out, local)
+            assert out.tolist() == [core, core + 1]
+        assert worker._chip_worker.committed_device_memory == sum(capacities) + global_bytes
         compiler = KernelCompiler(st_platform)
         source = Path(__file__).parent / "direct_launch/kernels/empty_orch.cpp"
         callable_ = ChipCallable.build(
@@ -71,18 +71,35 @@ def test_standard_worker_fixed_sram_and_empty_run(st_platform):
         )
         handle = worker.register(callable_)
         worker.submit(handle, TaskArgs()).wait()
-        worker.free(buffer)
-        with pytest.raises((ValueError, RuntimeError), match="freed|released|stale|closed"):
-            worker.copy_from(torch.empty(2, dtype=torch.int32), buffer)
-        again = worker.malloc(sum(sizes))
-        worker.free(again)
+    finally:
+        worker.close()
+
+
+def test_l3_child_fixed_memory_windows(st_platform, st_device_ids):
+    worker = Worker(
+        level=3, num_sub_workers=0, platform=st_platform, runtime="host_build_graph", device_ids=st_device_ids[:1]
+    )
+    try:
+        worker.init()
+        with pytest.raises(NotImplementedError):
+            worker.alloc_child_tensor(0, (1,), DataType.FLOAT32)
+        host = worker.create_buffer(4)
+        local = worker.get_base_addr(coreid=0, worker_id=0)
+        global_mem = worker.get_base_addr(memory="global", worker_id=0)
+        for value, target in ((b"abcd", local), (b"wxyz", global_mem)):
+            host.shm.buf[:4] = value
+            worker.copy_to(target + 128, host)
+        for value, source in ((b"abcd", local), (b"wxyz", global_mem)):
+            worker.copy_from(host, source + 128)
+            assert bytes(host.shm.buf[:4]) == value
+        worker.release_buffer(host)
     finally:
         worker.close()
 
 
 @pytest.mark.parametrize("blocks", [8, 40, 96])
 def test_standard_submission_uses_all_cores(tmp_path, st_platform, blocks):
-    capacities, sizes, offsets = fixed_layout()
+    _, sizes, _ = fixed_layout()
     compiler = KernelCompiler(st_platform)
     source = Path(__file__).parent / "direct_launch/kernels"
     kernel = compiler.compile_incore(
@@ -99,16 +116,16 @@ def test_standard_submission_uses_all_cores(tmp_path, st_platform, blocks):
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     worker.init()
     try:
-        buffer = worker.malloc(sum(sizes))
         handle = worker.register(callable_)
         a = torch.arange(1024, dtype=torch.float32).reshape(32, 32) % 7 - 3
         b = torch.eye(32, dtype=torch.float32) * 2
         values = [a, b, torch.full((blocks, 32, 32), -1.0), torch.full((blocks, 2), -1.0)]
         args = TaskArgs()
         for index, value in enumerate(values):
-            worker.copy_to(buffer, value, dst_offset=offsets[index])
+            buffer = worker.get_base_addr(coreid=index)
+            worker.copy_to(buffer, value)
             args.add_tensor(
-                buffer.tensor(shapes=tuple(value.shape), dtype=DataType.FLOAT32, byte_offset=offsets[index]),
+                buffer.tensor(shapes=tuple(value.shape), dtype=DataType.FLOAT32),
                 TensorArgType.INPUT if index < 2 else TensorArgType.OUTPUT_EXISTING,
             )
         args.add_scalar(blocks)
@@ -116,10 +133,14 @@ def test_standard_submission_uses_all_cores(tmp_path, st_platform, blocks):
         config.output_prefix = str(tmp_path)
         worker.submit(handle, args, config).wait()
         for index in (2, 3):
-            worker.copy_from(values[index], buffer, src_offset=offsets[index])
+            worker.copy_from(values[index], worker.get_base_addr(coreid=index))
         expected = torch.stack([a @ b + float(block + 1) for block in range(blocks)])
         torch.testing.assert_close(values[2], expected, rtol=0, atol=0)
         assert values[3].to(torch.int64).tolist() == [[block % len(sizes), 0] for block in range(blocks)]
+        global_window = worker.get_base_addr(memory="global")
+        global_record = json.loads((tmp_path / "wse_sram.json").read_text())["global_memory"]
+        assert global_record["base"] == global_window.base
+        assert global_record["bytes"] == global_window.nbytes
         rows = [json.loads(line) for line in (tmp_path / "wse_events.jsonl").read_text().splitlines()]
         assert rows[0]["core_count"] == len(sizes)
         events = rows[1:]
@@ -128,6 +149,5 @@ def test_standard_submission_uses_all_cores(tmp_path, st_platform, blocks):
         }
         assert sum(e["kind"] == 6 for e in events) == 1
         assert sorted(e["block"] for e in events if e["kind"] == 5) == list(range(blocks))
-        worker.free(buffer)
     finally:
         worker.close()

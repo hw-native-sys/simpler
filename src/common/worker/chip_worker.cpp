@@ -341,6 +341,7 @@ void ChipWorker::init(
             module->required<DeviceReleaseCallerBuffersCtxFn>("device_release_caller_buffers_ctx");
         device_committed_memory_fn_ = module->required<GetCommittedDeviceMemoryFn>("committed_device_memory_ctx");
         device_memory_info_fn_ = module->required<GetDeviceMemoryInfoFn>("device_memory_info_ctx");
+        get_fixed_memory_window_fn_ = module->optional<GetFixedMemoryWindowFn>("get_fixed_memory_window_ctx");
         copy_to_device_ctx_fn_ = module->required<CopyToDeviceCtxFn>("copy_to_device_ctx");
         copy_from_device_ctx_fn_ = module->required<CopyFromDeviceCtxFn>("copy_from_device_ctx");
         get_runtime_size_fn_ = module->required<GetRuntimeSizeFn>("get_runtime_size");
@@ -970,6 +971,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     device_release_caller_buffers_ctx_fn_ = nullptr;
     device_committed_memory_fn_ = nullptr;
     device_memory_info_fn_ = nullptr;
+    get_fixed_memory_window_fn_ = nullptr;
     copy_to_device_ctx_fn_ = nullptr;
     copy_from_device_ctx_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
@@ -2513,6 +2515,19 @@ DeviceMemoryInfo ChipWorker::device_memory_info() const {
     return info;
 }
 
+std::pair<uint64_t, uint64_t> ChipWorker::get_fixed_memory_window(int32_t core_id) const {
+    if (!initialized_) throw std::runtime_error("ChipWorker not initialized; call init() first");
+    validate_execution_context();
+    if (!has_fixed_memory_windows()) throw UnsupportedRuntimeOperation("platform has no fixed memory windows");
+    uint64_t base = 0, bytes = 0;
+    const int rc = get_fixed_memory_window_fn_(device_ctx_, core_id, &base, &bytes);
+    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED) throw UnsupportedRuntimeOperation("device has no global memory window");
+    if (rc == PTO_RUNTIME_ERR_INVALID_ARGUMENT) throw std::invalid_argument("invalid memory window core ID");
+    if (rc != 0 || bytes == 0)
+        throw std::runtime_error("get_fixed_memory_window failed with code " + std::to_string(rc));
+    return {base, bytes};
+}
+
 size_t ChipWorker::host_dlopen_count() const {
     if (!initialized_) {
         return 0;
@@ -2796,6 +2811,8 @@ uint64_t ChipWorker::malloc(size_t size) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     validate_execution_context();
+    if (has_fixed_memory_windows())
+        throw UnsupportedRuntimeOperation("fixed-memory platform: use get_base_addr() instead of malloc()");
     void *ptr = device_malloc_ctx_fn_(device_ctx_, size);
     if (ptr == nullptr) {
         throw std::runtime_error("malloc failed");

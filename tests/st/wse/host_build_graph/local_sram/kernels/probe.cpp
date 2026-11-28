@@ -47,7 +47,7 @@ extern "C" void kernel_entry(int64_t *args) {
         bad.start_offset = 0;
         bad.shapes[0] = bad.strides[0] = 1;
         if (wse::make_sram_view(args, bad, rejected)) y[b] = 0;
-        // Adjacent Core application windows share a backing, but a Tensor still has one owner.
+        // A Tensor crossing from application SRAM into the Core's runtime reserve is invalid.
         bad = input;
         bad.buffer.addr = regions[0].base + regions[0].capacity - regions[0].reserve - 8;
         bad.buffer.size = 16;

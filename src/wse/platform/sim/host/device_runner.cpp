@@ -71,7 +71,28 @@ struct DeviceRunner::ActiveRun {
 DeviceRunner::DeviceRunner() = default;
 DeviceRunner::~DeviceRunner() { finalize(); }
 void *DeviceRunner::allocate_tensor(size_t bytes) { return host_graph_storage_.alloc(bytes); }
-void *DeviceRunner::allocate_caller_storage(size_t bytes) { return sram_.claim(bytes); }
+void DeviceRunner::initialize_fixed_memory() {
+    if (sram_.committed_bytes()) return;
+    sram_.initialize();
+    try {
+        for (int32_t core = -1; core < static_cast<int32_t>(sram_.core_count()); ++core) {
+            const auto window = sram_.window(core);
+            caller_device_buffers_.record(reinterpret_cast<void *>(window.base), window.bytes);
+        }
+    } catch (...) {
+        clear_fixed_memory();
+        throw;
+    }
+}
+void DeviceRunner::clear_fixed_memory() {
+    if (!sram_.committed_bytes()) return;
+    for (int32_t core = -1; core < static_cast<int32_t>(sram_.core_count()); ++core) {
+        const auto window = sram_.window(core);
+        if (window.base) caller_device_buffers_.forget_if_unborrowed(reinterpret_cast<void *>(window.base));
+    }
+    sram_.clear();
+}
+
 void *DeviceRunner::allocate_graph_storage(size_t bytes) { return host_graph_storage_.alloc(bytes); }
 void DeviceRunner::free_graph_storage(void *ptr) { host_graph_storage_.free(ptr); }
 size_t DeviceRunner::committed_device_memory() const { return sram_.committed_bytes(); }
@@ -83,10 +104,7 @@ int DeviceRunner::device_memset(void *ptr, int value, size_t bytes) {
     sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
     return WseHostRunner::device_memset(ptr, value, bytes);
 }
-void DeviceRunner::free_tensor(void *ptr) {
-    if (sram_.owns(ptr)) sram_.release(ptr);
-    else host_graph_storage_.free(ptr);
-}
+void DeviceRunner::free_tensor(void *ptr) { host_graph_storage_.free(ptr); }
 int DeviceRunner::copy_to_device(void *ptr, const void *host, size_t bytes) {
     sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
     return WseHostRunner::copy_to_device(ptr, host, bytes);
@@ -110,7 +128,6 @@ int DeviceRunner::prepare_launch_shape(Runtime &runtime, const CallConfig &confi
         LOG_ERROR("WSE exposes PE events through output_prefix; legacy device diagnostic collectors are unsupported");
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
-    sram_.freeze();
     block_dim_ = cores;
     worker_count_ = cores * WSE_PE_PER_CORE;
     runtime.set_worker_count(worker_count_);
@@ -294,7 +311,9 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
                    << ",\"runtime_base\":" << sram_.regions()[core].runtime_base << ",\"runtime_used\":" << info[6]
                    << ",\"control_address\":" << control_address_(active_run_->state, core) << "}";
         }
-        memory << "],\"sections\":[";
+        const auto global = sram_.window(-1);
+        memory << "],\"global_memory\":{\"base\":" << global.base << ",\"bytes\":" << global.bytes
+               << "},\"sections\":[";
         uint64_t section_count = 0;
         const auto *sections = memory_sections_(active_run_->state, &section_count);
         for (uint64_t i = 0; i < section_count; ++i) {
@@ -369,7 +388,7 @@ int DeviceRunner::finalize() {
         dma_workspace_addr_[kind] = 0;
     }
 
-    sram_.clear();
+    clear_fixed_memory();
     host_graph_storage_.finalize();
     clear_cpu_sim_shared_storage();
 

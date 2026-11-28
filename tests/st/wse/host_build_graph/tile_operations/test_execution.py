@@ -206,8 +206,8 @@ def test_shared_state_between_threads_of_one_block(tmp_path, st_platform):
         assert gate.wait_probe(), "consumers did not acknowledge real waits before producer publication"
         with pytest.raises(TimeoutError):
             run.wait(timeout=0.01)
-        with pytest.raises(RuntimeError, match="in.flight"):
-            worker.free(buffers[1].root)
+        with pytest.raises(NotImplementedError):
+            worker.free(buffers[1].address)
         gate.release_probe()
         run.wait()
         copy_from(worker, tensors[1], buffers[1])
