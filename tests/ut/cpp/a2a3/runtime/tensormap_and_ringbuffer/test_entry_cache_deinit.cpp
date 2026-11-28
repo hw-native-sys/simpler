@@ -304,6 +304,51 @@ TEST(EntryCacheDeinit, AsyncFailureRetainsPendingAndInvalidRecords) {
     }
 }
 
+TEST(EntryCacheDeinit, RdmaCancellationWaitsForRealCqWithoutReclaimingTheQueue) {
+    for (const bool failed : {false, true}) {
+        using pto::comm::rdma::RdmaInfo;
+        using pto::comm::rdma::in_die::Queue;
+        struct Workspace {
+            RdmaInfo info{};
+            Queue queues[2]{};
+        } workspace;
+        uint32_t cqe[2][8]{};
+        uint32_t head = 1, tail = 0;
+        workspace.info.magic = pto::comm::rdma::kRdmaWorkspaceMagic;
+        workspace.info.version = pto::comm::rdma::kRdmaWorkspaceVersion;
+        workspace.info.backend = pto::comm::RdmaBackend::IN_DIE;
+        workspace.info.rankCount = 2;
+        workspace.info.qpNum = 1;
+        workspace.info.sqPtr = reinterpret_cast<uint64_t>(workspace.queues);
+        workspace.info.scqPtr = workspace.info.sqPtr;
+        workspace.info.memPtr = workspace.info.sqPtr + sizeof(workspace.queues);
+        auto &queue = workspace.queues[1];
+        queue.cq.buffer = reinterpret_cast<uint64_t>(cqe);
+        queue.cq.depth = 2;
+        queue.cq.stride = 32;
+        queue.cq.tail = reinterpret_cast<uint64_t>(&tail);
+        queue.sq.head = reinterpret_cast<uint64_t>(&head);
+        auto executor = std::make_unique<AicpuExecutor>();
+        auto runtime = std::make_unique<RuntimeContext>();
+        auto &slab = SchedulerContextTestPeer::prepare(executor->sched_ctx_, *runtime, TaskId::make(0, 19));
+        slab.count = 1;
+        slab.entries[0] = {(uint64_t{1} << 32) | 1, reinterpret_cast<uint64_t>(&workspace),   0,
+                           COMPLETION_ENGINE_ROCE,  COMPLETION_TYPE_RDMA_IN_DIE_EVENT_HANDLE, 0};
+        KernelErrorCleanup cleanup{};
+        executor->sched_ctx_.drain_cancelled_run(0, cleanup);
+        EXPECT_EQ(cleanup.complete, 0U);
+        EXPECT_EQ(cleanup.async_error, SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+        cqe[0][0] = failed ? 0x380 : 0x80;
+        cleanup = {};
+        executor->sched_ctx_.drain_cancelled_run(UINT64_MAX, cleanup);
+        EXPECT_EQ(cleanup.complete, failed ? 0U : 1U);
+        EXPECT_EQ(cleanup.async_error, failed ? SIMPLER_ERROR_ASYNC_COMPLETION_INVALID : SIMPLER_ERROR_NONE);
+        EXPECT_EQ(cleanup.drained_conditions, failed ? 0U : 1U);
+        EXPECT_EQ(tail, 0U);
+        EXPECT_EQ(slab.count, 1U);
+    }
+}
+
 TEST(EntryCacheDeinit, WaitListTrackingFailureCannotCertifyCompleteRetirement) {
     for (const int code : {101, 102}) {
         auto executor = std::make_unique<AicpuExecutor>();

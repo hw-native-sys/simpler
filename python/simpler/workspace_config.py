@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import operator
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -23,7 +24,40 @@ class SdmaConfig:
 
 @dataclass(frozen=True)
 class RdmaConfig:
-    """RDMA resources with the provider's default configuration."""
+    """Per-domain QP budget and optional device RoCE addresses in member order."""
+
+    qp_num: int = 1
+    base_port: int | None = None
+    roce_ips: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        for name in ("qp_num", "base_port"):
+            value = getattr(self, name)
+            if name == "base_port" and value is None:
+                continue
+            if isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer, not bool")
+            object.__setattr__(self, name, operator.index(value))
+        if not 1 <= self.qp_num <= 8:
+            raise ValueError("qp_num must be between 1 and 8")
+        if self.base_port is not None and not 1 <= self.base_port <= 65535:
+            raise ValueError("base_port must be between 1 and 65535")
+        if isinstance(self.roce_ips, str):
+            raise TypeError("roce_ips must be a sequence of device IP literals")
+        addresses = tuple(self.roce_ips)
+        if any(not isinstance(address, str) for address in addresses):
+            raise TypeError("roce_ips must contain strings")
+        for address in addresses:
+            try:
+                encoded = address.encode("ascii")
+            except UnicodeEncodeError as error:
+                raise ValueError("roce_ips must contain ASCII device addresses") from error
+            if len(encoded) >= 64 or b"\0" in encoded:
+                raise ValueError("roce_ips entries must use fewer than 64 ASCII bytes without NUL")
+        canonical = tuple(str(ipaddress.ip_address(address)) for address in addresses)
+        if len(set(canonical)) != len(canonical):
+            raise ValueError("roce_ips must contain distinct device addresses")
+        object.__setattr__(self, "roce_ips", canonical)
 
 
 @dataclass(frozen=True)

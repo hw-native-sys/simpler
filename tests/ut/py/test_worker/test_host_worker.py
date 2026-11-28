@@ -7069,7 +7069,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 assert struct.unpack_from(f"<{len(members)}I", req_buf, header.size) == members
                 assert worker_mod._DOMAIN_WORKSPACE_CONFIG.unpack_from(
                     req_buf, worker_mod._DOMAIN_WORKSPACE_CONFIG_OFFSET
-                ) == (1, 0, 1)
+                ) == (1, 0, 1, 1, 0, b"\0" * 64)
             for chip_idx in owners:
                 reply_buf = reply_shms[chip_idx].buf
                 assert reply_buf is not None
@@ -7152,7 +7152,16 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
             cw = cast(Any, SimpleNamespace())
 
-            def committed(*args, workspace_mask, urma_jetties_per_aiv, urma_sq_depth, ccu_mode):
+            def committed(
+                *args,
+                workspace_mask,
+                urma_jetties_per_aiv,
+                urma_sq_depth,
+                ccu_mode,
+                rdma_qp_num,
+                rdma_base_port,
+                rdma_local_ip,
+            ):
                 assert workspace_mask == 0
                 ctypes.c_uint64.from_address(args[5]).value = 1
                 return 0xC7, 0xB000, 64
@@ -7185,7 +7194,16 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             worker_mod._DOMAIN_REQ_HEADER.pack_into(req_buf, 0, 7, 1, 0, 64, 0)
             struct.pack_into("<I", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
 
-            def committed_then_failed(*args, workspace_mask, urma_jetties_per_aiv, urma_sq_depth, ccu_mode):
+            def committed_then_failed(
+                *args,
+                workspace_mask,
+                urma_jetties_per_aiv,
+                urma_sq_depth,
+                ccu_mode,
+                rdma_qp_num,
+                rdma_base_port,
+                rdma_local_ip,
+            ):
                 assert workspace_mask == 0
                 commit_address = args[5]
                 ctypes.c_uint64.from_address(commit_address).value = 1

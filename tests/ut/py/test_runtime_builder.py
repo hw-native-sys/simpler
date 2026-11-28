@@ -417,7 +417,7 @@ class TestRuntimeBuilderGetBinaries:
             expected = dict(expected_defaults)
             if call.args[0] == "host":
                 expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
-            if call.args[0] == "host" and default_test_platform in {"a5sim", "wsesim"}:
+            if call.args[0] == "host" and default_test_platform in {"a2a3sim", "a5sim", "wsesim"}:
                 from simpler_setup.pto_isa import read_pto_isa_pin  # noqa: PLC0415
 
                 expected["SIMPLER_PTO_ISA_BUILD_COMMIT"] = read_pto_isa_pin()
@@ -465,7 +465,7 @@ class TestRuntimeBuilderGetBinaries:
             expected = dict(config)
             if call.args[0] == "host":
                 expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
-            if call.args[0] == "host" and default_test_platform in {"a5sim", "wsesim"}:
+            if call.args[0] == "host" and default_test_platform in {"a2a3sim", "a5sim", "wsesim"}:
                 from simpler_setup.pto_isa import read_pto_isa_pin  # noqa: PLC0415
 
                 expected["SIMPLER_PTO_ISA_BUILD_COMMIT"] = read_pto_isa_pin()
@@ -540,6 +540,7 @@ class TestRuntimeBuilderGetBinaries:
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         pin = "a" * 40
+        monkeypatch.setenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", "ON")
         self._make_runtime(tmp_path, "a2a3")
 
         mock_instance = MockCompiler.get_instance.return_value
@@ -564,6 +565,7 @@ class TestRuntimeBuilderGetBinaries:
         }
         assert host_call.kwargs["cmake_defines"] == {
             **profiling,
+            "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE": "ON",
             "PTO_ISA_ROOT": "/tmp/pto-isa",
             "SIMPLER_PTO_ISA_BUILD_COMMIT": pin,
             "SIMPLER_RUNTIME_NAME": "test_rt",
@@ -832,16 +834,16 @@ class TestBuildCacheStamp:
         builder = self._make_builder("a5")
         assert builder._build_cache_stamp() == "runtime_sha:pto-isa=isa_sha"
 
-    def test_non_a2a3_onboard_uses_pure_runtime_sha(self, monkeypatch):
-        """Other arch/variant ignores pto-isa → stamp keyed on runtime HEAD only."""
+    def test_a2a3_sim_includes_the_observer_layout_pin(self, monkeypatch):
+        """A3 simulation compiles the pinned Host-safe IN_DIE layout too."""
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.setattr(rb_module, "_runtime_source_stamp", lambda _root: "runtime_sha")
-        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
 
         builder = self._make_builder("a2a3sim")
-        assert builder._build_cache_stamp() == "runtime_sha"
+        assert builder._build_cache_stamp() == "runtime_sha:pto-isa=isa_sha"
 
     def test_empty_runtime_head_yields_empty_stamp(self, monkeypatch):
         """No runtime HEAD → empty stamp, preserving the 'unavailable → clean rebuild' path."""
@@ -867,13 +869,13 @@ class TestResolveBuildPtoIsaCommit:
         builder._arch, builder._variant = parse_platform(platform)
         return builder
 
-    def test_non_a2a3_onboard_returns_empty(self, monkeypatch):
+    def test_a2a3_sim_reads_pin_for_workspace_types(self, monkeypatch):
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
 
         builder = self._make_builder("a2a3sim")
-        assert builder._resolve_build_pto_isa_commit() == ""
+        assert builder._resolve_build_pto_isa_commit() == "isa_sha"
 
     def test_a5sim_reads_pin_for_workspace_types(self, monkeypatch):
         from simpler_setup import pto_isa  # noqa: PLC0415
@@ -983,19 +985,19 @@ class TestPlaceBinary:
         assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
 
 
-@pytest.mark.parametrize("platform", ["a5", "a5sim"])
+@pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
 @pytest.mark.parametrize("target", ["host", "aicpu", "aicore"])
-def test_a5_tmr_targets_use_pinned_isa_headers(tmp_path, monkeypatch, platform, target):
+def test_tmr_targets_use_pinned_isa_headers(tmp_path, monkeypatch, platform, target):
     from simpler_setup import pto_isa  # noqa: PLC0415
     from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
     pto_root = tmp_path / "pinned-isa"
     monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda: str(pto_root))
     builder = RuntimeBuilder.__new__(RuntimeBuilder)
-    builder._arch = "a5"
+    builder._arch = "a2a3" if platform.startswith("a2a3") else "a5"
     builder.platform = platform
     config_dir = tmp_path / "tensormap_and_ringbuffer"
     config = {target: {"include_dirs": ["runtime"], "source_dirs": [target]}}
     includes, sources = builder._resolve_target_dirs(config_dir, config, target)
-    assert includes == [str(config_dir / "runtime"), str(pto_root / "include")]
+    assert includes == [str(config_dir / "runtime"), str(pto_root / "include"), str(pto_root / "pkg_inc")]
     assert sources == [str(config_dir / target)]

@@ -233,9 +233,12 @@ A `pto_isa.pin` bump changes the SDMA headers embedded by
 `host_runtime.so`. Install-time runtime builds and run-time kernel compilation
 both read `pto_isa.pin`; use a different ISA revision by updating that file.
 
-The a5 RDMA workspace is an explicit opt-in overlay enabled with
+The A3 IN_DIE and A5 HNS1825 RDMA workspaces are explicit opt-in overlays enabled with
 `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON`. It requires a `pto_isa.pin` revision
-that provides the PTO-ISA RDMA/HNS1825 headers. SDMA and URMA are always compiled
+that provides the corresponding PTO-ISA backend headers. A3 uses TMR and a
+dedicated DEVICE domain. Its domain Host object requires `ccec --cce-host-only`
+and matching HCCP, verbs, HCCL, driver and TSD declarations. No AIV intrinsic is
+compiled into the AICPU observer. SDMA and URMA are always compiled
 on A5; their resources are initialized only when requested by a domain. All three providers
 can be compiled together. A5 domains select resources with `workspace_engines`;
 RDMA uses a separate domain because its window has no mapped peer VAs. See

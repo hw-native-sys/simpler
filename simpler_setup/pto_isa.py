@@ -60,7 +60,7 @@ _CLONE_RETRY_BACKOFF_S = 2
 logger = logging.getLogger(__name__)
 
 _PTO_ISA_GITHUB_HTTPS = "https://github.com/hw-native-sys/pto-isa.git"
-_PTO_ISA_GITCODE_HTTPS = "https://gitcode.com/luohuan40/pto-isa.git"
+_PTO_ISA_GITCODE_HTTPS = "https://gitcode.com/cann/pto-isa.git"
 _PTO_ISA_PIN_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 PTO_ISA_PIN_FILE = "pto_isa.pin"
 PTO_ISA_BUILD_METADATA = "pto_isa_build.json"

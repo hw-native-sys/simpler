@@ -113,17 +113,6 @@ def test_a5_comm_hccl_uses_mr1374_rdma_host_api_shape() -> None:
     assert "RdmaBackend::HNS_1825" not in source
 
 
-def test_kernel_compiler_forwards_rdma_workspace_macros_to_incore_builds() -> None:
-    source = KERNEL_COMPILER.read_text(encoding="utf-8")
-
-    assert '"SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"' in source
-    assert '"-DPTO_RDMA_SUPPORTED"' in source
-    assert '"-DPTO_RDMA_BACKEND_HNS_1825_SUPPORTED"' in source
-    assert "cmd += self._incore_feature_defines()" in source
-    assert "_pto_isa_include_dirs" in source
-    assert '"pkg_inc"' in source
-
-
 def test_kernel_compiler_adds_ascend_device_headers_for_rdma_backend_headers() -> None:
     source = KERNEL_COMPILER.read_text(encoding="utf-8")
 

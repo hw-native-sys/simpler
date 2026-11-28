@@ -25,10 +25,15 @@ and a5 has a stronger DMA/HBM coherency model:
 | **AICore** (AIC / AIV / MIX) | **Yes** | **No** | **No** |
 | Host DMA (`rtMemcpy` from host RAM) | No | **Yes** | **No** |
 | SDMA engine (device-side DMA) | No (assumed) | **Yes** | **No** |
-| Device writes to RDMA/URMA completion records (CQEs) | N/A (unsupported) | N/A (unsupported) | **No** |
+| Device writes to RDMA completion records (CQEs) | Conservatively treated as non-coherent for A3 IN_DIE | **Yes** | **No** |
+| Device writes to URMA completion records (CQEs) | N/A (unsupported) | N/A (unsupported) | **No** |
 
-The RDMA/URMA backends are supported only on A5. A2/A3 is outside their
-supported platform scope; the corresponding cache-policy entries are not applicable.
+A3 TMR can build the optional IN_DIE RDMA backend. Its read-only AICPU observer
+invalidates each cache line before acquire-loading workspace metadata and CQEs;
+the provider's AIV `Progress()` alone writes queue tails and doorbells. This is a
+conservative implementation policy, not a measured A3 NIC coherency guarantee.
+CQE atomic publication and reuse still require A3 hardware acceptance. URMA
+remains A5-only.
 
 These are AICPU-side data-cache rules, not instructions to flush an
 AICore L2 cache. The AICPU cache can contain an old copy of a GM address;

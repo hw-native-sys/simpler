@@ -297,10 +297,11 @@ class RuntimeBuilder:
         cfg = build_config[target]
         include_dirs = [str((config_dir / p).resolve()) for p in cfg["include_dirs"]]
         source_dirs = [str((config_dir / p).resolve()) for p in cfg["source_dirs"]]
-        if self._arch == "a5" and config_dir.name == "tensormap_and_ringbuffer":
+        if self._arch in ("a2a3", "a5") and config_dir.name == "tensormap_and_ringbuffer":
             from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-            include_dirs.append(str(Path(ensure_pto_isa_root()) / "include"))
+            pto_root = Path(ensure_pto_isa_root())
+            include_dirs.extend(str(pto_root / name) for name in ("include", "pkg_inc"))
         return include_dirs, source_dirs
 
     def _requires_pto_isa_metadata_validation(self) -> bool:
@@ -327,7 +328,7 @@ class RuntimeBuilder:
         invalid, let ``read_pto_isa_pin`` raise so an embedding onboard build
         cannot silently proceed with unknown PTO-ISA headers.
         """
-        if not self._requires_pto_isa_metadata_validation() and self.platform not in {"a5sim", "wsesim"}:
+        if not self._requires_pto_isa_metadata_validation() and self.platform not in {"a2a3sim", "a5sim", "wsesim"}:
             return ""
         from .pto_isa import read_pto_isa_pin  # noqa: PLC0415
 
@@ -498,7 +499,7 @@ class RuntimeBuilder:
                 # overlay — so a value left in the CMake cache by an earlier
                 # build cannot survive a reconfigure (see
                 # _a5_async_workspace_overlay_defines).
-                if self._arch == "a5" and self._variant == "onboard":
+                if self._arch in ("a2a3", "a5") and self._variant == "onboard":
                     defines.update(_a5_async_workspace_overlay_defines())
             cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir

@@ -431,7 +431,7 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles for peer-mapped windows. Explicit P2P enablement applies to the a2a3 IPC fallback and the a5 peer-mapped Device path. Successful a2a3 Fabric V2 imports skip this step. A5 URMA and RDMA use peer MRs |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
-| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: domain-selected SDMA/URMA/RDMA; RDMA retains its optional build gate |
+| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: Worker-owned SDMA and A3 TMR domain-owned IN_DIE RDMA; a5: domain-selected SDMA/URMA/RDMA; RDMA retains its optional build gate |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
@@ -444,8 +444,7 @@ point can erase a signal the owner has not yet waited on, and the owner then
 waits on it forever. The rank skew that opens that window grows with host load,
 so the resulting hang shows up only under a loaded box.
 
-On a2a3, async-DMA resources are a Worker-level opt-in, not a
-communication-domain property. Construct the Worker with `enable_sdma=True` and
+On a2a3, SDMA resources are a Worker-level opt-in. Construct the Worker with `enable_sdma=True` and
 the runtime provisions the SDMA workspace once at init, latches its address into
 the resident `KernelArgs`, and injects it into every run's kernel
 `GlobalContext` (`get_dma_workspace`). A Worker without `enable_sdma` creates no
@@ -460,7 +459,40 @@ it borrows the device workspace allocated by simpler. These are separate
 lifetimes. On A2/A3, the opaque Worker owner records both the manager and the
 original allocation, including when `Init` fails before binding the address.
 On A5, SDMA's manager/allocation belong to the communication handle; URMA and
-RDMA's belong to each domain allocation.
+RDMA's belong to each domain allocation. A3 IN_DIE RDMA also belongs to each
+domain allocation, independently of Worker SDMA provisioning.
+
+### A3 IN_DIE RDMA domains
+
+For same-Host, two-rank A3 `a2a3` TMR, request a dedicated DEVICE domain with
+`workspace_engines={"rdma": RdmaConfig(qp_num=2)}` (or `("rdma",)` for defaults).
+`RdmaConfig` is exported by `simpler.workspace_config`; its immutable fields are
+`qp_num` (1–8), optional `base_port` (1–65535), and optional `roce_ips` in member
+order, using fewer than 64 ASCII bytes per address without embedded NULs.
+Invalid addresses are rejected before collective allocation. Nondefault RDMA options are rejected on A5 until that provider supports
+them. RDMA cannot be combined with peer-mapping engines in the same domain.
+
+With the existing `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON` build setting, the A3
+allocator reserves a device/port lock, confirms the candidate across the domain's
+members, allocates the external GM regions and invokes PTO `BuildComm`. A subset
+Host exchange carries connection metadata; it does not use the base communicator's
+full-rank collective. No per-transfer Host network proxy is involved. Peer window
+addresses are MR addresses for AIV RDMA and must not be dereferenced locally.
+
+`get_or_allocate_domain` compares the original port request, not the chosen
+automatic port. Reuse preserves the business window, MR, QPs and workspace;
+`device_context(worker, workspace_engines=("rdma",))` records the domain's use in
+each run, including scalar-only submissions. Cleanup destroys PTO resources
+before releasing external GM and the port. Unconfirmed cleanup retains the owner.
+
+The [direct SDK example](../examples/a2a3/tensormap_and_ringbuffer/rdma_async_completion_demo/)
+uses ordinary callable compilation and six dynamic scalar arguments. Host,
+AICPU and AIV builds have been checked with CANN 9.3.0-beta.1 and the fixed PTO
+revision in `pto_isa.pin`. Same-Host two-rank NIC smoke tests passed four PUT/GET
+example runs and 12 payload/QP combinations, including a rerun after the upstream
+rebase. CQ wrap under load, concurrent producers, controlled FIN/CQ ordering and
+fault recovery remain hardware acceptance tasks. More ranks, HBG, L4 and
+Host-backed A3 RDMA are outside this backend's scope.
 
 Initialization rollback and normal teardown check the external `aclrtFree`
 result. When reclamation is unconfirmed, the owner and allocation identity stay

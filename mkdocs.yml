@@ -198,6 +198,13 @@ nav:
       - Python Callable Serialization: python-callable-serialization.md
   - Multi-chip and comm:
       - Communication Domains: comm-domain.md
+      - A3 IN_DIE RDMA:
+          - 设计总览: zh-cn/design/rdma-a3-simpler.md
+          - 架构与调用流程: zh-cn/design/rdma-a3-simpler/architecture.md
+          - 接口清单: zh-cn/design/rdma-a3-simpler/interfaces.md
+          - 请求与完成协议: zh-cn/design/rdma-a3-simpler/completion.md
+          - 资源生命周期: zh-cn/design/rdma-a3-simpler/lifecycle.md
+          - 实现与验证: zh-cn/design/rdma-a3-simpler/implementation.md
       - A5 Host-source Domains: a5-host-comm-domain.md
       - L3-L2 Orchestrator Comm: l3-l2-orch-comm.md
       - L3-L2 Message Queue: l3-l2-message-queue.md

@@ -864,7 +864,9 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
     auto retire = [&](CompletionCondition &condition, TaskId task, uint32_t source, int32_t core) {
         const size_t alignment =
             condition.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD ? alignof(uint64_t) : alignof(uint32_t);
-        if (condition.engine != ASYNC_ENGINE_SDMA || condition.addr % alignment != 0) {
+        const bool rdma = condition.engine == ASYNC_ENGINE_ROCE &&
+                          condition.completion_type == COMPLETION_TYPE_RDMA_IN_DIE_EVENT_HANDLE;
+        if (!rdma && (condition.engine != ASYNC_ENGINE_SDMA || condition.addr % alignment != 0)) {
             result.async_error = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
             result.task_token = TaskId::to_uint64(task);
             result.source = source;
@@ -883,6 +885,15 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
                 return true;
             }
             if (poll.state == CompletionPollState::FAILED || get_sys_cnt_aicpu() >= deadline) {
+                if (rdma && poll.state == CompletionPollState::FAILED) {
+                    LOG_ERROR(
+                        "RDMA cancellation completion failed: task=%llu handle=0x%llx workspace=0x%llx "
+                        "backend_error=%u",
+                        static_cast<unsigned long long>(TaskId::to_uint64(task)),
+                        static_cast<unsigned long long>(condition.addr),
+                        static_cast<unsigned long long>(condition.backend_cookie), condition.rdma_cursor.error
+                    );
+                }
                 result.async_error =
                     poll.state == CompletionPollState::FAILED ? poll.error_code : SIMPLER_ERROR_SCHEDULER_TIMEOUT;
                 result.task_token = TaskId::to_uint64(task);
@@ -901,6 +912,7 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
         condition.expected_value = expected;
         condition.engine = static_cast<AsyncEngine>(engine);
         condition.completion_type = type;
+        condition.owner_epoch = task.is_valid() ? TaskId::to_uint64(task) + 1 : 0;
         condition.counter_addr =
             type == COMPLETION_TYPE_COUNTER ? reinterpret_cast<volatile uint32_t *>(addr) : nullptr;
         return retire(condition, task, source, core);
