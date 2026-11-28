@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: PLC0415 -- bootstrap tests import optional native dependencies at point of use
+import json
 import socket
 import struct
 import sys
@@ -21,6 +22,7 @@ from unittest.mock import Mock
 import pytest
 from simpler import mpi_direct_runtime as runtime
 from simpler import mpi_direct_supervisor as supervisor
+from simpler.mpi_direct_protocol import MPI_DIRECT_STARTUP_TOKEN_ENV
 from simpler.mpi_direct_topology import MpiDirectTopology
 
 
@@ -33,6 +35,44 @@ def topology():
             ],
         }
     )
+
+
+@pytest.mark.parametrize("service_mode", [False, True], ids=["l3-executor", "pd-services"])
+def test_hydra_startup_token_precedes_inherited_environment(tmp_path, monkeypatch, service_mode):
+    path = tmp_path / "topology.json"
+    if service_mode:
+        config = {
+            "router_port": 18421,
+            "services": [
+                {"id": "p0", "role": "prefill", "host": "127.0.0.1", "argv": ["serving"]},
+                {"id": "d0", "role": "decode", "host": "127.0.0.1", "bind_port": 18422, "argv": ["serving"]},
+            ],
+        }
+        args = ["--service-config", str(path)]
+        monkeypatch.setenv(supervisor.ROUTER_TOKEN_ENV, "router-token")
+    else:
+        config = topology().runtime_manifest(1)
+        args = ["--topology", str(path), "--controller", "controller.py"]
+    path.write_text(json.dumps(config), encoding="utf-8")
+
+    token = "new-startup-token"
+    monkeypatch.delenv(MPI_DIRECT_STARTUP_TOKEN_ENV, raising=False)
+    monkeypatch.setenv(MPI_DIRECT_STARTUP_TOKEN_ENV, "stale-startup-token")
+    monkeypatch.setattr(supervisor.secrets, "token_urlsafe", lambda _size: token)
+    monkeypatch.setattr(
+        supervisor.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="MPICH\n")
+    )
+
+    def launcher(command, *, env, **_kwargs):
+        assert next(iter(env)) == MPI_DIRECT_STARTUP_TOKEN_ENV
+        assert env[MPI_DIRECT_STARTUP_TOKEN_ENV] == token
+        assert command[command.index("-genvlist") + 1] == MPI_DIRECT_STARTUP_TOKEN_ENV
+        assert all(token not in arg for arg in command)
+        raise OSError("launch intercepted")
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", launcher)
+    with pytest.raises(OSError, match="launch intercepted"):
+        supervisor.main([*args, "--launcher-family", "mpich"])
 
 
 def test_bootstrap_stream_transfers_bytes_larger_than_gate():
