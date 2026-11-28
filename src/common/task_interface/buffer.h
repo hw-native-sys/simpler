@@ -107,6 +107,7 @@ enum class BackendKind : uint8_t {
     FORK_COW = 5,
     VMM_SHAREABLE = 6,
     SHARED_FD_SLICE = 7,
+    FORK_UPLOAD = 8,
 };
 
 /**
@@ -260,7 +261,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     if (h.address_space > static_cast<uint8_t>(AddressSpace::DEVICE))
         reject("invalid BufferDescriptor: address_space out of range");
     if (h.access > static_cast<uint8_t>(AccessMode::READWRITE)) reject("invalid BufferDescriptor: access out of range");
-    if (h.backend_kind > static_cast<uint8_t>(BackendKind::SHARED_FD_SLICE))
+    if (h.backend_kind > static_cast<uint8_t>(BackendKind::FORK_UPLOAD))
         reject("invalid BufferDescriptor: backend_kind out of range");
     if (h.body_len > DESC_MAX_BYTES) reject("invalid BufferDescriptor: body_len exceeds DESC_MAX_BYTES");
     if (h.identity.generation == 0) reject("invalid BufferDescriptor: generation 0 is reserved (uninitialized)");
@@ -297,6 +298,10 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
         if (base == 0) reject("invalid BufferDescriptor: address-bearing backend body is a null base");
         break;
     }
+    case BackendKind::FORK_UPLOAD:
+        if (h.body_len != 0 || h.access != static_cast<uint8_t>(AccessMode::READ) || h.nbytes == 0)
+            reject("invalid BufferDescriptor: FORK_UPLOAD requires a nonempty read-only storage and an empty body");
+        break;
     case BackendKind::POSIX_SHM: {
         // The consumer opens this by name, and the Python side decodes it as UTF-8 before the open.
         // Restricting the name to printable ASCII other than '/' makes that decode total instead of
@@ -384,6 +389,8 @@ inline void validate_tensor(const Tensor &r) {
     const BufferDescriptor &h = r.buffer;
 
     validate_buffer_descriptor(h);
+    if (h.backend_kind == static_cast<uint8_t>(BackendKind::FORK_UPLOAD))
+        reject("invalid Tensor: FORK_UPLOAD is only valid as a copy_to source");
 
     if (r.ndims == 0 || r.ndims > static_cast<uint32_t>(MAX_TENSOR_DIMS)) reject("invalid Tensor: ndims out of range");
     if (r.dtype >= DataType::DATA_TYPE_NUM) reject("invalid Tensor: unknown dtype");

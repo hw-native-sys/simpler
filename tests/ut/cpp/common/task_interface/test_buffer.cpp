@@ -544,6 +544,27 @@ TEST(BufferAbi, DecodedIdentityIgnoresWirePadding) {
 
 }  // namespace
 
+TEST(BufferAbi, ForkUploadIsAnIdentityOnlyReadOnlyCopySource) {
+    auto tensor = make_tensor();
+    auto &descriptor = tensor.buffer;
+    descriptor.backend_kind = static_cast<uint8_t>(BackendKind::FORK_UPLOAD);
+    descriptor.access = static_cast<uint8_t>(AccessMode::READ);
+    descriptor.body_len = 0;
+    std::memset(descriptor.body, 0, DESC_MAX_BYTES);
+    EXPECT_NO_THROW(validate_buffer_descriptor(descriptor));
+    EXPECT_THROW(validate_tensor(tensor), std::invalid_argument);
+
+    auto invalid = descriptor;
+    invalid.body_len = BACKEND_ADDRESS_BODY_BYTES;
+    EXPECT_THROW(validate_buffer_descriptor(invalid), std::invalid_argument);
+    invalid = descriptor;
+    invalid.access = static_cast<uint8_t>(AccessMode::READWRITE);
+    EXPECT_THROW(validate_buffer_descriptor(invalid), std::invalid_argument);
+    invalid = descriptor;
+    invalid.nbytes = 0;
+    EXPECT_THROW(validate_buffer_descriptor(invalid), std::invalid_argument);
+}
+
 TEST(BufferAbi, SharedHeapSliceRejectsInvalidLocatorAndOverflow) {
     auto descriptor = make_tensor().buffer;
     descriptor.backend_kind = static_cast<uint8_t>(BackendKind::SHARED_FD_SLICE);

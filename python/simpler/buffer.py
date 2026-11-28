@@ -481,6 +481,35 @@ class Buffer:
             self.shm = None
 
 
+class _ForkUploadBuffer(Buffer):
+    """One process-local retention of a shared Torch storage across a worker fork."""
+
+    def __init__(self, identity: CanonicalIdentity, tensor) -> None:
+        storage = tensor.untyped_storage()
+        self._offset = int(tensor.data_ptr()) - int(storage.data_ptr())
+        super().__init__(
+            identity=identity,
+            address_space=AddressSpace.HOST,
+            access=AccessMode.READ,
+            backend_kind=BackendKind.FORK_UPLOAD,
+            nbytes=int(tensor.numel()) * int(tensor.element_size()),
+            owner_worker_path_id=intern_worker_path("L3"),
+        )
+        self._storage = storage
+
+    def copy_source(self, descriptor: BufferDescriptor) -> int:
+        storage = self._storage
+        if storage is None or self.closed or self.to_descriptor() != descriptor:
+            raise ValueError("copy_to: inherited upload storage is closed or its descriptor differs")
+        if self._offset + self.nbytes > storage.nbytes():
+            raise ValueError("copy_to: inherited upload storage has shrunk")
+        return int(storage.data_ptr()) + self._offset
+
+    def close(self) -> None:
+        super().close()
+        self._storage = None
+
+
 @contextmanager
 def _owned_host_release(buffer_ref):
     buffer = buffer_ref()

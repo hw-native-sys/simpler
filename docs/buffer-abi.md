@@ -468,6 +468,7 @@ gates, or keys on it.
 | `POSIX_SHM` | a named shm mapped into the consumer | the shm name: 1–32 bytes of printable ASCII, no `/` | `create_buffer` |
 | `SHARED_FD_SLICE` | an allocation-bounded view of a shared heap mapping | producer PID (u32), inherited fd (u32), slab offset (u64), all LE | `Orchestrator.alloc` / `alloc_shared_tensor` in an L3 Worker with exec chip children |
 | `FORK_SHM` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork `MAP_SHARED` host buffer (e.g. `share_memory_()`), writable from the child |
+| `FORK_UPLOAD` | a live shared CPU tensor view retained by the forked chip worker | empty (lookup by canonical identity) | read-only source for synchronous `Worker.copy_to` |
 | `FORK_COW` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork plain host buffer: copy-on-write, so **READ only** |
 | `VMM_WINDOW` | the device VA of the window carved by `allocate_domain`, no map | exactly 8 bytes, a non-zero u64 LE base | communication-domain window / buffer |
 | `DEVICE_MALLOC` | the device pointer, no map (chip-local) | exactly 8 bytes, a non-zero u64 LE base | `alloc_child_tensor` |
