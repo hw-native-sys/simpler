@@ -71,13 +71,18 @@ def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids, 
             if not cached:
                 resources = worker._building_run_resources
                 assert resources is not None and resources.live_domains.get("tp") is domain
-                assert resources.requires_ordered_cleanup
+                assert not resources.requires_ordered_cleanup
+                assert resources.retained_domain_uses[domain.allocation_id] is domain
+                assert domain._run_uses[id(resources)] is resources
                 domain.release()
                 assert domain.released and not domain.freed
 
         run = worker.submit(second)
         if cached:
-            assert run._resources.live_domains.get("tp") is domain and run._resources.requires_ordered_cleanup
+            assert run._resources.live_domains.get("tp") is domain
+            assert not run._resources.requires_ordered_cleanup
+            assert run._resources.retained_domain_uses[domain.allocation_id] is domain
+            assert domain._run_uses[id(run._resources)] is run._resources
             domain.release()
             assert domain.released and not domain.freed
         run.wait()
