@@ -101,8 +101,9 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
     uint64_t runtime_args, uint32_t enable_profiling_flag, uint64_t ffts_base_addr,
     uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch
 ) {
-    // Calculate block_idx for this core
 #ifdef __DAV_VEC__
+    // The first vector payload expects normal mask mode even if the previous launch used count mode.
+    set_mask_norm();
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();
     core_type = CoreType::AIV;
 #else
