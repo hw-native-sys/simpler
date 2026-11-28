@@ -159,6 +159,30 @@ TEST_F(OrchestratorFaninTest, DuplicateProducerOrAccumulatesFlags) {
     EXPECT_EQ(producer_slot.fanout_count, FANOUT_SCOPE_BIT + 1);
 }
 
+TEST_F(OrchestratorFaninTest, StaleGenerationCannotStrengthenPinnedEdge) {
+    orch.begin_scope();
+    CoreTaskArgs producer_args;
+    auto producer = orch.submit_dummy_task(producer_args);
+    ASSERT_TRUE(producer.task_id().is_valid());
+    auto &ring = sm_handle->header->rings[producer.task_id().ring()];
+    auto &slot = ring.get_slot_state_by_task_id(producer.task_id().local_id());
+    // Model a reused slot while the published watermark still admits the old ID.
+    TaskId live = TaskId::make(producer.task_id().ring(), producer.task_id().local_id() + ring.task_window_size);
+    slot.task->task_id = live;
+
+    TaskId deps[] = {live, producer.task_id()};
+    DepFlags kinds[] = {DEP_WAIT, DEP_WAIT | DEP_RETAIN};
+    CoreTaskArgs consumer_args;
+    consumer_args.set_dependencies_with_kinds(deps, kinds, 2);
+    auto consumer = orch.submit_dummy_task(consumer_args);
+    ASSERT_TRUE(consumer.task_id().is_valid());
+    auto *payload = ring.get_slot_state_by_task_id(consumer.task_id().local_id()).payload;
+    ASSERT_NE(payload, nullptr);
+    ASSERT_EQ(payload->fanin_actual_count, 1);
+    EXPECT_EQ(payload->fanin_inline_edges[0].flags(), DEP_WAIT);
+    EXPECT_EQ(slot.fanout_count, FANOUT_SCOPE_BIT + 1);
+}
+
 // The duplicate lands in the spill region (>64 fanin), exercising
 // or_flags_into_existing's spill lookup: the dup folds (65 edges, not 66), claims
 // exactly one pin, and OR-accumulates its flags into the spilled edge.
