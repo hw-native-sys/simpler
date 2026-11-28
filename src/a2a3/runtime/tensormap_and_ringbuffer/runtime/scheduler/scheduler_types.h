@@ -548,10 +548,10 @@ struct alignas(64) SchedChipSwimlaneCounters {
 // sync_start drain coordination
 // =============================================================================
 
-// When sync_start_pending != 0, all scheduler threads skip dispatch
-// (only process completions) until the fixed coordinator finishes launching all blocks.
+// A block count selects the capacity drain. The coordinator checks capacity before owners stage their local cores.
+// SchedulerContext::WAVE_GATE (INT32_MAX) selects queued MIX dispatch. Each owner publishes its assigned blocks.
 struct alignas(64) SyncStartDrainState {
-    std::atomic<int32_t> sync_start_pending{0};              // 0=normal; -1=initializing; >0=active (value=block_num)
+    std::atomic<int32_t> sync_start_pending{0};              // 0 idle, -1 initializing, block count or WAVE_GATE
     std::atomic<ChipTaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
     std::atomic<uint64_t> drain_attempt{0};                  // incremented whenever an ack round is reset
     // The coordinator publishes stage_go after global capacity is confirmed.

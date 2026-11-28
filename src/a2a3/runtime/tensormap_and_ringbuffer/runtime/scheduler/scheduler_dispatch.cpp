@@ -478,7 +478,7 @@ void SchedulerContext::dispatch_shape(
                         }
                         continue;
                     }
-                    if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
+                    if (!enter_ready_drain(slot_state, slot_state->logical_block_num)) {
                         if (!requeue_ready_tasks(
                                 thread_idx, disp_queues[static_cast<int32_t>(shape)], &batch[bi], 1, shape
                             )) {
@@ -861,6 +861,11 @@ int32_t SchedulerContext::try_early_dispatch(
     //     regular ready_queues) strictly precedes early — there is no real ready task
     //     to delay only when every normal queue is drained.
     if (pmu_active || !tracker.has_any_free_slot()) return 0;
+    if (sched_->early_sync_start_queue.size() == 0 &&
+        sched_->early_dispatch_queues[static_cast<int>(ResourceShape::MIX)].size() == 0 &&
+        sched_->early_dispatch_queues[static_cast<int>(ResourceShape::AIC)].size() == 0 &&
+        sched_->early_dispatch_queues[static_cast<int>(ResourceShape::AIV)].size() == 0)
+        return 0;
     for (int s = 0; s < NUM_RESOURCE_SHAPES; s++) {
         if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0) return 0;
     }
@@ -955,6 +960,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // completed count so the caller still sees the negative error rc while the
     // shared end-of-loop flush below runs.
     int32_t timeout_rc = 0;
+    bool past_first_queue = false;
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
 #if SIMPLER_DFX
@@ -1216,7 +1222,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool try_pushed = false;
 
         // Phase 2 drain check
-        if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+        const int queue_gate = drain_state_.sync_start_pending.load(std::memory_order_acquire);
+        const bool service_wave = queue_gate == WAVE_GATE;
+        if (service_wave) {
+            try_pushed = service_queued_wave(thread_idx) > 0;
+            made_progress = made_progress || try_pushed;
+        } else if (queue_gate != 0) {
 #if SIMPLER_DFX
             // The drain is otherwise a swimlane blind spot: the `continue` below skips
             // every phase record, and handle_drain_mode is uninstrumented. Time it here so
@@ -1352,72 +1363,74 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
         }
 
-        // Phase 4: MIX-strict-priority dispatch with phase-split and
-        // cross-thread idle gating. See dispatch_ready_tasks for the policy.
+        if (!service_wave && (past_first_queue || allow_first_queue(thread_idx, past_first_queue))) {
+            // Phase 4: MIX-strict-priority dispatch with phase-split and
+            // cross-thread idle gating. See dispatch_ready_tasks for the policy.
 #if SIMPLER_DFX
-        uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+            uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
-        dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+            dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 #if SIMPLER_DFX
-        // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
-        // covers the actual publish work — not the trailing second-poll /
-        // early-dispatch time. (Pre-redesign the Dispatch emit lived at iter
-        // end with span extending past the second poll, which made finish_time
-        // events from the second poll fall under the Dispatch bar rather than
-        // a Complete bar of their own — confusing for trace consumers.)
-        if (dispatch_t0 != 0 && chip_swimlane.phase_dispatch_count > 0) {
-            uint64_t dispatch_t1 = get_sys_cnt_aicpu();
-            uint64_t pop_hit_delta = chip_swimlane.pop_hit - chip_swimlane.pop_hit_at_last_emit;
-            uint64_t pop_miss_delta = chip_swimlane.pop_miss - chip_swimlane.pop_miss_at_last_emit;
-            debug_assert(pop_hit_delta < (1ULL << 32));
-            debug_assert(pop_miss_delta < (1ULL << 32));
-            int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
-            capture_phase_end(phase_end_shared);
-            chip_swimlane_aicpu_record_sched_phase(
-                thread_idx, SchedPhaseKind::Dispatch, _t0_phase, dispatch_t1, chip_swimlane.sched_loop_count,
-                chip_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
-                static_cast<uint32_t>(pop_miss_delta), phase_start_shared, phase_end_shared
-            );
-            for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++) {
-                phase_start_shared[s] = phase_end_shared[s];
+            // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
+            // covers the actual publish work — not the trailing second-poll /
+            // early-dispatch time. (Pre-redesign the Dispatch emit lived at iter
+            // end with span extending past the second poll, which made finish_time
+            // events from the second poll fall under the Dispatch bar rather than
+            // a Complete bar of their own — confusing for trace consumers.)
+            if (dispatch_t0 != 0 && chip_swimlane.phase_dispatch_count > 0) {
+                uint64_t dispatch_t1 = get_sys_cnt_aicpu();
+                uint64_t pop_hit_delta = chip_swimlane.pop_hit - chip_swimlane.pop_hit_at_last_emit;
+                uint64_t pop_miss_delta = chip_swimlane.pop_miss - chip_swimlane.pop_miss_at_last_emit;
+                debug_assert(pop_hit_delta < (1ULL << 32));
+                debug_assert(pop_miss_delta < (1ULL << 32));
+                int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
+                capture_phase_end(phase_end_shared);
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, SchedPhaseKind::Dispatch, _t0_phase, dispatch_t1, chip_swimlane.sched_loop_count,
+                    chip_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
+                    static_cast<uint32_t>(pop_miss_delta), phase_start_shared, phase_end_shared
+                );
+                for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++) {
+                    phase_start_shared[s] = phase_end_shared[s];
+                }
+                _t0_phase = dispatch_t1;
+                chip_swimlane.phase_dispatch_count = 0;
+                chip_swimlane.pop_hit_at_last_emit = chip_swimlane.pop_hit;
+                chip_swimlane.pop_miss_at_last_emit = chip_swimlane.pop_miss;
             }
-            _t0_phase = dispatch_t1;
-            chip_swimlane.phase_dispatch_count = 0;
-            chip_swimlane.pop_hit_at_last_emit = chip_swimlane.pop_hit;
-            chip_swimlane.pop_miss_at_last_emit = chip_swimlane.pop_miss;
-        }
 #endif
 
-        // Phase 4b: early-dispatch onto spare cores, mirroring the Phase 4 call
-        // shape. try_early_dispatch owns its own gating (off-PMU, this
-        // thread has a spare slot, no normal ready work queued) and updates
-        // made_progress / try_pushed, so this is a single unconditional call — it
-        // returns 0 without staging when gated out.
+            // Phase 4b: early-dispatch onto spare cores, mirroring the Phase 4 call
+            // shape. try_early_dispatch owns its own gating (off-PMU, this
+            // thread has a spare slot, no normal ready work queued) and updates
+            // made_progress / try_pushed, so this is a single unconditional call — it
+            // returns 0 without staging when gated out.
 #if SIMPLER_DFX
-        bool early_dispatch_record = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
-        uint64_t early_dispatch_t0 = early_dispatch_record ? get_sys_cnt_aicpu() : 0;
+            bool early_dispatch_record = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
+            uint64_t early_dispatch_t0 = early_dispatch_record ? get_sys_cnt_aicpu() : 0;
 #endif
-        [[maybe_unused]] int32_t staged_count =
-            try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+            [[maybe_unused]] int32_t staged_count =
+                try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 #if SIMPLER_DFX
-        // Emit an EarlyDispatch bar so a staging-dominated iteration is attributed
-        // to early-dispatch rather than disappearing into a blank gap.
-        if (early_dispatch_record && staged_count > 0) {
-            uint64_t early_dispatch_t1 = get_sys_cnt_aicpu();
-            chip_swimlane_aicpu_record_sched_phase(
-                thread_idx, SchedPhaseKind::EarlyDispatch, early_dispatch_t0, early_dispatch_t1,
-                sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(staged_count)
-            );
-            // prepare_block_for_dispatch bumped phase_dispatch_count while staging;
-            // those blocks belong to this EarlyDispatch bar, so clear the counter
-            // before it leaks into the next Dispatch bar.
-            sched_chip_swimlane_[thread_idx].phase_dispatch_count = 0;
-            // Advance _t0_phase so the next phase bar starts at the EarlyDispatch
-            // end, not before it (otherwise their spans overlap and the
-            // outer-phase mutual-exclusion breaks).
-            _t0_phase = early_dispatch_t1;
+            // Emit an EarlyDispatch bar so a staging-dominated iteration is attributed
+            // to early-dispatch rather than disappearing into a blank gap.
+            if (early_dispatch_record && staged_count > 0) {
+                uint64_t early_dispatch_t1 = get_sys_cnt_aicpu();
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, SchedPhaseKind::EarlyDispatch, early_dispatch_t0, early_dispatch_t1,
+                    sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(staged_count)
+                );
+                // prepare_block_for_dispatch bumped phase_dispatch_count while staging;
+                // those blocks belong to this EarlyDispatch bar, so clear the counter
+                // before it leaks into the next Dispatch bar.
+                sched_chip_swimlane_[thread_idx].phase_dispatch_count = 0;
+                // Advance _t0_phase so the next phase bar starts at the EarlyDispatch
+                // end, not before it (otherwise their spans overlap and the
+                // outer-phase mutual-exclusion breaks).
+                _t0_phase = early_dispatch_t1;
+            }
+#endif
         }
-#endif
 
 #if SIMPLER_DFX
         // Cycle-counter LAP for the iter tail. Dispatch's emit moved earlier
