@@ -60,7 +60,14 @@ def l3(monkeypatch):
         chips.append(chip)
     transport = MagicMock()
     native_orch = MagicMock()
-    native_orch._begin_run.side_effect = itertools.count(1).__next__
+    run_ids = itertools.count(1)
+
+    def begin_run(hold_activation=False, enqueue_before_success=False):
+        assert not hold_activation
+        assert not enqueue_before_success
+        return next(run_ids)
+
+    native_orch._begin_run.side_effect = begin_run
     native_orch._wait_run_for.return_value = True
     worker._worker = transport
     worker._orch = Orchestrator(native_orch, worker)

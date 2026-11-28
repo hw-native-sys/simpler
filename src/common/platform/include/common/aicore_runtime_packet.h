@@ -19,4 +19,7 @@ struct AicoreRuntimePacket {
     AicoreLaunchArgs args;
     alignas(DeviceRuntimeLaunchDesc) unsigned char descriptor[RUNTIME_LAUNCH_DESCRIPTOR_BYTES];
 };
-static_assert(offsetof(AicoreRuntimePacket, descriptor) == 64);
+static_assert(
+    offsetof(AicoreRuntimePacket, descriptor) == (sizeof(AicoreLaunchArgs) + alignof(DeviceRuntimeLaunchDesc) - 1) /
+                                                     alignof(DeviceRuntimeLaunchDesc) * alignof(DeviceRuntimeLaunchDesc)
+);

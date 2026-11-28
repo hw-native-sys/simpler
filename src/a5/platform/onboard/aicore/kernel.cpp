@@ -116,11 +116,13 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  * @param report_epoch This run's handshake report identity; 0 selects the
  *        pre-existing kernel/persistent report protocol
  */
-extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
+extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel_abi2)(
     uint64_t runtime_args, uint32_t enable_profiling_flag, uint32_t force_simt_anchor,
     uint64_t chip_swimlane_aicore_rotation_table, uint64_t aicore_pmu_ring_addrs, uint64_t pmu_reg_addrs,
-    uint64_t report_epoch
+    uint64_t report_epoch, uint64_t execution_gate_address, uint64_t execution_gate_identity,
+    uint64_t execution_gate_generation
 ) {
+    if (execution_gate_address != 0 || execution_gate_identity != 0 || execution_gate_generation != 0) return;
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();

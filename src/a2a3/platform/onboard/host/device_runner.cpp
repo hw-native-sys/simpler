@@ -532,6 +532,7 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     // result. Completion uses the run's bound handles, including the no-boundary
     // fallback inside poll_run_fence. A second run may have submitted on the
     // same pair; the named owner's result belongs only to this run.
+    if (prepared.execution_gate) return poll_run_fence(prepared);
     return run_streams_.poll(&prepared, [this, &prepared](void *, void *) {
         return poll_run_fence(prepared);
     });
@@ -547,14 +548,22 @@ int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
     prepared.physical_complete = true;
     const int wait_rc = poll_boundary_waits(prepared);
     if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
-    const int diagnostics_rc =
-        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    if (validate_execution_gate(prepared) != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    const bool cancelled = prepared.execution_gate && prepared.execution_gate->cancelled();
+    const int diagnostics_rc = cancelled ? withdraw_gate_cancelled_swimlane(prepared) :
+                                           teardown_shared_collectors_after_run(
+                                               prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true
+                                           );
     prepared.retirement_diagnostics_rc = diagnostics_rc;
-    read_device_wall_ns(prepared.pipeline_slot);
-    emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
-    print_handshake_results(prepared.kernel_args, prepared.num_aicore);
+    if (cancelled && diagnostics_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    if (!cancelled) {
+        read_device_wall_ns(prepared.pipeline_slot);
+        emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
+        print_handshake_results(prepared.kernel_args, prepared.num_aicore);
+    }
     prepared.aicore_retirement_attempted = true;
-    const int retire_rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
+    const int retire_rc =
+        prepared.execution_gate ? 0 : retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
     if (retire_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     cleanup_execution(prepared, true);
     return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
@@ -597,8 +606,11 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // stale. Publish retirement so cleanup does not replace it with an
     // unproven state after the device result has already been established.
     prepared.aicore_retirement_attempted = true;
-    rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
+    rc = prepared.execution_gate ? 0 : retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
     if (rc != 0) return DrainOutcome::device_error(rc, prepared.physical_complete);
+
+    if (prepared.execution_gate && prepared.execution_gate->cancelled())
+        return DrainOutcome::device_complete(diagnostics_rc);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup. Sized
     // by this run's own core count rather than the runner's, which describes
@@ -646,7 +658,7 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
     }
     prepared.kernel_args.args.regs = 0;
     prepared.kernel_args.args.pmu_reg_addrs = 0;
-    if (retire_aicore && !abandon && !prepared.aicore_retirement_attempted) {
+    if (retire_aicore && !abandon && !prepared.execution_gate && !prepared.aicore_retirement_attempted) {
         prepared.aicore_retirement_attempted = true;
         (void)retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Unproven);
     }
@@ -781,7 +793,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
         prepared.streams = {
             static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())
         };
-    if (!prepared.stream_lifetime) prepared.stream_lifetime = run_streams_.retain_aicore();
+    if (!prepared.stream_lifetime && !prepared.execution_gate) prepared.stream_lifetime = run_streams_.retain_aicore();
     if (prepared.caller_stream != nullptr) prepared.streams.aicpu = prepared.caller_stream;
     const auto &streams = prepared.streams;
     if (prepared.caller_stream != nullptr && !execution_mode_latch_.is_kernel()) {
@@ -851,6 +863,8 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                     // than during arming because dep_gen admits last, and a run
                     // whose arming resolved an address it was later refused would
                     // hand the device a bank it does not hold.
+                    if (prepared.execution_gate && prepared.dfx.chip_swimlane_enabled())
+                        prepared.gate_swimlane_admitted = true;
                     resolve_run_terminal_banks(prepared.dfx, prepared.identity.run_epoch, prepared.kernel_args);
                     // The resident copy, which the serial non-retained path reads at
                     // its own close.
@@ -880,7 +894,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
 
             // Publishing query/drain ownership is a state change, so it sits past
             // the arming block: everything the block covers is rollback-free.
-            int rc = prepared.caller_owns_submission ?
+            int rc = (prepared.caller_owns_submission || prepared.execution_gate) ?
                          0 :
                          run_streams_.mark_submitted(
                              &prepared, prepared.streams.aicore,
@@ -894,6 +908,10 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             if (prepared.join.predecessor_owner != nullptr) {
                 const int join_rc = queue_cross_run_wait(prepared, streams.aicpu, sink);
                 if (join_rc != 0) return join_rc;
+            }
+            if (prepared.execution_gate) {
+                const int gate_rc = prepared.execution_gate->enqueue_waits(streams.aicpu, streams.aicore, sink);
+                if (gate_rc != 0) return gate_rc;
             }
             if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
 
@@ -965,6 +983,9 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             return queue_caller_exit(prepared);
         }
     );
+    if (result.rc != 0 && prepared.execution_gate && result.progress != LaunchProgress::NotStarted) {
+        (void)release_execution_gate(prepared.identity, ExecutionGateDecision::Cancel);
+    }
     return result;
 }
 
@@ -1028,6 +1049,14 @@ int DeviceRunner::reap_run(PreparedExecution &prepared, int *diagnostics_rc) {
         // the SAME DeviceRunner's next run, so attempt recovery / mark-unusable
         // here too, not only on the launch-error path above.
         recover_device_or_mark_unusable(rc);
+        if (prepared.execution_gate && (prepared.execution_gate->pending() || prepared.execution_gate->cancelled())) {
+            // An unproved drain cannot authorize either withdrawal or the
+            // ordinary producer terminal reconciliation. Keep this admission
+            // and its bank owned until a later last-use proof is available.
+            prepared.retirement_diagnostics_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+            if (diagnostics_rc != nullptr) *diagnostics_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+            return rc;
+        }
         // On an AICPU-detected scheduler hang the device flushed its diagnostic
         // buffers during emergency_shutdown before returning the timeout rc.
         // Export them here too — otherwise the success-only teardown below is
@@ -1049,6 +1078,14 @@ int DeviceRunner::reap_run(PreparedExecution &prepared, int *diagnostics_rc) {
         return rc;
     }
 
+    const int gate_rc = validate_execution_gate(prepared);
+    if (gate_rc != 0) return gate_rc;
+    if (prepared.execution_gate && prepared.execution_gate->cancelled()) {
+        const int withdrawal_rc = withdraw_gate_cancelled_swimlane(prepared);
+        prepared.retirement_diagnostics_rc = withdrawal_rc;
+        if (diagnostics_rc != nullptr) *diagnostics_rc = withdrawal_rc;
+        return 0;
+    }
     read_device_wall_ns(pipeline_slot);
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe

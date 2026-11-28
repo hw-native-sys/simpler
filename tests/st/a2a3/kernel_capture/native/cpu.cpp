@@ -14,7 +14,7 @@
 
 extern "C" int simpler_aicpu_init(void *) { return 0; }
 
-extern "C" int simpler_aicpu_exec(void *raw) {
+extern "C" int simpler_aicpu_exec_abi2(void *raw) {
     const auto &args = *static_cast<CaptureArgs *>(raw);
     *reinterpret_cast<int64_t *>(args.output) = *reinterpret_cast<const int64_t *>(args.first) + args.addend;
     __asm__ volatile("dsb sy" ::: "memory");

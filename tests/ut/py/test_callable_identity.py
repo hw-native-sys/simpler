@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 from multiprocessing.shared_memory import SharedMemory
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -620,7 +621,7 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
             pass
 
         def get_orchestrator(self):
-            return None
+            return SimpleNamespace(_cancel_wait_any=lambda: None)
 
         def check_control_payloads_retired(self):
             pass

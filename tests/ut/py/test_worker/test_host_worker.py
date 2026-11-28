@@ -4093,6 +4093,9 @@ class TestRunHandle:
                 events.append("close")
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def __init__(self):
                 self.failures_left = failures
 
@@ -4270,6 +4273,9 @@ class TestRunHandle:
                 return None
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def __init__(self, lifecycle_cv):
                 self.lifecycle_cv = lifecycle_cv
                 self.cancellations = 0
@@ -4543,6 +4549,9 @@ class TestRunHandle:
                 native_closes.append("close")
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             complete = False
 
             def _wait_run_for(self, run_id, timeout):
@@ -5024,6 +5033,9 @@ class TestRunHandle:
                 released_refs.append("released")
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def _wait_run(self, run_id):
                 assert run_id == 1
 
@@ -5082,6 +5094,9 @@ class TestRunHandle:
                 return super().__setattr__(name, value)
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def _run_done(self, run_id):
                 assert run_id == 1
                 return False
@@ -5141,6 +5156,9 @@ class TestRunHandle:
                 return super().__setattr__(name, value)
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def _wait_run(self, run_id):
                 native_waits.append(run_id)
 
@@ -5191,6 +5209,9 @@ class TestRunHandle:
                 return None
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def _wait_run(self, run_id):
                 assert run_id == 1
 
@@ -5235,6 +5256,9 @@ class TestRunHandle:
         released_runs: list[int] = []
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def _wait_run_for(self, run_id, timeout):
                 assert run_id == 1
                 native_waits.append(("timed", timeout))
@@ -5294,6 +5318,9 @@ class TestRunHandle:
                 raise cleanup_error
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def _wait_run(self, run_id):
                 native_waits.append(run_id)
 
@@ -5429,6 +5456,9 @@ class TestRunHandle:
                     raise interrupt
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def _wait_run(self, run_id):
                 assert run_id == 1
 
@@ -5665,6 +5695,9 @@ class TestRunHandle:
                 return _native_control_payload(self.released_regions, worker_id, payload)
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def __init__(self):
                 self.released_runs = []
 
@@ -5772,6 +5805,9 @@ class TestRunHandle:
                 return result
 
         class NativeOrchestrator:
+            def _cancel_wait_any(self):
+                pass
+
             def _release_run(self, run_id):
                 raise AssertionError(f"ambiguous run {run_id} must stay owned until tree teardown")
 
@@ -7040,6 +7076,22 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         worker._worker = cast(Any, object())
         return worker
 
+    @staticmethod
+    def _domain_worker():
+        class FenceRecorder:
+            def __init__(self):
+                self.active_fences = set()
+
+            def _set_comm_execution_fence(self, allocation_id, active):
+                if active:
+                    self.active_fences.add(allocation_id)
+                else:
+                    self.active_fences.discard(allocation_id)
+
+        worker = TestUnreclaimedDeviceStateIsNeverSilent._worker()
+        worker._orch = cast(Any, FenceRecorder())
+        return worker
+
     @pytest.mark.parametrize("failed_rank_owns", [False, True])
     @pytest.mark.parametrize("members", [(0, 1, 2), (1, 2), (2, 1)])
     @pytest.mark.parametrize("unknown_reply", [False, True])
@@ -7051,7 +7103,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         A failed rank may retain an unpublished allocation for late import.
         A rank that failed before acquiring ownership has no cleanup debt.
         """
-        worker = self._worker()
+        worker = self._domain_worker()
         worker._config = {"device_ids": [0, 1, 2]}
         resources = worker_mod._RunResources()
         worker._building_run_resources = resources
@@ -7085,6 +7137,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
         handle = resources.live_domains["d"]
         assert handle.workers == owners
+        orch = worker._orch
+        assert orch is not None
+        assert orch.active_fences == {handle.allocation_id}
         assert handle.contexts == {}, "failed initialization must not publish usable contexts"
         assert worker._live_domains["d"] is handle
         assert resources.requires_ordered_cleanup, "a leaked window did not degrade the successor"
@@ -7106,6 +7161,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         monkeypatch.setattr(worker, "_dispatch_control_domain", capture_release)
         worker._release_domain_claimed(handle)
         assert not worker._comm_domain_alloc_errors
+        assert not orch.active_fences
         assert (worker._comm_domain_error is not None) is (unknown_reply and not failed_rank_owns)
 
         assert release_headers == {
@@ -7212,7 +7268,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
     @pytest.mark.parametrize("acknowledged", [False, True])
     def test_a_fully_failed_domain_allocation_owes_nothing(self, monkeypatch, acknowledged):
-        worker = self._worker()
+        worker = self._domain_worker()
         worker._config = {"device_ids": [0, 1, 2]}
         resources = worker_mod._RunResources()
         worker._building_run_resources = resources
@@ -7237,6 +7293,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         assert "d" not in worker._live_domains
         assert not resources.requires_ordered_cleanup
         assert bool(worker._comm_domain_alloc_errors) is not acknowledged
+        orch = worker._orch
+        assert orch is not None
+        assert orch.active_fences == (set() if acknowledged else set(attempted))
         with pytest.raises(RuntimeError, match="no rank committed" if acknowledged else "admission stopped"):
             worker._allocate_domain(name="retry", workers=(0, 1, 2), window_size=64, buffers=[])
         assert len(attempted) == (2 if acknowledged else 1)
@@ -9779,3 +9838,19 @@ def test_peer_cancel_before_activation_discards_unstarted_ccu(monkeypatch, peer_
         reclaim.assert_called_once_with()
     else:
         reclaim.assert_not_called()
+
+
+def test_public_run_identity_capacity_is_a_read_only_directory_limit():
+    worker = Worker(level=3, device_ids=[0, 1], num_sub_workers=0, platform="a2a3", runtime="host_build_graph")
+    # Querying directory capacity before init must not initialize devices or
+    # claim that this many execution slots have been granted.
+    assert worker.run_identity_capacity > 2
+    with pytest.raises(AttributeError):
+        worker.run_identity_capacity = 1
+
+
+def test_public_run_identity_capacity_preserves_explicit_request():
+    worker = Worker(
+        level=3, device_ids=[0, 1], num_sub_workers=0, platform="a2a3", runtime="host_build_graph", pipeline_depth=2
+    )
+    assert worker.run_identity_capacity == 2

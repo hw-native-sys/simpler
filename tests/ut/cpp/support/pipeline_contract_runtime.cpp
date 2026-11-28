@@ -117,6 +117,12 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx) { return PTO
 // safe "cannot" answer for a fixture that executes no run.
 int supports_joined_native_launch_ctx(DeviceContextHandle ctx) { return PTO_RUNTIME_ERR_INTERNAL; }
 
+int supports_execution_gate_ctx(DeviceContextHandle) { return 0; }
+int simpler_enqueue_run_held(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+int simpler_release_execution_gate(DeviceContextHandle, const NativeRunDescriptor *, uint32_t) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id) { return 0; }
 
 uint64_t get_retained_temp_addr_ctx(DeviceContextHandle ctx, uint32_t slot_id) { return 0; }

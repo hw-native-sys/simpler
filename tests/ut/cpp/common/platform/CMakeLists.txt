@@ -154,6 +154,7 @@ platform_single_case(test_sim_run_completion.cpp
 # RegisterCallableArgs lives in the arch platform headers, and a2a3's
 # kernel_args.h is not a5's, so the POD shape this checks is checked per arch.
 platform_case(test_runtime_orch_so.cpp PER_ARCH)
+platform_case(test_execution_gate.cpp PER_ARCH)
 
 # Both compile the host logger alongside themselves, so they take the platform
 # stubs without the log group — the one entry unified_log_host.cpp replaces.
@@ -1112,12 +1113,19 @@ set_target_properties(test_aicore_pmu_lease PROPERTIES ENABLE_EXPORTS ON)
 # measurement: a case listed here that does open one of those trees is a
 # reported gap, not a silent single build.
 # ---------------------------------------------------------------------------
+platform_single_case(test_domain_allocation_views.cpp
+    SOURCES ${SIMPLER_SRC}/common/platform_comm/comm_sim.cpp)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(test_domain_allocation_views PRIVATE rt)
+endif()
+
 simpler_ut_cases(platform_single_case
     test_acl_hal_device.cpp
     test_arena_replacement_transaction.cpp
     test_auto_admission.cpp
     test_caller_device_buffers.cpp
     test_native_invocation_completion.cpp
+    test_device_buffer_owners.cpp
     test_context_lifecycle.cpp
     test_device_fault_monitor.cpp
     test_device_health_state.cpp
@@ -1257,6 +1265,12 @@ foreach(arch a2a3 a5)
 endforeach()
 else()
     simpler_ut_exclude_case(test_abort_aicore_startup.cpp)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    platform_single_case(test_executor_binary_abi.cpp)
+else()
+    simpler_ut_exclude_case(test_executor_binary_abi.cpp)
 endif()
 
 simpler_ut_glob_cases(platform_case_without_axes)

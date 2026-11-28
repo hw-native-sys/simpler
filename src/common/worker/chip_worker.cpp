@@ -10,6 +10,7 @@
  */
 
 #include "chip_worker.h"
+#include "common/execution_gate.h"
 #include "call_argument_snapshot.h"
 #include "queued_submission.h"
 #include "native_submission_state.h"
@@ -29,6 +30,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cassert>
@@ -363,7 +365,12 @@ void ChipWorker::init(
         launch_run_on_stream_fn_ = module->optional<CallerStreamLaunchFn>("simpler_launch_run_on_stream");
         submit_run_on_stream_fn_ = module->optional<CallerStreamSubmitFn>("simpler_submit_run_on_stream");
         launch_run_joined_fn_ = module->required<SimplerJoinedLaunchFn>("simpler_launch_run_joined");
+        enqueue_run_held_fn_ = module->required<SimplerJoinedLaunchFn>("simpler_enqueue_run_held");
+        release_execution_gate_fn_ = module->required<ReleaseExecutionGateFn>("simpler_release_execution_gate");
+        supports_execution_gate_fn_ =
+            module->required<SupportsConcurrentNativePrepareFn>("supports_execution_gate_ctx");
         poll_run_fn_ = module->required<SimplerNativeRunFn>("simpler_poll_run");
+        poll_run_observing_fn_ = module->optional<SimplerNativeRunFn>("simpler_poll_run_observing");
         query_run_completion_fn_ = module->optional<SimplerNativeRunFn>("simpler_query_run_completion");
         peer_cancel_fn_ = module->optional<decltype(&simpler_bind_peer_cancel)>("simpler_bind_peer_cancel");
         wait_run_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run");
@@ -471,6 +478,32 @@ void ChipWorker::init(
         comm_get_local_window_base_fn_ = module->required<CommGetLocalWindowBaseFn>("comm_get_local_window_base");
         comm_get_window_size_fn_ = module->required<CommGetWindowSizeFn>("comm_get_window_size");
         comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
+        // WSE is an active backend without owner-backed dynamic domains.
+        // A missing group disables domain allocation; it never admits unknown owners.
+        device_register_domain_owner_ctx_fn_ =
+            module->optional<DeviceRegisterDomainOwnerCtxFn>("device_register_domain_owner_ctx");
+        device_domain_owner_registered_ctx_fn_ =
+            module->optional<DeviceDomainOwnerRegisteredCtxFn>("device_domain_owner_registered_ctx");
+        device_begin_domain_release_ctx_fn_ =
+            module->optional<DeviceBeginDomainReleaseCtxFn>("device_begin_domain_release_ctx");
+        device_finish_domain_release_ctx_fn_ =
+            module->optional<DeviceFinishDomainReleaseCtxFn>("device_finish_domain_release_ctx");
+        device_begin_domain_session_release_ctx_fn_ =
+            module->optional<DeviceBeginDomainSessionReleaseCtxFn>("device_begin_domain_session_release_ctx");
+        device_finish_domain_session_release_ctx_fn_ =
+            module->optional<DeviceFinishDomainSessionReleaseCtxFn>("device_finish_domain_session_release_ctx");
+        comm_query_domain_allocation_fn_ =
+            module->optional<CommQueryDomainAllocationFn>("comm_query_domain_allocation");
+        const unsigned domain_owner_symbols =
+            static_cast<unsigned>(device_register_domain_owner_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_domain_owner_registered_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_begin_domain_release_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_finish_domain_release_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_begin_domain_session_release_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_finish_domain_session_release_ctx_fn_ != nullptr);
+        if (domain_owner_symbols != 0 && (domain_owner_symbols != 6 || comm_query_domain_allocation_fn_ == nullptr)) {
+            throw std::runtime_error("runtime exports an incomplete native domain owner capability");
+        }
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
         comm_alloc_host_domain_windows_fn_ =
             module->optional<CommAllocHostDomainWindowsFn>("comm_alloc_host_domain_windows");
@@ -644,22 +677,10 @@ void ChipWorker::init(
             if (set_retain_runs_fn_(device_ctx_, 1) != 0) {
                 throw std::runtime_error("ChipWorker::init: retaining runs across boundaries could not be enabled");
             }
-            // How many runs this Worker could ever have open at once: its own
-            // launch budget and the resource sets this context was actually
-            // granted, never the request and never a host-build constant --
-            // the runtime is loaded, so only it knows its device bound.
-            //
-            // A depth below two asks for nothing: that is L2's shape, whose
-            // launch budget is one, and it keeps the shipped capacity without
-            // being asked about separately. Only a success return records the
-            // grant; absence or refusal leaves this Worker exactly as a module
-            // without the entry leaves it.
-            const uint32_t depth =
-                launch_depth_ < resolved_contract.pipeline_depth ? launch_depth_ : resolved_contract.pipeline_depth;
-            if (depth > simpler::dfx::runs::kMaxOpenEpochs && set_retained_epoch_limit_fn_ != nullptr &&
-                set_retained_epoch_limit_fn_(device_ctx_, static_cast<int32_t>(depth)) == 0) {
-                retained_epoch_limit_granted_ = depth;
-            }
+            // Held submissions use independently granted resources, so their
+            // retention budget is negotiated independently of ordinary joined
+            // launch depth. The collector's own ceiling remains authoritative.
+            negotiate_retained_epoch_capacity(resolved_contract.pipeline_depth);
         }
         // Onboard init installs workspace ownership for both owned and borrowed
         // contexts. A finite limit is staged before either init entry runs.
@@ -882,7 +903,7 @@ void ChipWorker::finalize() {
                 lane_error = std::make_exception_ptr(std::runtime_error("native close retained an unproved run"));
             }
             run_lane_->detach_after_failed_teardown(lane_error);
-            (void)run_lane_.release();
+            (void)run_lane_.release();  // NOLINT(bugprone-unused-return-value): retain unproven device-use snapshots
         }
         if (device_ctx_ == nullptr || finalize_device_fn_ == nullptr || runtime_module_ == nullptr) {
             throw std::runtime_error("ChipWorker::finalize: native owners retained without an owner-close entry");
@@ -960,6 +981,8 @@ void ChipWorker::finalize() {
 }
 
 void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
+    joined_domain_spans_.clear();
+    comm_join_unsupported_ = false;
     quiesce_host_uses_fn_ = nullptr;
     create_device_context_fn_ = nullptr;
     simpler_init_fn_ = nullptr;
@@ -989,7 +1012,11 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     launch_run_on_stream_fn_ = nullptr;
     submit_run_on_stream_fn_ = nullptr;
     launch_run_joined_fn_ = nullptr;
+    enqueue_run_held_fn_ = nullptr;
+    release_execution_gate_fn_ = nullptr;
+    supports_execution_gate_fn_ = nullptr;
     poll_run_fn_ = nullptr;
+    poll_run_observing_fn_ = nullptr;
     query_run_completion_fn_ = nullptr;
     peer_cancel_fn_ = nullptr;
     wait_run_fn_ = nullptr;
@@ -1037,6 +1064,13 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_get_local_window_base_fn_ = nullptr;
     comm_get_window_size_fn_ = nullptr;
     comm_derive_context_fn_ = nullptr;
+    device_register_domain_owner_ctx_fn_ = nullptr;
+    device_domain_owner_registered_ctx_fn_ = nullptr;
+    device_begin_domain_release_ctx_fn_ = nullptr;
+    device_finish_domain_release_ctx_fn_ = nullptr;
+    device_begin_domain_session_release_ctx_fn_ = nullptr;
+    device_finish_domain_session_release_ctx_fn_ = nullptr;
+    comm_query_domain_allocation_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
     comm_alloc_host_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
@@ -1242,6 +1276,10 @@ bool ChipWorker::supports_concurrent_native_prepare() const {
            supports_concurrent_native_prepare_fn_(device_ctx_) > 0;
 }
 
+bool ChipWorker::supports_execution_gate() const {
+    return initialized_ && supports_execution_gate_fn_ != nullptr && supports_execution_gate_fn_(device_ctx_) > 0;
+}
+
 bool ChipWorker::supports_joined_native_launch() const {
     return initialized_ && launch_depth_ > 1 && pipeline_contract_.pipeline_depth > 1 &&
            supports_joined_native_launch_fn_(device_ctx_) > 0;
@@ -1296,6 +1334,63 @@ bool ChipWorker::holds_live_comm_resources() const {
     std::lock_guard<std::mutex> lock(host_ddr_mutex_);
     return !comm_sessions_.empty() || !global_domain_ids_.empty() || exported_device_regions_live_ ||
            !host_ddr_mappings_.empty();
+}
+
+void ChipWorker::advance_comm_join_generation() {
+    if (comm_join_generation_ == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("communication resource generation exhausted");
+    ++comm_join_generation_;
+}
+
+uint64_t ChipWorker::joined_comm_generation() const {
+    if (comm_join_unsupported_ || !communication_cleanup_confirmed() || terminal_reclamation_fenced_ ||
+        comm_reclamation_unconfirmed_ || !global_domain_ids_.empty() || exported_device_regions_live_)
+        return 0;
+    {
+        std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+        if (!host_ddr_mappings_.empty()) return 0;
+    }
+    if (!comm_sessions_.empty() &&
+        (device_begin_domain_session_release_ctx_fn_ == nullptr || device_borrow_caller_buffers_ctx_fn_ == nullptr))
+        return 0;
+    for (const auto &session : comm_sessions_) {
+        if (session.handle == nullptr || !session.is_base || session.device_ctx != 0) return 0;
+    }
+    for (const auto &[identity, spans] : joined_domain_spans_) {
+        if (spans.empty() || comm_session_index_.find(identity.first) == comm_session_index_.end()) return 0;
+    }
+    return comm_join_generation_;
+}
+
+uint64_t ChipWorker::append_joined_comm_spans(std::vector<CallerDeviceSpan> &spans) const {
+    const auto generation = joined_comm_generation();
+    if (generation == 0) return 0;
+    // Contexts may arrive as scalar arguments. Each admitted run retains every
+    // eligible domain, including contexts absent from its tensor operands.
+    for (const auto &item : joined_domain_spans_)
+        spans.insert(spans.end(), item.second.begin(), item.second.end());
+    return generation;
+}
+
+void ChipWorker::negotiate_retained_epoch_capacity(uint32_t resource_grant) {
+    if (set_retained_epoch_limit_fn_ == nullptr) return;
+    const bool gated = supports_execution_gate_fn_ != nullptr && supports_execution_gate_fn_(device_ctx_) > 0;
+    uint32_t requested = gated ? resource_grant : std::min(launch_depth_, resource_grant);
+    if (requested > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+        throw std::runtime_error("retained epoch resource grant is outside the runtime API range");
+    while (requested > simpler::dfx::runs::kMaxOpenEpochs) {
+        const int rc = set_retained_epoch_limit_fn_(device_ctx_, static_cast<int32_t>(requested));
+        if (rc == 0) {
+            retained_epoch_limit_granted_ = requested;
+            return;
+        }
+        if (rc != PTO_RUNTIME_ERR_UNSUPPORTED)
+            throw std::runtime_error("retained epoch capacity negotiation failed with code " + std::to_string(rc));
+        if (!gated) return;
+        // UNSUPPORTED explicitly guarantees no mutation. Other errors cannot
+        // be treated as an invitation to retry with a different capacity.
+        --requested;
+    }
 }
 
 void ChipWorker::configure_launch_depth(unsigned depth) {
@@ -1402,7 +1497,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                 ++occupied;
                 const bool eager_peer =
                     allow_prepared_successor && entry.permits_prepared_successor &&
-                    (entry.phase == NativeRunPhase::LAUNCHED || entry.phase == NativeRunPhase::REAPED);
+                    (entry.phase == NativeRunPhase::LAUNCHED || entry.phase == NativeRunPhase::ENQUEUED_HELD ||
+                     entry.phase == NativeRunPhase::REAPED);
                 if (!eager_peer) {
                     throw RunPreparationRefused(
                         "prepare_native_run requires an active predecessor before staging a successor " +
@@ -1439,6 +1535,10 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                                              launch_depth_ > 1 ? 1u : 0u,
                                              provenance,
                                              ccu_workspace};
+        {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            native_runs_.at(run_epoch)->gate_descriptor = descriptor;
+        }
         rc = prepare(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
     } catch (...) {
         drop_preparing_native_run(run_epoch);
@@ -1612,9 +1712,9 @@ void ChipWorker::validate_execution_context() const {
 
 void ChipWorker::abandon_after_failed_teardown(std::exception_ptr error) noexcept {
     if (run_lane_ != nullptr) {
-        run_lane_->detach_after_failed_teardown(error);
+        run_lane_->detach_after_failed_teardown(std::move(error));
         // The retained lane keeps any run-side host snapshots alive as well.
-        (void)run_lane_.release();
+        (void)run_lane_.release();  // NOLINT(bugprone-unused-return-value): retain unproven device-use snapshots
     }
     for (auto &storage : runtime_bufs_)
         storage.abandon();
@@ -1664,15 +1764,21 @@ bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase
     switch (op) {
     case NativeRunOp::BindPeerCancel:
     case NativeRunOp::Launch:
+    case NativeRunOp::HeldEnqueue:
         return phase == NativeRunPhase::PREPARED;
+    case NativeRunOp::HeldClaimPredecessor:
+        return phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::ENQUEUED_HELD;
+    case NativeRunOp::ReleaseGate:
+        return phase == NativeRunPhase::ENQUEUED_HELD;
     case NativeRunOp::Poll:
     case NativeRunOp::WaitCompletion:
     case NativeRunOp::Wait:
         return phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED;
     case NativeRunOp::Finalize:
     case NativeRunOp::QueryCompletion:
-        return phase == NativeRunPhase::PREPARED || phase == NativeRunPhase::LAUNCHED ||
-               phase == NativeRunPhase::REAPED || phase == NativeRunPhase::CALLER_SUBMITTED;
+        return phase == NativeRunPhase::PREPARED || phase == NativeRunPhase::ENQUEUED_HELD ||
+               phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED ||
+               phase == NativeRunPhase::CALLER_SUBMITTED;
     case NativeRunOp::Probe:
         return phase == NativeRunPhase::LAUNCHED;
     case NativeRunOp::Predecessor:
@@ -1689,7 +1795,8 @@ bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase
 ChipWorker::NativeRunLease
 ChipWorker::inspect_native_run_locked(const ChipWorkerNativeRun &run, NativeRunOp op, NativeRunEntry **entry_out) {
     if (((native_runs_closing_ || terminal_reclamation_fenced_) && op != NativeRunOp::QueryCompletion) ||
-        (ccu_admission_closed_ && (op == NativeRunOp::Launch || op == NativeRunOp::ProbeSuccessor)))
+        (ccu_admission_closed_ && (op == NativeRunOp::Launch || op == NativeRunOp::HeldEnqueue ||
+                                   op == NativeRunOp::ReleaseGate || op == NativeRunOp::ProbeSuccessor)))
         return NativeRunLease::Reserved;
     const auto it = native_runs_.find(run.run_epoch);
     if (it == native_runs_.end()) return NativeRunLease::Absent;
@@ -1744,9 +1851,11 @@ ChipWorker::NativeRunLease ChipWorker::acquire_native_run_pair(
         // Both are decided under one hold of the mutex, so neither can change between them, and
         // both leases are taken together or not at all.
         const NativeRunLease own = inspect_native_run_locked(run, op, &entry);
-        const NativeRunLease other = inspect_native_run_locked(
-            predecessor, op == NativeRunOp::ProbeSuccessor ? NativeRunOp::Probe : NativeRunOp::Predecessor, &ahead
-        );
+        const NativeRunOp predecessor_op =
+            op == NativeRunOp::HeldEnqueue ?
+                NativeRunOp::HeldClaimPredecessor :
+                (op == NativeRunOp::ProbeSuccessor ? NativeRunOp::Probe : NativeRunOp::Predecessor);
+        const NativeRunLease other = inspect_native_run_locked(predecessor, predecessor_op, &ahead);
         if (own == NativeRunLease::Busy || other == NativeRunLease::Busy) {
             if (wait == LeaseWait::Immediate) return NativeRunLease::Busy;
             native_run_ops_done_.wait(lk);
@@ -1976,6 +2085,72 @@ bool ChipWorker::launch_native_run_joined(
     return !declined;
 }
 
+bool ChipWorker::enqueue_native_run_held(
+    const ChipWorkerNativeRun &run, const ChipWorkerNativeRun *predecessor, bool *credit_full
+) {
+    if (credit_full != nullptr) *credit_full = false;
+    validate_execution_process();
+    require_ccu_run_admission();
+    if (!supports_execution_gate()) return false;
+    void *storage = nullptr;
+    void *predecessor_storage = nullptr;
+    NativeRunOpLease held;
+    NativeRunOpLease predecessor_held;
+    const auto lease = predecessor != nullptr ?
+                           acquire_native_run_pair(
+                               run, *predecessor, NativeRunOp::HeldEnqueue, &storage, &predecessor_storage, &held,
+                               &predecessor_held, LeaseWait::Block
+                           ) :
+                           acquire_native_run_op(run, NativeRunOp::HeldEnqueue, &storage, nullptr, &held);
+    if (lease == NativeRunLease::Absent || lease == NativeRunLease::Stale) return false;
+    if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "enqueue_native_run_held");
+    validate_execution_context();
+    bool prior_launch_attempted;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        auto &entry = *native_runs_.at(run.run_epoch);
+        prior_launch_attempted = entry.launch_attempted;
+        entry.launch_attempted = true;
+    }
+    // From this point even an exception is a possible submission. Finalization
+    // must ask the backend to cancel and drain, never release a prepared plan.
+    const int rc = enqueue_run_held_fn_(device_ctx_, storage, predecessor_storage);
+    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED || rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL) {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        native_runs_.at(run.run_epoch)->launch_attempted = prior_launch_attempted;
+        if (credit_full != nullptr) *credit_full = rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        return false;
+    }
+    if (rc != 0) {
+        note_native_run_result(run.run_epoch, rc);
+        throw std::runtime_error(
+            "enqueue_native_run_held failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+        );
+    }
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    native_runs_.at(run.run_epoch)->phase = NativeRunPhase::ENQUEUED_HELD;
+    return true;
+}
+
+void ChipWorker::release_native_run_held(const ChipWorkerNativeRun &run) {
+    validate_execution_process();
+    require_ccu_run_admission();
+    NativeRunOpLease held;
+    void *storage = nullptr;
+    const auto lease = acquire_native_run_op(run, NativeRunOp::ReleaseGate, &storage, nullptr, &held);
+    if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "release_native_run_held");
+    validate_execution_context();
+    NativeRunDescriptor descriptor;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        descriptor = native_runs_.at(run.run_epoch)->gate_descriptor;
+    }
+    const int rc =
+        release_execution_gate_fn_(device_ctx_, &descriptor, static_cast<uint32_t>(ExecutionGateDecision::Go));
+    if (rc != 0) throw std::runtime_error("release_native_run_held failed with code " + std::to_string(rc));
+    note_native_run_launched(run.run_epoch);
+}
+
 void ChipWorker::bind_peer_cancel(const ChipWorkerNativeRun &run, const int32_t *request) {
     validate_execution_process();
     void *storage = nullptr;
@@ -1990,6 +2165,10 @@ void ChipWorker::bind_peer_cancel(const ChipWorkerNativeRun &run, const int32_t 
 }
 
 bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
+    return poll_native_run_progress(run, false) == SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+}
+
+int ChipWorker::poll_native_run_progress(const ChipWorkerNativeRun &run, bool observing) {
     validate_execution_process();
     void *storage = nullptr;
     NativeRunOpLease held;
@@ -1997,21 +2176,25 @@ bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
     // Completion already established answers the question without a device call. A run another
     // operation is inside reads as "not yet": a poll reports progress and never holds a thread.
     if (lease == NativeRunLease::Acquired || lease == NativeRunLease::AlreadyComplete) validate_execution_context();
-    if (lease == NativeRunLease::AlreadyComplete) return true;
-    if (lease == NativeRunLease::Busy) return false;
+    if (lease == NativeRunLease::AlreadyComplete) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    if (lease == NativeRunLease::Busy) return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
     if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "poll_native_run");
+    if (observing && poll_run_observing_fn_ == nullptr) {
+        throw UnsupportedRuntimeOperation("runtime does not provide nonblocking result observation");
+    }
 
     int rc = SIMPLER_NATIVE_RUN_POLL_ERROR;
     std::exception_ptr failure;
     try {
-        rc = poll_run_fn_(device_ctx_, storage);
+        rc = (observing ? poll_run_observing_fn_ : poll_run_fn_)(device_ctx_, storage);
     } catch (...) {
         failure = std::current_exception();
     }
     // A completed poll proves last use, without observing the stream's execution status.
     if (failure == nullptr && rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
         note_native_run_completion(run.run_epoch, 0, false);
-    } else if (failure == nullptr && rc != SIMPLER_NATIVE_RUN_POLL_NOT_READY) {
+    } else if (failure == nullptr && rc != SIMPLER_NATIVE_RUN_POLL_NOT_READY &&
+               !(observing && rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE)) {
         failure = std::make_exception_ptr(
             std::runtime_error(
                 "poll_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
@@ -2019,7 +2202,11 @@ bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
         );
     }
     if (failure != nullptr) std::rethrow_exception(failure);
-    return rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    return rc;
+}
+
+std::runtime_error ChipWorker::execution_wait_error(int code) {
+    return std::runtime_error("wait_native_run_completion failed with code " + std::to_string(code));
 }
 
 void ChipWorker::wait_native_run_completion(const ChipWorkerNativeRun &run) {
@@ -2031,9 +2218,7 @@ void ChipWorker::wait_native_run_completion(const ChipWorkerNativeRun &run) {
     if (lease == NativeRunLease::AlreadyComplete) return;
     if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "wait_native_run_completion");
     const int rc = wait_run_completion_fn_(device_ctx_, storage);
-    if (rc != 0) {
-        throw std::runtime_error("wait_native_run_completion failed with code " + std::to_string(rc));
-    }
+    if (rc != 0) throw execution_wait_error(rc);
     note_native_run_completion(run.run_epoch, 0, false);
 }
 
@@ -2201,6 +2386,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     int persisted_rc = 0;
     bool persisted = false;
     bool result_observed = false;
+    NativeRunDescriptor gate_descriptor{};
     try {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         const auto it = native_runs_.find(run_epoch);
@@ -2209,6 +2395,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         persisted_rc = it->second->pending_rc;
         persisted = it->second->pending_rc_set;
         result_observed = it->second->result_observed;
+        gate_descriptor = it->second->gate_descriptor;
     } catch (...) {
         outcome.captured = std::current_exception();
         clear_finalize_reservation_noexcept(run_epoch);
@@ -2218,6 +2405,22 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
                             (phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED) &&
                             wait_run_fn_ != nullptr;
 
+    bool gate_cancel_requested = false;
+    if (phase == NativeRunPhase::ENQUEUED_HELD) {
+        // HELD is already submitted, but has never received logical execution
+        // authority. Cancel before any blocking drain; the private streams do
+        // not depend on an earlier lane member being released.
+        try {
+            gate_cancel_requested =
+                release_execution_gate_fn_(
+                    device_ctx_, &gate_descriptor, static_cast<uint32_t>(ExecutionGateDecision::Cancel)
+                ) == 0;
+        } catch (...) {
+            // Backend finalization still attempts cancellation and retains the
+            // context if it cannot prove both producer streams have drained.
+        }
+        deliver_outputs = false;
+    }
     bool entered_finalize = false;
     int finalize_rc = 0;
 
@@ -2306,6 +2509,8 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     }
 
     if (threw || outcome.fault != FinalizeFault::None) return outcome;
+    const bool cancelled_and_destroyed = gate_cancel_requested && outcome.context_destroyed;
+    if (cancelled_and_destroyed && finalize_rc == SIMPLER_NATIVE_RUN_CANCELLED) finalize_rc = 0;
     const int rc = finalize_rc != 0 ? finalize_rc : (persisted ? persisted_rc : 0);
     if (rc != 0) {
         outcome.fault = FinalizeFault::Failed;
@@ -2598,6 +2803,7 @@ ChipWorker::CommSession *ChipWorker::create_comm_session(void *handle, void *str
     if (comm_session_index_.find(key) != comm_session_index_.end()) {
         return nullptr;
     }
+    advance_comm_join_generation();
     CommSession session{};
     session.handle = handle;
     session.stream = stream;
@@ -2610,18 +2816,45 @@ ChipWorker::CommSession *ChipWorker::create_comm_session(void *handle, void *str
 
 int ChipWorker::destroy_comm_session(CommSession &session) {
     if (comm_cleanup_unconfirmed_) return COMM_RECLAMATION_UNCONFIRMED;
+    advance_comm_join_generation();
     int rc = 0;
+    const uint64_t session_id = reinterpret_cast<uint64_t>(session.handle);
+    const bool guarded = session.handle != nullptr && device_begin_domain_session_release_ctx_fn_ != nullptr;
+    if (guarded && device_begin_domain_session_release_ctx_fn_(device_ctx_, session_id) != 0) {
+        throw std::runtime_error("communication session is revoked or still in use");
+    }
     if (session.handle != nullptr && comm_destroy_fn_ != nullptr) {
-        rc = comm_destroy_fn_(session.handle);
+        try {
+            rc = comm_destroy_fn_(session.handle);
+        } catch (...) {
+            comm_reclamation_unconfirmed_ = true;
+            retain_unconfirmed_comm_cleanup();
+            if (guarded) (void)device_finish_domain_session_release_ctx_fn_(device_ctx_, session_id, 0);
+            throw;
+        }
         if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            if (guarded) (void)device_finish_domain_session_release_ctx_fn_(device_ctx_, session_id, 0);
+            comm_reclamation_unconfirmed_ = true;
             retain_unconfirmed_comm_cleanup();
             return rc;
+        }
+    }
+    if (guarded) {
+        const int settled = device_finish_domain_session_release_ctx_fn_(device_ctx_, session_id, rc == 0);
+        if (rc != 0 || settled != 0) {
+            comm_reclamation_unconfirmed_ = true;
+            retain_unconfirmed_comm_cleanup();
+            return COMM_RECLAMATION_UNCONFIRMED;
         }
     }
     if (reinterpret_cast<uint64_t>(session.handle) == base_comm_handle_) {
         base_comm_handle_ = 0;
     }
     comm_session_index_.erase(reinterpret_cast<uint64_t>(session.handle));
+    for (auto it = joined_domain_spans_.begin(); it != joined_domain_spans_.end();) {
+        if (it->first.first == session_id) it = joined_domain_spans_.erase(it);
+        else ++it;
+    }
     session.handle = nullptr;
     session.device_ctx = 0;
     session.local_window_base = 0;
@@ -2889,9 +3122,11 @@ bool ChipWorker::borrow_caller_device_spans(uint64_t borrow_id, const CallerDevi
     for (size_t i = 0; i < count; ++i) {
         wire[i] = CallerBufferSpan{spans[i].addr, spans[i].bytes};
     }
-    return device_borrow_caller_buffers_ctx_fn_(
-               device_ctx_, wire.data(), static_cast<uint32_t>(wire.size()), borrow_id
-           ) == 0;
+    const int rc =
+        device_borrow_caller_buffers_ctx_fn_(device_ctx_, wire.data(), static_cast<uint32_t>(wire.size()), borrow_id);
+    if (rc == 0) return true;
+    if (rc == PTO_RUNTIME_ERR_INVALID_STATE) return false;
+    throw std::runtime_error("borrow_caller_device_spans failed with code " + std::to_string(rc));
 }
 
 void ChipWorker::release_caller_device_borrow(uint64_t borrow_id, bool keep) noexcept {
@@ -2938,6 +3173,8 @@ uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo
 uint64_t ChipWorker::comm_alloc_windows(uint64_t comm_handle, size_t win_size) {
     require_comm_cleanup_confirmed();
     uint64_t device_ctx = 0;
+    comm_join_unsupported_ = true;
+    advance_comm_join_generation();
     int rc = comm_alloc_windows_fn_(reinterpret_cast<void *>(comm_handle), win_size, &device_ctx);
     if (rc != 0) {
         throw std::runtime_error("comm_alloc_windows failed with code " + std::to_string(rc));
@@ -2988,6 +3225,8 @@ uint64_t ChipWorker::comm_derive_context(
     if (rank_ids.empty()) {
         throw std::runtime_error("comm_derive_context: rank_ids must not be empty");
     }
+    comm_join_unsupported_ = true;
+    advance_comm_join_generation();
     uint64_t device_ctx = 0;
     int rc = comm_derive_context_fn_(
         reinterpret_cast<void *>(comm_handle), rank_ids.data(), rank_ids.size(), domain_rank, window_offset,
@@ -3011,6 +3250,9 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     if (comm_alloc_domain_windows_fn_ == nullptr) {
         throw std::runtime_error("comm_alloc_domain_windows is not supported by this runtime");
     }
+    if (device_register_domain_owner_ctx_fn_ == nullptr || comm_query_domain_allocation_fn_ == nullptr) {
+        throw UnsupportedRuntimeOperation("runtime does not support owner-backed communication domains");
+    }
     if (rank_ids.empty()) {
         throw std::runtime_error("comm_alloc_domain_windows: rank_ids must not be empty");
     }
@@ -3030,6 +3272,10 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     if (!host_shm_name.empty() && (workspace_mask & kSdmaWorkspace) != 0 && !worker_sdma_enabled_) {
         throw std::runtime_error("Host-domain SDMA requires an SDMA-enabled Worker");
     }
+    advance_comm_join_generation();
+    const auto identity = std::make_pair(comm_handle, allocation_id);
+    auto [tracked, inserted] = joined_domain_spans_.try_emplace(identity);
+    if (!inserted) throw std::runtime_error("communication allocation already tracked");
     const int rc =
         host_shm_name.empty() ?
             comm_alloc_domain_windows_fn_(
@@ -3074,6 +3320,8 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
         case COMM_DOMAIN_URMA_WORKSPACE_INVALID:
             reason = "URMA manager returned a null workspace address or zero workspace size";
             break;
+        default:
+            break;
         }
         throw std::runtime_error(
             "comm_alloc_domain_windows: " + std::string(reason) + " (code " + std::to_string(rc) + ")"
@@ -3081,6 +3329,41 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     }
     if (device_ctx == 0 || local_window_base == 0) {
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");
+    }
+
+    {
+        // Query the backend's allocation record, never mutable device CommContext contents.
+        size_t count = 0;
+        const auto handle = reinterpret_cast<CommHandle>(comm_handle);
+        int query_rc = comm_query_domain_allocation_fn_(handle, allocation_id, nullptr, 0, &count);
+        if (query_rc != 0 || count == 0 || count > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("comm allocation owner query failed");
+        }
+        std::vector<CommAllocationSpan> views(count);
+        const size_t capacity = count;
+        query_rc = comm_query_domain_allocation_fn_(handle, allocation_id, views.data(), capacity, &count);
+        if (query_rc != 0 || count != capacity) {
+            throw std::runtime_error("comm allocation owner changed during query");
+        }
+        std::vector<CallerBufferSpan> wire;
+        wire.reserve(count);
+        for (const auto &view : views)
+            wire.push_back({view.addr, view.bytes});
+        query_rc = device_register_domain_owner_ctx_fn_(
+            device_ctx_, comm_handle, allocation_id, wire.data(), static_cast<uint32_t>(wire.size())
+        );
+        if (query_rc != 0) {
+            // Do not introduce an unmatched collective rollback on one rank.
+            // The backend still owns this allocation and session close will reclaim it.
+            throw std::runtime_error("comm allocation owner registration failed with code " + std::to_string(query_rc));
+        }
+        if (host_shm_name.empty() && workspace_mask == 0) {
+            std::vector<CallerDeviceSpan> spans;
+            spans.reserve(count);
+            for (const auto &view : views)
+                spans.push_back({view.addr, view.bytes});
+            tracked->second = std::move(spans);
+        }
     }
     return {device_ctx, local_window_base, actual_window_size};
 }
@@ -3098,6 +3381,8 @@ uint64_t ChipWorker::register_ccu_callable(
     if (found == callable_artifacts_.end()) throw std::runtime_error("CCU callable ID is not registered");
     if (found->second.ccu_modules.empty()) throw std::runtime_error("callable has no native CCU modules");
     const auto package = pack_ccu_modules(found->second.ccu_modules);
+    comm_join_unsupported_ = true;
+    advance_comm_join_generation();
     uint64_t registration_id = 0;
     if (ccu_id != UINT32_MAX && !comm_register_domain_ccu_fn_)
         throw std::runtime_error("runtime has no domain CCU registration backend");
@@ -3323,31 +3608,55 @@ void ChipWorker::control_tracked_ccu_runs(uint32_t control) {
 void ChipWorker::comm_release_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank
 ) {
-    require_comm_reclamation_safe();
-    if (comm_release_domain_windows_fn_ == nullptr) {
-        throw std::runtime_error("comm_release_domain_windows is not supported by this runtime");
-    }
-    int rc =
-        comm_release_domain_windows_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, rank_count, domain_rank);
-    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
-    if (rc != 0) {
-        throw std::runtime_error("comm_release_domain_windows failed with code " + std::to_string(rc));
-    }
+    release_domain_windows(comm_handle, allocation_id, rank_count, domain_rank, false);
 }
 
 void ChipWorker::comm_abort_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank
 ) {
+    release_domain_windows(comm_handle, allocation_id, rank_count, domain_rank, true);
+}
+
+void ChipWorker::release_domain_windows(
+    uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool abort_initialization
+) {
     require_comm_reclamation_safe();
-    if (comm_abort_domain_windows_fn_ == nullptr) {
-        throw std::runtime_error("comm_abort_domain_windows is not supported by this runtime");
+    const auto release = abort_initialization ? comm_abort_domain_windows_fn_ : comm_release_domain_windows_fn_;
+    const char *operation = abort_initialization ? "comm_abort_domain_windows" : "comm_release_domain_windows";
+    if (release == nullptr) {
+        throw std::runtime_error(std::string(operation) + " is not supported by this runtime");
     }
-    int rc =
-        comm_abort_domain_windows_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, rank_count, domain_rank);
+    advance_comm_join_generation();
+    bool enrolled = false;
+    if (device_domain_owner_registered_ctx_fn_ != nullptr) {
+        const int registered = device_domain_owner_registered_ctx_fn_(device_ctx_, comm_handle, allocation_id);
+        if (registered != 0 && registered != 1) throw std::runtime_error("comm allocation owner lookup failed");
+        enrolled = registered == 1;
+        if (enrolled && device_begin_domain_release_ctx_fn_(device_ctx_, comm_handle, allocation_id) != 0)
+            throw std::runtime_error("comm allocation is revoked or still in use");
+    }
+    int rc = 0;
+    try {
+        rc = release(reinterpret_cast<void *>(comm_handle), allocation_id, rank_count, domain_rank);
+    } catch (...) {
+        comm_reclamation_unconfirmed_ = true;
+        retain_unconfirmed_comm_cleanup();
+        if (enrolled) (void)device_finish_domain_release_ctx_fn_(device_ctx_, comm_handle, allocation_id, 0);
+        throw;
+    }
     if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
-    if (rc != 0) {
-        throw std::runtime_error("comm_abort_domain_windows failed with code " + std::to_string(rc));
+    if (enrolled) {
+        const int settled = device_finish_domain_release_ctx_fn_(device_ctx_, comm_handle, allocation_id, rc == 0);
+        if (rc != 0 || settled != 0) {
+            comm_reclamation_unconfirmed_ = true;
+            retain_unconfirmed_comm_cleanup();
+            throw std::runtime_error("comm allocation release is unconfirmed");
+        }
     }
+    if (rc != 0) {
+        throw std::runtime_error(std::string(operation) + " failed with code " + std::to_string(rc));
+    }
+    joined_domain_spans_.erase({comm_handle, allocation_id});
 }
 
 std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domain_prepare(
@@ -3426,10 +3735,11 @@ void ChipWorker::comm_destroy(uint64_t comm_handle) {
     require_comm_reclamation_safe();
     CommSession *session = find_comm_session(comm_handle);
     if (session == nullptr) {
-        int rc = comm_destroy_fn_(reinterpret_cast<void *>(comm_handle));
+        CommSession untracked;
+        untracked.handle = reinterpret_cast<void *>(comm_handle);
+        const int rc = destroy_comm_session(untracked);
         if (rc == COMM_RECLAMATION_UNCONFIRMED) {
-            retain_unconfirmed_comm_cleanup();
-            create_comm_session(reinterpret_cast<void *>(comm_handle), nullptr, false);
+            create_comm_session(reinterpret_cast<void *>(comm_handle), untracked.stream, false);
         }
         if (rc != 0) {
             throw std::runtime_error("comm_destroy failed with code " + std::to_string(rc));

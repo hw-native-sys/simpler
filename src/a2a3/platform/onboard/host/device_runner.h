@@ -128,6 +128,14 @@ public:
     // for the successor would have to destroy a stream with live work on it.
     // Answering no here leaves that successor on the ordinary path instead of
     // turning a fallback into a launch failure.
+    bool supports_execution_gate() const override { return !execution_mode_latch().is_kernel(); }
+    int bind_execution_gate(PreparedExecution &prepared) override {
+        prepared.kernel_args.args.execution_gate_address = prepared.execution_gate->device_address();
+        prepared.kernel_args.args.execution_gate_identity = prepared.identity.run_epoch;
+        prepared.kernel_args.args.execution_gate_generation = prepared.identity.generation;
+        return 0;
+    }
+
     bool ready_to_join_launch() const override { return !run_streams_.aicore_replacement_pending(); }
 
     // The boundary markers are recorded on this pair's two streams, so the pair's own retirement

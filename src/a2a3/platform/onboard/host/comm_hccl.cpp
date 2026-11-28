@@ -21,6 +21,7 @@
  */
 
 #include "platform_comm/comm.h"
+#include "platform_comm/domain_allocation_views.h"
 #include "platform_comm/comm_context.h"
 #include "platform_comm/comm_domain_onboard.h"
 #include "runtime_c_api.h"
@@ -1770,6 +1771,39 @@ extern "C" int comm_alloc_host_domain_windows(
         return COMM_INITIALIZATION_ABORT_REQUIRED;
     }
 } catch (...) {
+    return -1;
+}
+
+extern "C" int comm_query_domain_allocation(
+    CommHandle h, uint64_t allocation_id, CommAllocationSpan *spans, size_t capacity, size_t *count_out
+) try {
+    if (count_out == nullptr) return -1;
+    *count_out = 0;
+    if (h == nullptr) return -1;
+    const auto found = h->domain_allocations.find(allocation_id);
+    if (found == h->domain_allocations.end() || !found->second) return -1;
+    const auto &owner = *found->second;
+    if (owner.device_ctx == nullptr || !owner.initialized || owner.release_failed) return -1;
+    std::vector<CommAllocationSpan> views;
+    views.reserve(owner.peer_windows.size() + owner.host_windows.size() + 2);
+    views.push_back({reinterpret_cast<uint64_t>(owner.device_ctx), sizeof(CommContext)});
+    if (!owner.host_windows.empty()) {
+        const auto local = static_cast<size_t>(owner.rank);
+        if (local >= owner.host_windows.size() || !owner.host_windows[local].registered) return -1;
+        // Local MTE maps only this rank. Peer entries are populated when
+        // the host domain requests SDMA.
+        for (const auto &window : owner.host_windows) {
+            if (window.registered) views.push_back({window.device_base, owner.host_window_size});
+        }
+    } else {
+        views.push_back({reinterpret_cast<uint64_t>(owner.local_window.base), owner.local_window.size});
+        for (const auto &peer : owner.peer_windows) {
+            views.push_back({reinterpret_cast<uint64_t>(peer.base), peer.size});
+        }
+    }
+    return simpler::comm::publish_domain_allocation_views(views, spans, capacity, count_out);
+} catch (...) {
+    if (count_out != nullptr) *count_out = 0;
     return -1;
 }
 

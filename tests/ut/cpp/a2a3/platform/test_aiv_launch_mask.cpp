@@ -18,6 +18,7 @@ namespace {
 enum class MaskMode { Normal, Count };
 MaskMode mask_mode;
 std::optional<MaskMode> executor_mask_mode;
+constexpr int DSB_DDR = 0;
 
 void set_mask_norm() { mask_mode = MaskMode::Normal; }
 int get_block_idx() { return 0; }
@@ -41,6 +42,6 @@ TEST(AivLaunch, EstablishesNormalMaskModeBeforeDispatch) {
     AicoreRuntimePacket packet{};
     mask_mode = MaskMode::Count;
     executor_mask_mode.reset();
-    aicore_kernel_0_mix_aiv(reinterpret_cast<uint64_t>(packet.descriptor), 0, 0, 0, 0);
+    aicore_kernel_abi2_0_mix_aiv(reinterpret_cast<uint64_t>(packet.descriptor), 0, 0, 0, 0, 0, 0, 0);
     EXPECT_EQ(executor_mask_mode, MaskMode::Normal);
 }

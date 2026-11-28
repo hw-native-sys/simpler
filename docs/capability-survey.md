@@ -152,7 +152,7 @@ Three stages, all shipped. A KFC launch targets CANN's preinstalled
 byte-offset ABI; the device-side dispatcher writes the inner SO to
 `/usr/lib64/aicpu_kernels/...` keyed by a truncated ELF Build-ID; then JSON
 registration with `opKernelLib=AICPUKernel`. Two symbols are launched, not one:
-`simpler_aicpu_init` (per-device one-shot `InitArgs`) and `simpler_aicpu_exec`
+`simpler_aicpu_init` (per-device one-shot `InitArgs`) and `simpler_aicpu_exec_abi2`
 (`src/common/aicpu_loader/host/load_aicpu_op.h:155-158`).
 
 `numBlocks` is the AICPU thread count, but placement belongs to CANN, so the

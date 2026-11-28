@@ -41,10 +41,15 @@ public:
     ChipRun() = default;
 
     bool done();
+    bool poll_observation();
     bool retire_framework(bool wait_for_own_completion, Deadline deadline = Deadline::max());
     bool framework_transferred() const;
     bool wait_until(Deadline deadline);
     void activate();
+    // Parent proof that no earlier dispatch can arrive; never grants execution.
+    void authorize_prepare();
+    // Explicit parent request after resource sealing; never grants execution.
+    bool enqueue_held();
     void abandon();
     // Release a caller-owned submission after its last possible execution.
     // Keep the handle for a checked retry if finalization fails.
@@ -75,6 +80,7 @@ private:
     friend class ChipRunLane;
     friend class ChipWorker;
     friend class NativeSubmissionState;
+    bool poll(bool observing);
     bool carrier_retired_for_submission() const;
     ChipRun(std::shared_ptr<ChipRunLaneState> lane, std::shared_ptr<ChipRunState> run);
 

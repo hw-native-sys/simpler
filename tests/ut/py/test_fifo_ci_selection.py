@@ -34,12 +34,26 @@ def test_default_ci_sweep_collects_all_fifo_cases():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     nodes = [line for line in result.stdout.splitlines() if line.startswith("tests/st/") and "::" in line]
-    assert len(nodes) == 8
+    assert len(nodes) == 19
     assert sum("independent-input" in node for node in nodes) == 2
     assert sum("shared-read-only-input" in node for node in nodes) == 2
     assert any("::TestWorkerAsyncWholeRunFifoTmrMultiRank::test_run" in node for node in nodes)
     assert any("::test_incompatible_runtime_env_falls_back_to_depth_one" in node for node in nodes)
     assert sum("::test_a_run_whose_cleanup_touches_the_device_degrades_to_depth_one" in node for node in nodes) == 2
+    for name in (
+        "TestWorkerAsyncIndependentDomainsHbg",
+        "TestWorkerAsyncIndependentDomainsTmr",
+        "TestWorkerAsyncRetainedDomainFifoHbgMultiRank",
+        "TestWorkerAsyncRetainedDomainFifoTmrMultiRank",
+        "TestWorkerAsyncRetainedDomainJoinedHbgSingleRank",
+        "TestWorkerAsyncRetainedDomainJoinedTmrSingleRank",
+        "TestWorkerAsyncRetainedDomainJoinedReleaseHbgSingleRank",
+        "TestWorkerAsyncRetainedDomainJoinedReleaseTmrSingleRank",
+        "TestWorkerAsyncRetainedDomainPeerFenceHbg",
+        "TestWorkerAsyncRetainedDomainPeerFenceTmr",
+        "TestWorkerAsyncWholeRunFifoHbgMultiRank",
+    ):
+        assert any(f"::{name}::test_run" in node for node in nodes)
 
 
 @pytest.mark.parametrize(

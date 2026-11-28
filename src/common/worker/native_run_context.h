@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <thread>
 
 #include "call_config.h"
@@ -99,6 +100,21 @@ struct NativeRunContext {
     bool completion_feedback_attempted{false};
     const int32_t *peer_cancel_request{nullptr};
     bool peer_cancel_sent{false};
+    using ProgressClock = std::chrono::steady_clock;
+    std::optional<ProgressClock::time_point> observation_deadline;
+
+    void start_observation() {
+        if (peer_cancel_request != nullptr && !observation_deadline) {
+            observation_deadline = progress_deadline(ProgressClock::now());
+        }
+    }
+
+    bool observation_expired() const { return observation_deadline && ProgressClock::now() >= *observation_deadline; }
+
+    ProgressClock::time_point progress_deadline(ProgressClock::time_point start) const {
+        const int timeout_ms = runner->peer_cancel_wait_timeout_ms();
+        return timeout_ms < 0 ? ProgressClock::time_point::max() : start + std::chrono::milliseconds(timeout_ms);
+    }
 
     bool bind_peer_cancel(const int32_t *request) {
         if (request == nullptr || phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared ||
@@ -119,17 +135,16 @@ struct NativeRunContext {
 
     int await_peer_cancel_progress() {
         if (peer_cancel_request != nullptr) {
-            const int timeout_ms = runner->peer_cancel_wait_timeout_ms();
-            const auto start = std::chrono::steady_clock::now();
+            const auto start = ProgressClock::now();
+            const auto deadline = observation_deadline ? *observation_deadline : progress_deadline(start);
             // Keep short completions fast, but let a healthy long-running kernel
             // execute without occupying a host core for its entire lifetime.
             const auto spin_until = start + std::chrono::microseconds(100);
             while (runner->poll_execution(*active_execution) == SIMPLER_NATIVE_RUN_POLL_NOT_READY) {
                 const int rc = poll_peer_cancel();
                 if (rc != 0) return rc;
-                const auto now = std::chrono::steady_clock::now();
-                if (timeout_ms >= 0 && now - start >= std::chrono::milliseconds(timeout_ms))
-                    return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+                const auto now = ProgressClock::now();
+                if (now >= deadline) return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
                 if (now >= spin_until) std::this_thread::sleep_for(std::chrono::microseconds(50));
             }
         }

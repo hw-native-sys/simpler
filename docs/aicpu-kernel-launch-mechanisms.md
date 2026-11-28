@@ -135,6 +135,33 @@ onboard Path A implementation:
    invariants (device id, log config) are NOT on `KernelArgs` — they travel once
    via `InitArgs`.
 
+The per-task launch envelope reserves 256 bytes for its header. A gated A2/A3
+launch carries an execution-gate address, native invocation identity and lease
+generation in both `KernelArgs` and the positional AICore argument block.
+The gate has four separate 64-byte lines: Host decision, AICPU outcome, AIC
+outcome and AIV outcome. The Host publishes the immutable GO/CANCEL decision
+before releasing the stream notifications; device entries invalidate and check
+it before changing runtime, profiling or handshake state. CANCEL returns from
+both entries without invoking the runtime. PENDING, an unknown decision or an
+identity mismatch does not execute user work. Host completion checks the entry
+outcomes after the submitted streams drain; an entry outcome alone is not a
+completion fence. An all-zero address/identity/generation tuple selects ordinary
+execution. A5 entries reject nonzero gate tuples.
+
+The executable entry ABI is version 2 (`simpler_aicpu_exec_abi2` and the
+`aicore_kernel_abi2` mixed AIC/AIV entries). The Host checks defined executable
+symbols in the actual ELF symbol tables before accepting the pair, so an old
+or mixed device image cannot silently ignore the gate fields.
+
+Retained chip-swimlane may reserve an identity-bound bucket while a gate is
+held. Cancellation does not run ordinary terminal reconciliation: after both
+private streams and publication complete, the native owner checks the CANCEL
+entry outcomes and issues a private producer-never-started receipt. Withdrawal
+checks that receipt against the still-admitting bucket, then waits for reader
+reference acknowledgements before returning its bank and bucket. A failed
+proof or acknowledgement retains the unresolved ownership. Other device
+profiling channels do not use this gate path.
+
 Keep those channels distinct. The bootstrap ABI still uses the `DeviceArgs`
 name because the dispatcher really reads that structure. The platform per-task
 ABI passes only the front-less `KernelArgs` and carries no CANN launch front.
@@ -176,7 +203,7 @@ length. The image length covers its header, snapshot and reference table.
 RTS copies the complete packet by `argsSize` with zero host-input relocations.
 TMR Program publishes a separately allocated descriptor on the AICPU stream.
 
-In TMR Kernel mode the host appends the KernelInvocation at byte 192 and the
+In TMR Kernel mode the host appends the KernelInvocation at byte 256 and the
 Runtime control descriptor after the invocation. The packet identifies the
 descriptor by its byte offset from the packet base and its length. RTS copies
 the complete packet according to `argsSize`, with zero host-input relocations.

@@ -874,6 +874,7 @@ class TestDomainReleaseOrdering:
         """A level-3 Worker holding one domain allocation's two carved buffers, plus a native worker."""
         w = _l3()
         w._worker = MagicMock()  # non-None so _release_domain_now proceeds
+        w._orch = Orchestrator(MagicMock(), w)
         bufs = (
             wrap_vmm_window(0x5000, 64, w._owner_instance_id, buffer_id=0x5000, owner_worker_id=0),
             wrap_vmm_window(0x6000, 64, w._owner_instance_id, buffer_id=0x6000, owner_worker_id=1),

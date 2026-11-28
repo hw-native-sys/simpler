@@ -38,6 +38,8 @@
 
 #pragma once
 #include "host/aligned_image_storage.h"
+#include "host/executor_binary_abi.h"
+#include "native_execution_gate.h"
 
 #include <runtime/rt.h>
 
@@ -351,6 +353,7 @@ public:
      * per-thread device bind off a borrowed device.
      */
     ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
+    const ExecutionModeLatch &execution_mode_latch() const { return execution_mode_latch_; }
 
     /** True only after simpler_init succeeds and before teardown begins. */
     bool program_initialized() const { return program_initialized_; }
@@ -493,14 +496,14 @@ public:
     /**
      * Allocate for a caller and record the allocation as theirs.
      *
-     * The caller-facing mint. Separate from `allocate_tensor` because only what a caller minted may
-     * be named by a run's arguments: this runner's own regions — workspace, retained temporaries,
-     * arena banks — go through that one and stay unrecorded, so they cannot be borrowed.
+     * The caller-facing mint. Internal workspace, retained temporaries and arena banks
+     * use `allocate_tensor` and stay unrecorded. Communication storage is registered
+     * separately through backend-attested domain grants.
      */
     void *allocate_caller_buffer(std::size_t bytes);
 
     bool external_buffer_borrows_live() const {
-        return caller_device_buffers_.borrow_count(CallerDeviceBuffers::EXTERNAL_BORROW_MIN_ID) != 0;
+        return device_buffer_owners_.borrow_count(CallerDeviceBuffers::EXTERNAL_BORROW_MIN_ID) != 0;
     }
 
     /** Adopt one fresh caller allocation; the allocator owns storage only after a successful return. */
@@ -523,8 +526,8 @@ public:
     /**
      * Take `identity`'s borrow over the caller allocations covering `spans`.
      *
-     * All or nothing — see host/caller_device_buffers.h. A span that names no recorded caller
-     * allocation is what makes this refuse, which is the proof-of-owner the joined path needs.
+     * Known spans remain held on incomplete coverage. Caller allocations and explicitly
+     * registered native domain owners contribute; unknown external storage does not.
      */
     bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count);
 
@@ -534,8 +537,35 @@ public:
     /** Detach only the exact currently reserved capture carrier from its retained references. */
     bool retire_caller_buffer_carrier(const void *owner, const NativeRunIdentity &identity);
 
+    bool register_domain_buffer_owner(
+        uint64_t session, uint64_t allocation, const CallerDeviceBuffers::Span *spans, std::size_t count
+    ) {
+        return device_buffer_owners_.register_domain_owner(session, allocation, spans, count);
+    }
+
+    bool has_domain_buffer_owner(uint64_t session, uint64_t allocation) const {
+        return device_buffer_owners_.has_domain_owner(session, allocation);
+    }
+
+    bool begin_domain_session_release(uint64_t session) {
+        return device_buffer_owners_.begin_domain_session_release(session);
+    }
+
+    bool finish_domain_session_release(uint64_t session, bool confirmed) {
+        return device_buffer_owners_.finish_domain_session_release(session, confirmed);
+    }
+
+    bool begin_domain_buffer_release(uint64_t session, uint64_t allocation) {
+        return device_buffer_owners_.begin_domain_release(session, allocation);
+    }
+
+    bool finish_domain_buffer_release(uint64_t session, uint64_t allocation, bool confirmed) {
+        return confirmed ? device_buffer_owners_.finish_domain_release(session, allocation) :
+                           device_buffer_owners_.mark_domain_release_unconfirmed(session, allocation);
+    }
+
     /**
-     * Declare which caller allocations `identity` produces; see host/caller_device_buffers.h.
+     * Declare which recorded storage extents `identity` produces; see host/device_buffer_owners.h.
      *
      * @return false when the statement could not be recorded, which the declaring run's bind has
      *         to treat as its own failure: an undeclared producer reads as no producer.
@@ -544,18 +574,18 @@ public:
         uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count,
         std::size_t *unresolved_out = nullptr
     ) {
-        return caller_device_buffers_.declare_writes(identity, spans, count, unresolved_out);
+        return device_buffer_owners_.declare_writes(identity, spans, count, unresolved_out);
     }
 
     /** Whether `[addr, addr + bytes)` has no readable content for `identity` yet. */
     bool caller_buffer_written_by_other_run(uint64_t identity, uint64_t addr, uint64_t bytes) const {
-        return caller_device_buffers_.written_by_other_run(identity, addr, bytes);
+        return device_buffer_owners_.written_by_other_run(identity, addr, bytes);
     }
 
     /** The caller allocations this context has recorded, for teardown reporting and tests. */
-    std::size_t caller_buffer_count() const { return caller_device_buffers_.allocation_count(); }
-    std::size_t caller_buffer_borrow_count() const { return caller_device_buffers_.borrow_count(); }
-    std::size_t caller_buffer_retained_count() const { return caller_device_buffers_.retained_count(); }
+    std::size_t caller_buffer_count() const { return device_buffer_owners_.caller_allocation_count(); }
+    std::size_t caller_buffer_borrow_count() const { return device_buffer_owners_.borrow_count(); }
+    std::size_t caller_buffer_retained_count() const { return device_buffer_owners_.retained_count(); }
 
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
@@ -1066,6 +1096,7 @@ public:
      * `aicore_kernel_binary_`.
      */
     void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
+        simpler::executor_abi::validate(aicpu_so_binary, aicore_kernel_binary);
         aicpu_so_binary_ = std::move(aicpu_so_binary);
         aicore_kernel_binary_ = std::move(aicore_kernel_binary);
     }
@@ -1641,6 +1672,12 @@ public:
             num_aicore(other.num_aicore),
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
+            execution_gate(std::move(other.execution_gate)),
+            gate_original_streams(other.gate_original_streams),
+            gate_original_stream_lifetime(std::move(other.gate_original_stream_lifetime)),
+            gate_streams_replaced(other.gate_streams_replaced),
+            gate_swimlane_admitted(other.gate_swimlane_admitted),
+            gate_swimlane_withdrawn(other.gate_swimlane_withdrawn),
             prepared_resources(std::move(other.prepared_resources)),
             streams(std::exchange(other.streams, RunStreams{})),
             stream_lifetime(std::move(other.stream_lifetime)),
@@ -1679,6 +1716,12 @@ public:
         int num_aicore{0};
         int launch_aicpu_num{0};
         KernelArgsHelper kernel_args{};
+        std::shared_ptr<NativeExecutionGate> execution_gate;
+        RunStreams gate_original_streams{};
+        std::shared_ptr<void> gate_original_stream_lifetime;
+        bool gate_streams_replaced{false};
+        bool gate_swimlane_admitted{false};
+        bool gate_swimlane_withdrawn{false};
         std::shared_ptr<const PreparedRunResources> prepared_resources;
         // Bound before publication under the execution claim, unchanged through
         // retirement. The runner retains its Core stream and the caller owns
@@ -1725,6 +1768,16 @@ public:
         int retirement_diagnostics_rc{0};
         uint32_t scheduler_runtime_mode{0};
     };
+
+    virtual bool supports_execution_gate() const { return false; }
+    virtual int bind_execution_gate(PreparedExecution &) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+    int prepare_execution_gate(PreparedExecution &prepared);
+    int rollback_unsubmitted_execution_gate(PreparedExecution &prepared);
+    bool execution_gate_diagnostics_eligible(const PreparedExecution &prepared) const;
+    int withdraw_gate_cancelled_swimlane(PreparedExecution &prepared);
+    int release_execution_gate(const NativeRunIdentity &identity, ExecutionGateDecision decision);
+    int retire_execution_gate(PreparedExecution &prepared, bool complete);
+    int validate_execution_gate(PreparedExecution &prepared);
 
     virtual int prepare_collector_storage(const Runtime &, PreparedExecution &) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
@@ -1894,7 +1947,7 @@ public:
     int prepare_caller_submission(void *owner, PreparedExecution &prepared);
     void yield_caller_submission(void *owner, const NativeRunIdentity &identity);
     int finish_caller_submission(ActiveExecution &active);
-    void release_caller_submission(void *owner) { caller_device_buffers_.release_reference(owner, false); }
+    void release_caller_submission(void *owner) { device_buffer_owners_.release_reference(owner, false); }
     bool caller_diagnostics_supported(const PreparedExecution &prepared) const;
     virtual bool supports_caller_scope_stats() const { return false; }
     virtual bool supports_caller_pmu() const { return false; }
@@ -3115,11 +3168,9 @@ protected:
     // cannot inherit or overwrite an unobserved predecessor result.
     ReportedPool reported_pool_{mem_alloc_};
 
-    // The device allocations a caller minted through this context, and which
-    // runs still hold them — see host/caller_device_buffers.h. Only the
-    // caller-facing mint records here, so an address this runner allocated for
-    // itself is absent and cannot be named by a run's arguments.
-    CallerDeviceBuffers caller_device_buffers_;
+    // Caller allocations and backend-attested domain extents, with each run's loans.
+    // Internal workspace and arena storage remain absent; see host/device_buffer_owners.h.
+    DeviceBufferOwners device_buffer_owners_;
 
     // One budget and one ownership ledger for this context's workspace
     // regions. Off unless a caller latches a budget.
@@ -3372,6 +3423,10 @@ protected:
     // `finalize()`. A2A3 reserves these for bootstrap/control operations and
     // submits runs on its own per-slot stream sets; A5 submits runs on these.
     // `nullptr` before init.
+    std::mutex execution_gates_mu_;
+    std::unordered_map<uint64_t, std::shared_ptr<NativeExecutionGate>> execution_gates_;
+    std::mutex gate_control_mu_;
+    std::atomic<rtStream_t> gate_control_stream_{nullptr};
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
     // Device-constant AICore MMIO register-address tables: one 8-byte entry per

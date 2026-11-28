@@ -26,7 +26,7 @@
  *   2. Init (per-DeviceRunner): JSON-registers the runtime SO via
  *      `rtsBinaryLoadFromFile` (cpuKernelMode=0, kernelSo points at the
  *      preinstall basename), then resolves runtime SO entry points such as
- *      `simpler_aicpu_exec`, `simpler_aicpu_init`, `simpler_aicpu_finalize`,
+ *      `simpler_aicpu_exec_abi2`, `simpler_aicpu_init`, `simpler_aicpu_finalize`,
  *      and `simpler_aicpu_register_callable` to `rtFuncHandle`s via
  *      `rtsFuncGetByName`. JSON uses `/tmp/simpler_inner_<fp>_<device>_<pid>.json`;
  *      device-scoped loaders use a stable per-process descriptor path.
@@ -213,8 +213,8 @@ private:
 // Runtime SO's actual exported symbol name. Looked up via the runtime SO's
 // own JSON registration (no dispatcher hop at runtime).
 namespace KernelNames {
-constexpr const char *RunName = "simpler_aicpu_exec";   // multi-threaded exec
-constexpr const char *InitName = "simpler_aicpu_init";  // per-device one-shot invariants
+constexpr const char *RunName = "simpler_aicpu_exec_abi2";  // multi-threaded exec
+constexpr const char *InitName = "simpler_aicpu_init";      // per-device one-shot invariants
 constexpr const char *FinalizeName = "simpler_aicpu_finalize";
 constexpr const char *RegisterCallableName = "simpler_aicpu_register_callable";
 }  // namespace KernelNames

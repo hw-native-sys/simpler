@@ -239,6 +239,14 @@ public:
     bool launch_native_run_joined(
         const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor, void *caller_stream = nullptr
     );
+    // Submit behind private notification waits. A predecessor supplies only
+    // execution-claim admission; no predecessor event is queued. False means
+    // no device submission. Every other failure requires backend finalization.
+    bool enqueue_native_run_held(
+        const ChipWorkerNativeRun &run, const ChipWorkerNativeRun *predecessor = nullptr, bool *credit_full = nullptr
+    );
+    // GO is irreversible and may only be called for the authorized lane front.
+    void release_native_run_held(const ChipWorkerNativeRun &run);
     bool poll_native_run(const ChipWorkerNativeRun &run);
     void bind_peer_cancel(const ChipWorkerNativeRun &run, const int32_t *request);
     void wait_native_run(const ChipWorkerNativeRun &run);
@@ -429,6 +437,7 @@ public:
     /// retaining every known allocation even if another span is external.
     /// True proves every span's owner; false refuses joined admission but can
     /// still hold references until `release_caller_device_borrow`.
+    /// Other native errors reject admission rather than granting a serial fallback.
     ///
     /// The three `device_*_caller_buffer(s)_ctx` entries are mandatory C ABI,
     /// like the rest of the `device_*_ctx` family: `init` resolves them with
@@ -562,6 +571,7 @@ public:
      * moment-to-moment fact about the device streams.
      */
     bool supports_joined_native_launch() const;
+    bool supports_execution_gate() const;
     /**
      * Whether `run` may be ordered behind `predecessor` while both collect
      * swimlane diagnostics.
@@ -595,14 +605,10 @@ public:
     CreditEntries credit_entries() const {
         return CreditEntries{device_ctx_, credit_generation_fn_, credit_wait_fn_, credit_cancel_fn_};
     }
-    /**
-     * Whether this worker holds a live communication session or global domain.
-     *
-     * A joined successor must not depend on either: both are released by the
-     * child before its device reset, so a run ordered behind another one cannot
-     * be allowed to still be naming them when that happens.
-     */
     bool holds_live_comm_resources() const;
+    /// Zero refuses joined launch; a nonzero snapshot identifies the complete resource set.
+    uint64_t joined_comm_generation() const;
+    uint64_t append_joined_comm_spans(std::vector<CallerDeviceSpan> &spans) const;
     /**
      * Declare whether this worker's host side still owns exported device
      * regions — resources this class does not itself create and so cannot see.
@@ -658,6 +664,14 @@ private:
     using DeviceFreeCallerBufferCtxFn = decltype(&device_free_caller_buffer_ctx);
     using DeviceBorrowCallerBuffersCtxFn = decltype(&device_borrow_caller_buffers_ctx);
     using DeviceReleaseCallerBuffersCtxFn = decltype(&device_release_caller_buffers_ctx);
+    using DeviceRegisterDomainOwnerCtxFn = decltype(&device_register_domain_owner_ctx);
+    using DeviceDomainOwnerRegisteredCtxFn = decltype(&device_domain_owner_registered_ctx);
+    using DeviceBeginDomainReleaseCtxFn = decltype(&device_begin_domain_release_ctx);
+    using DeviceFinishDomainReleaseCtxFn = decltype(&device_finish_domain_release_ctx);
+    using DeviceBeginDomainSessionReleaseCtxFn = decltype(&device_begin_domain_session_release_ctx);
+    using DeviceFinishDomainSessionReleaseCtxFn = decltype(&device_finish_domain_session_release_ctx);
+    using CommQueryDomainAllocationFn = decltype(&comm_query_domain_allocation);
+
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
@@ -677,6 +691,7 @@ private:
     using SimplerFinalizeRunFn = decltype(&simpler_finalize_run_with_delivery);
     using ObserveFrameworkSubmissionsFn = decltype(&simpler_observe_framework_submissions);
     using SimplerJoinedLaunchFn = decltype(&simpler_launch_run_joined);
+    using ReleaseExecutionGateFn = decltype(&simpler_release_execution_gate);
     using ValidateExecutionContextFn = decltype(&simpler_validate_execution_context);
     using ValidateCallerStreamFn = decltype(&simpler_validate_caller_stream);
     // Optional ACL symbols use SDK pointer arguments. The status pointer
@@ -745,8 +760,12 @@ private:
     CommSession *find_comm_session(uint64_t comm_handle);
     CommSession *create_comm_session(void *handle, void *stream, bool is_base);
     int destroy_comm_session(CommSession &session);
+    void release_domain_windows(
+        uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool abort_initialization
+    );
     uint64_t create_base_comm(int rank, int nranks, const std::string &rootinfo_path);
     void clear_comm_sessions();
+    void advance_comm_join_generation();
     void retain_unconfirmed_comm_cleanup() noexcept;
     void retain_unconfirmed_ccu_cleanup() noexcept;
     void retain_unconfirmed_comm_stream(void *stream);
@@ -767,6 +786,14 @@ private:
     DeviceFreeCallerBufferCtxFn device_free_caller_buffer_ctx_fn_ = nullptr;
     DeviceBorrowCallerBuffersCtxFn device_borrow_caller_buffers_ctx_fn_ = nullptr;
     DeviceReleaseCallerBuffersCtxFn device_release_caller_buffers_ctx_fn_ = nullptr;
+    DeviceRegisterDomainOwnerCtxFn device_register_domain_owner_ctx_fn_ = nullptr;
+    DeviceDomainOwnerRegisteredCtxFn device_domain_owner_registered_ctx_fn_ = nullptr;
+    DeviceBeginDomainReleaseCtxFn device_begin_domain_release_ctx_fn_ = nullptr;
+    DeviceFinishDomainReleaseCtxFn device_finish_domain_release_ctx_fn_ = nullptr;
+    DeviceBeginDomainSessionReleaseCtxFn device_begin_domain_session_release_ctx_fn_ = nullptr;
+    DeviceFinishDomainSessionReleaseCtxFn device_finish_domain_session_release_ctx_fn_ = nullptr;
+    CommQueryDomainAllocationFn comm_query_domain_allocation_fn_ = nullptr;
+
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
@@ -790,7 +817,10 @@ private:
     using CallerStreamSubmitFn = decltype(&simpler_submit_run_on_stream);
     CallerStreamSubmitFn submit_run_on_stream_fn_ = nullptr;
     SimplerJoinedLaunchFn launch_run_joined_fn_ = nullptr;
+    SimplerJoinedLaunchFn enqueue_run_held_fn_ = nullptr;
+    ReleaseExecutionGateFn release_execution_gate_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
+    SimplerNativeRunFn poll_run_observing_fn_ = nullptr;
     SimplerNativeRunFn query_run_completion_fn_ = nullptr;
     decltype(&simpler_bind_peer_cancel) peer_cancel_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;
@@ -845,6 +875,7 @@ private:
     SimplerFlushDiagnosticsFn flush_diagnostics_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_joined_native_launch_fn_ = nullptr;
+    SupportsConcurrentNativePrepareFn supports_execution_gate_fn_ = nullptr;
     SupportsJoinedDiagnosticLaunchFn supports_joined_diagnostic_launch_fn_ = nullptr;
     // The credit bridge. A runtime that exports none of these leaves the
     // slots null, which degrades to "no credit wait": the caller re-asks on
@@ -904,6 +935,10 @@ private:
     KernelLaunchFn kernel_launch_fn_ = nullptr;
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
+    // An empty view list owns admission debt, including partial allocation or registration failure.
+    std::map<std::pair<uint64_t, uint64_t>, std::vector<CallerDeviceSpan>> joined_domain_spans_;
+    uint64_t comm_join_generation_ = 1;
+    bool comm_join_unsupported_ = false;
     std::unordered_map<uint64_t, size_t> comm_session_index_;
     std::unordered_set<uint64_t> global_domain_ids_;
     uint64_t base_comm_handle_ = 0;
@@ -916,10 +951,20 @@ private:
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint64_t> ccu_preparation_keys_;
     std::unordered_map<int32_t, CcuCallableArtifacts> callable_artifacts_;
 
+    void negotiate_retained_epoch_capacity(uint32_t resource_grant);
     uint32_t resource_bank_for_slot(uint32_t kind, uint32_t slot_id) const;
     RegionBanks region_banks_for_slot(uint32_t slot_id) const;
 
-    enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, CALLER_SUBMITTED, FINALIZING };
+    enum class NativeRunPhase : uint8_t {
+        EMPTY,
+        PREPARING,
+        PREPARED,
+        ENQUEUED_HELD,
+        LAUNCHED,
+        REAPED,
+        CALLER_SUBMITTED,
+        FINALIZING
+    };
     class PreparedRunIncompatible : public std::runtime_error {
     public:
         using std::runtime_error::runtime_error;
@@ -1001,12 +1046,16 @@ private:
         bool pending_rc_set{false};
         bool result_observed{false};
         bool permits_prepared_successor{false};
+        NativeRunDescriptor gate_descriptor{};
     };
     /** What the storage tag says after a finalize that reached the C entry. */
     enum class RunStorageTag : uint8_t { Destroyed, Canonical, Noncanonical };
     /** Which operation a lease is being taken for; decides blocking and the admitted phases. */
     enum class NativeRunOp : uint8_t {
         Launch,
+        HeldEnqueue,
+        HeldClaimPredecessor,
+        ReleaseGate,
         BindPeerCancel,
         Poll,
         QueryCompletion,
@@ -1032,6 +1081,8 @@ private:
     );
     void submit_native_run_to_caller(const ChipWorkerNativeRun &run, void *caller_stream);
     void wait_native_run_completion(const ChipWorkerNativeRun &run);
+    int poll_native_run_progress(const ChipWorkerNativeRun &run, bool observing);
+    static std::runtime_error execution_wait_error(int code);
     void cleanup_native_runs_noexcept() noexcept;
     std::exception_ptr stop_and_cleanup_native_runs();
     void clear_runtime_binding(bool release_device_reservation = true);

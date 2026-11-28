@@ -25,7 +25,6 @@
  */
 
 #include "host/host_dependency_capture_scope.h"
-#include <optional>
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
@@ -49,6 +48,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <pthread.h>
 #include <utility>
 #include <vector>
@@ -632,7 +632,8 @@ declare_caller_device_writes(void *runner_ctx, uint64_t run_id, const CallerBuff
             // exactly as wide as what was recorded, so those bytes read as having no declared
             // producer — which is why this is said out loud rather than skipped silently.
             LOG_WARN(
-                "declare_caller_device_writes: %zu of %u produced span(s) name no caller allocation of this "
+                "declare_caller_device_writes: %zu of %u produced span(s) name no caller or native-domain allocation "
+                "of this "
                 "device context; their bytes carry no readable-yet fence for a concurrently preparing run",
                 unresolved, count
             );
@@ -822,6 +823,77 @@ int device_borrow_caller_buffers_ctx(
         const bool held =
             static_cast<DeviceRunnerBase *>(ctx)->borrow_caller_buffers(borrow_id, resolved.data(), resolved.size());
         return held ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_register_domain_owner_ctx(
+    DeviceContextHandle ctx, uint64_t session, uint64_t allocation, const CallerBufferSpan *spans, uint32_t count
+) {
+    if (ctx == nullptr || spans == nullptr || count == 0) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        std::vector<CallerDeviceBuffers::Span> views(count);
+        for (uint32_t i = 0; i < count; ++i)
+            views[i] = {spans[i].addr, spans[i].bytes};
+        return static_cast<DeviceRunnerBase *>(ctx)->register_domain_buffer_owner(
+                   session, allocation, views.data(), views.size()
+               ) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_domain_owner_registered_ctx(DeviceContextHandle ctx, uint64_t session, uint64_t allocation) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->has_domain_buffer_owner(session, allocation) ? 1 : 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_begin_domain_session_release_ctx(DeviceContextHandle ctx, uint64_t session) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->begin_domain_session_release(session) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_finish_domain_session_release_ctx(DeviceContextHandle ctx, uint64_t session, int confirmed) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->finish_domain_session_release(session, confirmed != 0) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_begin_domain_release_ctx(DeviceContextHandle ctx, uint64_t session, uint64_t allocation) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->begin_domain_buffer_release(session, allocation) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_finish_domain_release_ctx(DeviceContextHandle ctx, uint64_t session, uint64_t allocation, int confirmed) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->finish_domain_buffer_release(session, allocation, confirmed != 0) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2338,6 +2410,83 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle
     return static_cast<DeviceRunnerBase *>(ctx)->can_join_diagnostic_run(*succ, *pred) ? 1 : 0;
 }
 
+int supports_execution_gate_ctx(DeviceContextHandle ctx) {
+    return ctx != nullptr && static_cast<DeviceRunnerBase *>(ctx)->supports_execution_gate() ? 1 : 0;
+}
+
+int simpler_release_execution_gate(DeviceContextHandle ctx, const NativeRunDescriptor *descriptor, uint32_t decision) {
+    if (ctx == nullptr || descriptor == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        const NativeRunIdentity identity{
+            descriptor->run_epoch, descriptor->generation, descriptor->dispatch_id, descriptor->pipeline_slot
+        };
+        return static_cast<DeviceRunnerBase *>(ctx)->release_execution_gate(
+            identity, static_cast<ExecutionGateDecision>(decision)
+        );
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_enqueue_run_held(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor) {
+    auto *state = native_run_context(ctx, runtime, "simpler_enqueue_run_held");
+    if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared ||
+        state->prepared_execution == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!state->runner->supports_execution_gate() || state->caller_prepared ||
+        state->descriptor.ccu_workspace_addr != 0)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    NativeRunJoin claim_join{};
+    if (predecessor != nullptr) {
+        auto *ahead = native_run_context(ctx, predecessor, "simpler_enqueue_run_held");
+        if (ahead == nullptr || ahead == state) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        if (ahead->phase.load(std::memory_order_acquire) != NativeRunPhase::Running || !ahead->runner_claimed)
+            return PTO_RUNTIME_ERR_UNSUPPORTED;
+        auto *ahead_prepared = ahead->active_execution ? ahead->active_execution->prepared.get() : nullptr;
+        if (state->prepared_execution->dfx.diagnostics_any() ||
+            (ahead_prepared != nullptr && ahead_prepared->dfx.diagnostics_any())) {
+            if (ahead_prepared == nullptr ||
+                !state->runner->can_join_diagnostic_run(*state->prepared_execution, *ahead_prepared))
+                return PTO_RUNTIME_ERR_UNSUPPORTED;
+        }
+        claim_join = NativeRunJoin{ahead, ahead->identity()};
+    }
+    const int rc = state->runner->prepare_execution_gate(*state->prepared_execution);
+    if (rc != 0) return rc;
+    // The claim admits independent storage while another owner is live. No
+    // predecessor stream wait is queued: GO carries the complete-parent fence,
+    // and CANCEL must drain even when an earlier held run has not been released.
+    const uint64_t enqueue_begin = STRACE_NOW_NS();
+    const int launch_rc = launch_prepared_run(state, predecessor != nullptr ? &claim_join : nullptr);
+    if (SIMPLER_HOST_STRACE && unified_log_host_span_enabled()) {
+        const char *name = launch_rc == 0 ? "chip.run.gate.held_enqueued" : "chip.run.gate.enqueue_refused";
+        STRACE_HOST_SPAN_AT_A(name, enqueue_begin, STRACE_NOW_NS() - enqueue_begin, 1, state->trace_attrs);
+    }
+    bool rolled_back = false;
+    if (launch_rc != 0 && state->launch_not_started_proven && state->prepared_execution != nullptr &&
+        state->active_execution == nullptr) {
+        const int rollback_rc = state->runner->rollback_unsubmitted_execution_gate(*state->prepared_execution);
+        if (rollback_rc != 0) {
+            state->completion_rc = rollback_rc;
+            state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+            return rollback_rc;
+        }
+        rolled_back = true;
+    }
+    // Only preflight may decline as unsupported. Once the launch transaction
+    // ran, every partial outcome is an error even if a backend used a retry code.
+    if (launch_rc == PTO_RUNTIME_ERR_UNSUPPORTED ||
+        (launch_rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL && !rolled_back))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    return launch_rc;
+}
+
+static bool execution_gate_cancelled(const OnboardNativeRunContext *state) {
+    const auto *prepared =
+        state->active_execution ? state->active_execution->prepared.get() : state->prepared_execution.get();
+    return prepared != nullptr && prepared->execution_gate && prepared->execution_gate->cancelled();
+}
+
 int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run_joined");
     if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
@@ -2428,7 +2577,8 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
 
     if (!state->runner->accepts_new_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
     if (state->prepared_execution == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    state->prepared_execution->join = join != nullptr ? *join : NativeRunJoin{};
+    const bool gated = state->prepared_execution->execution_gate != nullptr;
+    state->prepared_execution->join = !gated && join != nullptr ? *join : NativeRunJoin{};
     if (!state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit, join)) {
         LOG_ERROR("launch_prepared_run: execution claim is occupied (%s)", state->trace_attrs);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -2483,7 +2633,7 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
             // is whether the *completed* enqueue preceded the predecessor's
             // completion; a read taken earlier leaves the window between it and
             // the submission returning, which is exactly the window in doubt.
-            if (rc == 0 && join != nullptr && launch.progress == LaunchProgress::Complete) {
+            if (rc == 0 && !gated && join != nullptr && launch.progress == LaunchProgress::Complete) {
                 emit_joined_launch_span(state->runner->note_joined_launch(*join, state->identity()));
             }
         }
@@ -2549,6 +2699,8 @@ static int retire_completed_native_run(OnboardNativeRunContext *state) {
     const int rc = state->runner->retire_completed_execution(*state->active_execution);
     if (rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return rc;
     note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
+    if (execution_gate_cancelled(state) && state->completion_rc == 0)
+        state->completion_rc = SIMPLER_NATIVE_RUN_CANCELLED;
     if (state->completion_rc == 0) collect_completion_feedback(state);
     const bool pending_outputs =
         state->runtime != nullptr && std::any_of(
@@ -2632,7 +2784,7 @@ int simpler_bind_peer_cancel(DeviceContextHandle ctx, RuntimeHandle runtime, con
     }
 }
 
-int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
+static int poll_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool observing) {
     try {
         OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
         if (state == nullptr || state->caller_owns_submission) return SIMPLER_NATIVE_RUN_POLL_ERROR;
@@ -2643,12 +2795,21 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         }
         const int attach_rc = state->runner->enter_run_thread();
         if (attach_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (observing) state->start_observation();
         if (state->poll_peer_cancel() != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
-        return retire_completed_native_run(state);
+        const int progress = retire_completed_native_run(state);
+        if (observing && progress == SIMPLER_NATIVE_RUN_POLL_NOT_READY && state->observation_expired()) {
+            return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+        }
+        return progress;
     } catch (...) {
         return SIMPLER_NATIVE_RUN_POLL_ERROR;
     }
 }
+
+int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return poll_run(ctx, runtime, false); }
+
+int simpler_poll_run_observing(DeviceContextHandle ctx, RuntimeHandle runtime) { return poll_run(ctx, runtime, true); }
 
 int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) {
     try {
@@ -2699,6 +2860,8 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
     if (!drain.physical_complete) quarantine_undrained_run(*state->runner, drain.device_rc);
     if (state->completion_rc == 0) state->completion_rc = drain.combined();
+    if (execution_gate_cancelled(state) && state->completion_rc == 0)
+        state->completion_rc = SIMPLER_NATIVE_RUN_CANCELLED;
     state->result_observed = true;
     state->physical_complete = state->physical_complete || drain.physical_complete;
     if (state->physical_complete) {
@@ -2879,6 +3042,10 @@ static int finalize_native_run(
     }
     auto *prepared =
         state->active_execution ? state->active_execution->prepared.get() : state->prepared_execution.get();
+    if (prepared != nullptr && prepared->execution_gate && prepared->execution_gate->pending()) {
+        const int cancel_rc = state->runner->release_execution_gate(prepared->identity, ExecutionGateDecision::Cancel);
+        if (cancel_rc != 0) return cancel_rc;
+    }
     const bool caller_submitted = state->caller_owns_submission && state->active_execution != nullptr;
     if (caller_submitted && !state->physical_complete) {
         const int rc = state->runner->finish_caller_submission(*state->active_execution);
@@ -2899,6 +3066,11 @@ static int finalize_native_run(
         if (execution_rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE && !state->physical_complete) return execution_rc;
     }
     state->completion_rc = execution_rc;
+    if (execution_rc == SIMPLER_NATIVE_RUN_CANCELLED && execution_gate_cancelled(state) && state->physical_complete) {
+        state->copyback_returned = true;
+        state->failure_reported = true;
+        note_workspace_fact(state, WorkspaceManager::RunFact::CopybackReturned);
+    }
     if (launched && !state->physical_complete) {
         // A cached error is not permission to release a live or unknown reader.
         // Keep the carrier, IO, actual streams and all unresolved cleanup debt.
@@ -2918,7 +3090,7 @@ static int finalize_native_run(
         } else if (attach_rc == 0) {
             if (launched && execution_rc == 0) collect_completion_feedback(state);
             // Error detail comes from the original call-owned record.
-            if (launched && execution_rc != 0) {
+            if (launched && execution_rc != 0 && !execution_gate_cancelled(state)) {
                 (void)state->runner->read_device_run_result(
                     state->descriptor.pipeline_slot, state->descriptor.run_epoch
                 );
@@ -3029,6 +3201,12 @@ static int finalize_native_run(
             resources_rc = PTO_RUNTIME_ERR_INTERNAL;
         }
         if (resources_rc == 0) state->runner_resources_owned = false;
+    }
+    if (resources_rc == 0) {
+        auto *prepared =
+            state->active_execution ? state->active_execution->prepared.get() : state->prepared_execution.get();
+        if (prepared != nullptr)
+            resources_rc = state->runner->retire_execution_gate(*prepared, state->physical_complete);
     }
     if (resources_rc != 0) return validation_rc != 0 ? validation_rc : resources_rc;
 

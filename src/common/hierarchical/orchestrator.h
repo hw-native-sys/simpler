@@ -38,6 +38,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -154,7 +155,22 @@ public:
     SubmitResult submit_sub_group(const CallableIdentity &callable, const std::vector<TaskArgs> &args_list);
 
     // Only the calling orchestration thread builds a run at a time.
-    RunId begin_run();
+    RunId begin_run(bool hold_activation = false, bool enqueue_before_success = false);
+    // Resolve an explicitly requested predecessor-success dependency. Failure
+    // cancels staged descriptors before their native launch or output delivery.
+    void resolve_held_run(RunId run_id, bool success);
+    RunId wait_any_run(const std::vector<RunId> &run_ids, double timeout_seconds);
+    void wake_wait_any();
+    void cancel_wait_any();
+    // Multi-rank windows require whole-parent execution order. Preparation is
+    // independent of this fence; only confirmed physical release removes it.
+    // Enable at the FIFO head before submitting its first task. An execution
+    // authorization already published to a child cannot be revoked here.
+    void set_comm_execution_fence(uint64_t allocation_id, bool enabled);
+    // Caller promises every opaque communication access belongs to these whole
+    // domains. Actual Tensor arguments are collected independently by submit.
+    // Seal once after scope_end and before close_run_submission.
+    void seal_run_resources(RunId run_id, const std::vector<uint64_t> &domain_allocation_ids, bool complete = false);
 
     /**
      * Set how many runs may hold a native pipeline-slot lease at once
@@ -263,6 +279,9 @@ public:
      * `preparable_run_id` reports.
      */
     std::vector<RunId> preparable_run_ids() const;
+    // Only the FIFO head has proof that no earlier dispatch can still arrive.
+    RunId preparation_ordered_run_id() const;
+    std::vector<RunId> held_enqueue_run_ids() const;
 
     // Scheduler-only: staging must follow every earlier run's publication on
     // this endpoint, including its dependency-blocked singles and groups.
@@ -370,6 +389,8 @@ private:
 
     mutable std::mutex runs_mu_;
     std::condition_variable runs_cv_;
+    bool completion_wait_wake_{false};
+    bool completion_wait_cancelled_{false};
     std::unordered_map<RunId, std::shared_ptr<RunState>> runs_;
     std::deque<RunId> run_fifo_;
     // The standing default, not a layout ceiling: an Orchestrator nobody
@@ -395,6 +416,7 @@ private:
     // How many runs may have their device work launched at once. One is the
     // serial behaviour, and at one nothing below authorizes an early launch.
     uint32_t launch_depth_{1};
+    std::unordered_set<uint64_t> comm_execution_fences_;
     // Which runs were already authorized to launch early. Not the answer to
     // "who may launch" — that is `early_launch_prefix_locked`, recomputed on
     // demand — only the comparison that says which transition authorized
@@ -477,6 +499,11 @@ private:
     RunId early_launch_first_locked() const;
     /** Callers hold `runs_mu_`; return the authorized successor after a FIFO index. */
     RunId early_launch_successor_locked(size_t predecessor_index) const;
+    void collect_run_resources(
+        const std::shared_ptr<RunState> &run, WorkerType worker_type, const CallableIdentity &callable,
+        const std::vector<TaskArgs> &args_list, const std::vector<int32_t> &worker_ids,
+        const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
+    );
     /** The FIFO prefix authorized to launch early right now; `runs_mu_` is held. */
     std::vector<RunId> early_launch_prefix_locked() const;
     void activate_fifo_head();

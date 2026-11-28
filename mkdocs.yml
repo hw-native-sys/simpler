@@ -132,6 +132,7 @@ nav:
       - A5 PGO 日历 DMB 通知: zh-cn/design/percounter-peer-dmb.md
       - Local Host DDR access: design/a5-host-ddr.md
       - Run completion fences: design/run-completion-fence.md
+      - Hierarchical success dependencies: design/hierarchical-success-dependencies.md
       - Native framework submission: design/native-framework-submission.md
       - Native CCU ABI: design/ccu-native-abi.md
       - CCU Window Validation: design/ccu-window-validation.md

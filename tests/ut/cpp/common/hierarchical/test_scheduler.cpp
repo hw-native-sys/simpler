@@ -3206,6 +3206,9 @@ struct MailboxPipelineSchedulerFixture : public ::testing::Test {
         scheduler_config.preparable_runs_cb = [this] {
             return orchestrator.preparable_run_ids();
         };
+        scheduler_config.preparation_ordered_run_cb = [this] {
+            return orchestrator.preparation_ordered_run_id();
+        };
         scheduler_config.can_stage_run_on_worker_cb = [this](RunId run_id, int32_t worker_id) {
             return orchestrator.can_stage_run_on_worker(run_id, worker_id);
         };
@@ -5825,4 +5828,244 @@ TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
     if (worker_b.is_running.load()) worker_b.complete();
     wait_consumed(b.task_slot);
     (void)a;  // suppress unused
+}
+
+TEST(LocalMailboxEndpointCancellation, StagedCancellationWaitsForChildAckAndNeverActivates) {
+    Ring allocator;
+    allocator.init(0);
+    const TaskSlot slot = make_progress_slot(allocator, 22, 0, 1);
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+    const WorkerDispatch staged{slot, 0, 42, true};
+    endpoint.submit_progress(&allocator, staged);
+    endpoint.cancel_staged_progress(22);
+    EXPECT_FALSE(endpoint.activate_progress(22));
+    WorkerEndpointProgress progress;
+    EXPECT_FALSE(endpoint.poll_progress(progress));
+    test_child_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
+    EXPECT_FALSE(endpoint.poll_progress(progress));
+    auto *entry = test_entry(mailbox, 0);
+    EXPECT_EQ(test_entry_state(entry), MailboxState::CANCEL_STAGED);
+    EXPECT_EQ(__atomic_load_n(&entry->accepted, __ATOMIC_ACQUIRE), 0);
+    EXPECT_FALSE(endpoint.poll_progress(progress));
+    entry->error = 1;
+    set_test_entry_state(entry, MailboxState::TASK_FAILED);
+    ASSERT_TRUE(endpoint.poll_progress(progress));
+    EXPECT_EQ(progress.kind, WorkerProgressKind::COMPLETED);
+    EXPECT_EQ(progress.dispatch.dispatch_id, 42u);
+    allocator.shutdown();
+}
+
+TEST_F(MailboxPipelineSchedulerFixture, WaitAnyRequestsRealEndpointObservationBeforeWaiting) {
+    const auto run = orchestrator.begin_run();
+    orchestrator.submit_next_level(C(91), single_tensor_args(0x9100, TensorArgType::OUTPUT), config, 0);
+    orchestrator.close_run_submission(run);
+    ASSERT_TRUE(child.wait_dispatched(1));
+    const auto entry_index = child.dispatched_records().front().entry_index;
+    auto *entry = test_entry(child.mailbox, entry_index);
+    auto waiting = std::async(std::launch::async, [&] {
+        return orchestrator.wait_any_run({run}, 5);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (__atomic_load_n(&entry->observation_requested, __ATOMIC_ACQUIRE) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(__atomic_load_n(&entry->observation_requested, __ATOMIC_ACQUIRE), 1)
+        << "wait_any must propagate observation through WorkerManager to the actual mailbox";
+    child.complete();
+    ASSERT_EQ(waiting.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    EXPECT_EQ(waiting.get(), run);
+}
+
+TEST_F(MailboxPipelineSchedulerFixture, SuccessHeldPrefixStagesThreeRunsWithoutAuthorizingSuccessors) {
+    // Hold A's transport acknowledgement so the mock child can service B/C
+    // without executing A. Separate request frames and retained entries let
+    // both successors prepare while their success gates remain closed.
+    child.hold_next_request_frames(1);
+    std::vector<RunId> runs;
+    struct ReleaseHeldOnExit {
+        MockMailboxWorker &child;
+        Orchestrator &orchestrator;
+        std::vector<RunId> &runs;
+        ~ReleaseHeldOnExit() {
+            child.drain();
+            for (RunId run : runs)
+                orchestrator.resolve_held_run(run, true);
+        }
+    } cleanup{child, orchestrator, runs};
+    for (int index = 0; index < 3; ++index) {
+        const RunId run = orchestrator.begin_run(/*hold_activation=*/index != 0);
+        runs.push_back(run);
+        orchestrator.submit_next_level(
+            C(101 + index), single_tensor_args(0xa100 + index * 0x100, TensorArgType::OUTPUT), config, 0
+        );
+        orchestrator.close_run_submission(run);
+        ASSERT_TRUE(child.wait_dispatched(index + 1));
+        if (index == 0) {
+            ASSERT_TRUE(child.wait_held_frames(1));
+        } else {
+            const auto record = child.dispatched_records().back();
+            auto *entry = test_entry(child.mailbox, record.entry_index);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (static_cast<MailboxState>(__atomic_load_n(&entry->state, __ATOMIC_ACQUIRE)) !=
+                       MailboxState::FRAME_STAGED &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(
+                static_cast<MailboxState>(__atomic_load_n(&entry->state, __ATOMIC_ACQUIRE)), MailboxState::FRAME_STAGED
+            );
+            EXPECT_EQ(__atomic_load_n(&entry->accepted, __ATOMIC_ACQUIRE), 0);
+            EXPECT_FALSE(orchestrator.run_activation_authorized(run));
+        }
+    }
+    const auto records = child.dispatched_records();
+    ASSERT_EQ(records.size(), 3u);
+    EXPECT_FALSE(records[0].prepare_only);
+    EXPECT_TRUE(records[1].prepare_only);
+    EXPECT_TRUE(records[2].prepare_only);
+    EXPECT_NE(records[1].entry_index, records[2].entry_index);
+    EXPECT_EQ(orchestrator.preparable_run_ids(), (std::vector<RunId>{runs[1], runs[2]}));
+    child.drain();
+    for (size_t index = 0; index < runs.size(); ++index) {
+        if (index != 0) orchestrator.resolve_held_run(runs[index], true);
+        ASSERT_TRUE(orchestrator.wait_run_for(runs[index], 3));
+        orchestrator.release_run(runs[index]);
+    }
+    EXPECT_TRUE(reported_failures().empty());
+}
+
+TEST_F(MailboxPipelineSchedulerFixture, IdleSuccessHeldHeadPublishesPreparationAuthorizationOnly) {
+    const RunId run = orchestrator.begin_run(true);
+    orchestrator.submit_next_level(C(111), single_tensor_args(0xb100, TensorArgType::OUTPUT), config, 0);
+    orchestrator.close_run_submission(run);
+    // Resolve on test failure as well: teardown must not await a deliberately held run.
+    struct Release {
+        Orchestrator &orchestrator;
+        RunId run;
+        MockMailboxWorker &child;
+        ~Release() {
+            child.drain();
+            orchestrator.resolve_held_run(run, true);
+            (void)orchestrator.wait_run_for(run, 3);
+        }
+    } cleanup{orchestrator, run, child};
+    ASSERT_TRUE(child.wait_dispatched(1));
+    const auto record = child.dispatched_records().front();
+    auto *entry = test_entry(child.mailbox, record.entry_index);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (__atomic_load_n(&entry->prepare_ordered, __ATOMIC_ACQUIRE) == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_EQ(__atomic_load_n(&entry->prepare_ordered, __ATOMIC_ACQUIRE), 1);
+    EXPECT_TRUE(record.prepare_only);
+    EXPECT_EQ(__atomic_load_n(&entry->accepted, __ATOMIC_ACQUIRE), 0);
+    EXPECT_FALSE(orchestrator.run_activation_authorized(run));
+    EXPECT_EQ(orchestrator.dispatchable_run_id(), INVALID_RUN_ID);
+}
+
+TEST(LocalMailboxEndpointPreparation, CancellationPrecedesLatePreparationAuthorization) {
+    Ring allocator;
+    allocator.init(0);
+    const TaskSlot slot = make_progress_slot(allocator, 22, 0, 1);
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+    endpoint.submit_progress(&allocator, WorkerDispatch{slot, 0, 42, true});
+    endpoint.cancel_staged_progress(22);
+    EXPECT_FALSE(endpoint.authorize_preparation(22));
+    EXPECT_EQ(__atomic_load_n(&test_entry(mailbox, 0)->prepare_ordered, __ATOMIC_ACQUIRE), 0);
+    allocator.shutdown();
+}
+
+TEST(LocalMailboxEndpointPreparation, AuthorizationIsIdentityCheckedAndDoesNotActivate) {
+    Ring allocator;
+    allocator.init(0);
+    const TaskSlot slot = make_progress_slot(allocator, 22, 0, 1);
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+    endpoint.submit_progress(&allocator, WorkerDispatch{slot, 0, 42, true});
+    auto *entry = test_entry(mailbox, 0);
+    EXPECT_FALSE(endpoint.authorize_preparation(23));
+    EXPECT_EQ(__atomic_load_n(&entry->prepare_ordered, __ATOMIC_ACQUIRE), 0);
+    ASSERT_TRUE(endpoint.authorize_preparation(22));
+    EXPECT_EQ(__atomic_load_n(&entry->prepare_ordered, __ATOMIC_ACQUIRE), 1);
+    EXPECT_EQ(__atomic_load_n(&entry->accepted, __ATOMIC_ACQUIRE), 0);
+    // A new publication generation must never inherit an older grant.
+    __atomic_add_fetch(&entry->entry_generation, 2, __ATOMIC_RELEASE);
+    __atomic_store_n(&entry->prepare_ordered, 0, __ATOMIC_RELEASE);
+    EXPECT_FALSE(endpoint.authorize_preparation(22));
+    EXPECT_EQ(__atomic_load_n(&entry->prepare_ordered, __ATOMIC_ACQUIRE), 0);
+    allocator.shutdown();
+}
+
+TEST_F(MailboxPipelineSchedulerFixture, AlreadyStagedHeldRunReceivesPreparationOrderAfterPredecessorEnds) {
+    const RunId first = orchestrator.begin_run();
+    orchestrator.submit_next_level(C(112), single_tensor_args(0xb200, TensorArgType::OUTPUT), config, 0);
+    orchestrator.close_run_submission(first);
+    ASSERT_TRUE(child.wait_dispatched(1));
+    const RunId second = orchestrator.begin_run(true);
+    orchestrator.submit_next_level(C(113), single_tensor_args(0xb300, TensorArgType::OUTPUT), config, 0);
+    orchestrator.close_run_submission(second);
+    struct Release {
+        Orchestrator &orchestrator;
+        RunId run;
+        MockMailboxWorker &child;
+        ~Release() {
+            child.drain();
+            orchestrator.resolve_held_run(run, true);
+            (void)orchestrator.wait_run_for(run, 3);
+        }
+    } cleanup{orchestrator, second, child};
+    const auto staged_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!worker()->has_staged_run(second) && std::chrono::steady_clock::now() < staged_deadline)
+        std::this_thread::yield();
+    ASSERT_TRUE(worker()->has_staged_run(second));
+    EXPECT_EQ(orchestrator.preparation_ordered_run_id(), INVALID_RUN_ID);
+    child.complete();
+    ASSERT_TRUE(orchestrator.wait_run_for(first, 3));
+    ASSERT_TRUE(child.wait_dispatched(2));
+    const auto record = child.dispatched_records().back();
+    auto *entry = test_entry(child.mailbox, record.entry_index);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (__atomic_load_n(&entry->prepare_ordered, __ATOMIC_ACQUIRE) == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_EQ(__atomic_load_n(&entry->prepare_ordered, __ATOMIC_ACQUIRE), 1);
+    EXPECT_EQ(__atomic_load_n(&entry->accepted, __ATOMIC_ACQUIRE), 0);
+    EXPECT_FALSE(orchestrator.run_activation_authorized(second));
+}
+
+TEST(LocalMailboxEndpointHeldEnqueue, CancellationPrecedesHeldEnqueueAuthorization) {
+    Ring allocator;
+    allocator.init(0);
+    const TaskSlot slot = make_progress_slot(allocator, 22, 0, 1);
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+    endpoint.submit_progress(&allocator, WorkerDispatch{slot, 0, 42, true});
+    endpoint.cancel_staged_progress(22);
+    EXPECT_FALSE(endpoint.authorize_held_enqueue(22));
+    EXPECT_EQ(__atomic_load_n(&test_entry(mailbox, 0)->enqueue_before_success, __ATOMIC_ACQUIRE), 0);
+    allocator.shutdown();
+}
+
+TEST(LocalMailboxEndpointHeldEnqueue, AuthorizationIsIdentityCheckedAndDoesNotActivate) {
+    Ring allocator;
+    allocator.init(0);
+    const TaskSlot slot = make_progress_slot(allocator, 22, 0, 1);
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+    endpoint.submit_progress(&allocator, WorkerDispatch{slot, 0, 42, true});
+    auto *entry = test_entry(mailbox, 0);
+    EXPECT_FALSE(endpoint.authorize_held_enqueue(23));
+    EXPECT_EQ(__atomic_load_n(&entry->enqueue_before_success, __ATOMIC_ACQUIRE), 0);
+    ASSERT_TRUE(endpoint.authorize_held_enqueue(22));
+    EXPECT_EQ(__atomic_load_n(&entry->enqueue_before_success, __ATOMIC_ACQUIRE), 1);
+    EXPECT_EQ(__atomic_load_n(&entry->accepted, __ATOMIC_ACQUIRE), 0);
+    // A new publication generation must never inherit an older grant.
+    __atomic_add_fetch(&entry->entry_generation, 2, __ATOMIC_RELEASE);
+    __atomic_store_n(&entry->enqueue_before_success, 0, __ATOMIC_RELEASE);
+    EXPECT_FALSE(endpoint.authorize_held_enqueue(22));
+    EXPECT_EQ(__atomic_load_n(&entry->enqueue_before_success, __ATOMIC_ACQUIRE), 0);
+    allocator.shutdown();
 }

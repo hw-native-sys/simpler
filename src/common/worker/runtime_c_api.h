@@ -131,12 +131,15 @@ enum {
        remains whose retirement could supply them: either none ever held any, or
        this plan has already waited for every one that did. Terminal. */
     SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE = PTO_RUNTIME_ERR_BASE - 7,
-    /* Reserved for simpler_wait_run: this wait did not observe the result.
+    /* The native observation exhausted its progress budget before establishing completion.
        The run remains live and may be waited/finalized again. Never store this
        operation result as the execution's terminal error. */
     SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE = PTO_RUNTIME_ERR_BASE - 8,
     /* Host register/unregister succeeded, but restoring the caller context failed. */
     SIMPLER_HOST_DDR_CONTEXT_RESTORE_FAILED = PTO_RUNTIME_ERR_BASE - 9,
+    /* A held execution was cancelled and its submitted streams completed
+       without user execution. This is not a successful model result. */
+    SIMPLER_NATIVE_RUN_CANCELLED = PTO_RUNTIME_ERR_BASE - 10,
 };
 
 /**
@@ -656,7 +659,7 @@ typedef struct CallerBufferSpan {
 } CallerBufferSpan;
 
 /**
- * Take `borrow_id`'s reference on the caller allocations covering `spans`.
+ * Take `borrow_id`'s reference on known caller allocations and registered native domain views.
  *
  * Every known allocation is retained, including when other spans are external. Re-borrowing
  * replaces this id's set. The caller must release the id even after incomplete coverage.
@@ -667,6 +670,26 @@ typedef struct CallerBufferSpan {
 int device_borrow_caller_buffers_ctx(
     DeviceContextHandle ctx, const CallerBufferSpan *spans, uint32_t count, uint64_t borrow_id
 );
+
+/** Register native allocation views after the communication backend proves their owner. */
+int device_register_domain_owner_ctx(
+    DeviceContextHandle ctx, uint64_t session, uint64_t allocation, const CallerBufferSpan *spans, uint32_t count
+);
+
+/** 1 for an enrolled owner (including revoked), 0 for absent, negative for query failure. */
+int device_domain_owner_registered_ctx(DeviceContextHandle ctx, uint64_t session, uint64_t allocation);
+
+/** Reserve all enrolled session owners atomically before an implicit backend close. */
+int device_begin_domain_session_release_ctx(DeviceContextHandle ctx, uint64_t session);
+
+/** Confirm the backend close, or quarantine all its enrolled owners. */
+int device_finish_domain_session_release_ctx(DeviceContextHandle ctx, uint64_t session, int confirmed);
+
+/** Revoke new loans and reserve one platform release; refuses while any consumer remains. */
+int device_begin_domain_release_ctx(DeviceContextHandle ctx, uint64_t session, uint64_t allocation);
+
+/** Confirm a successful release, or quarantine an ambiguous result without authorizing a retry. */
+int device_finish_domain_release_ctx(DeviceContextHandle ctx, uint64_t session, uint64_t allocation, int confirmed);
 
 /**
  * Drop `borrow_id`'s reference, or keep it for the process's remaining life.
@@ -1264,6 +1287,27 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle
  */
 int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor);
 
+/** Nonzero only when this backend provides held device enqueue and release. */
+int supports_execution_gate_ctx(DeviceContextHandle ctx);
+
+/**
+ * Enqueue a prepared run behind an optional local predecessor and an unreleased
+ * execution gate. Success acknowledges device submission, not authorization to
+ * execute. Unsupported leaves the run prepared with no device work submitted.
+ * Other failures retain the ordinary partial-launch reclamation obligations.
+ */
+int simpler_enqueue_run_held(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor);
+
+/**
+ * Publish an immutable terminal gate decision: 1 permits execution, 2 cancels.
+ * The descriptor's slot, generation, dispatch id and run epoch must identify
+ * the registered gate exactly. The entry uses a separate release stream and
+ * does not wait for native execution or take the run-lane mutex. Success only
+ * acknowledges release submission; resource retirement still requires physical
+ * completion of every possibly submitted stream and release operation.
+ */
+int simpler_release_execution_gate(DeviceContextHandle ctx, const NativeRunDescriptor *descriptor, uint32_t decision);
+
 /**
  * Nonblocking own-execution completion query after launch. Returns POLL_*.
  * COMPLETE proves owned physical retirement, without reading semantic status
@@ -1273,6 +1317,11 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /** Optional terminal preflight. Observe physical completion without retiring execution or releasing run storage. */
 int simpler_query_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/** Progress a result request without blocking. For a run bound to peer cancellation, the first request fixes
+ * its native deadline. An expired poll returns WAIT_INCOMPLETE and leaves its device ownership intact. */
+int simpler_poll_run_observing(DeviceContextHandle ctx, RuntimeHandle runtime);
+
 /** Bind a parent-owned cancellation word before launch. The word must remain
  * mapped until this native run is finalized; only its parent publishes 0 -> 1.
  * Unsupported backends leave the run unchanged. */

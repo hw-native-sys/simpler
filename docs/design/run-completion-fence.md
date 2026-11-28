@@ -99,10 +99,15 @@ until strong observation and finalization publish DONE or FAILED. TensorMap outp
 remain result-terminal, as does public L3 `RunHandle.done`.
 
 Explicit wait requests observation, including when the request precedes task
-publication. Eligible installed activations reach the child before it enters a
-blocking observer. Idle or entry-pressure delivery and close also finish retained
-results; physical progress never requires a whole-stream observation merely to
-admit a successor. One-resource-set and staged execution use the same child loop.
+publication. Eligible installed activations reach the child before it observes
+a result. For local A2/A3 TMR runs, the child can continue receiving frames
+while the requested run still executes. The first observation of the running
+front sets its native progress deadline. Later polling and cleanup use that
+same deadline, so retrying an observation cannot extend the budget. A run
+that exhausts the budget keeps its ownership until last use is proved.
+Idle or entry-pressure delivery and close also finish retained results.
+Physical progress never requires a whole-stream observation simply to admit a
+successor. One-resource-set and staged execution use the same child loop.
 
 A still-unobserved call that the lane already rejects does not publish Program
 HOST outputs during finalization. The internal finalization operation receives
@@ -116,6 +121,10 @@ wait/finalize path. Kernel calls gain no implicit tensor transfers. Physical
 completion does not replace strong error observation or Program output delivery.
 A host wait deadline and the configured RTS stream-synchronization budget are
 separate limits; this host protocol does not change either timeout budget.
+
+Hierarchical callers can additionally require [explicit predecessor
+success](hierarchical-success-dependencies.md), including outer-runtime cleanup
+and output publication, before activating a prepared successor.
 
 ## Stream binding
 

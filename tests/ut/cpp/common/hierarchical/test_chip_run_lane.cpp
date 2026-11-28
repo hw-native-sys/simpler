@@ -1347,6 +1347,39 @@ TEST(ChipRunLaneTest, PollFailureReportsTheTerminalNativeError) {
     worker.finalize();
 }
 
+TEST(ChipRunLaneTest, ObservationTimeoutKeepsTheBlockingWaitErrorAndNativeOwner) {
+    for (bool cooperative : {false, true}) {
+        ChipWorker worker;
+        prime_worker(worker);
+        worker.poll_run_observing_fn_ = poll_run;
+        ChipRunLane lane(worker);
+        ChipRun run = submit(lane, 101, 0);
+        g_wait_rc[0] = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+
+        if (cooperative) {
+            g_poll_rc[0] = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+            EXPECT_TRUE(run.poll_observation());
+        } else {
+            g_completion_wait_rc = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+        }
+        try {
+            (void)run.wait_until(ChipRunLane::Deadline::max());
+            FAIL() << "expected the native wait timeout";
+        } catch (const std::runtime_error &error) {
+            const std::string expected =
+                "wait_native_run_completion failed with code " + std::to_string(SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE);
+            EXPECT_NE(std::string(error.what()).find(expected), std::string::npos);
+        }
+        EXPECT_TRUE(run.owner_recovery_required());
+        EXPECT_TRUE(lane.poisoned());
+        EXPECT_THROW(lane.close(), std::runtime_error);
+        EXPECT_THROW(worker.finalize(), std::runtime_error);
+        // The test backend has no device to recover or owner-close entry.
+        worker.native_runs_.clear();
+        worker.finalize();
+    }
+}
+
 TEST(ChipRunLaneTest, CloseDrainsAndRejectsNewSubmissions) {
     ChipWorker worker;
     prime_worker(worker);
@@ -2792,4 +2825,112 @@ TEST(ChipRunLaneTest, AclModelRetentionRefusesInactiveCaptureWithoutEmitting) {
     state->release_model_resources();
     state->retire();
     worker->finalize();
+}
+
+TEST(ChipRunLaneTest, FourGrantedSlotsCanHoldFourNativePreparedAndLaunchedRuns) {
+    auto worker = std::make_shared<ChipWorker>();
+    prime_capture_worker(*worker, 4);
+    worker->launch_depth_ = 4;
+    worker->supports_joined_native_launch_fn_ = [](void *) {
+        return 1;
+    };
+    worker->launch_run_joined_fn_ = [](void *, void *runtime, void *predecessor) {
+        g_events.push_back("join" + std::to_string(slot_of(runtime)) + "_after" + std::to_string(slot_of(predecessor)));
+        return 0;
+    };
+    std::vector<ChipRun> runs;
+    runs.push_back(worker->submit_chip_run(1, device_args(), CallConfig{}));
+    for (uint32_t slot = 1; slot < 4; ++slot) {
+        runs.push_back(worker->run_lane_->submit(
+            1, device_args(), CallConfig{}, PipelineSlotLease{slot, 0, 1}, 200 + slot, 200 + slot, nullptr, 0, true
+        ));
+        runs.back().activate();
+    }
+    EXPECT_EQ(worker->native_runs_.size(), 4u);
+    for (uint32_t slot = 0; slot < 4; ++slot) {
+        EXPECT_EQ(g_prepare_count[slot], 1u);
+        EXPECT_TRUE(runs[slot].launched());
+        EXPECT_FALSE(g_complete[slot]);
+    }
+    EXPECT_EQ(
+        g_events,
+        (std::vector<std::string>{
+            "prepare0", "launch0", "prepare1", "join1_after0", "prepare2", "join2_after1", "prepare3", "join3_after2"
+        })
+    );
+    std::fill(g_complete.begin(), g_complete.end(), true);
+    for (auto it = runs.rbegin(); it != runs.rend(); ++it)
+        EXPECT_TRUE(it->wait_until(ChipRun::Deadline::max()));
+    EXPECT_TRUE(worker->native_runs_.empty());
+    worker->finalize();
+}
+
+TEST(ChipRunLaneTest, OrderedPreparationOfIdleHeldHeadDoesNotLaunch) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun run = submit(lane, 101, 0, false);
+    EXPECT_EQ(run.preparation_disposition(), ChipRunPreparationDisposition::VALIDATED_ONLY);
+    run.authorize_prepare();
+    EXPECT_EQ(run.preparation_disposition(), ChipRunPreparationDisposition::NATIVE_PREPARED);
+    EXPECT_FALSE(run.launched());
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0"}));
+    run.authorize_prepare();
+    EXPECT_EQ(g_events.size(), 1u);
+    run.abandon();
+    EXPECT_FALSE(run.launched());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, OrderedPreparationOfHeldHeadDoesNotAuthorizeFollowingRun) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0, false);
+    first.authorize_prepare();
+    ChipRun second = submit(lane, 102, 1, false);
+    EXPECT_EQ(first.preparation_disposition(), ChipRunPreparationDisposition::NATIVE_PREPARED);
+    // Native successor preparation still requires an executing predecessor.
+    EXPECT_EQ(second.preparation_disposition(), ChipRunPreparationDisposition::VALIDATED_ONLY);
+    EXPECT_FALSE(first.launched());
+    EXPECT_FALSE(second.launched());
+    second.abandon();
+    first.abandon();
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "finalize0"}));
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, OrderedPreparationFailureNeverLaunchesHeldRun) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_prepare_rc[0] = -5;
+    ChipRun run = submit(lane, 101, 0, false);
+    run.authorize_prepare();
+    EXPECT_TRUE(run.done());
+    EXPECT_FALSE(run.launched());
+    EXPECT_THROW(run.wait_until(ChipRunLane::Deadline::max()), RunPreparationRefused);
+    EXPECT_FALSE(lane.poisoned());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, LatePreparationAuthorizationCannotReviveAbandonedRun) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun run = submit(lane, 101, 0, false);
+    run.abandon();
+    const auto events = g_events;
+    try {
+        run.authorize_prepare();
+    } catch (const std::runtime_error &) {
+        // The cached cancellation may be reported, but must not reenter prepare.
+    }
+    EXPECT_EQ(g_events, events);
+    EXPECT_FALSE(run.launched());
+    lane.close();
+    worker.finalize();
 }

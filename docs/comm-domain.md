@@ -78,6 +78,13 @@ wrappers; `workers=` remains the legacy L3 allocation spelling.
 Domain creation and configuration reuse occur in an orchestration callback.
 L3 creation and staging precede its first submission; a reuse hit performs no device control and remains valid afterwards.
 A successful run preserves domains created with `retain_after_run=True`.
+An L3 run that only reuses an existing retained domain can prepare ahead of
+its predecessor. Per-run use records keep the backing alive through every
+accepted consumer's native fence. Whole-parent FIFO orders execution unless
+the run supplies the complete memory-access contract described below.
+Initial allocation, nonretained domains and explicit release retain their
+ordered cleanup, and Host staging/reset follows the existing direct-control
+ordering. Failed uses revoke new submissions before deferred physical release.
 Later runs can submit cached Buffers/Tensors directly. Submission and ordinary copies enroll
 the current run; release waits for it and its descendants, while a failed run closes its used domains.
 Use `with` only when the scope should release the shared handle: context exit
@@ -87,6 +94,30 @@ Physical release still waits for accepted tasks and their children to complete.
 After run completion, retained handles can be inspected, copied through a
 matching Orchestrator and released serially outside a callback; successful release
 reclaims the backend resources synchronously and repeated release is a no-op.
+
+For L3 Device domains without auxiliary workspaces, preallocate a separate
+retained domain for each in-flight request before starting the pipeline. Inside
+each request callback, call `orch.declare_comm_domains([domain, ...])` with all
+domains it may access. This is an explicit contract: all implicit communication
+accesses, including scalar context pointers, are confined to those domains;
+every other memory access is represented by the actual TaskArgs tensors and
+their access tags. Hidden global pointers outside that contract are unsupported.
+Declarations accumulate within the callback and are sealed when submission
+closes. Declaring a domain also retains it through this run's native fence.
+
+The runtime compares each candidate against every unfinished predecessor. A
+shared domain always conflicts, even when different named buffers are passed.
+Tensor resources use their canonical allocation identities and conservative
+byte ranges; shared reads are allowed, while overlapping writes retain ordering.
+Unknown or undeclared resources, MAP, CCU, remote and SubWorker tasks keep the
+conservative admission path. Host tensors are tracked over their whole backing.
+The caller must keep their backing and contents consistent with the access tags
+until completion, including read-only Host control inputs.
+
+Return a pooled domain only after the whole parent run completes, never on
+submit return or one rank's local completion. Failure without confirmed device
+termination must not return the domain to the pool. Pool exhaustion applies
+backpressure; it does not justify aliasing an unfinished run's windows.
 Only the creating Worker owns release. Lookup, creation, publication and release share
 the callback serializer; concurrent matching requests share one transaction and conflicts fail.
 `Worker.close()` attempts to free remaining owned domains after its existing lease/fence drain.
@@ -1033,3 +1064,32 @@ The repeated A2/A3 allocation-retirement qualification covers Device windows.
 Failed-initialization markers and A2/A3 Host-SDMA `host_window` retirement
 require separate qualification. Concurrent first-time CCU registration on a
 single Worker also requires separate bootstrap synchronization coverage.
+
+### Native domain ownership and retained uses
+
+Native domain storage is enrolled in the device context only after the communication backend attests its allocation-owned context and window extents. Mutable CommContext fields are not allocation evidence. These grants share caller-storage run loans and producer fences, but cannot be freed through the caller allocator. Explicit allocation release and implicit session close revoke new uses before checking outstanding loans; unconfirmed backend release quarantines the grants instead of retrying a possibly consumed handle. Native joined launch accepts Device-source domains with no auxiliary communication workspace when every allocation has an attested owner. Domain rank count alone does not prohibit admission. Each admitted run borrows the context and window extents of all eligible domains, including contexts passed as scalars. The successor must borrow the current resource-set generation; the predecessor retains the resources its launch borrowed. Allocation, release, or session changes invalidate older snapshots for new admission. Global domains, exported regions, Host mappings, legacy windows, auxiliary communication workspaces, and incomplete allocation records retain serial launch. CCU activation follows its separate protocol. Unknown spans remain ineligible for native concurrent admission.
+
+Joined submission queues a successor behind the predecessor's local whole-operator completion boundary; it does not permit concurrent kernel execution on that chip. Local completion is not a whole-parent fence: another rank may still read this chip's communication window. While a communication execution constraint is registered, early activation requires a sealed complete resource declaration for the successor and every earlier parent, with independent domain identities and no overlapping tensor interval involving a writer. Unknown or conflicting resources retain the whole-parent physical END fence. This constraint is registered before allocation side effects and removed only after confirmed physical release (or confirmed rejection on every rank); logical release and unknown cleanup do not remove it. Multiple allocations retain independent constraints. Releasing the last one restores ordinary early activation. No Python result observation or cleanup is required to advance this execution boundary. An explicit success predecessor separately holds activation until its complete result succeeds, even when resource declarations are independent. On A2/A3, a resource-complete held successor with native owner proof can enqueue behind a device execution gate. Its private AICPU and AICore streams wait on notifications from an independent release stream. GO requires complete predecessor success and the local execution queue front; CANCEL exits both entry wrappers before user work. The private streams do not queue a predecessor event wait, so cancellation can drain independently. This path excludes caller-owned submissions, auxiliary communication workspaces and device diagnostics. Other supported paths retain preparation-only admission until activation. Executable ABI 2 symbols are verified before accepting the device binaries. Unknown partial submission retains resources and poisons admission; it is not reported as a clean cancellation. The existing failure contract remains conservative: all launched consumers must prove last use before their loans retire. An unknown drain or partially failed launch retains storage, and poisoned communication cleanup refuses domain release, session destruction and reset. This does not promise transparent recovery after a failed communication run. Explicit domain release continues to use ordered cleanup.
+
+L3 reuse of an existing retained domain registers a per-run use without adding
+an ordered-cleanup barrier. Initial allocation, non-retained domains, explicit
+release and global domains retain their existing admission gates. Cached domain
+Tensor arguments register their use before native submission under the provenance
+guard. Release revokes new uses immediately and keeps backing until every admitted
+use has a confirmed native fence and its CCU producers have stopped. This does not
+change ordinary task-error semantics or guarantee zero successor execution after
+a predecessor's late Host error.
+
+The complete native owner capability is required before allocating a dynamic
+domain. Active backends without it, including WSE, refuse domain allocation before
+backend side effects; ordinary execution remains supported.
+
+### Retained-domain control ordering
+
+Retained-state preparation can overlap an active predecessor. Allocation and
+release and first-time CCU registration RPC fanouts nevertheless complete one whole participating-chip round
+before the next round starts, including failure cleanup. This ordering prevents
+different ranks from entering different collectives; it does not serialize host
+preparation outside the control RPC. Initialization abort retires enrolled owner
+grants. A backend release or destruction exception leaves ownership unconfirmed
+and stops further worker admission instead of reusing uncertain storage.

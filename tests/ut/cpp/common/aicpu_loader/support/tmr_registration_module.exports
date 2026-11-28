@@ -1,4 +1,4 @@
-_simpler_aicpu_exec
+_simpler_aicpu_exec_abi2
 _simpler_aicpu_init
 _simpler_aicpu_register_callable
 _simpler_aicpu_finalize

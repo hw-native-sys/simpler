@@ -32,8 +32,7 @@
  * we use host memory instead of device memory.
  */
 
-#ifndef PLATFORM_COMMON_KERNEL_ARGS_H_
-#define PLATFORM_COMMON_KERNEL_ARGS_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -103,7 +102,7 @@ struct KernelArgs {
         LaunchImageSection image_section;
     };
     uint64_t regs{0};  // Per-core register base address array (platform-specific)
-    // Remaining 64-bit fields. Grouped before the 32-bit tail so the struct
+    // Runtime and diagnostic 64-bit fields. Grouped before the 32-bit tail so the struct
     // needs no interior alignment padding — every uint64_t lands on its natural
     // 8-byte boundary. The nine 32-bit tail members require four trailing
     // padding bytes for the structure's 8-byte alignment. Order among
@@ -193,6 +192,11 @@ struct KernelArgs {
     uint32_t entry_cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
     uint32_t runtime_descriptor_bytes{0};
     RuntimeDescriptorSection runtime_section{};
+    // Zero in all three fields selects an ordinary launch. A nonzero gate
+    // names a per-run record whose published identity must match both values.
+    uint64_t execution_gate_address{0};
+    uint64_t execution_gate_identity{0};
+    uint64_t execution_gate_generation{0};
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
@@ -217,7 +221,10 @@ static_assert(
 static_assert(offsetof(KernelArgs, graph_section_offset) == 164, "KernelArgs::graph_section_offset offset drift");
 static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 176, "entry cache policy offset drift");
 static_assert(offsetof(KernelArgs, runtime_section) == 184, "runtime descriptor section offset drift");
-static_assert(sizeof(KernelArgs) == 192, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, execution_gate_address) == 192, "execution gate address offset drift");
+static_assert(offsetof(KernelArgs, execution_gate_identity) == 200, "execution gate identity offset drift");
+static_assert(offsetof(KernelArgs, execution_gate_generation) == 208, "execution gate generation offset drift");
+static_assert(sizeof(KernelArgs) == 216, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
@@ -238,8 +245,8 @@ static_assert(
  * scalar list and this is the host-side image of it. Changing either without
  * the other silently mis-decodes the block.
  *
- * Every address an AICore entry needs is here, so the entry publishes its
- * per-core state from these values alone and reads no GM to do it. The driver
+ * Every address an AICore entry needs is here. A gated launch reads its private
+ * execution record before publishing per-core state. The driver
  * copies the block during the launch call, so the host builds it after
  * collector arming and these are this run's final values.
  */
@@ -253,9 +260,15 @@ struct AicoreLaunchArgs {
     // this run's report. Zero on a kernel/persistent launch, which keeps the
     // `aicore_done != 0` predicate.
     uint64_t report_epoch;
+    uint64_t execution_gate_address;
+    uint64_t execution_gate_identity;
+    uint64_t execution_gate_generation;
 };
 
-static_assert(sizeof(AicoreLaunchArgs) == 40, "AicoreLaunchArgs size drift");
+static_assert(offsetof(AicoreLaunchArgs, execution_gate_address) == 40);
+static_assert(offsetof(AicoreLaunchArgs, execution_gate_identity) == 48);
+static_assert(offsetof(AicoreLaunchArgs, execution_gate_generation) == 56);
+static_assert(sizeof(AicoreLaunchArgs) == 64, "AicoreLaunchArgs size drift");
 
 /**
  * Fill the `AicoreLaunchArgs` fields every architecture shares, from the
@@ -271,6 +284,9 @@ inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_
     args.runtime_args = k_args.runtime_descriptor_bytes == 0 ? reinterpret_cast<uint64_t>(k_args.runtime_args) : 0;
     args.enable_profiling_flag = k_args.enable_profiling_flag;
     args.report_epoch = k_args.run_result_epoch;
+    args.execution_gate_address = k_args.execution_gate_address;
+    args.execution_gate_identity = k_args.execution_gate_identity;
+    args.execution_gate_generation = k_args.execution_gate_generation;
 }
 
 /**
@@ -333,5 +349,3 @@ struct RegisterCallableArgs {
 #ifdef __cplusplus
 }
 #endif
-
-#endif  // PLATFORM_COMMON_KERNEL_ARGS_H_

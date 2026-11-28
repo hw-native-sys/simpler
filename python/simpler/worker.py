@@ -421,7 +421,7 @@ _DISPOSITION_NONE = 0
 _VALIDATED_ONLY = 1
 _NATIVE_PREPARED = 2
 _TASK_ACCEPTED = 1
-_TASK_PROTOCOL_VERSION = 7
+_TASK_PROTOCOL_VERSION = 8
 
 # A request frame's own header: which run-state entry this payload belongs to,
 # that entry's generation, and this frame's generation — which the child echoes
@@ -456,7 +456,9 @@ _OFF_ENTRY_ERROR_TEXT = 104
 _OFF_ENTRY_ADMISSIBLE_SETS = _OFF_ENTRY_ERROR_TEXT + MAILBOX_ERROR_MSG_SIZE
 _OFF_ENTRY_OBSERVATION_REQUESTED = _OFF_ENTRY_ADMISSIBLE_SETS + 4
 _OFF_ENTRY_PEER_CANCEL_REQUESTED = _OFF_ENTRY_OBSERVATION_REQUESTED + 4
-_ENTRY_BYTES = _OFF_ENTRY_PEER_CANCEL_REQUESTED + 4
+_OFF_ENTRY_PREPARE_ORDERED = _OFF_ENTRY_PEER_CANCEL_REQUESTED + 4
+_OFF_ENTRY_ENQUEUE_BEFORE_SUCCESS = _OFF_ENTRY_PREPARE_ORDERED + 4
+_ENTRY_BYTES = _OFF_ENTRY_ENQUEUE_BEFORE_SUCCESS + 4
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
@@ -500,6 +502,7 @@ _TASK_FAILED = 10
 _ACTIVATE = 11
 _PREPARE_READY = 12
 _TASK_ENDED = 13
+_CANCEL_STAGED = 14
 
 
 def _assert_mailbox_wire_constants() -> None:
@@ -525,6 +528,7 @@ def _assert_mailbox_wire_constants() -> None:
         "FRAME_STAGED": _FRAME_STAGED,
         "TASK_LAUNCHED": _TASK_LAUNCHED,
         "TASK_ENDED": _TASK_ENDED,
+        "CANCEL_STAGED": _CANCEL_STAGED,
         "TASK_FAILED": _TASK_FAILED,
         "ACTIVATE": _ACTIVATE,
         "PREPARE_READY": _PREPARE_READY,
@@ -605,6 +609,11 @@ def _assert_mailbox_wire_constants() -> None:
         "entry.peer_cancel_requested": (
             _OFF_ENTRY_PEER_CANCEL_REQUESTED,
             MAILBOX_RUN_ENTRY_OFFSETS["peer_cancel_requested"],
+        ),
+        "entry.prepare_ordered": (_OFF_ENTRY_PREPARE_ORDERED, MAILBOX_RUN_ENTRY_OFFSETS["prepare_ordered"]),
+        "entry.enqueue_before_success": (
+            _OFF_ENTRY_ENQUEUE_BEFORE_SUCCESS,
+            MAILBOX_RUN_ENTRY_OFFSETS["enqueue_before_success"],
         ),
         # And the request frame's header, which binds a payload to its entry.
         "frame.entry_index": (_OFF_FRAME_ENTRY_INDEX, MAILBOX_REQUEST_FRAME_OFFSETS["entry_index"]),
@@ -4091,6 +4100,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             ccu_binding: Any = None
             ccu_started: bool = False
             native_activated: bool = False
+            prepare_ordered: bool = False
+            enqueued_held: bool = False
             cancelled_before_launch: bool = False
 
         staged_runs: dict[int, _StagedRun] = {}
@@ -4383,12 +4394,81 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
         shutdown_addr = _buffer_field_addr(buf, _OFF_SHUTDOWN)
         ccu_control_requires_idle: bool | None = None
 
+        def enqueue_held_if_authorized(staged: _StagedRun, entry_state: int) -> bool:
+            nonlocal shutdown_message
+            if (
+                staged.native_activated
+                or staged.enqueued_held
+                or entry_state != _FRAME_STAGED
+                or not _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_ENQUEUE_BEFORE_SUCCESS)
+                or _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_PEER_CANCEL_REQUESTED)
+            ):
+                return True
+            if (
+                _mailbox_load_u64(staged.entry_addr + _OFF_ENTRY_GENERATION) != staged.entry_generation
+                or _read_run_entry_identity(staged.entry_buf) != staged.identity
+            ):
+                shutdown_message = f"chip_process dev={device_id}: stale held enqueue authorization"
+                return False
+            try:
+                if not staged.prepare_ordered:
+                    # The held grant follows native acceptance of every
+                    # earlier parent; frame consumption alone is insufficient.
+                    staged.chip_run._authorize_prepare()
+                    staged.prepare_ordered = True
+                    republish_native_preparation(staged)
+                staged.enqueued_held = staged.chip_run._enqueue_held()
+            except Exception as error:
+                shutdown_message = _format_exc("chip run held enqueue", error)
+                return False
+            return True
+
         def activate_pending_runs() -> bool:
             nonlocal shutdown_message
 
             broke_on_activation = False
             for staged in list(staged_runs.values()):
                 entry_state = _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_STATE)
+                if entry_state == _CANCEL_STAGED:
+                    if (
+                        staged.activated
+                        or staged.native_activated
+                        or _read_run_entry_identity(staged.entry_buf) != staged.identity
+                    ):
+                        shutdown_message = f"chip_process dev={device_id}: stale staged cancellation"
+                        return False
+                    try:
+                        staged.chip_run.abandon()
+                        discard_unlaunched_ccu(staged)
+                        if import_registry.host_mappings is not None and not staged.chip_run._owner_recovery_required:
+                            import_registry.host_mappings.release(staged.identity)
+                    except Exception as e:
+                        shutdown_message = _format_exc("chip run cancellation", e)
+                        return False
+                    fail_run(staged, "predecessor failed before launch")
+                    staged_runs.pop(staged.index, None)
+                    continue
+                if (
+                    not staged.prepare_ordered
+                    and not staged.native_activated
+                    and _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_PREPARE_ORDERED)
+                    and not _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_PEER_CANCEL_REQUESTED)
+                ):
+                    if (
+                        _mailbox_load_u64(staged.entry_addr + _OFF_ENTRY_GENERATION) != staged.entry_generation
+                        or _read_run_entry_identity(staged.entry_buf) != staged.identity
+                    ):
+                        shutdown_message = f"chip_process dev={device_id}: stale preparation authorization"
+                        return False
+                    try:
+                        staged.chip_run._authorize_prepare()
+                        staged.prepare_ordered = True
+                        republish_native_preparation(staged)
+                    except Exception as error:
+                        shutdown_message = _format_exc("chip run preparation authorization", error)
+                        return False
+                if not enqueue_held_if_authorized(staged, entry_state):
+                    return False
                 if staged.native_activated or (entry_state != _ACTIVATE and not staged.activated):
                     continue
                 if _read_run_entry_identity(staged.entry_buf) != staged.identity:
@@ -4617,9 +4697,12 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                         if _read_run_entry_identity(staged.entry_buf) != staged.identity:
                             raise RuntimeError("stale observation request identity")
                         if not staged.ended_published:
-                            # An explicit wait must reach the native bounded wait even
-                            # when a hung launch never reports physical END on its own.
-                            staged.chip_run.wait()
+                            if chip_platform == "a2a3" and chip_runtime == "tensormap_and_ringbuffer":
+                                if not staged.chip_run._poll_observation():
+                                    continue
+                            else:
+                                # The result observer must still reach the backend's bounded wait.
+                                staged.chip_run.wait()
                         code, msg = publish_completed_run(staged)
                         if code != 0 and (staged.chip_run.lane_poisoned or staged.ccu_started):
                             shutdown_message = msg
@@ -5419,6 +5502,9 @@ class _RunResources:
     ccu_domains: dict[int, CommDomainHandle] = field(default_factory=dict)
     ccu_bindings: dict[tuple[int, bytes], bytes] = field(default_factory=dict)
     pending_release_domains: list[CommDomainHandle] = field(default_factory=list)
+    retained_domain_uses: dict[int, CommDomainHandle] = field(default_factory=dict)
+    declared_comm_domains: dict[int, CommDomainHandle] | None = None
+    domains_fenced: bool = False
     live_global_domains: dict[str, GlobalCommDomainHandle] = field(default_factory=dict)
     pending_release_global_domains: list[GlobalCommDomainHandle] = field(default_factory=list)
     worker_chip_orch_comm_host_buffers: dict[int, int] = field(default_factory=dict)
@@ -5573,6 +5659,11 @@ class RunHandle:
         # follows it has happened. A successor keyed on the native answer would
         # be admitted while that teardown is still outstanding.
         self._cleanup_published = False
+        self._success_predecessor: RunHandle | None = None
+        self._success_successors: list[int] = []
+        self._completion_callback: Callable[[BaseException | None], None] | None = None
+        self._completion_callback_thread: int | None = None
+        self._outer_completion_pending = False
 
     @classmethod
     def _completed(cls, worker: Worker) -> RunHandle:
@@ -5592,6 +5683,11 @@ class RunHandle:
         handle._finalization_abandoned = False
         # Nothing was ever admitted, so there is no cleanup owing.
         handle._cleanup_published = True
+        handle._success_predecessor = None
+        handle._success_successors = []
+        handle._completion_callback = None
+        handle._completion_callback_thread = None
+        handle._outer_completion_pending = False
         return handle
 
     @staticmethod
@@ -5625,6 +5721,18 @@ class RunHandle:
             assert run_id is not None
             self._execution_done = self._worker._run_handle_done(run_id)
             return self._execution_done
+
+    @property
+    def finalized(self) -> bool:
+        """Whether the final result and cleanup outcome have been published.
+
+        Unlike ``done``, this excludes physical completion awaiting cleanup.
+        An interrupted wait can leave this false. A true value does not imply
+        success or permit reuse of resources quarantined by a failed run.
+        Reading this property never observes or consumes the cached error.
+        """
+        with self._cv:
+            return self._terminal
 
     def _clear_wait_owner(self, election: object = True) -> None:
         """Make an interrupted pre-finalization fence wait re-electable."""
@@ -5682,6 +5790,23 @@ class RunHandle:
         """Publish one terminal result despite interruptions between assigns."""
         effective_error = error
         try:
+            # Both ordinary finalization and interrupted-finalizer recovery
+            # converge here, before publishing the success dependency outcome.
+            callback = self._completion_callback
+            if callback is not None:
+                self._outer_completion_pending = True
+                self._completion_callback = None
+                try:
+                    self._completion_callback_thread = threading.get_ident()
+                    self._worker._invoke_completion_callback(callback, effective_error)
+                except BaseException as callback_error:
+                    if effective_error is None:
+                        effective_error = callback_error
+                finally:
+                    self._completion_callback_thread = None
+            if self._outer_completion_pending:
+                self._worker._complete_outer_callback(self)
+                self._outer_completion_pending = False
             while not self._terminal or self._wait_in_progress or self._accept_wait_in_progress:
                 try:
                     if not self._terminal:
@@ -5740,6 +5865,30 @@ class RunHandle:
         except BaseException:  # noqa: BLE001
             return self._recover_and_publish_terminal(error)
 
+    def _resolve_success_predecessor(self, deadline: float | None) -> None:
+        predecessor = self._success_predecessor
+        if predecessor is None:
+            return
+        remaining = None if deadline is None else max(0.0, deadline - _monotonic())
+        try:
+            predecessor.wait(remaining)
+        except BaseException as error:  # noqa: BLE001 -- distinguish a cached failure from a wait interruption
+            if not predecessor._terminal or error is not predecessor._error:
+                raise
+        run_id = self._run_id
+        if run_id is not None:
+            self._worker._resolve_held_run(run_id, predecessor._error is None)
+        self._success_predecessor = None
+
+    def _resolve_success_successors(self) -> None:
+        with self._cv:
+            successors = tuple(self._success_successors)
+        for run_id in successors:
+            self._worker._resolve_held_run(run_id, self._error is None)
+            with self._cv:
+                if run_id in self._success_successors:
+                    self._success_successors.remove(run_id)
+
     def wait(self, timeout: float | None = None) -> None:  # noqa: PLR0912 -- one owner spans fence through publication
         """Wait for completion, raising ``TimeoutError`` or the run's error."""
         # One owner spans the native fence through finalization. An interruption
@@ -5748,12 +5897,18 @@ class RunHandle:
         # ownership. Terminal fields are monotonic, and parked waiters use
         # bounded re-checks when notification itself is interrupted.
         deadline = self._deadline(timeout)
+        self._resolve_success_predecessor(deadline)
+        if self._terminal:
+            self._resolve_success_successors()
         elected = False
         finalization_started = False
         final_error: BaseException | None = None
         native_error: BaseException | None = None
         try:
             with self._cv:
+                callback_thread = self._completion_callback_thread
+                if callback_thread is not None and callback_thread == threading.get_ident():
+                    raise RuntimeError("RunHandle.wait() cannot wait from this run's completion callback")
                 while not self._terminal and self._wait_in_progress:
                     remaining = None if deadline is None else deadline - _monotonic()
                     if remaining is not None and remaining <= 0:
@@ -5830,6 +5985,7 @@ class RunHandle:
                 preferred_error = final_error if final_error is not None else exc
             published_error = self._recover_and_publish_terminal(preferred_error)
 
+        self._resolve_success_successors()
         self._teardown_delegated_fatal_after_wait(published_error)
         if published_error is not None:
             raise published_error
@@ -6524,6 +6680,8 @@ class Worker:
         # among live handles).  ``orch.allocate_domain`` adds entries here;
         # ``release()`` removes them and queues a deferred backend free.
         self._live_domains: dict[str, CommDomainHandle] = {}
+        self._domain_lifetime_mu = threading.RLock()
+        self._retained_domain_backings: dict[int, CommDomainHandle] = {}
         self._live_global_domains: dict[str, GlobalCommDomainHandle] = {}
         self._global_node_domains: dict[int, _GlobalNodeDomainState] = {}
         self._global_cluster_id = uuid.uuid4().hex
@@ -6544,6 +6702,9 @@ class Worker:
         # before the first one finishes would let close() tear the mailboxes
         # down under an in-flight release.
         self._domain_free_mu = threading.Lock()
+        # One collective control round must finish on every chip before the next.
+        # This gate covers RPC fanout only; retained preparation remains concurrent.
+        self._domain_control_mu = threading.Lock()
         self._domain_free_results: dict[int, BaseException | None] = {}
         self._global_domain_free_mu = threading.Lock()
         self._global_domain_free_results: dict[int, BaseException | None] = {}
@@ -8377,7 +8538,14 @@ class Worker:
             self._chip_worker._validate_execution_context()
 
     @contextlib.contextmanager
-    def _operation_lease(self, api: str, *, requires_execution_context: bool = True, allow_continuation: bool = False):
+    def _operation_lease(
+        self,
+        api: str,
+        *,
+        requires_execution_context: bool = True,
+        allow_continuation: bool = False,
+        completion_observation: bool = False,
+    ):
         """Admit an operation onto a READY worker and hold a lease for its whole
         duration, so a concurrent close() drains it before teardown.
 
@@ -8393,22 +8561,25 @@ class Worker:
         Current-context validation runs outside the lifecycle lock while the
         lease pins the native tree. Only pure source-descriptor queries opt out;
         refusal releases the temporary lease before the operation body starts.
+        Completion observation only drains existing work and must remain usable
+        after execution admission is poisoned by a cleanup failure.
         """
         _check_domain_initializer_context(self, api)
         tid = threading.get_ident()
         with self._hierarchical_start_cv:
-            self._consume_worker_host_mapped_cleanup_error_locked(api)
+            if not completion_observation:
+                self._consume_worker_host_mapped_cleanup_error_locked(api)
             continued = (
                 allow_continuation and self._lifecycle is _Lifecycle.CLOSED and self._lease_depth.get(tid, 0) > 0
             )
             if self._lifecycle is not _Lifecycle.READY and not continued:
                 raise RuntimeError(f"Worker.{api}: requires an initialized (READY) worker") from self._startup_error
-            if self._ordered_cleanup_error is not None:
+            if not completion_observation and self._ordered_cleanup_error is not None:
                 raise RuntimeError(
                     f"Worker.{api}: a prior run's ordered cleanup failed, so this worker's device state is "
                     "unreclaimed and no further work is admitted; close() it"
                 ) from self._ordered_cleanup_error
-            if self._delegated_session_fatal is not None:
+            if not completion_observation and self._delegated_session_fatal is not None:
                 raise RuntimeError(
                     f"Worker.{api}: delegated-region session is fatal and no further work is admitted; "
                     "close this Worker"
@@ -11470,6 +11641,50 @@ class Worker:
                         raise creation_error from cleanup_error
                 raise
 
+    def _declare_comm_domains(self, handles) -> None:
+        resources = self._building_run_resources
+        if self.level != 3 or _callback_frame_for(self) is None or resources is None:
+            raise RuntimeError("declare_comm_domains requires this L3 Worker's orchestration callback")
+        handles = tuple(handles)
+        for handle in handles:
+            if not isinstance(handle, CommDomainHandle) or self._live_domains.get(handle.name) is not handle:
+                raise ValueError("declared communication domain must belong to this Worker")
+            handle._require_ready()
+            config = handle._config
+            if (
+                not handle.retain_after_run
+                or config is None
+                or config.memory_source != AddressSpace.DEVICE
+                or config.workspace_engines
+            ):
+                raise ValueError("declaration requires retained Device domains without auxiliary workspaces")
+        for handle in handles:
+            self._use_domain(handle)
+        if resources.declared_comm_domains is None:
+            resources.declared_comm_domains = {}
+        resources.declared_comm_domains.update((handle.allocation_id, handle) for handle in handles)
+
+    def _seal_comm_resources(self, run_id: int, resources: _RunResources) -> None:
+        orch = self._orch
+        assert orch is not None
+        declared = resources.declared_comm_domains
+        complete = (
+            declared is not None
+            and not (resources.requires_ordered_cleanup or resources.live_global_domains or resources.ccu_domains)
+            and all(
+                declared.get(handle.allocation_id) is handle
+                and not handle.released
+                and self._live_domains.get(handle.name) is handle
+                for handle in resources.live_domains.values()
+            )
+        )
+        orch._seal_run_resources(run_id, list(declared or ()), complete)
+
+    def _set_comm_execution_fence(self, allocation_id: int, active: bool) -> None:
+        orch = self._orch
+        assert orch is not None
+        orch._set_comm_execution_fence(allocation_id, active)
+
     def _use_domain(self, handle, *, config=None) -> None:
         handle._require_ready()
         resources = self._building_run_resources if _callback_frame_for(self) is not None else None
@@ -11478,10 +11693,19 @@ class Worker:
         if handle.released:
             raise RuntimeError(f"domain {handle.name!r} is already released")
         local = self.level == 3
+        if local and handle.retain_after_run:
+            with handle._run_use_lock:
+                if handle.released:
+                    raise RuntimeError(f"domain {handle.name!r} is already released")
+                # The run owns the retirement path before the domain publishes
+                # its use; interruption cannot strand a domain-only reference.
+                resources.retained_domain_uses[handle.allocation_id] = handle
+                handle._run_uses[id(resources)] = resources
         with resources.domain_lock:
             table = resources.live_domains if local else resources.live_global_domains
             table[handle.name] = handle
-            resources.requires_ordered_cleanup = True
+            if not (local and handle.retain_after_run):
+                resources.requires_ordered_cleanup = True
         release = self._release_domain_handle if local else self._release_global_domain_handle
         handle._release_fn = lambda released, owner=resources: release(released, owner)
 
@@ -11657,7 +11881,8 @@ class Worker:
             except BaseException as error:
                 errors[index] = error
 
-        _start_and_join_threads(enumerate(workers), lambda item: send(*item), name_prefix="ccu-register-")
+        with self._domain_control_mu:
+            _start_and_join_threads(enumerate(workers), lambda item: send(*item), name_prefix="ccu-register-")
         for error in errors:
             if error is not None:
                 raise error
@@ -11739,6 +11964,25 @@ class Worker:
             )
             if allocation_id in used:
                 self._use_domain(handle)
+
+    def _retain_native_domains(self, resources: _RunResources) -> None:
+        """Retain native context backing before entering a graph callback.
+
+        Native preparation borrows all eligible domains, including contexts
+        passed as scalars. Logical release revokes application access but cannot
+        remove a backing from this admission snapshot until physical free.
+        This lock is never acquired by per-task provenance validation.
+        """
+        if self.level != 3:
+            return
+        with self._domain_lifetime_mu:
+            for handle in tuple(self._live_domains.values()):
+                if handle.retain_after_run and not handle.freed:
+                    self._retained_domain_backings[handle.allocation_id] = handle
+            for handle in self._retained_domain_backings.values():
+                with handle._run_use_lock:
+                    resources.retained_domain_uses[handle.allocation_id] = handle
+                    handle._run_uses[id(resources)] = resources
 
     @contextlib.contextmanager
     def _domain_release_scope(self, handle: CommDomainHandle):
@@ -11913,6 +12157,8 @@ class Worker:
                 # finish importing. Dispatch joins all requests before the fence
                 # sweep aborts these unpublished allocations. RPC success alone
                 # cannot identify the ranks that still hold resources.
+                if len(workers) > 1:
+                    self._set_comm_execution_fence(allocation_id, True)
                 dispatch_started = True
                 try:
                     self._dispatch_control_domain(
@@ -11976,6 +12222,8 @@ class Worker:
                     handle.workers = committed
                     if not committed:
                         if all(_domain_reply_ownership(reply_shms[w]) == _DOMAIN_REPLY_REJECTED for w in workers):
+                            if len(workers) > 1:
+                                self._set_comm_execution_fence(allocation_id, False)
                             with self._alloc_id_lock:
                                 self._comm_domain_alloc_errors.pop(allocation_id, None)
                         if self._live_domains.get(name) is handle:
@@ -11985,6 +12233,8 @@ class Worker:
                         resources.requires_ordered_cleanup = previous_ordered_cleanup
             except BaseException:  # noqa: BLE001
                 if handle is not None and not dispatch_started:
+                    if len(workers) > 1:
+                        self._set_comm_execution_fence(allocation_id, False)
                     if self._live_domains.get(name) is handle:
                         self._live_domains.pop(name)
                     if resources.live_domains.get(name) is handle:
@@ -12055,7 +12305,8 @@ class Worker:
         # the backend call runs; exact-once free removes the global entry only
         # after it commits, and the run entry is retired below.
         try:
-            self._free_domain_after_fence(handle)
+            if self._free_domain_after_fence(handle) is False:
+                return
         except BaseException:
             self._defer_domain_retirement(handle)
             raise
@@ -12073,6 +12324,7 @@ class Worker:
         retirement and frees itself.
         """
         with resources.domain_lock:
+            resources.domains_fenced = True
             resources.retired = True
             stragglers = list(resources.pending_release_domains)
             global_stragglers = list(resources.pending_release_global_domains)
@@ -12080,13 +12332,20 @@ class Worker:
             resources.live_domains.clear()
         self._drain_pending_domain_snapshot(resources, stragglers)
         self._drain_pending_global_domain_snapshot(resources, global_stragglers)
+        for handle in list(resources.retained_domain_uses.values()):
+            if handle.released:
+                self._free_domain_after_fence(handle)
+            with handle._run_use_lock:
+                handle._run_uses.pop(id(resources), None)
+            resources.retained_domain_uses.pop(handle.allocation_id, None)
 
     def _drain_pending_domain_snapshot(self, resources: _RunResources, pending: list[CommDomainHandle]) -> None:
         """Free a snapshot while each source-queue claim stays durable."""
 
         def _release(handle: CommDomainHandle) -> None:
             try:
-                self._free_domain_after_fence(handle)
+                if self._free_domain_after_fence(handle) is False:
+                    return
             except BaseException:
                 self._defer_domain_retirement(handle)
                 raise
@@ -12145,36 +12404,62 @@ class Worker:
             if table.get(handle.name) is handle:
                 table.pop(handle.name)
 
-    def _free_domain_after_fence(self, handle: CommDomainHandle) -> None:
+    def _free_domain_after_fence(self, handle: CommDomainHandle) -> bool:
+        # Admission snapshots and physical reclamation are mutually exclusive.
+        # Do not use _submit_mu here: a graph callback may be waiting for this
+        # run's finalizer while holding that serializer.
+        with self._domain_lifetime_mu:
+            if handle.retain_after_run and not handle.freed:
+                self._retained_domain_backings[handle.allocation_id] = handle
+            freed = self._free_domain_after_fence_locked(handle)
+            if freed:
+                self._retained_domain_backings.pop(handle.allocation_id, None)
+            return freed
+
+    def _free_domain_after_fence_locked(self, handle: CommDomainHandle) -> bool:
         """Back-end free for a handle whose owning run has retired.
 
         Tolerates a handle the end-of-run sweep already freed: the sweep works
         from a snapshot, so a release taken after that snapshot reaches here
         for a domain that is already gone.
 
-        A failed release propagates. Its run carries
-        ``requires_ordered_cleanup`` — that is set when the domain is created —
-        so the error is what stops a successor from starting on top of device
-        state nobody can describe.
+        A failed release propagates and stops further admission through the
+        ordered-cleanup failure path. Already registered users retain the
+        backing until their completion fences are confirmed.
         """
         if handle.freed:
-            return
+            return True
         seal_host_mappings(handle._host_mappings)
+        try:
+            allocation_id = (
+                handle.allocation_id if self.level == 3 else self._global_domain_provenance_id(handle.domain_id)
+            )
+            self._drop_domain_allocs(allocation_id)
+        except BaseException:
+            self._defer_domain_retirement(handle)
+            raise
+        with handle._run_use_lock:
+            if any(not use.domains_fenced for use in handle._run_uses.values()):
+                return False
+        # Release has revoked new use. Backend reclamation takes provenance
+        # locks, so it cannot run while holding the per-domain use lock.
+        return self._free_domain_without_active_uses(handle)
+
+    def _free_domain_without_active_uses(self, handle: CommDomainHandle) -> bool:
+        if handle.freed:
+            return True
         try:
             results = self._domain_free_results if self.level == 3 else self._global_domain_free_results
             key = handle.allocation_id if self.level == 3 else handle.domain_id
             if self._worker is None and results.get(key, False) is not None:
                 raise RuntimeError(f"domain {handle.name!r}: window reclamation is unconfirmed")
-            allocation_id = (
-                handle.allocation_id if self.level == 3 else self._global_domain_provenance_id(handle.domain_id)
-            )
-            self._drop_domain_allocs(allocation_id)
             release = self._release_domain_now if self.level == 3 else self._release_global_domain_now
             release(handle)
         except BaseException:
             self._defer_domain_retirement(handle)
             raise
         handle._freed = True  # noqa: SLF001 -- runtime owns this transition
+        return True
 
     def _execute_pending_domain_releases(self, resources: _RunResources) -> None:
         """Drive CTRL_RELEASE_DOMAIN for every queued handle.  Must run
@@ -12287,6 +12572,8 @@ class Worker:
             )
 
         def retire_live_handle() -> None:
+            if handle._domain_size > 1:
+                self._set_comm_execution_fence(handle.allocation_id, False)
             if handle._allocation_pending:
                 with self._alloc_id_lock:
                     self._comm_domain_alloc_errors.pop(handle.allocation_id, None)
@@ -12337,7 +12624,8 @@ class Worker:
             except BaseException as e:  # noqa: BLE001
                 errors[chip_idx] = e
 
-        _start_and_join_threads(workers, dispatch, name_prefix=f"{op}_domain_chip_")
+        with self._domain_control_mu:
+            _start_and_join_threads(workers, dispatch, name_prefix=f"{op}_domain_chip_")
 
         if errors:
             first = next(iter(errors.items()))
@@ -13370,7 +13658,8 @@ class Worker:
             if not handle.released:
                 handle._released = True  # noqa: SLF001 -- runtime owns the transition
             try:
-                self._free_domain_after_fence(handle)
+                if self._free_domain_after_fence(handle) is False:
+                    return
             except BaseException:
                 self._defer_domain_retirement(handle)
                 if resources is not None:
@@ -13801,6 +14090,19 @@ class Worker:
         if resources is None:
             return
         resources.touched_identities.update(self._identities_in_args(args))
+
+    def _record_touched_identities_locked(self, args: Any) -> None:
+        """Register cached domain uses before native submit; provenance is held."""
+        self._record_touched_identities(args)
+        resources = self._building_run_resources
+        if resources is None or self.level != 3:
+            return
+        for handle in tuple(self._live_domains.values()):
+            if resources.live_domains.get(handle.name) is handle:
+                continue
+            identities = self._domain_members.get(handle.allocation_id, ())
+            if not resources.touched_identities.isdisjoint(identities):
+                self._use_domain(handle)
 
     def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
         """Validate device args against the worker they are dispatched to.
@@ -14977,7 +15279,16 @@ class Worker:
     # run — uniform entry point
     # ------------------------------------------------------------------
 
-    def submit(self, callable, args=None, config=None, *, caller_stream: int | None = None) -> RunHandle:
+    def submit(
+        self,
+        callable,
+        args=None,
+        config=None,
+        *,
+        caller_stream: int | None = None,
+        success_predecessor: RunHandle | None = None,
+        completion_callback: Callable[[BaseException | None], None] | None = None,
+    ) -> RunHandle:
         """Submit one task (L2) or one DAG (L3+) and return its completion handle.
 
         Dispatch:
@@ -15024,8 +15335,39 @@ class Worker:
         depend on a later Python graph callback entering while admission is
         full, including the automatic cold depth of one. Completion and cleanup
         stay attached to each handle.
+
+        For a hierarchical run, ``success_predecessor`` explicitly requires a
+        prior handle from this Worker to finish successfully before device
+        activation. Host graph construction and preparation can proceed early;
+        direct device allocation/copy in such a held callback is rejected, so
+        prepare those resources first. Waiting on the successor also resolves
+        its predecessor, including when handles are waited in reverse order.
+
+        The synchronous ``completion_callback(error)`` runs once after native completion and
+        Simpler cleanup, before publishing the final result or authorizing a
+        successor. It runs on the thread resolving the handle (possibly close)
+        and receives the preceding error or None. It must return without waiting
+        for a run that requires this completion. An exception it raises becomes
+        the final error when no earlier error exists. Use it to include outer
+        copyback or cleanup in the predecessor-success boundary.
         """
         submit_options = {}
+        if completion_callback is not None:
+            if self.level == 2 or not hasattr(completion_callback, "__call__"):
+                raise ValueError("completion_callback requires a callable and hierarchical Worker")
+            if inspect.iscoroutinefunction(completion_callback) or inspect.iscoroutinefunction(
+                completion_callback.__call__
+            ):
+                raise TypeError("completion_callback must be synchronous")
+            submit_options["completion_callback"] = completion_callback
+        if success_predecessor is not None:
+            if (
+                self.level == 2
+                or not isinstance(success_predecessor, RunHandle)
+                or success_predecessor._worker is not self
+            ):
+                raise ValueError("success_predecessor requires a handle from this hierarchical Worker")
+            submit_options["success_predecessor"] = success_predecessor
         if caller_stream is not None:
             if self.level != 2:
                 raise ValueError("caller_stream requires a direct L2 Worker")
@@ -15093,10 +15435,22 @@ class Worker:
         with ``simpler_setup.tools.strace_timing`` (see
         ``docs/dfx/host-trace.md``).
         """
-        submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
-        self.submit(callable, args=args, config=config, **submit_options).wait()
+        if caller_stream is None:
+            handle = self.submit(callable, args=args, config=config)
+        else:
+            handle = self.submit(callable, args=args, config=config, caller_stream=caller_stream)
+        handle.wait()
 
-    def _submit_locked(self, callable, args, config, *, caller_stream: int | None = None) -> RunHandle:
+    def _submit_locked(
+        self,
+        callable,
+        args,
+        config,
+        *,
+        caller_stream: int | None = None,
+        success_predecessor: RunHandle | None = None,
+        completion_callback: Callable[[BaseException | None], None] | None = None,
+    ) -> RunHandle:
         cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
@@ -15108,14 +15462,35 @@ class Worker:
                 state.slot_id, args, cfg, caller_stream=caller_stream, original_handle=callable
             )
 
-        while True:
-            with self._submit_mu.exclusive():
-                predecessor = self._cleanup_bearing_predecessor()
-                if predecessor is None:
-                    self._require_no_ordered_cleanup_failure("submit")
-                    return self._submit_l3_locked(callable, args, cfg)
-            # Finalization can drop keepalives whose destructors acquire this serializer.
-            predecessor._wait_for_handoff()
+        failed_completion: list[BaseException | None] | None = [] if completion_callback is not None else None
+        try:
+            while True:
+                with self._submit_mu.exclusive():
+                    predecessor = self._cleanup_bearing_predecessor()
+                    if predecessor is None:
+                        self._require_no_ordered_cleanup_failure("submit")
+                        if success_predecessor is not None or completion_callback is not None:
+                            return self._submit_l3_locked(
+                                callable,
+                                args,
+                                cfg,
+                                success_predecessor=success_predecessor,
+                                completion_callback=completion_callback,
+                                failed_completion=failed_completion,
+                            )
+                        return self._submit_l3_locked(callable, args, cfg)
+                # Finalization can drop keepalives whose destructors acquire this serializer.
+                predecessor._wait_for_handoff()
+        except BaseException:
+            if failed_completion and completion_callback is not None:
+                # The failed run has no public handle. The submit operation
+                # still holds its Worker lease while the outer callback runs.
+                try:
+                    self._invoke_completion_callback(completion_callback, failed_completion[0])
+                except BaseException:  # noqa: BLE001
+                    # The graph failure remains the synchronous submit outcome.
+                    pass
+            raise
 
     def _record_unreclaimable(self, message: str, cause: BaseException | None = None) -> RuntimeError:
         """Refuse all further work on this worker, and return the reason.
@@ -15420,6 +15795,17 @@ class Worker:
         if str(self._config.get("platform", "")).endswith("sim"):
             return False
         return not any(key in self._config for key in ("pending_run_depth", "launch_depth", "workspace_budget_bytes"))
+
+    @property
+    def run_identity_capacity(self) -> int:
+        """Upper bound on run identities for this Worker's configuration.
+
+        Available before initialization without touching devices. Adapters may
+        use this directory bound to cap their own resource budgets. It is not
+        a grant of execution slots, a free-slot count, or a memory reservation:
+        native admission still enforces the resources each endpoint can hold.
+        """
+        return self._requested_chip_pipeline_depth()
 
     def _requested_chip_pipeline_depth(self) -> int:
         """The capacity this Worker asks each chip child for.
@@ -15776,15 +16162,25 @@ class Worker:
         mappings = self._l3_host_mappings() if has_map or supported else self._host_group_mappings
         return host_args, mappings
 
-    def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
+    def _submit_l3_locked(
+        self,
+        callable,
+        args,
+        cfg: CallConfig,
+        *,
+        success_predecessor: RunHandle | None = None,
+        completion_callback: Callable[[BaseException | None], None] | None = None,
+        failed_completion: list[BaseException | None] | None = None,
+    ) -> RunHandle:
         host_args, mappings = self._prepare_l3_host_args(args)
         assert self._orch is not None
         assert self._worker is not None
         if getattr(cfg, "output_prefix", ""):
             _bind_host_log_session_directory()
-        run_id = self._orch._begin_run()
+        run_id = self._orch._begin_run(True, True) if success_predecessor is not None else self._orch._begin_run()
         resources = _RunResources()
         handle = RunHandle(self, run_id, (callable, args, cfg), resources)
+        handle._completion_callback = completion_callback
         with self._hierarchical_start_cv:
             self._accepted_run_handles.add(handle)
             self._hierarchical_start_cv.notify_all()
@@ -15792,6 +16188,7 @@ class Worker:
         scope_open = False
         self._building_run_resources = resources
         try:
+            self._retain_native_domains(resources)
             if mappings is not None:
                 mappings.acquire(run_id, host_args)
                 resources.touched_identities.update(
@@ -15824,6 +16221,7 @@ class Worker:
                 ) from self._delegated_session_fatal
             scope_open = False
             self._orch._scope_end()
+            self._seal_comm_resources(run_id, resources)
             self._orch._close_run_submission(run_id)
         except BaseException as e:
             try:
@@ -15847,6 +16245,11 @@ class Worker:
                 # either the run fence fires or whole-tree teardown reclaims an
                 # unsettled cancellation.
                 self._building_run_resources = None
+                # Capture the cleanup result under the serializer. The caller
+                # invokes the user callback after releasing it.
+                handle._completion_callback = (
+                    completion_callback if failed_completion is None else failed_completion.append
+                )
                 if cancellation_error is None:
                     handle._wait_for_serialization()
                 else:
@@ -15859,7 +16262,94 @@ class Worker:
             raise
         finally:
             self._building_run_resources = None
+        self._attach_success_predecessor(handle, success_predecessor)
         return handle
+
+    def _attach_success_predecessor(self, handle: RunHandle, predecessor: RunHandle | None) -> None:
+        if predecessor is None:
+            return
+        handle._success_predecessor = predecessor
+        run_id = handle._run_id
+        assert run_id is not None
+        with predecessor._cv:
+            terminal = predecessor._terminal
+            if not terminal:
+                predecessor._success_successors.append(run_id)
+        if terminal:
+            self._resolve_held_run(run_id, predecessor._error is None)
+
+    def _resolve_held_run(self, run_id: int, success: bool) -> None:
+        # Close checks this same accepted set before tearing down the tree.
+        # Keep the check and native resolution together. A stale snapshot can
+        # reach here after another waiter has retired the last accepted run.
+        with self._hierarchical_start_cv:
+            orch = self._orch
+            if orch is not None and self._accepted_run_handles:
+                orch._resolve_held_run(run_id, success)
+
+    def _invoke_completion_callback(self, callback, error: BaseException | None) -> None:
+        tid = threading.get_ident()
+        self._run_finalization_depth[tid] = self._run_finalization_depth.get(tid, 0) + 1
+        try:
+            result = callback(error)
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise TypeError("completion_callback returned an awaitable")
+        finally:
+            depth = self._run_finalization_depth.get(tid, 0) - 1
+            if depth <= 0:
+                self._run_finalization_depth.pop(tid, None)
+            else:
+                self._run_finalization_depth[tid] = depth
+
+    def _complete_outer_callback(self, handle: RunHandle) -> None:
+        # close() must see the handle until its outer copyback/cleanup returns.
+        with self._hierarchical_start_cv:
+            handle._cleanup_published = True
+            self._accepted_run_handles.discard(handle)
+            self._hierarchical_start_cv.notify_all()
+
+    def wait_any(self, handles: Sequence[RunHandle], timeout: float | None = None) -> RunHandle | None:
+        """Wait for any hierarchical native terminal; call result() to finish cleanup.
+
+        A wake or cancellation returns None so a single completion consumer can
+        rebuild its handle snapshot or stop. wake_wait_any is sticky until consumed.
+        """
+        deadline = RunHandle._deadline(timeout)
+        if self.level == 2:
+            raise ValueError("wait_any requires a hierarchical Worker")
+        selected = tuple(handles)
+        by_id = {}
+        for handle in selected:
+            if not isinstance(handle, RunHandle) or handle._worker is not self:
+                raise ValueError("wait_any handles must belong to this Worker")
+            with handle._cv:
+                if handle._terminal:
+                    return handle
+                if handle._run_id is not None:
+                    by_id[handle._run_id] = handle
+        # close first cancels this wait, then drains its operation lease before
+        # destroying the native Worker/Orchestrator referenced by the call.
+        with self._operation_lease("wait_any", requires_execution_context=False, completion_observation=True):
+            orch = self._orch
+            if orch is None:
+                return None
+            remaining = -1.0 if deadline is None else max(0.0, deadline - _monotonic())
+            ready = orch._wait_any_run(list(by_id), remaining)
+        return by_id.get(ready)
+
+    def wake_wait_any(self) -> None:
+        """Wake the single completion consumer, including a not-yet-entered wait."""
+        orch = self._orch
+        if orch is not None:
+            orch._wake_wait_any()
+
+    def cancel_wait_any(self) -> None:
+        """Permanently cancel completion observation waits; running work is unchanged."""
+        orch = self._orch
+        if orch is not None:
+            orch._cancel_wait_any()
 
     def _run_handle_done(self, run_id: int) -> bool:
         chip_run = self._chip_run_for(run_id)
@@ -15974,6 +16464,8 @@ class Worker:
                 self._publish_abandoned_run(handle, native_error)
                 return native_error
 
+            resources.domains_fenced = True
+
             def _poison_endpoint() -> None:
                 if native_error is not None:
                     if self._poison_spsc_queue_from_endpoint_error(native_error, resources):
@@ -16063,8 +16555,9 @@ class Worker:
                             self._abandoned_run_handles.append(handle)
                     elif cleanup_error is not None and self._ordered_cleanup_error is None:
                         self._ordered_cleanup_error = cleanup_error
-                    handle._cleanup_published = True
-                    self._accepted_run_handles.discard(handle)
+                    if handle._completion_callback is None:
+                        handle._cleanup_published = True
+                        self._accepted_run_handles.discard(handle)
                     self._hierarchical_start_cv.notify_all()
                 break
             except BaseException as exc:  # noqa: BLE001, PERF203
@@ -16418,6 +16911,7 @@ class Worker:
                 # lease that consumes most of it must not be followed by a
                 # fresh full-budget wait on an accepted run fence.
                 drain_deadline = _monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
+                self.cancel_wait_any()
                 # Drain in-flight leases before touching the tree. CLOSED already
                 # rejects new leases; a tree with a live op is never torn down.
                 # If an op outlives the budget, teardown stays UN-attempted and

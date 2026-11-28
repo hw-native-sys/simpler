@@ -25,7 +25,7 @@ extern "C" __attribute__((visibility("default"))) int probe_selected_config(int 
     ChipTaskArgs args{};
     return entry.config_func(args).expected_arg_count;
 }
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *) { return 0; }
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec_abi2(void *) { return 0; }
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *) { return 0; }
 
 namespace {
