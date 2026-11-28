@@ -24,5 +24,7 @@ namespace aicpu_cache_maintenance {
 void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
 
 void flush_range_impl(const void * /* addr */, size_t /* size */) {}
+void clean_line_impl(const void * /* addr */) {}
+void complete_clean_impl() {}
 
 }  // namespace aicpu_cache_maintenance

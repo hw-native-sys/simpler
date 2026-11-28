@@ -20,6 +20,7 @@
 #include <mutex>
 #include <thread>
 
+#include "aicpu/cache_maintenance.h"
 #include "runtime.h"
 #include "scheduler/scheduler_context.h"
 #ifdef PTO_ASYNC_WAIT_H
@@ -40,6 +41,10 @@ bool pause_open = false;
 bool open_paused = false;
 bool resume_open = false;
 bool silent_first_core = false;
+#ifdef PTO_ASYNC_WAIT_H
+void (*on_clean_line)(const void *) = nullptr;
+void (*on_clean_complete)() = nullptr;
+#endif
 
 template <typename Context>
 auto initialize(Context &context, Runtime *runtime, uint64_t regs, int)
@@ -108,6 +113,20 @@ volatile uint32_t *get_reg_ptr(uint64_t address, RegId) { return &conditions.at(
 
 #ifdef PTO_ASYNC_WAIT_H
 void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *, const char *) {}
+
+namespace aicpu_cache_maintenance {
+void invalidate_range_impl(const void *, size_t) {}
+void flush_range_impl(const void *addr, size_t) {
+    clean_line_impl(addr);
+    complete_clean_impl();
+}
+void clean_line_impl(const void *addr) {
+    if (on_clean_line != nullptr) on_clean_line(addr);
+}
+void complete_clean_impl() {
+    if (on_clean_complete != nullptr) on_clean_complete();
+}
+}  // namespace aicpu_cache_maintenance
 #endif
 
 void platform_init_aicore_regs(uint64_t address) {
@@ -528,6 +547,70 @@ TEST_F(SchedulerRetirement, CancelledDrainRequiresEveryCoreRelease) {
     EXPECT_EQ(result.source, 1u);
     EXPECT_EQ(result.core, 0);
     EXPECT_EQ(result.released_cores, kCores - 1);
+}
+
+class ReportCleanBatchTest : public SchedulerRetirement {
+protected:
+    static inline ReportCleanBatchTest *observer = nullptr;
+    std::array<int, kCores> cleaned{};
+    int completions = 0;
+
+    void observe_clean() {
+        observer = this;
+        on_clean_line = [](const void *addr) {
+            for (int i = 0; i < kCores; ++i) {
+                const Handshake &report = observer->runtime->get_workers()[i];
+                if (&report != addr) continue;
+                EXPECT_EQ(report.aicore_done, 0u);
+                EXPECT_EQ(report.aicpu_ready, 0u);
+                EXPECT_EQ(observer->completions, 0);
+                ++observer->cleaned[i];
+                return;
+            }
+            ADD_FAILURE() << "Unexpected report line";
+        };
+        on_clean_complete = [] {
+            ++observer->completions;
+            KernelErrorCleanup result{};
+            observer->context->drain_cancelled_run(UINT64_MAX, result);
+            EXPECT_EQ(result.released_cores, 0);
+        };
+    }
+
+    void TearDown() override {
+        on_clean_line = nullptr;
+        on_clean_complete = nullptr;
+        observer = nullptr;
+    }
+};
+
+TEST_F(ReportCleanBatchTest, PartialRetirementCleansOnlySuccessfulUniqueReportsBeforePublication) {
+    handshake();
+    silent_first_core = true;
+    observe_clean();
+    const int32_t ids[] = {0, 1, 1, 4};
+    EXPECT_EQ(SchedulerContextTestPeer::request(*context, runtime.get(), ids, 4), -1);
+    EXPECT_EQ(cleaned, (std::array<int, kCores>{0, 1, 0, 0, 1, 0}));
+    EXPECT_EQ(completions, 1);
+    KernelErrorCleanup result{};
+    context->drain_cancelled_run(UINT64_MAX, result);
+    EXPECT_EQ(result.released_cores, 2);
+    // A repeat must neither retire nor clean those claimed cores again.
+    EXPECT_EQ(SchedulerContextTestPeer::request(*context, runtime.get(), ids, 4), 0);
+    EXPECT_EQ(completions, 1);
+}
+
+TEST_F(ReportCleanBatchTest, AllFailedBatchDoesNotCleanOrComplete) {
+    handshake();
+    silent_first_core = true;
+    observe_clean();
+    const int32_t ids[] = {0};
+    EXPECT_EQ(SchedulerContextTestPeer::request(*context, runtime.get(), ids, 1), -1);
+    EXPECT_EQ(cleaned, (std::array<int, kCores>{}));
+    EXPECT_EQ(completions, 0);
+    KernelErrorCleanup result{};
+    context->drain_cancelled_run(UINT64_MAX, result);
+    EXPECT_EQ(result.released_cores, 0);
 }
 #endif
 

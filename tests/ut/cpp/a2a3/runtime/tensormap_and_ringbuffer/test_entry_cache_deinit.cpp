@@ -100,6 +100,8 @@ public:
 namespace aicpu_cache_maintenance {
 void invalidate_range_impl(const void *address, size_t bytes) { invalidations.emplace_back(address, bytes); }
 void flush_range_impl(const void *, size_t) {}
+void clean_line_impl(const void *) {}
+void complete_clean_impl() {}
 }  // namespace aicpu_cache_maintenance
 
 TEST(EntryCacheDeinit, PeerCancellationIgnoresOldEpochAndPreservesPriorError) {
