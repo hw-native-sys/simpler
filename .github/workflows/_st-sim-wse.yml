@@ -126,7 +126,7 @@ jobs:
         uses: ./.github/actions/setup-venv
         with:
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
-          packages: "--no-build-isolation --config-settings=build.targets=build_package_wsesim .[test] perfetto==0.59.1"
+          packages: "--no-build-isolation --config-settings=build.targets=build_package_wsesim .[test]"
           install-torch: ${{ inputs.setup_variant == 'github' && 'true' || 'false' }}
           system-site-packages: ${{ inputs.setup_variant == 'self-cpu' && 'true' || 'false' }}
 

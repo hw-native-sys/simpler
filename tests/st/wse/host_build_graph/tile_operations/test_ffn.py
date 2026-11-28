@@ -49,11 +49,11 @@ def audit_ffn(path, *, timed=False):
     if timed:
         assert header["clock"] == "CLOCK_MONOTONIC" and header["timestamp_unit"] == "ns"
         assert all(e["monotonic_ns"] > 0 for e in events)
-        assert (path.parent / "wse_swimlane.pftrace").stat().st_size > 0
+        assert (path.parent / "chip_swimlane_records.json").stat().st_size > 0
     else:
         assert "clock" not in header and "timestamp_unit" not in header
         assert all("monotonic_ns" not in e for e in events)
-        assert not (path.parent / "wse_swimlane.pftrace").exists()
+        assert not (path.parent / "chip_swimlane_records.json").exists()
     done = [e for e in events if e["kind"] == 6]
     assert len(done) == 5 and sorted(e["value"] for e in done) == [1, 2, 3, 4, 5]
     for task in (1, 2, 3):

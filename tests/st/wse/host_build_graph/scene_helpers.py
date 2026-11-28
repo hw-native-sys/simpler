@@ -6,7 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Callable construction and deterministic FFN inputs for WSE-owned scenes."""
+"""Helpers for WSE scene execution and capture verification."""
+
+import json
+import subprocess
+import sys
 
 import torch
 from simpler.task_interface import ChipCallable, CoreCallable
@@ -45,3 +49,12 @@ def ffn_inputs(seed, shards):
         w2.reshape(shards, 32, shards, 32).permute(2, 0, 3, 1).contiguous(),
     ]
     return inputs, [t.reshape(128, shards, 32).permute(1, 0, 2).contiguous() for t in (h, a, y)]
+
+
+def convert_swimlane(directory):
+    subprocess.run(
+        [sys.executable, "-m", "simpler_setup.tools.swimlane_converter", str(directory / "chip_swimlane_records.json")],
+        check=True,
+        timeout=60,
+    )
+    return json.loads((directory / "merged_swimlane.json").read_text())

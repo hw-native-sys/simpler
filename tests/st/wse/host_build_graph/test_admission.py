@@ -19,6 +19,7 @@ import pytest
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
 from simpler_setup.runtime_builder import RuntimeBuilder
+from tests.st.wse.host_build_graph.scene_helpers import convert_swimlane
 
 _ROOT = Path(__file__).resolve().parents[4]
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph")]
@@ -277,3 +278,23 @@ def test_started_peer_waits_for_busy_core_completion_or_failure(tmp_path, st_pla
         output = tmp_path / mode
         output.mkdir()
         subprocess.run([str(probe), mode, str(output)], check=True, timeout=20)
+        if mode == "fail":
+            assert not (output / "chip_swimlane_records.json").exists()
+            continue
+        trace = convert_swimlane(output)["traceEvents"]
+        (busy,) = [event for event in trace if event.get("name") == "SS · T0" and event["ph"] == "X"]
+        assert (busy["args"]["core_id"], busy["args"]["pe_id"]) == (2, 3)
+        starts = [event for event in trace if event["ph"] == "X" and event["name"] == "Group · T1"]
+        assert sorted((e["args"]["core_id"], e["args"]["pe_id"]) for e in starts) == [(2, 2), (2, 3), (6, 2), (6, 3)]
+        if mode == "sync_start":
+            arrivals = sorted(
+                (e for e in trace if e["ph"] == "i" and e["name"] == "PE_ARRIVE"), key=lambda e: e["args"]["seq"]
+            )
+            assert len(arrivals) == 4
+            assert arrivals[-2]["args"]["seq"] < busy["args"]["end_seq"] < arrivals[-1]["args"]["seq"]
+            (release,) = [e for e in trace if e["ph"] == "i" and e["name"] == "SYNC_RELEASE"]
+            assert (release["args"]["core_id"], release["args"]["pe_id"]) == (2, 3)
+            assert arrivals[-1]["args"]["seq"] < release["args"]["seq"] < min(e["args"]["seq"] for e in starts)
+        else:
+            early = [e for e in starts if e["args"]["end_seq"] < busy["args"]["end_seq"]]
+            assert sorted((e["args"]["core_id"], e["args"]["pe_id"]) for e in early) == [(2, 2), (6, 2), (6, 3)]

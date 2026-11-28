@@ -5712,6 +5712,8 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
     for rank, records_path in rank_inputs:
         with records_path.open() as f:
             raw_inputs[rank] = json.load(f)
+        if (raw_inputs[rank].get("metadata") or {}).get("platform") == "wsesim":
+            raise ValueError("WSE captures have per-host clocks; convert each Rank records file independently")
         if _is_recorded_window(raw_inputs[rank]):
             raise ValueError("recorded windows cannot be merged into a single-invocation Host timeline")
         # Resolved once per Rank and reused for every companion read below. For
@@ -5921,6 +5923,11 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
     return output_path, rank_metadata
 
 
+def _require_separate_output(input_path, output_path):
+    if output_path.exists() and output_path.samefile(input_path):
+        raise ValueError("recorded trace output must not replace its raw input")
+
+
 def _convert_recorded_window(data, input_path, output_path):
     """Publish separate traces while leaving the original observations untouched."""
     timeline = dict(data["timeline_metadata"])
@@ -5929,8 +5936,7 @@ def _convert_recorded_window(data, input_path, output_path):
     companion = output_path.with_name(f"{output_path.stem}.host-preparation.{uuid.uuid4().hex}.json")
     destinations = [output_path, companion] if data["host_preparation"] else [output_path]
     for destination in destinations:
-        if destination.resolve() == input_path.resolve() or (destination.exists() and destination.samefile(input_path)):
-            raise ValueError("recorded trace output must not replace its raw input")
+        _require_separate_output(input_path, destination)
     if data["host_preparation"]:
         timeline["host_preparation_file"] = companion.name
         host_timeline = {**timeline, "clock_domain": "host_monotonic_ns", "preparation_only": True}
@@ -5982,6 +5988,14 @@ def main():
         if args.verbose:
             print(f"Reading performance data from: {input_path}")
         raw, placement = _prepare_capture_clock_alignment(input_path, args.host_log)
+        if (raw.get("metadata") or {}).get("platform") == "wsesim":
+            from simpler_setup.tools.wse_swimlane import generate_wse_trace  # noqa: PLC0415
+
+            output_path = _resolve_output_path(args, input_path)
+            _require_separate_output(input_path, output_path)
+            _atomic_json(output_path, generate_wse_trace(raw))
+            print(f"  Output: {output_path}")
+            return 0
         data = _decode_perf_data(raw, placement=placement)
         if (data.get("timeline_metadata") or {}).get("recorded_window"):
             if args.overhead or args.deps_json:
