@@ -984,6 +984,12 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
 // built serially in post_handshake_init (core-index order) once every slice has
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
+static inline void arm_teardown_gate(AicoreTeardownControl &gate) {
+    gate.post_close_release = 0;
+    gate.exit_request = 0;
+    gate.release_epoch = 0;
+}
+
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->get_workers());
     // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
@@ -993,6 +999,9 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     const int32_t total = cores_total_num_;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
+    auto *gates = runtime->get_teardown_gates();
+    for (int32_t i = lo; i < hi; ++i)
+        arm_teardown_gate(gates[i]);
 
     // The AICore publishes {physical_core_id, core_type, aicore_done} on launch,
     // gated by nothing. task is not published here: the AICore's aicore_done
@@ -1083,9 +1092,11 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     // stores before any window STR. Writing task now (after the report) also
     // keeps the core's CACHELINE_OUT report flush from clobbering it.
     for (int32_t r = 0; r < n_ready; r++) {
-        all_handshakes[ready[r].i].task = reinterpret_cast<uint64_t>(&payload_per_core_[ready[r].i][0]);
+        const int32_t i = ready[r].i;
+        all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
     }
-    OUT_OF_ORDER_STORE_BARRIER();
+    // Complete both Normal-memory publications before opening these cores' Device windows.
+    wmb();
 
     // Phase 3: open every window. platform_init_aicore_regs' STRs are posted
     // Device-nGnRE writes, issued back-to-back with no interleaved GM stores.
@@ -1132,10 +1143,15 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
 
     int32_t owned[RUNTIME_MAX_WORKER];
     int32_t own_n = 0;
+    auto *gates = runtime->get_teardown_gates();
+    const auto add_core = [&](int32_t i) {
+        owned[own_n++] = i;
+        arm_teardown_gate(gates[i]);
+    };
     for (int32_t ci = tidx; ci < aic_n; ci += active_threads) {
-        owned[own_n++] = ci;                  // AIC
-        owned[own_n++] = aic_n + 2 * ci;      // AIV0
-        owned[own_n++] = aic_n + 2 * ci + 1;  // AIV1
+        add_core(ci);
+        add_core(aic_n + 2 * ci);
+        add_core(aic_n + 2 * ci + 1);
     }
 
     uint32_t max_physical_cores_count = platform_get_physical_cores_count();
@@ -1198,9 +1214,11 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
     // only after its window opens (Phase 3), so a single barrier orders all task
     // stores before any window STR.
     for (int32_t r = 0; r < n_ready; r++) {
-        all_handshakes[ready[r].i].task = reinterpret_cast<uint64_t>(&payload_per_core_[ready[r].i][0]);
+        const int32_t i = ready[r].i;
+        all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
     }
-    OUT_OF_ORDER_STORE_BARRIER();
+    // Complete both Normal-memory publications before opening these cores' Device windows.
+    wmb();
 
     // Phase 3: open every window (the IDLE write is also the core's ack).
     for (int32_t r = 0; r < n_ready; r++) {
@@ -1474,22 +1492,18 @@ int32_t SchedulerContext::pre_handshake_init(
 
     // Core count is needed by every thread to compute its handshake slice.
     cores_total_num_ = runtime->dev.worker_count;
-    if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
+    if (cores_total_num_ <= 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
         LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
         return -1;
     }
-    // The prior launch may have left RELEASE=1. The wmb() is what orders these
-    // resets before hs_setup_done_ and before any register window opens: a
-    // window is a plain Device-nGnRE store, carrying no release semantics of
-    // its own.
-    memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * cores_total_num_);
-    wmb();
     // The blocked 1 AIC : 2 AIV layout requires an exact multiple of 3: cluster ci
     // owns cores {ci, N/3+2ci, N/3+2ci+1}, so a non-zero remainder leaves the tail
     // AIV cores [3*(N/3), N) in no cluster — unhandshaked, their windows never open,
     // and the run hangs at the op-execute timeout. assign_cores_to_threads pairs
     // aiv_worker_ids_[2*ci]/[2*ci+1] on the serial path too, so this holds for both.
     if (cores_total_num_ % PLATFORM_CORES_PER_BLOCKDIM != 0) {
+        memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * cores_total_num_);
+        wmb();
         LOG_ERROR(
             "cores_total_num %d is not a multiple of %d (blocked 1 AIC : 2 AIV layout)", cores_total_num_,
             PLATFORM_CORES_PER_BLOCKDIM

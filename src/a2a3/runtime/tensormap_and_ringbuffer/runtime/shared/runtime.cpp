@@ -127,19 +127,17 @@ uint64_t Runtime::callable_entry_table_addr() const { return callable_entry_tabl
 
 uint32_t Runtime::callable_table_len() const { return dev.callable_table_len_; }
 
-// A steady-state trb run uploads the `dev` descriptor before the handshake
-// region (the rest of Runtime is host-only). Neither that region nor the gate
-// tail carries a host value the device consumes: the AICore publishes its
-// report, the AICPU writes the task pointer it answers with, and the AICPU
-// zeroes the active gates and executes wmb() before publishing hs_setup_done_,
-// with no register window open before that.
+// Descriptor publication excludes RuntimeSharedState, which holds the
+// handshake buffers and teardown gates. Each handshaking scheduler resets its
+// workers' gates, publishes their task pointers and completes these writes
+// before opening any of their register windows.
 //
 // The length stops inside the entry args, after the tensor slots this run
 // filled, which is why it is the one length that depends on the run rather than
 // only on the runtime: `orch_args_storage_` is the last uploaded member and its
 // tensor array is the last thing in it. At capacity this is exactly
-// offsetof(workers); with no tensors it is 1,280 bytes on both arches. Slots the
-// length leaves out keep whatever an earlier run of the same allocation wrote,
+// sizeof(DeviceRuntimeLaunchDesc). Slots the length leaves out keep whatever
+// an earlier run of the same allocation wrote,
 // so every consumer reads through the counts — see
 // ChipTaskArgs::create_from_entry_storage.
 size_t runtime_device_copy_size(const Runtime &rt) {
