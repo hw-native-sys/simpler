@@ -30,11 +30,35 @@ import pytest
 import simpler.remote_l3_session as session_mod
 import simpler.remote_l3_worker as daemon_mod
 import simpler.worker as worker_mod
-from simpler.worker import RemoteWorkerSpec, Worker
+from simpler.worker import RemoteChipSpec, RemoteWorkerSpec, Worker
 
 
 def _spec(port: int = 19073) -> RemoteWorkerSpec:
     return RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim")
+
+
+def test_remote_chip_ids_follow_local_chips_and_manifest_selects_l2():
+    worker = Worker(level=3, platform="a2a3sim", device_ids=[0, 1], num_sub_workers=0)
+    spec = RemoteChipSpec(endpoint="127.0.0.1:19073", platform="a2a3sim", device_id=0)
+    assert worker.add_remote_chip(spec) == 2
+    assert worker.add_remote_chip(RemoteChipSpec(endpoint=spec.endpoint, platform=spec.platform, device_id=1)) == 3
+    manifest = worker._build_remote_manifest(spec=spec, worker_id=2, session_id=7, startup_remaining_s=10)
+    daemon_mod._validate_manifest(manifest)
+    assert (manifest["parent_worker_level"], manifest["remote_worker_level"]) == (3, 2)
+    assert manifest["device_ids"] == [0]
+    assert manifest["remote_task_dispatcher"] == manifest["inner_l3_worker"] == []
+
+
+@pytest.mark.parametrize("device_id", [-1, 1 << 31])
+def test_remote_chip_rejects_invalid_device_id(device_id):
+    with pytest.raises(ValueError, match="device_id"):
+        RemoteChipSpec(endpoint="127.0.0.1:19073", platform="a2a3sim", device_id=device_id)
+
+
+@pytest.mark.parametrize("device_id", [-0.5, 1.5])
+def test_remote_chip_rejects_fractional_device_id(device_id):
+    with pytest.raises(TypeError):
+        RemoteChipSpec(endpoint="127.0.0.1:19073", platform="a2a3sim", device_id=device_id)
 
 
 def _l4_with_remotes(n: int, **config) -> Worker:

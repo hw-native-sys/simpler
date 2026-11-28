@@ -11,8 +11,11 @@ import contextlib
 import ctypes
 import json
 import os
+import signal
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -52,6 +55,22 @@ def _manifest(**extra):
     }
     manifest.update(extra)
     return manifest
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        ({"device_ids": []}, "exactly one device"),
+        ({"device_ids": [0, 1]}, "exactly one device"),
+        ({"parent_worker_level": 4}, "parent_worker_level"),
+        ({"remote_task_dispatcher": [{}]}, "chip_worker registry"),
+    ],
+)
+def test_daemon_rejects_invalid_remote_l2_role(extra, message):
+    manifest = _manifest(parent_worker_level=3, remote_worker_level=2, device_ids=[0])
+    manifest.update(extra)
+    with pytest.raises(ValueError, match=message):
+        remote_l3_worker._validate_manifest(manifest)
 
 
 @pytest.mark.parametrize("command_fails", [False, True])
@@ -352,7 +371,11 @@ def test_run_session_bounds_command_accept_by_startup_deadline_not_session_timeo
     assert command_sock.timeout == 5.0
 
 
-def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
+@pytest.mark.parametrize(
+    "role, cleanup_fails, expected_rc",
+    [(3, False, 0), (3, True, 0), (2, True, 1)],
+)
+def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch, capsys, role, cleanup_fails, expected_rc):
     # A finite timeout on the command connection would self-destruct a healthy but
     # idle session (read_frame idle-waiting for the next command would raise). The
     # accept()'d socket inherits socket.getdefaulttimeout() (a user module could
@@ -383,7 +406,8 @@ def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
             pass
 
         def close(self):
-            pass
+            if cleanup_fails:
+                raise RuntimeError("synthetic cleanup failure")
 
     class FakeCommandSock:
         def getsockname(self):
@@ -416,10 +440,13 @@ def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *args, **kwargs: None)
 
     try:
-        rc = remote_l3_session.run_session(
-            _manifest(startup_deadline_monotonic=1005.0, session_timeout_s=0.05), ready_w
-        )
-        assert rc == 0
+        manifest = _manifest(startup_deadline_monotonic=1005.0, session_timeout_s=0.05)
+        if role == 2:
+            manifest.update(remote_worker_level=2, parent_worker_level=3, device_ids=[0])
+        rc = remote_l3_session.run_session(manifest, ready_w)
+        assert rc == expected_rc
+        if expected_rc:
+            assert "synthetic cleanup failure" in capsys.readouterr().err
     finally:
         os.close(ready_r)
 
@@ -1213,6 +1240,7 @@ def test_borrowed_session_commit_and_revocation(monkeypatch, scenario):
         return (borrowed,)
 
     inner = SimpleNamespace(
+        level=3,
         _commit_global_domain_node=commit,
         _release_global_domain_node=lambda _command, **_kwargs: releases.append(_command),
     )
@@ -1288,3 +1316,28 @@ def test_borrowed_session_commit_and_revocation(monkeypatch, scenario):
                 error and ("borrowed" in message or "differs" in message)
                 for error, message, _ in results[1:repeated] + results[repeated + 1 :]
             )
+
+
+def test_daemon_reaps_unhanded_runner_after_startup_timeout():
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); sys.stdin.buffer.read()",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline() == b"ready\n"
+        remote_l3_worker._wait_or_kill_runner(proc, timeout_s=0.1)
+        assert proc.poll() == -signal.SIGKILL
+    finally:
+        if proc.stdin is not None:
+            proc.stdin.close()
+        proc.wait(timeout=5)
+        if proc.stdout is not None:
+            proc.stdout.close()

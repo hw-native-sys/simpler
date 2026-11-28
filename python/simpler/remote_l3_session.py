@@ -6,16 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Remote L3 session runner.
+"""Per-session runner for remote L2 and L3 execution.
 
 The runner is started by ``simpler-remote-worker`` after the daemon validates a
 bootstrap manifest. It reads the manifest before starting transport threads,
-prestarts the embedded L3 Worker, then exposes the Remote L3 command lane.
+initializes the declared Worker, then exposes its command and health lanes.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import importlib
@@ -69,6 +70,7 @@ from .global_comm_domain import (
     resolve_global_comm_capability,
 )
 from .remote_l3_protocol import (
+    HELLO_FEATURE_REMOTE_CHIP,
     HOST_TCP_TRANSPORT_PROFILE,
     PROTOCOL_VERSION,
     CallableKind,
@@ -363,12 +365,19 @@ def _prepare_register_callable(
         digest, _target, target_callable = _validate_python_import_command(command_payload)
         return digest, command.callable_kind, command.target_registry, target_callable
     if command.target_registry == RemoteRegistryTarget.INNER_L3_WORKER:
+        if int(manifest.get("remote_worker_level", 3)) != 3:
+            raise ValueError("INNER_L3_WORKER requires an L3 session")
         if command.callable_kind == CallableKind.PYTHON_IMPORT:
             digest, target, _target_callable = _validate_python_import_command(command_payload)
             return digest, command.callable_kind, command.target_registry, target
         if command.callable_kind == CallableKind.CHIP_CALLABLE:
             digest, callable_obj = _prepare_inner_chip_callable(command_payload, manifest)
             return digest, command.callable_kind, command.target_registry, callable_obj
+    if command.target_registry == RemoteRegistryTarget.REMOTE_CHIP_WORKER:
+        if int(manifest.get("remote_worker_level", 3)) != 2:
+            raise ValueError("REMOTE_CHIP_WORKER requires an L2 session")
+        digest, callable_obj = _prepare_inner_chip_callable(command_payload, manifest)
+        return digest, command.callable_kind, command.target_registry, callable_obj
     raise ValueError("unsupported remote callable target/kind combination")
 
 
@@ -417,10 +426,12 @@ def _manifest_dispatcher_register_command(entry: dict[str, Any]) -> bytes:
     )
 
 
-def _manifest_inner_register_command(entry: dict[str, Any]) -> bytes:
-    target_registry = entry.get("target_registry", "INNER_L3_WORKER")
-    if target_registry != "INNER_L3_WORKER":
-        raise ValueError("inner_l3_worker manifest entry target_registry must be INNER_L3_WORKER")
+def _manifest_inner_register_command(
+    entry: dict[str, Any], *, registry: RemoteRegistryTarget = RemoteRegistryTarget.INNER_L3_WORKER
+) -> bytes:
+    target_registry = entry.get("target_registry", registry.name)
+    if target_registry != registry.name:
+        raise ValueError(f"manifest entry target_registry must be {registry.name}")
     kind = _manifest_kind(entry)
     digest = _manifest_digest(entry)
     payload_version = int(entry.get("payload_version", 1))
@@ -440,7 +451,7 @@ def _manifest_inner_register_command(entry: dict[str, Any]) -> bytes:
     else:
         payload = b""
     return encode_register_callable_command(
-        RemoteRegistryTarget.INNER_L3_WORKER,
+        registry,
         kind,
         digest,
         payload_version,
@@ -473,7 +484,10 @@ def _install_manifest_inner_registry(
     manifest: dict[str, Any],
     inner_worker: Worker,
 ) -> dict[tuple[CallableKind, bytes], CallableHandle]:
-    entries = manifest.get("inner_l3_worker", [])
+    registry = (
+        RemoteRegistryTarget.REMOTE_CHIP_WORKER if inner_worker.level == 2 else RemoteRegistryTarget.INNER_L3_WORKER
+    )
+    entries = manifest.get("chip_worker" if inner_worker.level == 2 else "inner_l3_worker", [])
     if entries is None:
         return {}
     if not isinstance(entries, list):
@@ -485,21 +499,25 @@ def _install_manifest_inner_registry(
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ValueError("inner_l3_worker manifest entries must be objects")
-            command_payload = _manifest_inner_register_command(entry)
-            digest, kind, registry, target = _prepare_register_callable(command_payload, manifest)
-            if registry != RemoteRegistryTarget.INNER_L3_WORKER:
+            command_payload = _manifest_inner_register_command(entry, registry=registry)
+            digest, kind, decoded_registry, target = _prepare_register_callable(command_payload, manifest)
+            if decoded_registry != registry:
                 raise ValueError("inner_l3_worker manifest entry decoded to the wrong registry")
             if digest in seen_digests:
                 raise ValueError(f"inner_l3_worker manifest contains duplicate hashid {digest.hex()}")
             seen_digests.add(digest)
+            if registry == RemoteRegistryTarget.REMOTE_CHIP_WORKER:
+                ref_count = entry.get("ref_count")
+                if type(ref_count) is not int or ref_count < 1:
+                    raise ValueError("chip_worker manifest ref_count must be a positive integer")
 
             if kind == CallableKind.PYTHON_IMPORT:
                 handle = inner_worker._register_child_python_import(target, digest=digest)  # noqa: SLF001
             elif kind == CallableKind.CHIP_CALLABLE:
-                handle = inner_worker._register_child_chip(  # noqa: SLF001
-                    target,
-                    digest=digest,
-                    publish_handle=True,
+                handle = (
+                    inner_worker.register(target)
+                    if inner_worker.level == 2
+                    else inner_worker._register_child_chip(target, digest=digest, publish_handle=True)  # noqa: SLF001
                 )
                 if handle is None:
                     raise RuntimeError("inner_l3_worker CHIP_CALLABLE manifest install did not publish a handle")
@@ -659,6 +677,7 @@ def _materialize_inline_payload(
         raise ValueError("HOST_INLINE payload range exceeds inline arena")
     backing = mint_inline_buffer(len(payload))
     ctypes.memmove(backing.base, payload, len(payload))
+    backing.access = AccessMode.READ
     return backing, 0
 
 
@@ -709,6 +728,15 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     prepared_dispatcher: dict[bytes, Callable[..., Any]] = {}
     prepared_inner: dict[tuple[CallableKind, bytes], Any] = {}
     inner_handles: dict[tuple[CallableKind, bytes], CallableHandle] = dict(manifest_inner_handles or {})
+    chip_handle_stacks = {key: [handle] for key, handle in inner_handles.items()} if inner_worker.level == 2 else {}
+    startup_refs = (
+        {
+            (CallableKind.CHIP_CALLABLE, _manifest_digest(entry, context="chip_worker")): entry["ref_count"]
+            for entry in (manifest.get("chip_worker") or [])
+        }
+        if inner_worker.level == 2
+        else {}
+    )
     next_buffer_id = 1
     next_export_id = 1
     next_import_id = 1
@@ -753,6 +781,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
         cache never sees two different backings arrive under one identity.
         """
         nonlocal next_buffer_id
+        if inner_worker.level == 2:
+            return inner_worker.create_buffer(max(1, int(nbytes)))
         buffer_id = next_buffer_id
         next_buffer_id += 1
         return create_host_shared_buffer(
@@ -767,7 +797,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
         worker_id=worker_id,
         protocol_version=PROTOCOL_VERSION,
         comm_profile=str(manifest.get("comm_profile", GLOBAL_DOMAIN_PROFILE_SIM)),
-        feature_flags=0,
+        feature_flags=HELLO_FEATURE_REMOTE_CHIP if inner_worker.level == 2 else 0,
         ready_state=ReadyState.READY,
     )
     send_frame(conn, FrameHeader(FrameType.HELLO, session_id, worker_id, 0), encode_hello(hello))
@@ -800,7 +830,10 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             if digest not in prepared_dispatcher:
                                 raise KeyError("COMMIT_REGISTER_CALLABLE digest was not prepared")
                             dispatch_registry[digest] = prepared_dispatcher.pop(digest)
-                        elif registry == RemoteRegistryTarget.INNER_L3_WORKER:
+                        elif registry in (
+                            RemoteRegistryTarget.INNER_L3_WORKER,
+                            RemoteRegistryTarget.REMOTE_CHIP_WORKER,
+                        ):
                             key = (kind, digest)
                             if key not in prepared_inner:
                                 raise KeyError("COMMIT_REGISTER_CALLABLE inner digest was not prepared")
@@ -808,16 +841,20 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             if kind == CallableKind.PYTHON_IMPORT:
                                 handle = inner_worker._register_child_python_import(target, digest=digest)  # noqa: SLF001
                             elif kind == CallableKind.CHIP_CALLABLE:
-                                handle = inner_worker._register_child_chip(  # noqa: SLF001
-                                    target,
-                                    digest=digest,
-                                    publish_handle=True,
+                                handle = (
+                                    inner_worker.register(target)
+                                    if inner_worker.level == 2
+                                    else inner_worker._register_child_chip(  # noqa: SLF001
+                                        target, digest=digest, publish_handle=True
+                                    )
                                 )
                                 if handle is None:
                                     raise RuntimeError("INNER_L3_WORKER CHIP_CALLABLE install did not publish a handle")
                             else:
                                 raise ValueError("COMMIT_REGISTER_CALLABLE unsupported inner callable kind")
                             inner_handles[key] = handle
+                            if inner_worker.level == 2:
+                                chip_handle_stacks.setdefault(key, []).append(handle)
                             _publish_inner_handle(digest, handle)
                         else:
                             raise ValueError("COMMIT_REGISTER_CALLABLE target/kind mismatch")
@@ -828,7 +865,10 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         digest, kind, registry = _decode_digest_command(control.command_bytes)
                         if registry == RemoteRegistryTarget.REMOTE_TASK_DISPATCHER:
                             prepared_dispatcher.pop(digest, None)
-                        elif registry == RemoteRegistryTarget.INNER_L3_WORKER:
+                        elif registry in (
+                            RemoteRegistryTarget.INNER_L3_WORKER,
+                            RemoteRegistryTarget.REMOTE_CHIP_WORKER,
+                        ):
                             prepared_inner.pop((kind, digest), None)
                         _control_reply(
                             conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
@@ -840,13 +880,32 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                 raise ValueError("UNREGISTER_CALLABLE target/kind mismatch")
                             prepared_dispatcher.pop(digest, None)
                             dispatch_registry.pop(digest, None)
-                        elif registry == RemoteRegistryTarget.INNER_L3_WORKER:
+                        elif registry in (
+                            RemoteRegistryTarget.INNER_L3_WORKER,
+                            RemoteRegistryTarget.REMOTE_CHIP_WORKER,
+                        ):
                             key = (kind, digest)
                             prepared_inner.pop(key, None)
-                            handle = inner_handles.pop(key, None)
-                            if handle is not None:
-                                inner_worker.unregister(handle)
-                                _unpublish_inner_handle(digest)
+                            if inner_worker.level == 2:
+                                handles = chip_handle_stacks.get(key, [])
+                                if len(handles) == 1 and startup_refs.get(key, 1) > 1:
+                                    # Startup transmits one callable image for all parent references.
+                                    startup_refs[key] -= 1
+                                elif handles:
+                                    inner_worker.unregister(handles[-1])
+                                    handles.pop()
+                                if handles:
+                                    inner_handles[key] = handles[-1]
+                                else:
+                                    startup_refs.pop(key, None)
+                                    chip_handle_stacks.pop(key, None)
+                                    inner_handles.pop(key, None)
+                                    _unpublish_inner_handle(digest)
+                            else:
+                                handle = inner_handles.pop(key, None)
+                                if handle is not None:
+                                    inner_worker.unregister(handle)
+                                    _unpublish_inner_handle(digest)
                         else:
                             raise ValueError("UNREGISTER_CALLABLE target/kind mismatch")
                         _control_reply(
@@ -854,6 +913,13 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         )
                     elif control.control_name == ControlName.PREPARE_CALLABLE:
                         digest, kind, registry = _decode_digest_command(control.command_bytes)
+                        if registry == RemoteRegistryTarget.REMOTE_CHIP_WORKER:
+                            if inner_worker.level != 2 or (kind, digest) not in inner_handles:
+                                raise KeyError("PREPARE_CALLABLE names an unregistered CHIP callable")
+                            _control_reply(
+                                conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
+                            )
+                            continue
                         if (
                             registry != RemoteRegistryTarget.REMOTE_TASK_DISPATCHER
                             or kind != CallableKind.PYTHON_IMPORT
@@ -1273,14 +1339,24 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
                 continue
 
+            cleanup_unconfirmed = False
+            task_failed = False
             try:
                 task = decode_task_payload(frame.payload)
-                orch_fn = dispatch_registry.get(task.callable_digest)
+                orch_fn = (
+                    inner_handles.get((CallableKind.CHIP_CALLABLE, task.callable_digest))
+                    if inner_worker.level == 2
+                    else dispatch_registry.get(task.callable_digest)
+                )
                 if orch_fn is None:
                     raise KeyError(f"remote TASK dispatcher has no callable hashid {task.callable_digest.hex()}")
                 task_args, inline_backings = _materialize_task_args(
-                    task.args, buffers, worker_id, mint_inline_buffer=mint_session_buffer
+                    task.args,
+                    buffers,
+                    worker_id,
+                    mint_inline_buffer=mint_session_buffer,
                 )
+                closed_after_error = False
                 try:
                     task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)
                     inner_worker.run(orch_fn, task_args, task.config)
@@ -1289,11 +1365,27 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                     # a failed/uncertain run retains it until worker shutdown.
                     if task_completed is not None:
                         task_completed()
+                except BaseException:
+                    if inner_worker.level == 2:
+                        try:
+                            inner_worker._close_framework()  # noqa: SLF001
+                            closed_after_error = True
+                        except BaseException:
+                            cleanup_unconfirmed = True
+                            raise
+                    raise
                 finally:
-                    for backing in inline_backings:
-                        backing.close()
+                    if not closed_after_error:
+                        for backing in inline_backings:
+                            if inner_worker.level == 2:
+                                inner_worker.release_buffer(backing)
+                            else:
+                                backing.close()
                 payload = encode_completion(header.sequence, 0, "")
             except BaseException as exc:  # noqa: BLE001
+                if cleanup_unconfirmed:
+                    raise
+                task_failed = True
                 payload = encode_completion(
                     header.sequence,
                     1,
@@ -1303,6 +1395,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                     ),
                 )
             send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
+            if task_failed and inner_worker.level == 2:
+                return
     finally:
         for key, entry in list(buffers.items()):
             try:
@@ -1323,11 +1417,15 @@ def run_session(
     ready_writer: Callable[[dict[str, Any]], None] | None = None,
     global_domain_prepare_import: Callable[[GlobalDomainCommand, Worker, int], bytes | None] | None = None,
 ) -> int:
+    remote_level = int(manifest.get("remote_worker_level", 3))
+    device_ids = tuple(int(x) for x in manifest.get("device_ids", []))
+    if remote_level == 2 and len(device_ids) != 1:
+        raise ValueError("remote L2 requires exactly one device")
     inner_worker = Worker(
-        level=3,
+        level=remote_level,
         platform=str(manifest["platform"]),
         runtime=str(manifest.get("runtime", "tensormap_and_ringbuffer")),
-        device_ids=tuple(int(x) for x in manifest.get("device_ids", [])),
+        **({"device_id": device_ids[0]} if remote_level == 2 else {"device_ids": device_ids}),
         num_sub_workers=int(manifest.get("num_sub_workers", 0)),
         heap_ring_size=int(manifest["heap_ring_size"]) if manifest.get("heap_ring_size") is not None else None,
     )
@@ -1338,15 +1436,16 @@ def run_session(
     health_sock: socket.socket | None = None
     stop_health = threading.Event()
     health_thread: threading.Thread | None = None
-    ready_sent = False
+    startup_complete = False
+    exit_code = 0
 
     def _publish_ready(payload: dict[str, Any]) -> None:
-        nonlocal ready_sent
+        nonlocal startup_complete
         if ready_writer is not None:
             ready_writer(payload)
         elif ready_fd is not None:
             _send_ready(ready_fd, payload)
-        ready_sent = True
+        startup_complete = payload["ok"]
 
     try:
         # Validate the runtime command timeout wire value up front (rejects a
@@ -1421,14 +1520,16 @@ def run_session(
                 manifest_dispatch_registry,
                 global_domain_prepare_import,
             )
-        return 0
     except BaseException as exc:  # noqa: BLE001
-        if not ready_sent:
+        if not startup_complete:
             try:
                 _publish_ready({"ok": False, "error": _format_remote_error("remote session startup", exc)})
             except OSError:
                 pass
-        return 1
+        elif remote_level == 2:
+            with contextlib.suppress(OSError, ValueError):
+                traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+        exit_code = 1
     finally:
         stop_health.set()
         if command_sock is not None:
@@ -1440,8 +1541,12 @@ def run_session(
             health_thread.join(timeout=1.0)
         try:
             inner_worker.close()
-        except BaseException:  # noqa: BLE001
-            pass
+        except BaseException as exc:  # noqa: BLE001 -- remote L2 exposes shutdown failure in its exit status
+            if remote_level == 2:
+                exit_code = 1
+                with contextlib.suppress(OSError, ValueError):
+                    print(_format_remote_error("remote L2 teardown", exc), file=sys.stderr, flush=True)
+    return exit_code
 
 
 def _raise_keyboard_interrupt(_signum, _frame):

@@ -54,6 +54,7 @@ CALLABLE_HASH_DIGEST_BYTES = 32
 FRAME_FLAG_GROUP_TARGET = 0x1
 # Every defined flag bit; a frame carrying any other bit is rejected.
 FRAME_FLAGS_KNOWN = FRAME_FLAG_GROUP_TARGET
+HELLO_FEATURE_REMOTE_CHIP = 1 << 0
 MAGIC = b"SLR3"
 
 
@@ -90,6 +91,7 @@ class ControlName(enum.IntEnum):
 class RemoteRegistryTarget(enum.IntEnum):
     REMOTE_TASK_DISPATCHER = 1
     INNER_L3_WORKER = 2
+    REMOTE_CHIP_WORKER = 3
 
 
 class CallableKind(enum.IntEnum):

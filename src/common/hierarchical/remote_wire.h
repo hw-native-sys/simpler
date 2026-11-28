@@ -78,6 +78,7 @@ enum class ReadyState : uint32_t {
 enum class RemoteRegistryTarget : uint32_t {
     REMOTE_TASK_DISPATCHER = 1,
     INNER_L3_WORKER = 2,
+    REMOTE_CHIP_WORKER = 3,
 };
 
 // FrameHeader::flags bit: the caller addresses every member of the target's
@@ -86,6 +87,7 @@ enum class RemoteRegistryTarget : uint32_t {
 inline constexpr uint32_t FRAME_FLAG_GROUP_TARGET = 0x1;
 // Every defined flag bit; a frame carrying any other bit is rejected.
 inline constexpr uint32_t FRAME_FLAGS_KNOWN = FRAME_FLAG_GROUP_TARGET;
+inline constexpr uint64_t HELLO_FEATURE_REMOTE_CHIP = 1ULL << 0;
 
 struct FrameHeader {
     FrameType frame_type{FrameType::HELLO};

@@ -578,14 +578,18 @@ std::vector<uint8_t> RemoteL3SocketTransport::read_frame(std::chrono::steady_clo
 }
 
 void RemoteL3SocketTransport::expect_hello_ready(
-    uint64_t session_id, int32_t worker_id, const std::string &comm_profile
+    uint64_t session_id, int32_t worker_id, const std::string &comm_profile, int32_t remote_worker_level
 ) {
+    if (remote_worker_level != 2 && remote_worker_level != 3)
+        throw std::invalid_argument("RemoteL3SocketTransport: worker level must be 2 or 3");
     // The HELLO read is an attach-phase op: it shares attach_deadline_ so the
     // whole (possibly multi-recv) read cannot outlast the startup-budget slice.
     auto frame = remote_l3::decode_frame(read_frame(attach_deadline_));
     if (frame.header.frame_type != remote_l3::FrameType::HELLO) {
         throw std::runtime_error("RemoteL3SocketTransport: expected HELLO frame");
     }
+    if (frame.header.session_id != session_id || frame.header.worker_id != worker_id)
+        throw std::runtime_error("RemoteL3SocketTransport: HELLO frame identity mismatch");
     auto hello = remote_l3::decode_hello(frame.payload.data(), frame.payload.size());
     if (hello.session_id != session_id || hello.worker_id != worker_id) {
         throw std::runtime_error("RemoteL3SocketTransport: HELLO session or worker mismatch");
@@ -596,6 +600,9 @@ void RemoteL3SocketTransport::expect_hello_ready(
     if (hello.comm_profile != comm_profile) {
         throw std::runtime_error("RemoteL3SocketTransport: HELLO comm profile mismatch");
     }
+    const bool remote_chip = (hello.feature_flags & remote_l3::HELLO_FEATURE_REMOTE_CHIP) != 0;
+    if (remote_chip != (remote_worker_level == 2))
+        throw std::runtime_error("RemoteL3SocketTransport: HELLO worker level mismatch");
     start_health_monitor(session_id, worker_id);
 }
 
@@ -1489,10 +1496,13 @@ void RemoteL3Endpoint::control_remote_prepare_register(
 }
 
 void RemoteL3Endpoint::control_prepare(const uint8_t *digest) {
+    const bool remote_chip = caps_.kind == WorkerEndpointKind::REMOTE_L2;
     run_control(
         remote_l3::ControlName::PREPARE_CALLABLE,
         remote_l3::encode_digest_callable_command(
-            remote_l3::RemoteRegistryTarget::REMOTE_TASK_DISPATCHER, CallableKind::PYTHON_IMPORT, digest_array(digest)
+            remote_chip ? remote_l3::RemoteRegistryTarget::REMOTE_CHIP_WORKER :
+                          remote_l3::RemoteRegistryTarget::REMOTE_TASK_DISPATCHER,
+            remote_chip ? CallableKind::CHIP_CALLABLE : CallableKind::PYTHON_IMPORT, digest_array(digest)
         )
     );
 }

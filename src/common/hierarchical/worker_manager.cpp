@@ -70,6 +70,8 @@ const char *endpoint_kind_name(WorkerEndpointKind kind) {
         return "local_mailbox";
     case WorkerEndpointKind::REMOTE_L3:
         return "remote_l3";
+    case WorkerEndpointKind::REMOTE_L2:
+        return "remote_l2";
     }
     return "unknown";
 }
@@ -2711,6 +2713,7 @@ WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, co
     workers.reserve(next_level_threads_.size());
     for (size_t i = 0; i < next_level_threads_.size(); ++i) {
         workers.emplace_back([this, i, digest, blob_size, name = shm.name(), &results]() {
+            if (next_level_threads_[i]->caps().kind == WorkerEndpointKind::REMOTE_L2) return;
             try {
                 next_level_threads_[i]->control_register(name.c_str(), blob_size, digest);
             } catch (const std::exception &e) {
@@ -2745,6 +2748,7 @@ std::vector<std::string> WorkerManager::broadcast_unregister_all(const uint8_t *
     workers.reserve(next_level_threads_.size());
     for (size_t i = 0; i < next_level_threads_.size(); ++i) {
         workers.emplace_back([this, i, digest, &per_worker]() {
+            if (next_level_threads_[i]->caps().kind == WorkerEndpointKind::REMOTE_L2) return;
             try {
                 next_level_threads_[i]->control_unregister(digest);
             } catch (const std::exception &e) {
