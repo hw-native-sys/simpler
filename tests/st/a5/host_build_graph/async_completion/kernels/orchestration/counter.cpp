@@ -60,7 +60,10 @@ TaskId action(
         task.launch_spec.set_block_num(rt_available_cluster_count());
         task.launch_spec.set_require_sync_start(true);
     }
-    if (op == Action::RESCUE) return rt_submit_aic_task(4, task).task_id();
+    const auto scenario = static_cast<Scenario>(p.scenario);
+    if (op == Action::RESCUE ||
+        (op == Action::PUBLISH && (scenario == Scenario::PROGRESS || scenario == Scenario::GRAPH)))
+        return rt_submit_aic_task(4, task).task_id();
     if (op == Action::WARM) return rt_submit_aic_task(7, task).task_id();
     if (op == Action::CONSUME) {
         if (static_cast<Scenario>(p.scenario) == Scenario::VISIBILITY) return rt_submit_aic_task(8, task).task_id();
@@ -92,6 +95,7 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
     if (p.mask & 1) kernels.aic_kernel_id = 0;
     if (p.mask & 2) kernels.aiv0_kernel_id = 1;
     if (p.mask & 4) kernels.aiv1_kernel_id = 2;
+    std::vector<TaskId> waited;
     for (int64_t waiter = 0; waiter < waiters; ++waiter) {
         const int64_t execution = base + waiter * p.blocks * 3;
         CoreTaskArgs task;
@@ -111,16 +115,21 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
             predicate.target = 0;
             task.set_predicate(predicate);
         }
-        const TaskId waited = rt_submit_task(kernels, task).task_id();
-        std::vector<TaskId> deps{waited};
+        waited.push_back(rt_submit_task(kernels, task).task_id());
+    }
+    if (scenario != Scenario::NEVER && !p.skip)
+        action(args, p, Action::PUBLISH, instance, base, waiters, publisher_record, capacity, warm, p.delay_ms);
+    for (int64_t waiter = 0; waiter < waiters; ++waiter) {
+        const int64_t execution = base + waiter * p.blocks * 3;
+        // Every consumer in the progress fixture follows the full registration group.
+        // The independent Cube publisher can observe registration while those counters remain pending.
+        std::vector<TaskId> deps = scenario == Scenario::PROGRESS ? waited : std::vector<TaskId>{waited[waiter]};
         if (prerequisite.is_valid()) deps.push_back(prerequisite);
         action(
             args, p, Action::CONSUME, instance, execution, 1, p.slots + instance * max_waiters + waiter,
             p.skip ? 2 : (scenario == Scenario::FANIN ? 1 : 0), deps
         );
     }
-    if (scenario != Scenario::NEVER && !p.skip)
-        action(args, p, Action::PUBLISH, instance, base, waiters, publisher_record, capacity, warm, p.delay_ms);
     if (scenario == Scenario::PROGRESS) action(args, p, Action::RESCUE, instance, base, waiters, int64_t{-1}, 0);
 }
 
@@ -132,6 +141,11 @@ void graph_body(const GraphTaskArgs &args, const BodyConfig &config) {
     // freeze them into the shared Graph definition and invalidate this isolation test.
     waiter.add_scalar(args.scalar(1), p.conditions, p.expected, args.scalar(0), p.tail_ms);
     const TaskId waited = rt_submit_aiv_task(1, waiter).task_id();
+    // This publication waits for the Graph's own kernel to register. It must execute in this range.
+    action(
+        args, p, Action::PUBLISH, args.scalar(0), args.scalar(1), 1, args.scalar(3), rt_available_aiv_count(), {},
+        p.delay_ms
+    );
     action(args, p, Action::CONSUME, args.scalar(0), args.scalar(1), 1, args.scalar(2), 0, {waited});
 }
 }  // namespace
@@ -153,18 +167,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 graph.add_no_dep(args.tensor(i).ref());
             const int64_t max_waiters = p.slots / (p.instances * p.blocks * 3);
             const int64_t base = instance * max_waiters * p.blocks * 3;
-            graph.add_scalar(instance, base, p.slots + instance * max_waiters);
+            graph.add_scalar(
+                instance, base, p.slots + instance * max_waiters, p.slots + max_waiters * p.instances + instance
+            );
             const auto invocation = rt_submit_graph(&graph_body, graph, BodyConfig{p});
             // A second consumer outside EXIT validates transitive completion and separate invocation bindings.
             action(
                 args, p, Action::CONSUME, instance, base, 1,
                 p.slots + max_waiters * p.instances + p.instances + instance, 0, {invocation.task_id}
-            );
-            // Keep the publisher outside the Graph. Otherwise its own compute
-            // completion could hold EXIT even if the async child retired early.
-            action(
-                args, p, Action::PUBLISH, instance, base, 1, p.slots + max_waiters * p.instances + instance,
-                rt_available_aiv_count(), {}, p.delay_ms
             );
         } else {
             body_tasks(args, p, instance);

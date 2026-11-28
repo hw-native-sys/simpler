@@ -13,7 +13,6 @@
 import copy
 
 import pytest
-from _native_protocol_builder import ProtocolBuilder
 
 from examples.a5.host_build_graph.deepseek_v4_pro_csa import fixture, graph_contract
 
@@ -101,8 +100,8 @@ def execution_rows():
             end_time_us=node["task_id"] * 1000000 + block * 4 + slot + 1,
             block_idx=block,
             block_num=node["block_num"],
-            subtask_slot=slot,
-            executed=True,
+            cluster_lane=slot,
+            kernel_only=True,
         )
         for node in NODES
         for block in range(node["block_num"])
@@ -122,74 +121,36 @@ def test_all_real_csa_execution_identities_match_the_external_graph():
 )
 def test_exact_counts_cannot_hide_corrupt_csa_block_identity(mutation):
     rows = execution_rows()
-    target = next(row for row in rows if row["block_idx"] == 1 and row["subtask_slot"] == 1)
+    target = next(row for row in rows if row["block_idx"] == 1 and row["cluster_lane"] == 1)
     if mutation == "duplicate_block":
         target["block_idx"] = 0
     elif mutation == "wrong_slot":
-        target["subtask_slot"] = 2
+        target["cluster_lane"] = 0
     elif mutation == "wrong_block_num":
         target["block_num"] += 1
     elif mutation == "missing_field":
         del target["block_idx"]
     else:
-        target["executed"] = False
-    with pytest.raises(ValueError, match="identity"):
+        target["kernel_only"] = False
+    with pytest.raises(ValueError, match="identity|calendar lane"):
         graph_contract.audit_execution(dependency_capture(), rows)
 
 
-def test_historical_csa_rows_stay_explicitly_unverified():
+def test_csa_rows_without_block_identity_are_rejected():
     rows = execution_rows()
     for row in rows:
-        for field in ("block_idx", "block_num", "subtask_slot", "executed"):
+        for field in ("block_idx", "block_num", "cluster_lane", "kernel_only"):
             del row[field]
-    assert graph_contract.audit_execution(dependency_capture(), rows)["block_identity_verified"] is False
+    with pytest.raises(ValueError, match="calendar execution identity is missing"):
+        graph_contract.audit_execution(dependency_capture(), rows)
 
 
-@pytest.mark.parametrize("mutation", (None, "missing_task", "kernel", "blocks", "fanin"))
-def test_native_frozen_graph_must_match_independent_dependency_capture(mutation):
-    protocol, _ = ProtocolBuilder([(None, 0, ()), (1, 1, (0,)), (0, 1, (1,)), (6, 2, (2,))]).run()
-    deps = {
-        "tasks": [
-            {"task_id": 1, "kernel_ids": [0, -1, -1], "block_num": 1},
-            {"task_id": 2, "kernel_ids": [-1, -1, -1], "block_num": 1},
-            {"task_id": 3, "kernel_ids": [-1, 0, 0], "block_num": 2},
-        ],
-        "edges": [{"pred": 0, "succ": 1}, {"pred": 1, "succ": 2}, {"pred": 2, "succ": 3}],
-    }
-    if mutation is None:
-        graph_contract.validate_native_graph(deps, protocol)
-        return
-    if mutation == "missing_task":
-        deps["tasks"].pop()
-    elif mutation == "kernel":
-        deps["tasks"][0]["kernel_ids"][0] = 7
-    elif mutation == "blocks":
-        deps["tasks"][-1]["block_num"] += 1
-    else:
-        deps["edges"].pop()
-    with pytest.raises(ValueError, match="native protocol graph"):
-        graph_contract.validate_native_graph(deps, protocol)
-
-
-def test_native_proof_does_not_suppress_the_existing_csa_timing_guard():
-    protocol, identities = ProtocolBuilder([(1, 1, ()), (2, 1, (0,))], epoch=1).run()
-    deps = {
-        "tasks": [
-            {"task_id": 0, "kernel_ids": [0, -1, -1], "block_num": 1},
-            {"task_id": 1, "kernel_ids": [-1, 0, -1], "block_num": 1},
-        ],
-        "edges": [{"pred": 0, "succ": 1}],
-    }
-    rows = [
-        dict(
-            identity,
-            core_type="aic" if identity["subtask_slot"] == 0 else "aiv",
-            start_time_us=identity["task_id"] * 100,
-            end_time_us=identity["task_id"] * 100 + 1,
-        )
-        for identity in identities
-    ]
-    assert graph_contract.audit_execution(deps, rows, protocol=protocol)["protocol_verified"] is True
-    rows[0]["end_time_us"] = 200
+def test_csa_checks_dependency_timestamps():
+    rows = execution_rows()
+    deps = dependency_capture()
+    pred, succ = (int(deps["edges"][0][field]) for field in ("pred", "succ"))
+    assert graph_contract.audit_execution(deps, rows)["dependency_timing_guard"] is True
+    late = next(row for row in rows if row["task_id"] == pred)
+    late["end_time_us"] = min(row["start_time_us"] for row in rows if row["task_id"] == succ) + 1
     with pytest.raises(ValueError, match="dependency started early"):
-        graph_contract.audit_execution(deps, rows, protocol=protocol)
+        graph_contract.audit_execution(deps, rows)

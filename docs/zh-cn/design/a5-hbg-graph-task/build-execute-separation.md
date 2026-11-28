@@ -1,8 +1,10 @@
 # HBG 调度设计：提前准备、最小领取与轻量等待
 
+> **历史文档。** 本页保留旧版A5 HBG resident 调度设计及其测量。文中的“当前”指当时的版本。现行协议见 [A5 HBG 日历调度](../../../../src/a5/runtime/host_build_graph/README.md)。
+
 全局自取与簇内 MIX 共用执行入口。每核从原自取记录或本 lane 的 MIX 记录执行；每簇 AIV0 发布 MIX 描述符，Host 计算的 rank 和每 lane 阈值约束互相冲突的资源承诺。任务形状和启动检查见[协作任务的 Host 准备与 Device 校验](admission-preparation.md)。
 
-在 A5 HBG 的 L3 图上，普通自取路径依次可见查目录、领执行票、本核准备、fanin 检查和执行。MIX 的 AIV0 在本簇有空闲 SSBUF 槽位时领取一个 block 的执行票，随即发布本代描述符。活动成员按各自的 lane 接收 Host 预建的 Call。泳道图中 `CLAIM_EXECUTE` 表示领执行票，`DISPATCH · notify_mix_members` 表示簇内通知。执行许可、对后继发布完成贡献和本核退役分别计时。各阶段和短调用的显示规则见[芯片泳道图说明](../../../dfx/chip-swimlane-profiling.md#a5-hbg-scalar-detail-at-level-3)。
+在 A5 HBG 的 L3 图上，普通自取路径依次可见查目录、领执行票、本核准备、fanin 检查和执行。MIX 的 AIV0 在本簇有空闲 SSBUF 槽位时领取一个 block 的执行票，随即发布本代描述符。活动成员按各自的 lane 接收 Host 预建的 Call。泳道图中 `CLAIM_EXECUTE` 表示领执行票，`DISPATCH · notify_mix_members` 表示簇内通知。执行许可、对后继发布完成贡献和本核退役分别计时。各阶段和短调用的显示规则见[芯片泳道图说明](https://github.com/hw-native-sys/simpler/blob/e5c0a697e90f/docs/dfx/chip-swimlane-profiling.md#a5-hbg-scalar-detail-at-level-3)。
 
 设计参考 `atomic_probe/pa_scheduler/cross_core_only_scheduler` 的有序领取与固定归属。Host 根据现有数据和 Graph 控制依赖生成稳定拓扑序，提前构造不可变 Call。Device 按序分发，接收本执行者的数据并准备，条件满足后原地执行。性能裁决沿用[7 组 AICore L0 口径](#performance-retention-policy)。
 
@@ -764,7 +766,7 @@ Host 规划按拓扑秩从近到远遍历真实前驱，遇到最近且容量足
 - 当前优化目标先减少同地址 atomic 请求，再减少 atomic 总调用及重复 ld_dev。每项策略比较同一组输入下 7 个 AICore L0 均值的总和及逐项变化：功能正确、明确消减冗余 atomic／ld_dev 且总和回退不超过0.5%时可保留，回退超过0.5%则撤回。计数减少和耗时收益分别提供证据，不能将新增 DCCI/DSB、普通读写或其他地址竞争隐去。percounter 作为定位参照，比较结论须由可比版本、输入及计时边界的实际对照支持。5 µs 交接用于分析关键路径，不能替代 7 组指标。
 - 最终性能以 AICore L0 `chip.run.runner_run.aicore_wall` 为准：在无 L1/L3 插桩的运行中，直接取所有实际 AIC/AIV kernel 的最晚 end 减最早 begin，包含首尾之间的调度空洞、依赖和通信等待，排除头尾 AICPU 开销。每个用例在同一设备分配内按 A×5、B×5、B×5、A×5 的顺序对照。A 为基线，B 为候选。每段先预热再计时 5 轮，预热排除在外。报告四段均值，并用每个版本各 10 轮的均值计算变化；无 kernel 的核不参与归并，缺失或无效时间戳不能用 Device wall 代替。HBG、基线及 percounter 必须核实同一首尾边界；percounter 原调度循环窗口不得直接冒充 kernel 首尾窗口。L1/L3 只用于定位。
 - 双卡用例每轮先做跨卡 Device 同步，再开始上述 L0 计时。测试启动门必须位于 AICPU 计时入口之前：两卡完成本轮入队后才允许设备会合，随后执行原有 AICPU/AICore 流程；同步门自身等待不计入 AICore L0；只有首末实际 kernel 之间的计算、调度空洞及通信等待计入，AICPU 启停与首末 kernel 之外的准备、退出不计入主指标。单卡不加门。每轮取两个 rank 的本卡耗时最大值，再对十轮求均值；不得跨卡相减硬件计数器或从旧样本减去估计的启动差。基线、候选与 percounter 均须使用同一门；旧的未同步双卡数据另标口径，不能直接作为新口径基线。
-- 性能验收使用 `dsv41_scheduler` 当前清单的 7 组配对对照，保持各组原 kernel、输入、图、sync_start 配置一致。6 组回放须通过数值验证；新版原生 MoE 沿用已约定的72/72性能专用模式，明确标记 `numerical_validation:false`，不能把执行成功当作数值通过；全部 7 组（含 MoE 与 layers_19_21 通信场景）的 AICore L0 均值之和决定是否保留，同时披露逐项回退；Graph、MIX、sync_start、defer_wait 的通用功能另按上述合同验证。单个 SWA 或其他模型的收益不能替代全套结果。
+- 当时的性能验收使用历史套件的 7 组配对对照，保持各组原 kernel、输入、图、sync_start 配置一致。6 组回放须通过数值验证；新版原生 MoE 沿用已约定的72/72性能专用模式，明确标记 `numerical_validation:false`，不能把执行成功当作数值通过；全部 7 组（含 MoE 与 layers_19_21 通信场景）的 AICore L0 均值之和决定是否保留，同时披露逐项回退；Graph、MIX、sync_start、defer_wait 的通用功能另按上述合同验证。单个 SWA 或其他模型的收益不能替代全套结果。
 - 所有硬件任务使用 `task-submit --device auto --device-num N`，在任务内使用并记录实际 `TASK_DEVICE`；attention 单卡，同一分配内做配对对照，记录先后顺序。
 - L1/L3 也区分预热与正式采集；不从单条交接里扣除整次 L1−L0，不累加跨核或嵌套 span 冒充串行耗时。5 µs 判断同时报告低扰动观测、采集开销和未达标原因。
 - 对照完整目标方案前后，并保留各独立改动的归因。常规性能改动以综合收益决定保留，1% 收益也记录；已证明消减冗余 atomic／ld_dev 的结构性修改适用上述不超过0.5%回退的保留例外，超过0.5%则撤回；回退如实记录。无 ±5% 忽略区间。有收益的独立修改分别本地 commit，未经允许不 push。
@@ -772,4 +774,4 @@ Host 规划按拓扑秩从近到远遍历真实前驱，遇到最近且容量足
 
 比较容量时固定执行结构。每行列出 W1、W2、W3、W4 四档同卡耗时，报告 7 项总和和各档相对 W4 的变化。单列 `G_worker/G_dep`、block 起跑跨度、实际参与核数/组数和域内进展；首次 kernel 提前不能代替 7 组 L0 均值总和改善。
 
-当前清单使用 `pypto_lib_latest` 的七个原生用例。单卡运行 `swa`、`c2a_full`、`c1a_reindex`、`c1a_reuse`、`engram`，双卡运行 `moe` 和 `layers_19_21`。用例集以 [list_cases.py](../../../../tests/fdwic/dsv41_scheduler/production/list_cases.py) 的输出为准。
+历史验收使用 `pypto_lib_latest` 的七个原生用例。单卡运行 `swa`、`c2a_full`、`c1a_reindex`、`c1a_reuse`、`engram`，双卡运行 `moe` 和 `layers_19_21`。旧用例清单见 [list_cases.py](https://github.com/hw-native-sys/simpler/blob/1ea06c2aee35993c288887582cb7f802b2724546/tests/fdwic/dsv41_scheduler/production/list_cases.py)。目前按 [pypto-lib 基准测试指南](../../../../.claude/skills/dsv41-scheduler-benchmark/references/pypto-lib.md)运行真实模型用例。

@@ -24,7 +24,7 @@ from typing import Callable
 
 HBG_RUNTIME = "host_build_graph"
 TMR_RUNTIME = "tensormap_and_ringbuffer"
-PERCOUNTER_RUNTIME = "percounter"
+CALENDAR_MODEL = "calendar"
 
 
 @dataclass(frozen=True)
@@ -83,37 +83,35 @@ def resolve_runtime(runtime_name, *, source="metadata.runtime"):
     Raises:
         ValueError: the name is absent, blank, or not a runtime this module handles.
     """
-    if runtime_name in (HBG_RUNTIME, TMR_RUNTIME, PERCOUNTER_RUNTIME):
+    if runtime_name in (HBG_RUNTIME, TMR_RUNTIME):
         return runtime_name
     if runtime_name is None or (isinstance(runtime_name, str) and not runtime_name.strip()):
         raise ValueError(
             f"{source} is missing; this capture predates the runtime name and its TaskId "
             f"layout cannot be determined. Re-capture with a current build, which writes "
-            f"{HBG_RUNTIME!r}, {TMR_RUNTIME!r}, or {PERCOUNTER_RUNTIME!r}."
+            f"{HBG_RUNTIME!r} or {TMR_RUNTIME!r}."
         )
     raise ValueError(
         f"{source} is {runtime_name!r}, which this module does not decode; expected "
-        f"{HBG_RUNTIME!r}, {TMR_RUNTIME!r}, or {PERCOUNTER_RUNTIME!r}. A task id has no self-describing layout, so "
+        f"{HBG_RUNTIME!r} or {TMR_RUNTIME!r}. A task id has no self-describing layout, so "
         f"an unrecognised runtime cannot be decoded by guessing."
     )
 
 
-def get(runtime_name):
-    """The package implementing the per-runtime DFX contract for ``runtime_name``.
+def get(runtime_name, scheduler_model=None):
+    """Select DFX behavior by TaskId runtime and, for A5, its calendar record model."""
+    runtime = resolve_runtime(runtime_name)
+    if scheduler_model is not None:
+        if runtime != HBG_RUNTIME or scheduler_model != CALENDAR_MODEL:
+            raise ValueError(f"invalid scheduler_model {scheduler_model!r} for runtime {runtime!r}")
+        from .hbg import calendar  # noqa: PLC0415
 
-    Imported lazily so this module carries no import-time dependency on either
-    runtime package, letting both runtime packages import back from here
-    (``normalize_task_id_int``) without a cycle.
-    """
-    if resolve_runtime(runtime_name) == PERCOUNTER_RUNTIME:
-        from simpler_setup.tools import percounter  # noqa: PLC0415
-
-        return percounter
-    if runtime_name == HBG_RUNTIME:
-        from simpler_setup.tools import hbg  # noqa: PLC0415
+        return calendar
+    if runtime == HBG_RUNTIME:
+        from . import hbg  # noqa: PLC0415
 
         return hbg
-    from simpler_setup.tools import tmr  # noqa: PLC0415
+    from . import tmr  # noqa: PLC0415
 
     return tmr
 

@@ -82,7 +82,6 @@ protected:
                 tensor.is_contiguous = true;
             }
         }
-        graph = {reinterpret_cast<uint64_t>(storage.data()), 0, storage.size(), storage.size() - 1};
         ASSERT_TRUE(scheduler_args_dump_plan_layout(2, 2, 2, true, &layout));
         ASSERT_TRUE(scheduler_args_dump_init_image(image.data(), image.size(), layout, epoch, DumpArgsLevel::FULL));
         for (uint64_t id = 0; id < 2; ++id) {
@@ -147,7 +146,6 @@ protected:
     std::vector<uint32_t> input, output;
     std::vector<uint8_t> callable_storage;
     std::array<uint64_t, 1> callables{};
-    SchedulerGraphView graph{};
     SchedulerArgsDumpLayout layout{};
     alignas(64) std::array<uint8_t, 4096> image{};
     SchedulerArgsDumpRequest *requests{};

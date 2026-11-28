@@ -1,5 +1,7 @@
 # A5 HBG 异步调度与完成协议
 
+> **历史文档。** 本页保留旧版A5 HBG resident 调度的异步完成设计及其验证。文中的“当前”指当时的版本。现行协议见 [A5 HBG 日历调度](../../../../src/a5/runtime/host_build_graph/README.md)。
+
 **共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；本页描述当前 CntNotify 计数器路径及 GM 回退，未来 STARS 后端不属于当前合同。
 
 [返回总览](../a5-hbg-async-completion.md)。记录身份与布局见[接口文档](interfaces-and-layout.md)，外部条件观察和 payload 可见性见[后端文档](backends-and-lifetime.md)。计数器分配及阈值见[构建与执行分离设计](../a5-hbg-graph-task/build-execute-separation.md)。

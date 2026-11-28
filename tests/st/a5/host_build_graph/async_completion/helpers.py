@@ -8,7 +8,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Public-API workloads and independent numerical/causal oracles for resident completion."""
+"""Public-API workloads and independent numerical oracles for calendar completion."""
 
 from __future__ import annotations
 
@@ -123,7 +123,7 @@ def _active_executions(case: Case, capacity_waiters: int, actual_waiters: int):
 def assert_observations(case: Case, capacity_waiters: int, records, output, control) -> None:
     """Expected executions come from the input graph, never from runtime completion counters."""
     assert not torch.count_nonzero(records[:, 2]), (
-        "resident deferred context is unavailable: this is missing async support, not an accepted synchronous fallback"
+        "calendar deferred context is unavailable: this is missing async support, not an accepted synchronous fallback"
     )
     assert not torch.count_nonzero(records[:, 3]), "a consumer entered before its conditions or dependencies"
     assert not torch.count_nonzero(records[:, 4]), "test producer could not observe registration progress"
@@ -164,14 +164,13 @@ def assert_observations(case: Case, capacity_waiters: int, records, output, cont
         assert torch.all(control[:, 3, 0] == control[:, 5, 0]), "not every consumer-capable lane warmed its cache"
 
 
-def assert_resident_capture(path: Path) -> None:
+def assert_calendar_capture(path: Path) -> None:
     captures = sorted(path.rglob("chip_swimlane_records.json"))
     assert captures, f"missing invocation evidence under {path}"
     for capture in captures:
         raw = json.loads(capture.read_text())
-        identity_key = "aicore_execution_identities" if raw.get("chip_swimlane_level") == 1 else "aicore_protocol"
-        identity = raw.get(identity_key, {})
-        assert identity.get("producer") == "aicore", f"not an AICore resident invocation: {capture}"
+        assert raw["metadata"]["runtime"] == "host_build_graph", capture
+        assert raw["metadata"]["scheduler_model"] == "calendar", capture
         assert raw.get("aicore_tasks"), f"no kernel executions in {capture}"
 
 
@@ -338,7 +337,7 @@ class CounterRunner:
     def check(self, case: Case | None = None, *, check_guards: bool = True):
         case = case or self.case
         assert_observations(case, self.capacity_waiters, self.records, self.output, self.control)
-        assert_resident_capture(self.capture)
+        assert_calendar_capture(self.capture)
         if check_guards:
             domain = self.worker.live_domains["async_completion_contract"]
             self.worker.copy_from(self.signal_staging, domain[0].buffers["signals"])
@@ -478,7 +477,7 @@ def run_sdma(platform: str, devices: list[int], directory: Path, elements: int):
         worker.submit(orchestrate, config=config).wait(timeout=30)
         for rank in range(2):
             meta = metadata[rank]
-            assert int(meta[16]) == 0, "resident deferred context unavailable; no SDMA support was exercised"
+            assert int(meta[16]) == 0, "calendar deferred context unavailable; no SDMA support was exercised"
             assert int(meta[32]) == 0, "SDMA submission, public record export, or probe failed"
             assert int(meta[48]) == 0, "SDMA consumer entered before completion"
             golden = torch.full_like(results[rank], -999.0)
@@ -492,15 +491,13 @@ def run_sdma(platform: str, devices: list[int], directory: Path, elements: int):
             golden_transfer[:elements] = sources[1 - rank][:elements]
             torch.testing.assert_close(transferred, golden_transfer, rtol=0, atol=0)
             rank_path = capture / f"rank_{rank}"
-            assert_resident_capture(rank_path)
+            assert_calendar_capture(rank_path)
             if elements == 1024 * 1024:
                 files = list(rank_path.rglob("chip_swimlane_records.json"))
                 assert len(files) == 1, files
                 raw = json.loads(files[0].read_text())
-                producer_traces = {
-                    task["trace_base"] for task in raw["aicore_protocol"]["tasks"] if 0 in task["kernel_ids"]
-                }
-                producer_rows = [row for row in raw["aicore_tasks"] if row[2] in producer_traces]
+                # The transfer is the first task submitted by the SDMA fixture.
+                producer_rows = [row for row in raw["aicore_tasks"] if row[1] == 0]
                 assert len(producer_rows) == 1
                 assert int(meta[64]) > 0 and int(meta[80]) > producer_rows[0][4], (
                     "no real SDMA PENDING observation after kernel return; numerical correctness alone is insufficient"

@@ -20,7 +20,7 @@ import torch
 
 @pytest.fixture(scope="module")
 def sync_ordered():
-    path = Path(__file__).resolve().parents[5] / "fdwic/pa_hbg/spmd/test_sync_ordered_execution.py"
+    path = Path(__file__).resolve().parents[5] / "support/a5/host_build_graph/spmd/sync_ordered_execution.py"
     with pytest.MonkeyPatch.context() as patch:
         patch.syspath_prepend(str(path.parent))
         spec = importlib.util.spec_from_file_location("_sync_ordered_hbg_fixture", path)
@@ -51,7 +51,7 @@ def _sample(native, params, *, overlap=None, reverse=False):
         events = [(row, col) for group in groups for col in (13, 14) for row in group]
     for event, (row, col) in enumerate(events, 1):
         rows[row, col] = event
-    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=2)
+    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=2)
     test._contract_publish_count = 1
     return test, actual, golden
 

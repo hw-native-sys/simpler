@@ -5,7 +5,7 @@ implementation has been rebased and functionally validated; refreshed DSV4.1
 performance acceptance is deferred to follow-up work. These historical figures
 are not a performance claim for the current PR head.
 
-`tests/fdwic/dsv41_scheduler` runs real DeepSeek-V4.1 regions on two A5 devices with
+The [historical benchmark suite](https://github.com/hw-native-sys/simpler/blob/1ea06c2aee35993c288887582cb7f802b2724546/tests/fdwic/dsv41_scheduler) ran real DeepSeek-V4.1 regions on two A5 devices with
 the original kernel binaries. percounter started this investigation between **2.11x
 faster and 37% slower** than the resident scheduler across its eighteen cases, and the
 spread is now attributed: a lane drew four order-list positions at a time and withheld

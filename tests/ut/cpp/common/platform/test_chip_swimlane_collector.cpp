@@ -1186,7 +1186,14 @@ protected:
             buf->records[i].reg_task_id = reg_task_id;
             buf->records[i].start_time = time_base + 10 * (i + 1);
             buf->records[i].end_time = time_base + 10 * (i + 1) + 5;
-            buf->records[i].receive_to_start_cycles = 2;
+            constexpr bool calendar =
+                std::string_view{SIMPLER_RUNTIME_NAME} == "host_build_graph" &&
+                (std::string_view{SIMPLER_PLATFORM_NAME} == "a5" || std::string_view{SIMPLER_PLATFORM_NAME} == "a5sim");
+            if constexpr (calendar) {
+                buf->records[i].percounter_block_shape = 1u << 16;
+            } else {
+                buf->records[i].receive_to_start_cycles = 2;
+            }
             chip_swimlane_aicpu_complete_task(
                 /*core_id=*/0, /*thread_idx=*/0, reg_task_id, /*dispatch_time=*/time_base + 10 * (i + 1) - 4,
                 /*finish_time=*/time_base + 10 * (i + 1) + 7
@@ -1218,14 +1225,25 @@ TEST_F(ChipSwimlaneExportIdentityTest, ExportsTwoRunsDistinctly) {
     EXPECT_NE(json.find("\"producer\": \"aicpu\""), std::string::npos)
         << "a transport without native scheduler identity must retain its AICPU producer";
 
-    // Three AICore rows and three scheduler rows per run, each ending in its epoch.
-    EXPECT_EQ(count_occurrences(json, ", 7]"), 6u) << "run 7 lost rows or lost its identity";
-    EXPECT_EQ(count_occurrences(json, ", 8]"), 6u) << "run 8 lost rows or lost its identity";
+    constexpr bool calendar =
+        std::string_view{SIMPLER_RUNTIME_NAME} == "host_build_graph" &&
+        (std::string_view{SIMPLER_PLATFORM_NAME} == "a5" || std::string_view{SIMPLER_PLATFORM_NAME} == "a5sim");
+    // Three scheduler rows end in the epoch. Calendar AICore rows append
+    // block identity after the epoch.
+    EXPECT_EQ(count_occurrences(json, ", 7]"), calendar ? 3u : 6u);
+    EXPECT_EQ(count_occurrences(json, ", 8]"), calendar ? 3u : 6u);
+    if constexpr (calendar) {
+        const size_t begin = json.find(R"("aicore_tasks")");
+        ASSERT_NE(begin, std::string::npos);
+        const auto aicore = json.substr(begin, json.find(R"("scheduler_tasks")", begin) - begin);
+        EXPECT_EQ(count_occurrences(aicore, ", 7,"), 3u);
+        EXPECT_EQ(count_occurrences(aicore, ", 8,"), 3u);
+    }
 }
 
 // The identity is per record, not one file-level field: a reader joining by
 // (run_epoch, core_id, reg_task_id) needs it on the row it keys.
-TEST_F(ChipSwimlaneExportIdentityTest, EveryAicoreRowIsSevenColumnsEndingInItsEpoch) {
+TEST_F(ChipSwimlaneExportIdentityTest, EveryAicoreRowCarriesItsEpoch) {
     collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
     device_run(/*epoch=*/11, /*dispatches=*/2, /*time_base=*/1000);
 
@@ -1253,43 +1271,37 @@ TEST_F(ChipSwimlaneExportIdentityTest, EveryAicoreRowIsSevenColumnsEndingInItsEp
     ASSERT_NE(close, std::string::npos) << "aicore_tasks array is unterminated";
     const std::string section = json.substr(open, close - open + 1);
 
+    constexpr bool calendar =
+        std::string_view{SIMPLER_RUNTIME_NAME} == "host_build_graph" &&
+        (std::string_view{SIMPLER_PLATFORM_NAME} == "a5" || std::string_view{SIMPLER_PLATFORM_NAME} == "a5sim");
     size_t rows = 0;
     for (size_t pos = section.find('[', 1); pos != std::string::npos; pos = section.find('[', pos + 1)) {
         const size_t row_end = section.find(']', pos);
         if (row_end == std::string::npos) break;
         const std::string row = section.substr(pos + 1, row_end - pos - 1);
         if (row.find(',') == std::string::npos) continue;
-        EXPECT_EQ(count_occurrences(row, ","), 6u) << "aicore_tasks row is not seven columns: [" << row << "]";
+        EXPECT_EQ(count_occurrences(row, ","), calendar ? 8u : 6u) << row;
         rows++;
     }
     EXPECT_EQ(rows, 2u) << "expected one row per dispatch";
-    EXPECT_EQ(count_occurrences(section, ", 11]"), 2u) << "a row carries an epoch other than its run's";
+    EXPECT_EQ(count_occurrences(section, calendar ? ", 11," : ", 11]"), 2u)
+        << "a row carries an epoch other than its run's";
 }
 
-TEST_F(ChipSwimlaneExportIdentityTest, NativeSnapshotSelectsSchedulerProducerOnlyForItsRuntime) {
+TEST_F(ChipSwimlaneExportIdentityTest, ExplicitSchedulerProducerIsExported) {
     collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
-    device_run(/*epoch=*/7, /*dispatches=*/2, /*time_base=*/1000);
-    const std::string identity = R"({"schema":"hbg-execution-identity","producer":"aicore","records":[]})";
+    const std::string scheduler = R"({"producer":"aicore","records":[[0,1,1000,1015,7]]})";
     ASSERT_TRUE(collector_.set_json_extension(
-        7, ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identity.c_str(), identity.size()
+        7, ChipSwimlaneExtensionSection::SchedulerTasks, scheduler.c_str(), scheduler.size()
     ));
     ASSERT_EQ(collector_.export_swimlane_json(), 0);
     const std::string json = read_whole_file(dir_ + "/chip_swimlane_records.json");
-    const auto scheduler = json.find("\"scheduler_tasks\":");
-    ASSERT_NE(scheduler, std::string::npos);
-    const auto section = json.substr(scheduler, json.find("\"records\":", scheduler) - scheduler);
-    const auto expected = std::string(SIMPLER_RUNTIME_NAME) == "host_build_graph" ? "aicore" : "aicpu";
-    EXPECT_NE(section.find(std::string("\"producer\": \"") + expected + "\""), std::string::npos);
-    EXPECT_EQ(count_occurrences(json, ", 7]"), 4u) << "source selection must keep both joined task streams";
+    EXPECT_NE(json.find(scheduler), std::string::npos);
 }
 
-TEST_F(ChipSwimlaneExportIdentityTest, NativeIdentityDoesNotAuthorizeAmbiguousTaskSources) {
+TEST_F(ChipSwimlaneExportIdentityTest, RejectsAmbiguousTaskSources) {
     collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
     device_run(/*epoch=*/7, /*dispatches=*/2, /*time_base=*/1000);
-    const std::string identity = R"({"schema":"hbg-execution-identity","producer":"aicore","records":[]})";
-    ASSERT_TRUE(collector_.set_json_extension(
-        7, ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identity.c_str(), identity.size()
-    ));
     ASSERT_TRUE(collector_.set_json_extension(7, ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
     EXPECT_EQ(collector_.export_swimlane_json(), PTO_RUNTIME_ERR_INTERNAL);
 }

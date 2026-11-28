@@ -120,7 +120,7 @@ nav:
       - HBG host data access: hbg-host-data-access.md
       - Orchestrator: orchestrator.md
       - Scheduler: scheduler.md
-      - A5 HBG AICore Walkthrough:
+      - Historical A5 HBG Resident Walkthrough:
           - Execution flow: zh-cn/a5-hbg-aicore-walkthrough/README.md
           - Structure scopes: zh-cn/a5-hbg-aicore-walkthrough/00-data-structure-scopes.md
           - Initialization: zh-cn/a5-hbg-aicore-walkthrough/01-initialization.md
@@ -135,7 +135,7 @@ nav:
       - Native framework submission: design/native-framework-submission.md
       - Native CCU ABI: design/ccu-native-abi.md
       - CCU Window Validation: design/ccu-window-validation.md
-      - A5 HBG Graph task 设计:
+      - 历史 A5 HBG Resident Graph 设计:
           - 设计总览: zh-cn/design/a5-hbg-graph-task.md
           - 数据布局与 Host 绑定: zh-cn/design/a5-hbg-graph-task/data-layout.md
           - 调度与发布协议: zh-cn/design/a5-hbg-graph-task/protocol.md
@@ -166,7 +166,7 @@ nav:
           - Execution and API: design/native-capture-common-contract.md
           - Resource lifetime: design/native-hbg-prepared-lifetime.md
           - HBG state restoration: design/native-hbg-resource-reset.md
-      - A5 HBG 异步完成设计:
+      - 历史 A5 HBG Resident 异步完成设计:
           - 设计总览: zh-cn/design/a5-hbg-async-completion.md
           - 接口与数据布局: zh-cn/design/a5-hbg-async-completion/interfaces-and-layout.md
           - 调度与完成协议: zh-cn/design/a5-hbg-async-completion/protocol.md

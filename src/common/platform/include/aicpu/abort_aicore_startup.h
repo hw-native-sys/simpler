@@ -31,6 +31,31 @@ inline Target startup_abort_target(uint64_t reg, AicoreTeardownControl *gate, co
     return {reg, gate};
 }
 
+#ifdef SIMPLER_HAS_AICORE_SOC_SRAM_LIFECYCLE
+namespace simpler::startup_abort {
+
+struct CalendarLifecycle {
+    volatile uint32_t *notify;
+    uint32_t *rejected;
+};
+
+template <typename Descriptor>
+auto calendar_lifecycle(const Descriptor &dev, int)
+    -> decltype(dev.scheduler_bootstrap.lifecycle_notify_address, CalendarLifecycle{}) {
+    return {
+        reinterpret_cast<volatile uint32_t *>(dev.scheduler_bootstrap.lifecycle_notify_address),
+        reinterpret_cast<uint32_t *>(dev.scheduler_bootstrap.rejected_exit_address),
+    };
+}
+
+template <typename Descriptor>
+CalendarLifecycle calendar_lifecycle(const Descriptor &, long) {
+    return {};
+}
+
+}  // namespace simpler::startup_abort
+#endif
+
 // Called once by callback 0 after the whole entry cohort rejected execution.
 // No executor has initialized, and affinity TLS may be unavailable. Discover
 // only this launch's reports and retire without publishing tasks or READY.
@@ -75,10 +100,31 @@ inline int32_t abort_aicore_startup(Runtime *runtime, uint64_t regs_base, uint64
         }
     } while (remaining != 0 && get_sys_cnt_aicpu() <= discovery_deadline);
 
+#ifdef SIMPLER_HAS_AICORE_SOC_SRAM_LIFECYCLE
+    const auto lifecycle = simpler::startup_abort::calendar_lifecycle(runtime->dev, 0);
+    if (lifecycle.notify != nullptr) {
+        const uint32_t previous = __atomic_load_n(lifecycle.notify, __ATOMIC_RELAXED);
+        const uint32_t exit = ((previous + 2U) & AICORE_LIFECYCLE_GENERATION_MASK) | AICORE_LIFECYCLE_EXIT_BIT;
+        bool has_target[PLATFORM_MAX_CORES]{};
+        for (size_t i = 0; i < count; ++i) {
+            has_target[ids[i]] = true;
+            targets[i].uses_dispatch_register = false;
+        }
+        if (lifecycle.rejected != nullptr) {
+            for (int32_t i = 0; i < total; ++i) {
+                if (!has_target[i]) __atomic_store_n(&lifecycle.rejected[i], exit, __ATOMIC_RELEASE);
+            }
+            cache_flush_range(lifecycle.rejected, total * sizeof(*lifecycle.rejected));
+        }
+        publish_aicore_lifecycle_word(lifecycle.notify, exit);
+    } else
+#endif
     // Unlike normal initialization, this must not publish IDLE: the core must
     // see EXIT before touching any uninitialized task/profiling state.
-    for (size_t i = 0; i < count; ++i)
-        platform_open_aicore_exit_window(targets[i].reg_addr);
+    {
+        for (size_t i = 0; i < count; ++i)
+            platform_open_aicore_exit_window(targets[i].reg_addr);
+    }
     bool released[PLATFORM_MAX_CORES];
     const int32_t retire_rc = platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline(), released);
     for (size_t i = 0; i < count; ++i) {

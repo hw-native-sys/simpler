@@ -9215,19 +9215,13 @@ class TestChipMainLoopDigestRegister:
         return t
 
     @pytest.mark.parametrize("fork_inherited", [True, False], ids=["fork", "exec"])
-    def test_register_uses_payload_size_and_allocates_local_slot(self, monkeypatch, fork_inherited):
+    def test_register_uses_payload_size_and_allocates_local_slot(self, fork_inherited):
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         from simpler.task_interface import CoreCallable
 
-        from simpler_setup import a5_input_cache
-
         cw = MagicMock()
         code = bytes.fromhex("00f06140")
-        analyzer = MagicMock(return_value=code)
-        monkeypatch.setattr(a5_input_cache, "annotate_a5_hbg_text", analyzer)
-        monkeypatch.setattr(worker_mod, "_monotonic", lambda: 100.0)
-        monkeypatch.setenv("ASCEND_HOME_PATH", "mock-toolchain")
         child = CoreCallable.build(signature=[], binary=code)
         callable_obj = ChipCallable.build(signature=[], func_name="entry", binary=b"host", children=[(1, child)])
         digest = _chip_digest(callable_obj, platform="a5", runtime="host_build_graph")
@@ -9247,7 +9241,6 @@ class TestChipMainLoopDigestRegister:
                 )
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 0
-                analyzer.assert_called_once_with(code, deadline=100.25)
                 assert cw.unregister_callable.call_count == 0
                 cw.register_callable_from_blob.assert_called_once()
                 assert cw.register_callable_from_blob.call_args.args[0] == 0

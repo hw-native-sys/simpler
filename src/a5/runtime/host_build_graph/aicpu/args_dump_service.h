@@ -13,7 +13,8 @@
 
 #include "aicpu/args_dump_aicpu.h"
 #include "scheduler/scheduler_args_dump.h"
-#include "scheduler/scheduler_graph.h"
+
+struct ChipTaskStorage;
 
 // One object per actual AICPU participant. It owns one stable shared-producer
 // reservation and a disjoint worker request partition for this invocation.
@@ -53,5 +54,10 @@ private:
 };
 
 // Runs once on the init leader before any context/READY publication. Only this
-// initialization may flush a task line; runtime phase words use GM atomics.
+// initialization sets the output mask. Runtime phase words use GM atomics.
 bool initialize_resident_args_dump_outputs(void *image, uint64_t callable_objects, uint64_t callable_count);
+
+// The materializer binds selected child arguments before advancing the Graph calendar watermark.
+bool bind_calendar_args_dump_child(
+    void *image, uint64_t task_ref, const ChipTaskStorage &child, const void *argument_region, uint64_t bytes
+);

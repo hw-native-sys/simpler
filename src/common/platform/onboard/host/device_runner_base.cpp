@@ -4493,6 +4493,7 @@ int DeviceRunnerBase::prepare_caller_diagnostics(PreparedExecution &prepared) {
                        SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
                        PTO_RUNTIME_ERR_INTERNAL;
         prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
+        prepared.kernel_args.args.enable_profiling_flag |= SIMPLER_DFX_FLAG_SWIMLANE_RECORDED_WINDOW;
     }
     if (prepared.dfx.dump_args_enabled()) {
         dump_armed = true;

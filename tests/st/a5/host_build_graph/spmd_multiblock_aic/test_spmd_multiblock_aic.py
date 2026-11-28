@@ -51,7 +51,7 @@ FLOATS_PER_CACHE_LINE = 16
 TRACE_BLOCKS = 16
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestSpmdMultiblockAic(SceneTestCase):
     RTOL = 0

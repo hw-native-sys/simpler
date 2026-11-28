@@ -11,8 +11,11 @@
 
 #include "orchestration_api.h"
 
-static void chain(
-    const simpler::hbg::Tensor &input, const simpler::hbg::Tensor &output, bool early, uint64_t increment = 3,
+namespace {
+
+template <typename Increment>
+void chain(
+    const simpler::hbg::Tensor &input, const simpler::hbg::Tensor &output, bool early, Increment increment,
     uint32_t scratch_elements = 16
 ) {
     uint32_t shape[] = {scratch_elements};
@@ -30,6 +33,25 @@ static void chain(
     second.add_scalar(uint64_t{7});
     rt_submit_aiv_task(0, second);
 }
+
+void nested_chain(const GraphTaskArgs &args) { chain(args.tensor(0).ref(), args.tensor(1).ref(), false, uint64_t{3}); }
+
+struct SharedHeapConfig : simpler::hbg::ConfigBase {
+    explicit SharedHeapConfig(uint32_t elements) :
+        scratch_elements(elements) {}
+
+    uint32_t scratch_elements;
+
+    uint64_t hash() const { return simpler::hbg::config_hash(scratch_elements); }
+    bool operator==(const SharedHeapConfig &other) const { return scratch_elements == other.scratch_elements; }
+};
+
+void shared_heap_chain(const GraphTaskArgs &args, const SharedHeapConfig &config) {
+    const auto &state = args.tensor(0).ref();
+    chain(state, state, false, args.scalar(0), config.scratch_elements);
+}
+
+}  // namespace
 
 extern "C" void hbg_capture_orchestration(const ChipTaskArgs &args) {
     const auto &input = args.tensor(0).ref();
@@ -75,12 +97,7 @@ extern "C" void hbg_capture_orchestration(const ChipTaskArgs &args) {
     GraphTaskArgs boundary;
     boundary.add_input(input);
     boundary.add_output(output);
-    const auto graph = rt_graph_begin(0xCADD, boundary, {});
-    if (graph.recording) {
-        always_assert(rt_graph_prepare(graph.recording_handle, boundary));
-        chain(graph.params->tensor(0).ref(), graph.params->tensor(1).ref(), false);
-        always_assert(rt_graph_end());
-    }
+    rt_submit_graph(&nested_chain, boundary);
 }
 
 extern "C" void hbg_inout_orchestration(const ChipTaskArgs &args) {
@@ -99,16 +116,9 @@ extern "C" void hbg_shared_heap_orchestration(const ChipTaskArgs &args) {
     const int32_t increment = args.scalar<int32_t>(0);
     GraphTaskArgs boundary;
     boundary.add_inout(args.tensor(0).ref());
-    const auto graph = rt_graph_begin(0xCAEE, boundary, {});
-    if (graph.recording) {
-        always_assert(rt_graph_prepare(graph.recording_handle, boundary));
-        // Models share a 64 KiB intermediate. The 256 KiB eager request must
-        // fail against the fixed 128 KiB capacity without disturbing replay.
-        const uint32_t scratch_elements = increment == 17 ? 65536 : 16384;
-        chain(
-            graph.params->tensor(0).ref(), graph.params->tensor(0).ref(), false, static_cast<uint64_t>(increment - 7),
-            scratch_elements
-        );
-        always_assert(rt_graph_end());
-    }
+    boundary.add_scalar(static_cast<uint64_t>(increment - 7));
+    // Captured models each require 64 KiB of scratch. The eager request needs
+    // 256 KiB, which exceeds the fixed shared capacity of 128 KiB.
+    const uint32_t scratch_elements = increment == 17 ? 65536 : 16384;
+    rt_submit_graph(&shared_heap_chain, boundary, SharedHeapConfig{scratch_elements});
 }

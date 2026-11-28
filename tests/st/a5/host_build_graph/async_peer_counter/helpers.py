@@ -26,7 +26,7 @@ from simpler.task_interface import (
 from simpler.worker import Worker
 
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
-from simpler_setup.tools.hbg.native_causality import audit_native_protocol
+from simpler_setup.tools.hbg.calendar.scheduler_view import parse_capture
 
 HERE = Path(__file__).resolve().parent
 MAX_ROWS = 256
@@ -102,11 +102,12 @@ def close_after_failure(worker):
 @cache
 def compile_peer_counter(platform):
     specifications = (
-        (0, "aiv/waiter.cpp", "aiv", 4),
-        (1, "aic/registration_gate.cpp", "aic", 2),
+        (0, "waiter.cpp", "aiv", 4),
+        (1, "aiv/registration_gate.cpp", "aiv", 2),
         (2, "aiv/ready_send.cpp", "aiv", 4),
         (3, "aiv/publish.cpp", "aiv", 5),
         (4, "aiv/consume.cpp", "aiv", 4),
+        (5, "waiter.cpp", "aic", 4),
     )
     spec = {
         "orchestration": {
@@ -132,13 +133,13 @@ def compile_peer_counter(platform):
 class PeerCounterRunner:
     """Keep both peer allocations alive until their enclosing L3 invocation completes."""
 
-    def __init__(self, platform, devices, directory, *, pressure=False, diagnostics=4):
+    def __init__(self, platform, devices, directory, *, pressure=False, diagnostics=2):
         assert len(devices) >= 2, "peer COUNTER qualification needs two assigned A5 devices"
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.pressure = pressure
         self.diagnostics = diagnostics
-        assert diagnostics in (0, 4)
+        assert diagnostics in (0, 2)
         self.iteration = 0
         self.prior_run_epochs = [None, None]
         self.diag = [torch.zeros((DIAG_ROWS, DIAG_WORDS), dtype=torch.int64).share_memory_() for _ in range(2)]
@@ -248,25 +249,34 @@ class PeerCounterRunner:
         finally:
             self._save_diagnostics(capture, epoch, value_tag, reset, failure)
 
-    def _audit_resident_capture(self, capture, rank):
+    def _audit_calendar_capture(self, capture, rank, expected_executions, expected_waiters):
         paths = list((capture / f"rank_{rank}").rglob("chip_swimlane_records.json"))
         assert len(paths) == 1, paths
         raw = json.loads(paths[0].read_text())
-        protocol = raw.get("aicore_protocol", {})
-        assert protocol.get("producer") == "aicore", paths[0]
-        assert protocol.get("schema") == "hbg-native-protocol", (
-            "resident diagnostic qualification requires resource-scoped native evidence",
-            paths[0],
-        )
-        assert raw["aicore_execution_identities"]["schema"] == "hbg-execution-identity"
-        identities = raw["aicore_execution_identities"]["records"]
-        audit = audit_native_protocol(protocol, identities)
-        assert audit["protocol_verified"]
-        epoch = protocol["run_epoch"]
+        assert raw["metadata"]["runtime"] == "host_build_graph", paths[0]
+        assert raw["metadata"]["scheduler_model"] == "calendar", paths[0]
+        tasks = raw["aicore_tasks"]
+        assert len(tasks) == expected_executions and all(len(row) == 9 for row in tasks)
+        events = parse_capture(raw["calendar_task_events"])
+        assert not events["dropped"] and not events["unmatched_deferred_updates"]
+        epochs = {row[6] for row in tasks}
+        assert len(epochs) == 1
+        (epoch,) = epochs
         prior = self.prior_run_epochs[rank]
         assert prior is None or epoch > prior, (rank, prior, epoch)
         self.prior_run_epochs[rank] = epoch
-        return protocol, audit
+        waiter_ids = set(range(expected_waiters))
+        registrations = [row for row in events["records"] if row["kind"] == "defer_registered"]
+        completions = [row for row in events["records"] if row["kind"] == "deferred_completion_issue"]
+        groups = {(row["task_id"], row["deferred_group"]) for row in registrations}
+        deferred = {task_id for task_id, _ in groups}
+        direct = {row["task_id"] for row in events["records"] if row["kind"] == "completion_issue"}
+        assert len(registrations) == len(completions) == len(groups) == len(deferred)
+        assert {(row["task_id"], row["deferred_group"]) for row in completions} == groups
+        # A COUNTER already satisfied at kernel return can publish ordinary DONE.
+        assert deferred <= waiter_ids and deferred.isdisjoint(direct)
+        assert waiter_ids <= deferred | direct
+        return {"run_epoch": epoch, "executions": expected_executions, "deferred_groups": len(groups)}
 
     def _check_business_progress(self, count, capacity, epoch, value_tag):
         expected_rows = ({READY_WAIT, PUBLISHER}, {*range(count), *range(MAX_ROWS, MAX_ROWS + count), GATE, READY_SEND})
@@ -302,7 +312,7 @@ class PeerCounterRunner:
         return values
 
     def _check_business_behavior(self, capture, epoch, value_tag, inputs):
-        # The gate records the public rt_available_aiv_count() value. Native
+        # The gate records the public rt_available_cluster_count() value. Native
         # trace topology is cross-checked separately as diagnostic qualification.
         capacity = int(self.diag[1][GATE][CAPACITY])
         assert 0 < capacity <= MAX_ROWS
@@ -336,18 +346,14 @@ class PeerCounterRunner:
         torch.testing.assert_close(self.output[1], expected_output.flatten(), rtol=0, atol=0)
         return count, capacity
 
-    def _check_resident_qualification(self, capture, count, capacity):
-        receiver, receiver_audit = self._audit_resident_capture(capture, 1)
-        source, source_audit = self._audit_resident_capture(capture, 0)
-        assert sum(worker["core_type"] == 1 for worker in receiver["workers"]) == capacity, (
-            "native worker topology differs from the public AIV capacity"
-        )
-        # Payload, epoch and registration gates are checked by the business
-        # oracle. The native audit verifies execution and dependency completion.
-        assert count > 0
+    def _check_calendar_qualification(self, capture, count, capacity):
+        receiver_audit = self._audit_calendar_capture(capture, 1, 2 * count + 2, count)
+        source_audit = self._audit_calendar_capture(capture, 0, 2, 1)
+        if self.pressure:
+            assert receiver_audit["deferred_groups"] > 0, "saturation must exercise actual deferred settlement"
         (capture / "peer-counter-audit.json").write_text(
             json.dumps(
-                {"capacity_aiv": capacity, "main_waiters": count, "source": source_audit, "receiver": receiver_audit},
+                {"capacity_aic": capacity, "main_waiters": count, "source": source_audit, "receiver": receiver_audit},
                 indent=2,
             )
             + "\n"
@@ -361,9 +367,9 @@ class PeerCounterRunner:
         if not self.diagnostics:
             return
         try:
-            self._check_resident_qualification(capture, count, capacity)
+            self._check_calendar_qualification(capture, count, capacity)
         except (AssertionError, KeyError, TypeError, ValueError) as error:
-            raise AssertionError(f"A5 resident diagnostic qualification failed: {error}") from error
+            raise AssertionError(f"A5 calendar diagnostic qualification failed: {error}") from error
 
     def __enter__(self):
         return self

@@ -16,7 +16,6 @@ satisfy both stage values. PARTIAL and HYBRID reuse the orchestration's marks.
 import json
 import struct
 
-import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -55,7 +54,6 @@ class _ArgumentDumpScene(SceneTestCase):
         self._check_dump(manifest, payload, level)
 
 
-@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestDumpArgsExampleA5(_ArgumentDumpScene):
     """f = (a + b) + 1, where a=2.0, b=3.0 -> f=6.0."""
@@ -164,7 +162,6 @@ def _check_task_payloads(manifest, payload, level, *, native=False):
     assert all(left[1] == right[0] for left, right in zip(ordered, ordered[1:]))
 
 
-@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestNativeGraphArgumentDumpA5(TestDumpArgsExampleA5):
     """Native child task identities retain task-time snapshots of one backing."""
@@ -181,7 +178,6 @@ class TestNativeGraphArgumentDumpA5(TestDumpArgsExampleA5):
         _check_task_payloads(manifest, payload, level, native=True)
 
 
-@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestEmptyArgumentDumpA5(_ArgumentDumpScene):
     CALLABLE = {
@@ -230,7 +226,6 @@ class TestEmptyArgumentDumpA5(_ArgumentDumpScene):
             assert not arg.get("truncated", False)
 
 
-@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestNativeGraphWaveArgumentDumpA5(_ArgumentDumpScene):
     """One 73-block Mix child exceeds A5's 36-cluster residency capacity."""

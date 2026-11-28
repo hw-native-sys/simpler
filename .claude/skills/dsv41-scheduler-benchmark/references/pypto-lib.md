@@ -49,4 +49,4 @@ Use a two-device reservation for the EP2 case. Use the same explicit card or pai
 - For device wall time, use the pinned checkout's raw benchmark or strace capture and verify it contains `chip.run.runner_run.device_wall` per measured dispatch. The daily `case` JSON in the verified dev checkout serializes effective samples. Where supported, enable `PYPTO_BENCH_RAW=1` and `SIMPLER_DEVICE_STRACE_ENABLE=1` for a separate wall-time capture and extract the field from the raw per-dispatch records. Keep those settings identical across arms. When wall time is required, confirm the raw capture fields on a smoke run. For the fastest-rank MoE convention, take the minimum of the fixed-rank medians across rounds and label it in the table.
 
 For operator swimlanes and Perfetto export, see
-[Capture Percounter swimlanes](percounter-l1.md).
+[Capture HBG calendar swimlanes](calendar-swimlane.md).

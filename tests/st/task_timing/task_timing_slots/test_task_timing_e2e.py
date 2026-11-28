@@ -202,7 +202,7 @@ def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd, drain_h
 
 
 # host_build_graph builds the graph on the host. A2A3 folds timing through
-# PublishHandle; A5 collects resident per-subtask windows at retirement.
+# PublishHandle; A5 collects calendar kernel windows at retirement.
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)

@@ -68,6 +68,9 @@
 // both headers from one scope is a compile error rather than a silent pick.
 #include "task_id.h"
 
+// Launch metadata for a caller-owned replay window, independent of terminal-bank availability.
+inline constexpr uint32_t SIMPLER_DFX_FLAG_SWIMLANE_RECORDED_WINDOW = 1u << 5;
+
 // =============================================================================
 // chip swimlane_level — granularity ladder for the chip swimlane profiler.
 //
@@ -187,7 +190,7 @@ struct ChipSwimlaneAicoreTaskRecord {
     uint32_t reg_task_id;  // Per-core dispatch token — host join key vs AICPU stream
     union {
         uint32_t receive_to_start_cycles;  // Local setup interval: start_time - receive_time
-        uint32_t percounter_block_shape;   // [block count:16, block index:16] for the calendar L1 stream
+        uint32_t percounter_block_shape;   // [block count:16, block index:16] for calendar task records
     };
 } __attribute__((aligned(32)));
 

@@ -17,10 +17,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from simpler_setup import SceneTestCase
+
 
 @pytest.fixture(scope="module")
 def ordered_native():
-    path = Path(__file__).resolve().parents[5] / "fdwic/pa_hbg/spmd/test_ordered_execution.py"
+    path = Path(__file__).resolve().parents[5] / "support/a5/host_build_graph/spmd/ordered_execution.py"
     with pytest.MonkeyPatch.context() as patch:
         patch.syspath_prepend(str(path.parent))
         spec = importlib.util.spec_from_file_location("_ordered_hbg_native_fixture", path)
@@ -50,7 +52,7 @@ def _sample(native, params, *, overlap=None, reverse=False):
         sequence = [(row, column) for group in groups for row in group for column in (13, 14)]
     for event, (row, column) in enumerate(sequence, 1):
         records[row, column] = event
-    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=2)
+    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=2)
     test._contract_publish_count = 1
     return test, actual, golden
 
@@ -159,18 +161,18 @@ def test_overlap_allows_either_independent_task_to_enter_first(ordered_native, m
     test.compare_outputs(actual, golden, ["records"], params)
 
 
-@pytest.mark.parametrize("mode", [0, 3, 4, 5, -1])
-def test_correct_records_do_not_allow_nonresident_mode(ordered_native, mode):
+@pytest.mark.parametrize("mode", [0, 2, 3, 4, -1])
+def test_correct_records_do_not_allow_noncalendar_mode(ordered_native, mode):
     params = {"scenario": "shape", "mask": 1, "blocks": 2}
     test, actual, golden = _sample(ordered_native, params)
     test._contract_worker.scheduler_runtime_mode = mode
-    with pytest.raises(AssertionError, match="resident required"):
+    with pytest.raises(AssertionError, match="calendar required"):
         test.compare_outputs(actual, golden, ["records"], params)
 
 
-@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("mode", [5])
 @pytest.mark.parametrize("count", [0, 1])
-def test_correct_records_do_not_allow_stale_resident_publication(ordered_native, mode, count):
+def test_correct_records_do_not_allow_stale_calendar_publication(ordered_native, mode, count):
     params = {"scenario": "shape", "mask": 2, "blocks": 2}
     test, actual, golden = _sample(ordered_native, params)
     test._contract_worker.scheduler_runtime_mode = mode
@@ -187,13 +189,13 @@ def _install_cpu_run(monkeypatch, native, worker, callable_obj, observed, broken
         for _ in range(kwargs.get("rounds", 1)):
             step = len(observed)
             observed.append(params["blocks"])
-            worker.scheduler_runtime_mode = 3 if step == broken_step and failure == "legacy" else 2
+            worker.scheduler_runtime_mode = 3 if step == broken_step and failure == "legacy" else 5
             if step != broken_step or failure != "stale":
                 worker.scheduler_mode_publish_count += 1
             self.compare_outputs(actual, golden, ["records"], params)
 
     # The real ordered and inherited fresh-mode hooks remain in the call chain.
-    monkeypatch.setattr(native.SceneTestCase, "_run_and_validate", run)
+    monkeypatch.setattr(SceneTestCase, "_run_and_validate", run)
 
 
 @pytest.mark.parametrize("mask", [1, 2])
@@ -201,7 +203,7 @@ def test_retained_reuse_checks_every_round_and_keeps_worker_and_registration(ord
     case = next(
         c for c in ordered_native.TestHbgOrderedExecution.CASES if c["name"] == f"retained_large_small_mask{mask}"
     )
-    worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=11)
+    worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=11)
     callable_obj = object()
     observed = []
     _install_cpu_run(monkeypatch, ordered_native, worker, callable_obj, observed)
@@ -215,19 +217,19 @@ def test_retained_reuse_checks_every_round_and_keeps_worker_and_registration(ord
 @pytest.mark.parametrize("failure", ["stale", "legacy"])
 def test_no_reuse_round_can_reuse_old_or_legacy_provenance(ordered_native, monkeypatch, broken_step, failure):
     case = next(c for c in ordered_native.TestHbgOrderedExecution.CASES if c["name"] == "retained_large_small_mask1")
-    worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=7)
+    worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=7)
     callable_obj = object()
     observed = []
     _install_cpu_run(monkeypatch, ordered_native, worker, callable_obj, observed, broken_step, failure)
     test = ordered_native.TestHbgOrderedExecution()
-    expected = "no fresh scheduler publication" if failure == "stale" else "resident required"
+    expected = "no fresh scheduler publication" if failure == "stale" else "calendar required"
     with pytest.raises(AssertionError, match=expected):
         test._run_and_validate(worker, callable_obj, case, rounds=2)
     assert len(observed) == broken_step + 1
 
 
 def test_ordered_acceptance_cannot_disable_golden_or_provenance(ordered_native):
-    worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=3)
+    worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=3)
     test = ordered_native.TestHbgOrderedExecution()
     with pytest.raises(AssertionError, match="cannot skip golden or invocation provenance"):
         test._run_and_validate(worker, object(), test.CASES[0], skip_golden=True)

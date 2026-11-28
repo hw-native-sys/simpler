@@ -7,7 +7,7 @@ DMB 提醒让后继在前驱的某个物理执行返回后提前检查依赖。�
 - 在已经排核的单一普通阶段里，按跨核依赖和可用 AIV 发送者选边。最多保留两个单成员前驱的提醒。MIX 和 SPMD 沿用整体完成依赖。多目标广播时，直接完成的 AIV 发出自身贡献后检查整项 DONE，达标时广播。登记 defer 的 AIV 可以发出返回提醒，促使后继检查实际登记。Graph、带谓词的执行、已经委托其他行观察的等待沿用当前日历协议。
 - AICPU 在 START 之前根据真实核映射绑定后继的 DMB 地址和本轮初值，并准备多目标 MTE3 批量写。启动、取消和退核沿用现有 DMB 地址生命周期。
 - 只有一个 AIC 前驱的候选行保留入场查数和 300 SYS_CNT 周期复查，无需读 DMB。DMB 开关两侧的候选接收行使用相同的周期复查、DONE 槽和前驱条件。对照实验通过独立构建切换提醒。
-  [日历生成](../../../src/a5/runtime/percounter/host/calendar_image.h) · [启动绑定](../../../src/a5/runtime/percounter/aicpu/supervisor.h)
+  [日历生成](../../../src/a5/runtime/host_build_graph/host/calendar_image.h) · [启动绑定](../../../src/a5/runtime/host_build_graph/aicpu/supervisor.h)
 
 ## AICore 执行
 
@@ -16,7 +16,7 @@ DMB 提醒让后继在前驱的某个物理执行返回后提前检查依赖。�
 3. 需要发送提醒的 AIV 完成设备写排序后，通过 MTE3 写后继的 DATA_MAIN_BASE【SPR】。批尾只设置完成事件，UB 源区在复用或交接前等待该事件。
 4. 后继在入场、看到合适的 DMB 变化或到达 300 SYS_CNT 周期时，按原有等待顺序检查仍未满足的前驱。每个前驱只读一次 DONE 字，计数不足且实际 defer 位置位时进入现有结算流程。
 5. 完成结算的核发布 DONE【SoC SRAM】。等待者下一次查数时观察其贡献。L2 报告已满足前驱的数量和检查原因。
-   [行执行和 defer 检查](../../../src/a5/runtime/percounter/aicore/calendar_loop.h)
+   [行执行和 defer 检查](../../../src/a5/runtime/host_build_graph/aicore/calendar_loop.h)
 
 验证使用同一个 kernel 分别走实际登记和未登记的分支。DMB 开关对照保持输入和排核相同，用无剖析的 L0 AICore wall 量性能，另采查询记录统计实际 SRAM 读次数。
 
@@ -24,7 +24,7 @@ DMB 提醒让后继在前驱的某个物理执行返回后提前检查依赖。�
 
 以下 L0 读数来自按核类型分开发出执行器之前的镜像，当时 AIV 在 L0 可落到 AIC 编译的调度循环。这些计时保留作历史记录。评估 AIV 的 MTE3 通知收益需使用已修复入口的镜像；L2 当时具有独立的 AIV 执行器。[L0/L1 入口修复](https://github.com/hw-native-sys/simpler/pull/3306)
 
-早期配对结果中，**仅迁移启停**就让均衡菱形从 7.96 降到 4.63 µs，六段满波 MIX 链从 37.61 增到 40.36 µs。新增 DMB 通知的收益须在迁移后的基线上重测。双前驱需实测的是 D 减少的 SRAM 查询与两次对端写及其排序开销。 [已有配对测量](https://github.com/hw-native-sys/simpler/pull/3263) · [七组用例与模型口径](../../../tests/fdwic/dsv41_scheduler/RESULTS.md)
+早期配对结果中，**仅迁移启停**就让均衡菱形从 7.96 降到 4.63 µs，六段满波 MIX 链从 37.61 增到 40.36 µs。新增 DMB 通知的收益须在迁移后的基线上重测。双前驱需实测的是 D 减少的 SRAM 查询与两次对端写及其排序开销。 [已有配对测量](https://github.com/hw-native-sys/simpler/pull/3263)
 
 **2026-11-25 初版验证结果（含退出回读）。** 七组使用最新启停实现作共同基线，每项两版各十个 AICore L0 wall 样本。七项全部通过数值校验。只有四任务菱形命中两条单前驱通知和一个双前驱汇合。均衡菱形从 4.5425 µs 增至 5.1212 µs（+12.74%）。另在同一候选二进制中固定扇出，将 D 从直接查询共同计数切换为接收 DMB 后查数，耗时从 4.7703 增至 5.0554 µs（+5.98%）。每项开销按各自的配对结果解释。
 

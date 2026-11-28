@@ -17,8 +17,7 @@ runtime's ordinary tensor dependency; there is no deferred completion or release
 of AIV while the copy is in flight. No SDMA or URMA workspace is allocated, and
 the kernel verifies that all workspace descriptors are empty.
 
-The three cases select `tensormap_and_ringbuffer`, `host_build_graph`, and
-`percounter`. Each case checks:
+The two cases select `tensormap_and_ringbuffer` and `host_build_graph`. Each case checks:
 
 - Two ranks reading 64 KiB from a non-self rank into ordinary HBM, with a
   256-byte buffer offset and a dependent consumer adding one.

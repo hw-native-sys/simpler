@@ -223,7 +223,7 @@ def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path)
             assert f"fault-replay={round_id} sync=507011" in stdout
             assert f"fault-replay={round_id} executed=16" in stdout
         if platform == "a5":
-            assert stdout.count("stage=resident-progress-timeout rc=0") == 2
+            assert stdout.count("stage=calendar-progress-timeout rc=0") == 2
         else:
             device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
             assert device_log.count("TIMEOUT_EXIT after_idle_iterations=") == 2, device_log
@@ -234,8 +234,8 @@ def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path)
         assert stdout.count("stage=boot-failure-retains-callable rc=0") == 2
         assert stdout.count("stage=boot-failure-execution-ended rc=0") == 2
         if platform == "a5":
-            assert stdout.count("stage=resident-bootstrap-failed rc=0") == 2
-            assert "stage=restore-injected-graph-view rc=0" in stdout
+            assert stdout.count("stage=calendar-bootstrap-failed rc=0") == 2
+            assert "stage=restore-injected-sync-width rc=0" in stdout
         else:
             assert "stage=restore-injected-task-capacity rc=0" in stdout
             device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))

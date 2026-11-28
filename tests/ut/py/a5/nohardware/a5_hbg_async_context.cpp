@@ -14,16 +14,20 @@
 #include <array>
 #include <cassert>
 #include <cstdlib>
-#include <string>
-#include <vector>
+#include <cstddef>
 
-#include "async_completion_plan.h"
 #include "async_kernel_api.h"
 #include "backend/sdma/sdma_completion_registration.h"
-#include "scheduler/scheduler_prepared_layout.h"
-#include "scheduler/scheduler_args_dump.h"
 
 namespace {
+void *lane_context = nullptr;
+
+struct AsyncImage {
+    alignas(64) std::array<uint8_t, 64> control{};
+    pto2::resident::AsyncGroupData group{};
+    alignas(64) std::array<DeferredCompletionEntry, 2> entries{};
+};
+
 struct Session {};
 struct Event {
     bool postFailed{false};
@@ -60,35 +64,44 @@ struct FlatTensor {
 int main(int argc, char **argv) {
     assert(argc == 2);
     const int scenario = std::atoi(argv[1]);
-    AsyncTaskPlanInput input;
-    input.task_ref = 0;
-    input.block_count = 1;
-    input.active_mask = LaneMask::aiv0();
-    input.capacities[1] = 2;
-    AsyncCompletionHostPlan plan;
-    std::string error;
-    assert(plan_async_completion(sizeof(SchedulerRunControl), 9, 1, {input}, &plan, &error));
-    std::vector<uint8_t> backing(plan.total_bytes + 127);
-    auto *image = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(backing.data()) + 127) & ~uintptr_t(127));
-    assert(initialize_async_completion(image, plan.total_bytes, plan));
-    auto *data = scheduler_state_at<pto2::resident::AsyncGroupData>(image, plan.layout.groups_offset);
-    SchedulerPreparedCall call{};
-    SchedulerExecutionBinding binding{};
-    static_assert(sizeof(SchedulerPreparedCall) == 512 && offsetof(SchedulerPreparedCall, args) == 64);
-    static_assert(offsetof(SchedulerExecutionBinding, global_context) == 64 && sizeof(LocalContext) == 8);
-    call.args[SPMD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&binding.local_context);
-    call.args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&binding.global_context);
-    auto &global = binding.global_context;
+    using simpler::percounter::PercounterInvocationContext;
+    constexpr uint64_t group_offset = offsetof(AsyncImage, group);
+    AsyncImage state{};
+    auto *image = reinterpret_cast<uint8_t *>(&state);
+    auto *data = &state.group;
+    data->run_epoch = 9;
+    data->capacity = state.entries.size();
+    data->entries_bytes = sizeof(state.entries);
+    data->entries_offset = offsetof(AsyncImage, entries);
+
+    PercounterInvocationContext context{};
+    context.local = {2, 5};
+    simpler_sim_install_invocation_context_hooks(
+        [](void *value) {
+            lane_context = value;
+            return 0;
+        },
+        [] {
+            return lane_context;
+        }
+    );
+    assert(simpler::percounter::percounter_bind_sim_context(&context));
+    auto &global = context.global;
+    global.sub_block_id = 1;
     global.async_present = 1;
     global.async_image_address = reinterpret_cast<uint64_t>(image);
-    global.async_image_bytes = plan.total_bytes;
-    global.async_run_epoch = 9;
-    global.async_group_offset = plan.layout.groups_offset;
-    global.async_group_index = 0;
-    auto *args = reinterpret_cast<int64_t *>(call.args);
+    global.async_image_bytes = sizeof(state);
+    global.async_run_epoch = data->run_epoch;
+    global.async_group_offset = group_offset;
+    global.async_group_index = data->group_index;
+    int64_t payload{};
+    auto *args = &payload;
+    assert(get_block_idx(args) == 2 && get_block_num(args) == 5 && get_sub_block_id(args) == 1);
     const CompletionToken token{0x10000, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
     if (scenario == 0) {
+        assert(context.async_touched == 0);
         auto ctx = get_async_ctx(args);
+        assert(context.async_touched == 1);
         assert(async_ctx_is_deferred(ctx));
         assert(register_completion_condition(ctx, token));
         auto second = get_async_ctx(args);
@@ -123,8 +136,6 @@ int main(int argc, char **argv) {
         assert(data->count == 0 && data->error_code == 0);
     } else if (scenario == 5) {
         global.async_present = 0;
-        // Absence of an async group never touches a LocalContext or a slab.
-        call.args[SPMD_LOCAL_CONTEXT_INDEX] = 0;
         auto ctx = get_async_ctx(args);
         assert(!async_ctx_is_deferred(ctx));
         assert(!register_completion_condition(ctx, token));
@@ -206,7 +217,7 @@ int main(int argc, char **argv) {
         assert(!pto2::resident::seal_conditions(ctx.resident));
     } else if (scenario == 26 || scenario == 27) {
         if (scenario == 26) data->entries_bytes += sizeof(*data);
-        else data->entries_offset = plan.layout.groups_offset;
+        else data->entries_offset = group_offset;
         auto ctx = get_async_ctx(args);
         assert(!async_ctx_is_deferred(ctx));
         assert(ctx.completion_entries == nullptr);
@@ -242,21 +253,20 @@ int main(int argc, char **argv) {
             assert(!pto2::resident::seal_conditions(ctx.resident));
             if (scenario == 32) assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
         }
-    } else if (scenario >= 33 && scenario <= 36) {
-        SchedulerArgsDumpTask selected{};
-        if (scenario == 33 || scenario == 36) selected.output_tensor_mask = 1;
-        scheduler_args_dump_limit_async_output(scenario == 34 ? nullptr : &selected, global);
-        const pto2::resident::AsyncWriter writer{image, plan.total_bytes, 9, plan.layout.groups_offset, 0};
-        if (scenario == 36) {
-            // An output snapshot of an ordinary synchronous task is still allowed.
+    } else if (scenario == 33 || scenario == 34) {
+        global.async_output_capture_refused = 1;
+        const pto2::resident::AsyncWriter writer{image, sizeof(state), data->run_epoch, group_offset, 0};
+        if (scenario == 34) {
+            // Selecting an output snapshot alone does not register any deferred condition.
+            assert(context.async_touched == 0);
             assert(pto2::resident::seal_conditions(writer));
         } else {
             auto ctx = get_async_ctx(args);
-            assert(async_ctx_is_deferred(ctx) == (scenario != 33));
-            assert(register_completion_condition(ctx, token) == (scenario != 33));
-            assert(data->count == (scenario == 33 ? 0u : 1u));
-            assert(pto2::resident::seal_conditions(writer) == (scenario != 33));
-            assert(data->error_code == (scenario == 33 ? SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED : 0));
+            assert(!async_ctx_is_deferred(ctx));
+            assert(!register_completion_condition(ctx, token));
+            assert(data->count == 0);
+            assert(!pto2::resident::seal_conditions(writer));
+            assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
         }
     } else return 2;
     return 0;

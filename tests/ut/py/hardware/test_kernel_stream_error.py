@@ -29,6 +29,10 @@ _RESIDENT_TIMEOUT_SIGNATURES = (
     r"aicpu_execute: runtime failed with rc=-100(?!\d)",
     r"simpler_aicpu_exec: aicpu_execute failed with rc=-100(?!\d)",
 )
+_RESIDENT_PROGRESS_TIMEOUT_LOG = (
+    "A5 HBG calendar: no progress; 0 of 1 sinks complete, 0 deferred completions outstanding"
+)
+_RESIDENT_TIMEOUT_LOG = f"aicpu_execute: runtime failed with rc=-100\n{_RESIDENT_PROGRESS_TIMEOUT_LOG}\n"
 _RESIDENT_TIMEOUT_PROFILE = {
     "SIMPLER_SCHEDULER_TIMEOUT_MS": "2000",
     "SIMPLER_OP_EXECUTE_TIMEOUT_US": "3000000",
@@ -38,27 +42,21 @@ _RESIDENT_OBSERVERS = ["prepare", "launch", "peek", "caller_sync"]
 _RESIDENT_SHAPES = ((4, 2), (1, 0), (7, 0), (7, 2))
 
 
-def _resident_timeout_evidence(logs, shape=(4, 2)):
-    matches = []
-    owned_lines = []
+def _resident_timeout_evidence(logs):
+    runtime_errors, progress_timeouts = [], []
     root = logs.resolve()
     for path in sorted(logs.rglob("*.log")):
         if not path.is_file() or not path.resolve().is_relative_to(root):
             continue
         for line in path.read_text(errors="replace").splitlines():
-            owned_lines.append({"path": str(path.relative_to(logs)), "line": line})
+            item = {"path": str(path.relative_to(logs)), "line": line}
             if any(re.search(pattern, line) for pattern in _RESIDENT_TIMEOUT_SIGNATURES):
-                matches.append({"path": str(path.relative_to(logs)), "line": line})
-    assert matches, f"No resident device -100 signature in owned log directory {logs}"
-    if shape != (4, 2):
-        for pattern in (
-            r"A5 HBG AICore Scheduler timeout site=95(?!\d)",
-            rf"A5 HBG AICore scheduler: unfinished task=.*\bactive_mask=0x{shape[0]:x}(?![0-9a-fA-F])",
-        ):
-            evidence = [item for item in owned_lines if re.search(pattern, item["line"])]
-            assert evidence, f"No owned execution-timeout evidence for shape {shape}: {pattern}"
-            matches.extend(evidence)
-    return matches
+                runtime_errors.append(item)
+            if _RESIDENT_PROGRESS_TIMEOUT_LOG in line:
+                progress_timeouts.append(item)
+    assert runtime_errors, f"No calendar device -100 signature in owned log directory {logs}"
+    assert progress_timeouts, f"No calendar progress timeout in owned log directory {logs}"
+    return runtime_errors + progress_timeouts
 
 
 def _wait_for_resident_timeout_evidence(logs, shape):
@@ -66,7 +64,7 @@ def _wait_for_resident_timeout_evidence(logs, shape):
     deadline = started + 5.0
     while True:
         try:
-            evidence = _resident_timeout_evidence(logs, shape)
+            evidence = _resident_timeout_evidence(logs)
         except (AssertionError, FileNotFoundError):
             evidence = []
         remaining = deadline - time.monotonic()
@@ -103,15 +101,12 @@ def test_resident_failure_child_waits_for_owned_evidence(tmp_path, monkeypatch, 
         assert 0 < seconds <= 0.05
         clock[0] += seconds
         if arrival is not None and clock[0] >= arrival:
-            owned.write_text(
-                signature + "A5 HBG AICore Scheduler timeout site=95\n"
-                "A5 HBG AICore scheduler: unfinished task=9 active_mask=0x7 flags=0x0\n"
-            )
+            owned.write_text(signature + _RESIDENT_PROGRESS_TIMEOUT_LOG + "\n")
 
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(time, "sleep", deliver)
     evidence = _wait_for_resident_timeout_evidence(tmp_path, shape)
-    assert len(evidence) == (3 if arrival is not None else 0)
+    assert len(evidence) == (2 if arrival is not None else 0)
     assert clock[0] == pytest.approx(1.5 if arrival is not None else 5.0)
 
 
@@ -119,11 +114,7 @@ def test_resident_failure_child_wait_rejects_foreign_evidence(tmp_path, monkeypa
     owned = tmp_path / "owned"
     owned.mkdir()
     foreign = tmp_path / "foreign.log"
-    foreign.write_text(
-        "aicpu_execute: runtime failed with rc=-100\n"
-        "A5 HBG AICore Scheduler timeout site=95\n"
-        "A5 HBG AICore scheduler: unfinished task=9 active_mask=0x7 flags=0x0\n"
-    )
+    foreign.write_text(_RESIDENT_TIMEOUT_LOG)
     (owned / "device.log").symlink_to(foreign)
     clock = [0.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
@@ -146,7 +137,7 @@ def _observe_resident_entry(lib, ctx, run, caller, args, config, descriptor, bud
     print("RESIDENT_STAGE " + json.dumps({"stage": "prepare", "rc": 0}), flush=True)
     mode = lib.get_last_scheduler_runtime_mode(ctx)
     count = lib.get_scheduler_mode_publish_count(ctx)
-    assert mode in (1, 2) and count > 0, (mode, count)
+    assert mode == 5 and count > 0, (mode, count)
     assert lib.simpler_launch_run_on_stream(ctx, run, caller, None) == 0
     stages.append("launch")
     print("RESIDENT_STAGE " + json.dumps({"stage": "launch", "rc": 0}), flush=True)
@@ -174,7 +165,7 @@ def _validate_resident_status(observed, failure, fixture, logs, shape=(4, 2)):
     assert observed["failure"] is failure
     assert observed["shape"] == list(shape) and observed["blocks"] == 1
     assert observed["execution_stages"] == _RESIDENT_OBSERVERS, observed
-    assert observed["scheduler_runtime_mode"] in (1, 2) and observed["scheduler_mode_publish_count"] > 0
+    assert observed["scheduler_runtime_mode"] == 5 and observed["scheduler_mode_publish_count"] > 0
     assert observed["peek_before"] == 0
     assert observed["stream_sync_timeout_ms"] == int(fixture["timeout_profile"]["SIMPLER_STREAM_SYNC_TIMEOUT_MS"])
     assert observed["caller_sync_rc"] == (507018 if failure else 0), observed
@@ -183,7 +174,7 @@ def _validate_resident_status(observed, failure, fixture, logs, shape=(4, 2)):
         deadline = time.monotonic() + 2
         while True:
             try:
-                return _resident_timeout_evidence(logs, shape)
+                return _resident_timeout_evidence(logs)
             except AssertionError:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -243,32 +234,18 @@ def test_resident_shape_checks_all_active_rows_and_summary(shape):
             _validate_resident_output(records, damaged, shape)
 
 
-@pytest.mark.parametrize("shape", _RESIDENT_SHAPES[1:])
-def test_resident_new_shape_requires_exact_owned_execution_timeout(tmp_path, shape):
-    signature = "aicpu_execute: runtime failed with rc=-100\n"
-    site = "A5 HBG AICore Scheduler timeout site=95\n"
-    unfinished = f"A5 HBG AICore scheduler: unfinished task=9 state=1 active_mask=0x{shape[0]:x} flags=0x0\n"
+def test_resident_timeout_requires_owned_progress_evidence(tmp_path):
+    status = "aicpu_execute: runtime failed with rc=-100\n"
     path = tmp_path / "device.log"
-    path.write_text(signature + site + unfinished)
-    assert len(_resident_timeout_evidence(tmp_path, shape)) == 3
-    for text in (
-        signature + unfinished,
-        signature + site,
-        signature + site.replace("95", "950") + unfinished,
-        signature + site.replace("95", "91") + unfinished,
-        signature + site + unfinished.replace(f"0x{shape[0]:x} ", f"0x{shape[0]:x}0 "),
-        signature + site + unfinished.replace(f"0x{shape[0]:x} ", "0x4 "),
-        signature.replace("-100", "-1000") + site + unfinished,
-    ):
-        path.write_text(text)
-        with pytest.raises(AssertionError):
-            _resident_timeout_evidence(tmp_path, shape)
-    path.write_text(signature)
+    path.write_text(status)
+    with pytest.raises(AssertionError, match="No calendar progress timeout"):
+        _resident_timeout_evidence(tmp_path)
+
     foreign = tmp_path.parent / (tmp_path.name + "-foreign.log")
-    foreign.write_text(site + unfinished)
+    foreign.write_text(_RESIDENT_PROGRESS_TIMEOUT_LOG + "\n")
     (tmp_path / "foreign.log").symlink_to(foreign)
-    with pytest.raises(AssertionError):
-        _resident_timeout_evidence(tmp_path, shape)
+    with pytest.raises(AssertionError, match="No calendar progress timeout"):
+        _resident_timeout_evidence(tmp_path)
 
 
 @pytest.mark.parametrize("shape", _RESIDENT_SHAPES[1:])
@@ -276,11 +253,8 @@ def test_resident_new_shape_status_rejects_wrong_shape_and_sdk_code(tmp_path, sh
     fixture = {"timeout_profile": _RESIDENT_TIMEOUT_PROFILE}
     observed = _resident_observation_fixture()
     observed["shape"] = list(shape)
-    (tmp_path / "device.log").write_text(
-        "aicpu_execute: runtime failed with rc=-100\nA5 HBG AICore Scheduler timeout site=95\n"
-        f"A5 HBG AICore scheduler: unfinished task=9 active_mask=0x{shape[0]:x} flags=0x0\n"
-    )
-    assert len(_validate_resident_status(observed, True, fixture, tmp_path, shape)) == 3
+    (tmp_path / "device.log").write_text(_RESIDENT_TIMEOUT_LOG)
+    assert len(_validate_resident_status(observed, True, fixture, tmp_path, shape)) == 2
     for sdk in (0, 507015, 507011, -100):
         observed["caller_sync_rc"] = sdk
         with pytest.raises(AssertionError):
@@ -292,8 +266,9 @@ def test_resident_new_shape_status_rejects_wrong_shape_and_sdk_code(tmp_path, sh
 
 @pytest.mark.parametrize("signature", _RESIDENT_TIMEOUT_SIGNATURES)
 def test_resident_timeout_accepts_its_owned_device_status(tmp_path, signature):
-    (tmp_path / "device.log").write_text(signature.removesuffix(r"(?!\d)") + "\n")
-    assert len(_resident_timeout_evidence(tmp_path)) == 1
+    status = signature.removesuffix(r"(?!\d)")
+    (tmp_path / "device.log").write_text(f"{status}\n{_RESIDENT_PROGRESS_TIMEOUT_LOG}\n")
+    assert len(_resident_timeout_evidence(tmp_path)) == 2
 
 
 @pytest.mark.parametrize(
@@ -308,7 +283,7 @@ def test_resident_timeout_accepts_its_owned_device_status(tmp_path, signature):
 )
 def test_resident_timeout_rejects_an_unqualified_error(tmp_path, message):
     (tmp_path / "device.log").write_text(message)
-    with pytest.raises(AssertionError, match="No resident device -100"):
+    with pytest.raises(AssertionError, match="No calendar device -100"):
         _resident_timeout_evidence(tmp_path)
 
 
@@ -316,9 +291,9 @@ def test_resident_timeout_rejects_foreign_logs(tmp_path):
     logs = tmp_path / "owned"
     logs.mkdir()
     foreign = tmp_path / "foreign.log"
-    foreign.write_text("aicpu_execute: runtime failed with rc=-100\n")
+    foreign.write_text(_RESIDENT_TIMEOUT_LOG)
     (logs / "device.log").symlink_to(foreign)
-    with pytest.raises(AssertionError, match="No resident device -100"):
+    with pytest.raises(AssertionError, match="No calendar device -100"):
         _resident_timeout_evidence(logs)
 
 
@@ -328,7 +303,7 @@ def _resident_observation_fixture():
         "shape": [4, 2],
         "blocks": 1,
         "execution_stages": list(_RESIDENT_OBSERVERS),
-        "scheduler_runtime_mode": 1,
+        "scheduler_runtime_mode": 5,
         "scheduler_mode_publish_count": 1,
         "peek_before": 0,
         "stream_sync_timeout_ms": 6000,
@@ -340,23 +315,23 @@ def _resident_observation_fixture():
 def test_resident_timeout_requires_both_the_sdk_status_and_owned_device_error(tmp_path):
     observed = _resident_observation_fixture()
     fixture = {"timeout_profile": _RESIDENT_TIMEOUT_PROFILE}
-    with pytest.raises(AssertionError, match="No resident device -100"):
+    with pytest.raises(AssertionError, match="No calendar device -100"):
         _validate_resident_status(observed, True, fixture, tmp_path)
-    (tmp_path / "device.log").write_text("aicpu_execute: runtime failed with rc=-100\n")
-    assert len(_validate_resident_status(observed, True, fixture, tmp_path)) == 1
+    (tmp_path / "device.log").write_text(_RESIDENT_TIMEOUT_LOG)
+    assert len(_validate_resident_status(observed, True, fixture, tmp_path)) == 2
 
 
 def test_resident_timeout_waits_only_for_owned_diagnostic_delivery(tmp_path, monkeypatch):
     logs = tmp_path / "owned"
     logs.mkdir()
     foreign = tmp_path / "foreign.log"
-    foreign.write_text("aicpu_execute: runtime failed with rc=-100\n")
+    foreign.write_text(_RESIDENT_TIMEOUT_LOG)
     (logs / "foreign.log").symlink_to(foreign)
     clock = [0.0]
 
     def deliver(seconds):
         clock[0] += seconds
-        (logs / "device.log").write_text("aicpu_execute: runtime failed with rc=-100\n")
+        (logs / "device.log").write_text(_RESIDENT_TIMEOUT_LOG)
 
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(time, "sleep", deliver)
@@ -364,27 +339,27 @@ def test_resident_timeout_waits_only_for_owned_diagnostic_delivery(tmp_path, mon
         _resident_observation_fixture(), True, {"timeout_profile": _RESIDENT_TIMEOUT_PROFILE}, logs
     )
     assert 0 < clock[0] <= 2
-    assert [match["path"] for match in evidence] == ["device.log"]
+    assert {match["path"] for match in evidence} == {"device.log"}
 
 
 def test_resident_timeout_diagnostic_delivery_expires_without_qualifying_a_foreign_log(tmp_path, monkeypatch):
     logs = tmp_path / "owned"
     logs.mkdir()
     foreign = tmp_path / "foreign.log"
-    foreign.write_text("aicpu_execute: runtime failed with rc=-100\n")
+    foreign.write_text(_RESIDENT_TIMEOUT_LOG)
     (logs / "foreign.log").symlink_to(foreign)
     clock = [0.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
-    with pytest.raises(AssertionError, match="No resident device -100"):
+    with pytest.raises(AssertionError, match="No calendar device -100"):
         _validate_resident_status(
             _resident_observation_fixture(), True, {"timeout_profile": _RESIDENT_TIMEOUT_PROFILE}, logs
         )
     assert clock[0] == pytest.approx(2)
 
 
-@pytest.mark.parametrize("mode", [0, 3, 4, 5])
-def test_resident_timeout_refuses_a_legacy_or_unpublished_mode(tmp_path, mode):
+@pytest.mark.parametrize("mode", [0, 1, 2, 3, 4])
+def test_resident_timeout_requires_calendar_mode(tmp_path, mode):
     observed = _resident_observation_fixture()
     observed["scheduler_runtime_mode"] = mode
     with pytest.raises(AssertionError):
@@ -395,7 +370,7 @@ def test_resident_timeout_refuses_a_legacy_or_unpublished_mode(tmp_path, mode):
 def test_resident_timeout_requires_the_reported_kernel_sdk_code(tmp_path, sdk_code):
     observed = _resident_observation_fixture()
     observed["caller_sync_rc"] = sdk_code
-    (tmp_path / "device.log").write_text("aicpu_execute: runtime failed with rc=-100\n")
+    (tmp_path / "device.log").write_text(_RESIDENT_TIMEOUT_LOG)
     with pytest.raises(AssertionError):
         _validate_resident_status(observed, True, {"timeout_profile": _RESIDENT_TIMEOUT_PROFILE}, tmp_path)
 
@@ -433,7 +408,7 @@ def test_resident_entry_observes_the_caller_without_a_native_drain(capsys):
     lib = SimpleNamespace(
         **{
             "simpler_prepare_run": leaf("prepare"),
-            "get_last_scheduler_runtime_mode": leaf("mode", 2),
+            "get_last_scheduler_runtime_mode": leaf("mode", 5),
             "get_scheduler_mode_publish_count": leaf("count", 1),
             "simpler_launch_run_on_stream": leaf("launch"),
             "aclrtPeekAtLastError": leaf("peek"),
@@ -498,7 +473,7 @@ def test_resident_child_preserves_its_owners_after_the_first_caller_error(
                     args[0]._obj.value = 0x1000 + len(calls) * 0x1000
                 return {
                     "create_device_context": 1,
-                    "get_last_scheduler_runtime_mode": 2,
+                    "get_last_scheduler_runtime_mode": 5,
                     "get_scheduler_mode_publish_count": 1,
                     "aclrtSynchronizeStreamWithTimeout": 507018 if failure else 0,
                 }.get(name, 0)
@@ -537,10 +512,7 @@ def test_resident_child_preserves_its_owners_after_the_first_caller_error(
     original_print = print
     logs = tmp_path / "ascend"
     logs.mkdir()
-    (logs / "device.log").write_text(
-        "aicpu_execute: runtime failed with rc=-100\nA5 HBG AICore Scheduler timeout site=95\n"
-        f"A5 HBG AICore scheduler: unfinished task=9 active_mask=0x{shape[0]:x} flags=0x0\n"
-    )
+    (logs / "device.log").write_text(_RESIDENT_TIMEOUT_LOG)
     monkeypatch.setenv("ASCEND_PROCESS_LOG_PATH", str(logs))
 
     def printed(*values, **kwargs):
@@ -614,7 +586,7 @@ def _compile_resident_fixture(output):
     started = time.monotonic()
     profile = _resident_timeout_profile(os.environ)
     compiler = KernelCompiler("a5")
-    sources = _ROOT / "tests/fdwic/pa_hbg/spmd/kernels"
+    sources = _ROOT / "tests/support/a5/host_build_graph/spmd/kernels"
     includes = list(compiler.get_orchestration_include_dirs("host_build_graph"))
     includes.append(str(compiler.platform_dir / "onboard/aicore"))
     children = []
@@ -832,10 +804,7 @@ def test_resident_matched_pair_selects_one_fixture_and_the_same_shape(tmp_path, 
         if not failure:
             observed.update(output_verified=True, cleanup="released")
         logs = Path(env["ASCEND_PROCESS_LOG_PATH"])
-        (logs / "device.log").write_text(
-            "aicpu_execute: runtime failed with rc=-100\nA5 HBG AICore Scheduler timeout site=95\n"
-            f"A5 HBG AICore scheduler: unfinished task=19 active_mask=0x{shape[0]:x} flags=0x0\n"
-        )
+        (logs / "device.log").write_text(_RESIDENT_TIMEOUT_LOG)
         return SimpleNamespace(returncode=0), "RESIDENT_CALLER_STATUS " + json.dumps(observed), ""
 
     monkeypatch.setattr(sys.modules[__name__], "_run_resident_child", child)
@@ -1030,7 +999,7 @@ def test_kernel_error_reaches_caller_stream(runtime, error_origin, failure, requ
     if error_origin == "aicore" and not failure:
         assert observed["output_marker"] == 42, observed
     if arch == "a5" and runtime == "host_build_graph":
-        assert observed["scheduler_runtime_mode"] in (1, 2), observed
+        assert observed["scheduler_runtime_mode"] == 5, observed
         assert observed["scheduler_mode_publish_count"] > 0, observed
         if failure:
             assert observed["resident_timeout_evidence"], observed
@@ -1078,7 +1047,7 @@ def test_completed_public_handle_observes_later_caller_error(runtime, request, t
     assert observed["repeat_wait_error"] == 507018 and observed["distinct_caller_outputs"]
     assert observed["caller_resources_retained"]
     if arch == "a5" and runtime == "host_build_graph":
-        assert observed["scheduler_runtime_mode"] in (1, 2), observed
+        assert observed["scheduler_runtime_mode"] == 5, observed
         assert observed["scheduler_mode_publish_count"] > 0, observed
 
 
@@ -1151,8 +1120,8 @@ def _probe(arch, runtime, error_origin, device, failure, output):
         _native_run_storage,
     )
 
-    resident_graph = arch == "a5" and runtime == "host_build_graph"
-    if resident_graph and failure:
+    calendar_graph = arch == "a5" and runtime == "host_build_graph"
+    if calendar_graph and failure:
         _resident_timeout_profile(os.environ)
     chip, hashes = _callable(arch, runtime, error_origin, failure, output)
     image = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
@@ -1209,7 +1178,7 @@ def _probe(arch, runtime, error_origin, device, failure, output):
     elapsed = time.monotonic() - started
     evidence = (
         _wait_for_resident_timeout_evidence(Path(os.environ["ASCEND_PROCESS_LOG_PATH"]), (4, 2))
-        if resident_graph and failure
+        if calendar_graph and failure
         else []
     )
     mode = count = 0

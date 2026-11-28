@@ -46,6 +46,14 @@ void platform_signal_aicore_exit(uint64_t reg_addr) { write_reg(reg_addr, RegId:
 // inner_get_deinit_timeout_ticks declaration in platform_regs.h.
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + inner_get_deinit_timeout_ticks(); }
 
+void publish_aicore_lifecycle_word(volatile uint32_t *word, uint32_t value) {
+    wmb();
+    __atomic_store_n(word, value, __ATOMIC_RELEASE);
+    // Drain the posted SET before any later publication or release of the lease.
+    (void)__atomic_load_n(word, __ATOMIC_RELAXED);
+    rmb();
+}
+
 void platform_close_aicore_window(uint64_t reg_addr) {
     // Initialize task dispatch register to idle state
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);

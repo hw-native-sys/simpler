@@ -148,7 +148,7 @@ rollback releases the partial allocation.
 
 ### A5 Host-source windows
 
-L3 A5 `tensormap_and_ringbuffer`, `host_build_graph`, and `percounter` domains
+L3 A5 `tensormap_and_ringbuffer` and `host_build_graph` domains
 accept `memory_source=AddressSpace.HOST` with `workspace_engines=()` for
 synchronous peer MTE reads on PR and DT.
 The default remains `AddressSpace.DEVICE`. Each participating L2 owns independent

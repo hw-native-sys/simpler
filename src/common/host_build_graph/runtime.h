@@ -101,17 +101,13 @@
  * between cores and optimize cache coherency operations.
  *
  * Field Access Patterns:
- * - aicpu_ready: unused on a2a3. On a5 it is the AICPU's resident hand-off
- *   publication: the AICPU writes SCHEDULER_RUNTIME_MODE_RESIDENT_READY once a
- *   worker's context is filled, and that worker's AICore polls its own copy for
- *   it. The host publishes the selected mode in
- *   DeviceRuntimeLaunchDesc::scheduler_bootstrap, not here
+ * - aicpu_ready: the AICPU's per-worker start publication on WSE.
+ *   A5 calendar lanes wait for START on the shared SoC SRAM word.
  * - aicore_done: Written by AICore, read by AICPU (final report; physical_core_id
  *   and core_type are published alongside it in the same write). AICPU clears
  *   this marker and aicpu_ready only after acknowledged retirement.
- * - task: Written by AICPU before window-open, read by AICore after window-open.
- *   On a5 the AICPU publishes it again at resident hand-off; the AICore's
- *   pre-READY context address comes from scheduler_bootstrap instead
+ * - task: Written by AICPU before window-open and read by AICore after window-open.
+ *   A5 obtains its calendar control address from scheduler_bootstrap.
  * - core_type: Written by AICore (with aicore_done), read by AICPU (CoreType::AIC or CoreType::AIV)
  * - physical_core_id: Written by AICore (with aicore_done), read by AICPU
  * - report_epoch: This run's identity, written by AICore *after* the payload and
@@ -122,9 +118,9 @@
  *   be confused with never-written device memory
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;  // a2a3: unused. a5: AICPU resident hand-off publication (see above)
+    volatile uint32_t aicpu_ready;  // WSE per-worker start publication
     volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;         // DispatchPayload*, or on a5 a SchedulerWorkerContext address
+    volatile uint64_t task;         // DispatchPayload* for dispatch-driven runtimes
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
     volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
@@ -220,32 +216,19 @@ inline __aicore__ void aicore_stage_native_report(
 }
 
 /**
- * Host-authored scheduler bootstrap inputs, A5 host_build_graph only.
+ * Host-authored scheduler bootstrap inputs. The device reads them after launch.
+ * A5 publishes the calendar mode and its shared control block. WSE publishes
+ * the resident mode and the base of its worker-context array.
  *
- * Both words are written by the host alone and read by the AICPU and the AICore;
- * no device tier writes them. That is what separates them from `Handshake`, where
- * `aicpu_ready` doubles as the AICPU's RESIDENT_READY publication and `task` as
- * the address the AICPU republishes at hand-off.
- *
- * `runtime_mode` is 0 until a run publishes a choice: a zero is "no scheduler
- * selected", not a selection. A5 HBG accepts only resident modes.
- * `worker_context_base` is the device address of worker 0's
- * SchedulerWorkerContext, so worker i's context is
- * `worker_context_base + i * sizeof(SchedulerWorkerContext)`; it is 0 whenever
- * the mode is not resident.
- *
- * One 64-byte line of its own so a single AICore `scheduler_observe_cache_line`
- * covers exactly the words that follow it, and so no field another tier writes
- * can share the line. Declared on A2/A3 and read and written by no A2/A3 code —
- * unused reserved storage there.
+ * A2/A3 leaves the unused storage zero. The dedicated cache line lets AICore
+ * acquire these words without fetching fields another tier writes.
  */
 struct alignas(64) SchedulerBootstrapInputs {
-    volatile uint32_t runtime_mode;         // A5 HBG: SCHEDULER_RUNTIME_MODE_*; 0 = none published
+    volatile uint32_t runtime_mode;         // SCHEDULER_RUNTIME_MODE_*; 0 before publication
     volatile uint32_t reserved_;            // keeps worker_context_base 8-byte aligned
-    volatile uint64_t worker_context_base;  // device address of worker 0's SchedulerWorkerContext, 0 when unused
-    uint64_t context_ready_address;         // Optional A5 READY generation, sampled before reporting this launch.
-    uint64_t lifecycle_notify_address;      // A5 calendar START/EXIT broadcast, owned by this run.
-    uint64_t rejected_exit_address;         // Launch-cleared per-worker slots for A5 calendar discovery failures.
+    volatile uint64_t worker_context_base;  // A5 calendar control or WSE worker contexts
+    uint64_t lifecycle_notify_address;      // A5 calendar SoC SRAM START/EXIT broadcast
+    uint64_t rejected_exit_address;         // Launch-cleared per-worker slots for rejected discovery
 };
 
 static_assert(sizeof(SchedulerBootstrapInputs) == 64);
@@ -558,17 +541,13 @@ public:
         return reinterpret_cast<const RuntimeSharedState *>(dev.shared_state_addr)->workers;
     }
 
-    // The two bootstrap words move together, so every A5 selection path goes
-    // through here: a resident base surviving a legacy selection would name an
-    // allocation that selection has already released, and a resident mode
-    // without its base would send each AICore to a null context.
+    // Publish or clear the mode and its backing allocation together.
     void publish_scheduler_bootstrap(
-        uint32_t mode, uint64_t worker_context_base, uint64_t context_ready_address = 0,
-        uint64_t lifecycle_notify_address = 0, uint64_t rejected_exit_address = 0
+        uint32_t mode, uint64_t worker_context_base, uint64_t lifecycle_notify_address = 0,
+        uint64_t rejected_exit_address = 0
     ) {
         dev.scheduler_bootstrap.runtime_mode = mode;
         dev.scheduler_bootstrap.worker_context_base = worker_context_base;
-        dev.scheduler_bootstrap.context_ready_address = context_ready_address;
         dev.scheduler_bootstrap.lifecycle_notify_address = lifecycle_notify_address;
         dev.scheduler_bootstrap.rejected_exit_address = rejected_exit_address;
     }

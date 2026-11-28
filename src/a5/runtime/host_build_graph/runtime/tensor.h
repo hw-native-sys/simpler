@@ -9,11 +9,15 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Both tensor types this runtime deals in: the boundary `ChipTensor` an argument
- * arrives as, and `simpler::hbg::Tensor`, the form everything inside the runtime —
- * orchestration included — actually works with.
+ * Which tensor type this runtime deals in.
  *
- * This sits first on the runtime include path, so a `#include "tensor.h"` from
+ * Four directories on a kernel or orchestration include path hold a `tensor.h`,
+ * and only a runtime's own says which one its sources mean. This runtime takes
+ * host_build_graph's sources and so its tensor, but it still has to say so
+ * here: a runtime that owns no `tensor.h` resolves the bare include to
+ * task_interface's, which declares no `Tensor` at all.
+ *
+ * It sits first on this runtime's include path, so a `#include "tensor.h"` from
  * runtime, orchestration or kernel sources lands here.
  */
 
@@ -22,13 +26,7 @@
 #include "task_interface/tensor.h"
 #include "host_build_graph/tensor.h"
 
-// The tensor type of whichever runtime this translation unit is being built for.
-// A kernel reads a payload element and does not care which orchestrator produced
-// it, so kernels and the orchestration sources shared between runtimes name this
-// rather than picking one — several are compiled under both.
-//
-// The name is unqualified because nothing on a kernel or orchestration include path
-// reaches task_interface/buffer.h, which declares a different `Tensor` — the L3+
-// wire form, at global scope. tests/lint/check_kernel_wire_isolation.py holds that
-// separation; an include that breaks it turns this line into a redeclaration.
+// The name is unqualified for the same reason host_build_graph's own shim gives:
+// nothing on a kernel or orchestration include path reaches task_interface/buffer.h,
+// which declares a different `Tensor` at global scope.
 using Tensor = simpler::hbg::Tensor;

@@ -13,7 +13,7 @@
 两队列当时 18 组模型功能通过，14 组单卡 L1 合计变化 −0.56%，按 ±5% 标准视为持平。
 462 份完整原语 L3 零丢失、零截断；两队列各项 L3/L1 增幅最高 13.65%。
 三臂详细表、初次 +5.23% 边界项及 A/B/A 复测、CPU/硬件覆盖范围见[历史报告](two-ready-queues/README.zh-CN.md)。
-当时采用 [dsv41_scheduler](../../fdwic/dsv41_scheduler/README.md) 的原始模型 case，
+当时采用 [dsv41_scheduler](https://github.com/hw-native-sys/simpler/blob/1ea06c2aee35993c288887582cb7f802b2724546/tests/fdwic/dsv41_scheduler/README.md) 的原始模型 case，
 范围、正常 `-O3 -g` 构建、每级 1 次预热及 10 次计时、完整 AICPU L1 边界见[当时的验收报告](two-ready-queues/README.zh-CN.md)。
 跨卡 MoE 相关四组功能通过，并已补测 L1/L3 参考数据和波动范围，不计入当时 14 组单卡性能考核。
 

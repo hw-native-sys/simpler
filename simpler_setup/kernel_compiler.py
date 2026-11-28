@@ -443,7 +443,7 @@ class KernelCompiler:
         )
 
     def _orchestration_toolchain(self, runtime_name: str) -> Union[GxxToolchain, Aarch64GxxToolchain]:
-        if runtime_name in ("host_build_graph", "percounter"):
+        if runtime_name == "host_build_graph":
             return self.host_gxx
         if runtime_name == "tensormap_and_ringbuffer":
             if self.platform.endswith("sim"):

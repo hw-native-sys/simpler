@@ -14,7 +14,7 @@
 //
 // Every case drives the production functions the producers and consumers call —
 // `aicore_stage_native_report`, `aicore_report_accepted`,
-// `aicore_context_reply_permitted`, `fill_shared_launch_args`. Deleting a
+// and `fill_shared_launch_args`. Deleting a
 // production reset or guard therefore fails a case here rather than leaving it
 // green.
 //
@@ -28,31 +28,29 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "aicore_scheduler_state.h"
 #include "common/kernel_args.h"
 #include "runtime.h"
-#include "scheduler/scheduler_layout.h"
-#include "scheduler/scheduler_types.h"
+#include "scheduler/wire_types.h"
 
 namespace {
 
 constexpr uint64_t kRunN = 0x0000'0000'0000'2a01ULL;
 constexpr uint64_t kRunNPlus1 = 0x0000'0000'0000'2a02ULL;
-constexpr uint64_t kRunNPlus2 = 0x0000'0000'0000'2a03ULL;
 constexpr uint32_t kBlockIdx = 5;
 constexpr uint32_t kPhysicalCoreId = 11;
 constexpr uint64_t kStaleContext = 0xdead'beefULL;
-constexpr uint64_t kSomeRegAddr = 0x7f00'1000ULL;
+constexpr uint32_t kPendingReply = 0;
+constexpr uint32_t kPublishedReply = SCHEDULER_RUNTIME_MODE_CALENDAR;
 
-// What a predecessor resident run leaves behind: its own accepted report, and
+// What a predecessor run leaves behind: its own accepted report, and
 // the reply its AICPU published to this worker.
-Handshake left_by_previous_resident_run() {
+Handshake left_by_previous_run() {
     Handshake handshake{};
     handshake.physical_core_id = kPhysicalCoreId;
     handshake.core_type = CoreType::AIC;
     handshake.aicore_done = kBlockIdx + 1;
     handshake.report_epoch = kRunN;
-    handshake.aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
+    handshake.aicpu_ready = kPublishedReply;
     handshake.task = kStaleContext;
     return handshake;
 }
@@ -62,9 +60,7 @@ Handshake left_by_previous_resident_run() {
 // can observe. `stage` and the marker store are the two production steps whose
 // order this file can check.
 void publish_native_report(Handshake *handshake, uint64_t epoch) {
-    aicore_stage_native_report(
-        handshake, kPhysicalCoreId, CoreType::AIC, kBlockIdx + 1, SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING
-    );
+    aicore_stage_native_report(handshake, kPhysicalCoreId, CoreType::AIC, kBlockIdx + 1, kPendingReply);
     handshake->report_epoch = epoch;
 }
 
@@ -106,7 +102,7 @@ TEST(HandshakeReportEpoch, WorkWindowDoesNotSurvivePhaseBufferReuse) {
 }
 
 TEST(HandshakeReportEpoch, APriorRunsReportIsRejected) {
-    const Handshake stale = left_by_previous_resident_run();
+    const Handshake stale = left_by_previous_run();
     EXPECT_TRUE(aicore_report_accepted(&stale, kRunN)) << "its own run must still accept it";
     EXPECT_FALSE(aicore_report_accepted(&stale, kRunNPlus1));
 }
@@ -133,16 +129,13 @@ TEST(HandshakeReportEpoch, AStampWithoutTheMarkerIsRejected) {
 // The reverse hand-off words are cleared by the production staging function, so
 // removing that reset breaks this case.
 TEST(HandshakeReportEpoch, NativeStagingClearsAPredecessorsReply) {
-    Handshake handshake = left_by_previous_resident_run();
-    ASSERT_EQ(handshake.aicpu_ready, SCHEDULER_RUNTIME_MODE_RESIDENT_READY) << "seed did not take";
+    Handshake handshake = left_by_previous_run();
+    ASSERT_EQ(handshake.aicpu_ready, kPublishedReply) << "seed did not take";
     ASSERT_EQ(handshake.task, kStaleContext);
 
-    aicore_stage_native_report(
-        &handshake, kPhysicalCoreId, CoreType::AIC, kBlockIdx + 1, SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING
-    );
+    aicore_stage_native_report(&handshake, kPhysicalCoreId, CoreType::AIC, kBlockIdx + 1, kPendingReply);
 
-    EXPECT_EQ(handshake.aicpu_ready, SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING)
-        << "a predecessor's READY survived this run's staging";
+    EXPECT_EQ(handshake.aicpu_ready, kPendingReply) << "a predecessor's READY survived this run's staging";
     EXPECT_EQ(handshake.task, 0u) << "a predecessor's context address survived this run's staging";
     EXPECT_EQ(handshake.physical_core_id, kPhysicalCoreId);
     EXPECT_EQ(handshake.aicore_done, kBlockIdx + 1);
@@ -152,11 +145,9 @@ TEST(HandshakeReportEpoch, NativeStagingClearsAPredecessorsReply) {
 // predecessor's epoch, so the AICPU cannot accept a half-published report —
 // which is what the barrier between the two steps exists to keep true.
 TEST(HandshakeReportEpoch, StagedPayloadIsNotAcceptableUntilTheMarkerIsWritten) {
-    Handshake handshake = left_by_previous_resident_run();
+    Handshake handshake = left_by_previous_run();
 
-    aicore_stage_native_report(
-        &handshake, kPhysicalCoreId, CoreType::AIC, kBlockIdx + 1, SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING
-    );
+    aicore_stage_native_report(&handshake, kPhysicalCoreId, CoreType::AIC, kBlockIdx + 1, kPendingReply);
     EXPECT_FALSE(aicore_report_accepted(&handshake, kRunNPlus1)) << "staging alone must not be acceptable";
     EXPECT_EQ(handshake.report_epoch, kRunN) << "staging must not touch the marker";
 
@@ -167,53 +158,12 @@ TEST(HandshakeReportEpoch, StagedPayloadIsNotAcceptableUntilTheMarkerIsWritten) 
 // An accepted native report always carries the cleared reply, because one
 // production function publishes both.
 TEST(HandshakeReportEpoch, AnAcceptedNativeReportCarriesNoPredecessorReply) {
-    Handshake handshake = left_by_previous_resident_run();
+    Handshake handshake = left_by_previous_run();
     publish_native_report(&handshake, kRunNPlus1);
 
     ASSERT_TRUE(aicore_report_accepted(&handshake, kRunNPlus1));
-    EXPECT_NE(handshake.aicpu_ready, SCHEDULER_RUNTIME_MODE_RESIDENT_READY);
+    EXPECT_NE(handshake.aicpu_ready, kPublishedReply);
     EXPECT_EQ(handshake.task, 0u);
-}
-
-// ---------------------------------------------------------------------------
-// When the AICPU may reply
-// ---------------------------------------------------------------------------
-
-TEST(HandshakeReportEpoch, NoReplyToAWorkerThatDidNotReport) {
-    SchedulerWorkerContext context{};
-    // `cores_[i].reg_addr` is zero for a worker this run never accepted.
-    EXPECT_FALSE(aicore_context_reply_permitted(&context, 0));
-    EXPECT_TRUE(aicore_context_reply_permitted(&context, kSomeRegAddr));
-}
-
-// The other half of the predicate. A null bootstrap context is the
-// mode-and-base verdict of `aicore_scheduler_bootstrap_context` — this run
-// carries no resident scheduler state. Whether configuration *succeeded* is an
-// outer gate in `AicpuExecutor::init`, which this predicate never sees.
-TEST(HandshakeReportEpoch, NoReplyWithoutResidentSchedulerState) {
-    EXPECT_FALSE(aicore_context_reply_permitted(nullptr, kSomeRegAddr))
-        << "a run with no resident scheduler state has no context to hand over";
-    EXPECT_FALSE(aicore_context_reply_permitted(nullptr, 0));
-}
-
-// Re-entry: a worker skipped by run N+1 must not be replied to on that run, and
-// must be replied to again once its own report is accepted on N+2.
-TEST(HandshakeReportEpoch, ASkippedWorkerIsRepliedToAgainOnItsNextAcceptedRun) {
-    SchedulerWorkerContext context{};
-    Handshake handshake = left_by_previous_resident_run();
-
-    // Run N+1: this worker never reported, so it is neither accepted nor
-    // replied to, and its line still holds run N's report.
-    EXPECT_FALSE(aicore_report_accepted(&handshake, kRunNPlus1));
-    EXPECT_FALSE(aicore_context_reply_permitted(&context, /*worker_reg_addr=*/0));
-    EXPECT_EQ(handshake.report_epoch, kRunN) << "a skipped worker's line is untouched";
-
-    // Run N+2: the core runs, stages over two-runs-old state, and is accepted.
-    publish_native_report(&handshake, kRunNPlus2);
-    EXPECT_FALSE(aicore_report_accepted(&handshake, kRunNPlus1)) << "the skipped run must still not match";
-    EXPECT_TRUE(aicore_report_accepted(&handshake, kRunNPlus2));
-    EXPECT_TRUE(aicore_context_reply_permitted(&context, kSomeRegAddr));
-    EXPECT_EQ(handshake.task, 0u) << "run N's context address must not survive into N+2";
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +201,7 @@ TEST(HandshakeReportEpoch, AKernelLaunchProjectsZeroAndKeepsTheOldPredicate) {
     handshake.aicore_done = kBlockIdx + 1;
     EXPECT_TRUE(aicore_report_accepted(&handshake, args.report_epoch));
 
-    Handshake carries_old_stamp = left_by_previous_resident_run();
+    Handshake carries_old_stamp = left_by_previous_run();
     EXPECT_TRUE(aicore_report_accepted(&carries_old_stamp, args.report_epoch))
         << "epoch 0 must not start rejecting on the stamp";
 }
@@ -276,7 +226,7 @@ TEST(HandshakeReportEpoch, TheWholeReportFitsOneCacheLine) {
 
 TEST(HandshakeReportEpoch, SerialReplayNeedsANewReportEvenWithTheSameEpoch) {
     for (bool cpu_first : {false, true}) {
-        Handshake handshake = left_by_previous_resident_run();
+        Handshake handshake = left_by_previous_run();
         for (int replay = 0; replay < 3; ++replay) {
             aicore_invalidate_retired_report(&handshake);
             EXPECT_EQ(handshake.aicpu_ready, 0u);
@@ -286,15 +236,15 @@ TEST(HandshakeReportEpoch, SerialReplayNeedsANewReportEvenWithTheSameEpoch) {
             if (cpu_first) EXPECT_FALSE(aicore_report_accepted(&handshake, kRunN));
             publish_native_report(&handshake, kRunN);
             EXPECT_TRUE(aicore_report_accepted(&handshake, kRunN));
-            EXPECT_EQ(handshake.aicpu_ready, SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
-            handshake.aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
+            EXPECT_EQ(handshake.aicpu_ready, kPendingReply);
+            handshake.aicpu_ready = kPublishedReply;
             handshake.task = kStaleContext;
         }
     }
 }
 
 TEST(HandshakeReportEpoch, RetirementInvalidatesUnstampedReportsWithoutErasingHistory) {
-    Handshake handshake = left_by_previous_resident_run();
+    Handshake handshake = left_by_previous_run();
     aicore_invalidate_retired_report(&handshake);
     EXPECT_FALSE(aicore_report_accepted(&handshake, 0));
     EXPECT_FALSE(aicore_report_accepted(&handshake, kRunN));

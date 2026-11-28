@@ -140,7 +140,7 @@ def test_invalid_hbg_measurement_is_rejected(tmp_path, mutation):
         perf.summarize(log, warmup=0, rounds=2 if mutation == "missing_round" else 1)
 
 
-def _trace(monkeypatch, producer="aicpu", identity=True, protocol=True):
+def _trace(monkeypatch, producer="aicore"):
     raw = {
         "metadata": {
             "runtime": "host_build_graph",
@@ -163,61 +163,37 @@ def _trace(monkeypatch, producer="aicpu", identity=True, protocol=True):
         "tasks": [{"dispatch_time_us": 1, "finish_time_us": 2}],
         "timeline_metadata": {"clock_alignment": {"status": "bounded"}, "cross_domain_latency_available": True},
     }
-    summary = {} if identity is None else {"block_identity_verified": identity}
-    if protocol is not None:
-        summary["protocol_verified"] = protocol
-    monkeypatch.setattr(runner, "validate_task_capture", lambda *args: (raw, parsed, summary))
+    monkeypatch.setattr(runner, "validate_task_capture", lambda *args: (raw, parsed, {"block_identity_verified": True}))
     return raw, parsed
 
 
-def test_aicpu_fallback_is_visible_and_fails_distributed_gate(monkeypatch):
+def test_l4_requires_aicore_scheduler_records(monkeypatch):
+    _trace(monkeypatch, "aicpu")
+    with pytest.raises(ValueError, match="Expected AICore scheduler records"):
+        runner.validate_trace(None, None, 4)
+
+
+def test_calendar_trace_passes_l4_gate(monkeypatch):
     _trace(monkeypatch)
     result = runner.validate_trace(None, None, 4)
-    assert result["scheduler_producer"] == "aicpu"
-    assert result["distributed_scheduler_verified"] is False
-    with pytest.raises(ValueError, match="Distributed scheduler required"):
-        runner.validate_trace(None, None, 4, require_aicore=True)
-
-
-def test_aicore_trace_passes_distributed_gate(monkeypatch):
-    _trace(monkeypatch, "aicore")
-    result = runner.validate_trace(None, None, 4, require_aicore=True)
     assert result["scheduler_producer"] == "aicore"
-    assert result["distributed_scheduler_verified"] is True
+    assert result["block_identity_verified"] is True
     assert result["clock_alignment_status"] == "bounded"
 
 
-@pytest.mark.parametrize("identity", (False, None))
-def test_resident_counts_without_explicit_block_identity_cannot_pass_strict_gate(monkeypatch, identity):
-    _trace(monkeypatch, "aicore", identity)
-    with pytest.raises(ValueError, match="identity"):
-        runner.validate_trace(None, None, 4, require_aicore=True)
-
-
-@pytest.mark.parametrize("protocol", (False, None))
-def test_resident_identity_without_native_causal_proof_cannot_pass_strict_gate(monkeypatch, protocol):
-    _trace(monkeypatch, "aicore", protocol=protocol)
-    with pytest.raises(ValueError, match="protocol"):
-        runner.validate_trace(None, None, 4, require_aicore=True)
-    assert runner.validate_trace(None, None, 4)["distributed_scheduler_verified"] is False
-
-
-def test_l1_cannot_establish_scheduler_provenance(monkeypatch):
-    raw, _ = _trace(monkeypatch, "aicore")
+def test_l1_uses_worker_identities_without_scheduler_phases(monkeypatch):
+    raw, _ = _trace(monkeypatch)
     raw["metadata"].pop("orchestrator_source")
     raw.pop("scheduler_tasks")
     raw.pop("host_orchestrator_phases")
     result = runner.validate_trace(None, None, 1)
     assert result["scheduler_producer"] is None
-    assert result["distributed_scheduler_verified"] is False
-    with pytest.raises(ValueError, match="Distributed scheduler required"):
-        runner.validate_trace(None, None, 1, require_aicore=True)
+    assert result["block_identity_verified"] is True
 
 
 @pytest.mark.parametrize(
     "mutation",
     [
-        "runtime",
         "producer",
         "records",
         "join",
@@ -233,16 +209,14 @@ def test_l1_cannot_establish_scheduler_provenance(monkeypatch):
 )
 def test_invalid_l4_capture_is_rejected(monkeypatch, mutation):
     raw, parsed = _trace(monkeypatch)
-    if mutation == "runtime":
-        raw["metadata"]["runtime"] = "tensormap_and_ringbuffer"
-    elif mutation == "producer":
+    if mutation == "producer":
         raw["scheduler_tasks"]["producer"] = None
     elif mutation == "records":
         raw["scheduler_tasks"]["records"] = []
     elif mutation == "join":
         parsed["tasks"][0]["finish_time_us"] = None
     elif mutation == "stream":
-        raw["scheduler_records"]["streams"][0]["producer"] = "aicore"
+        raw["scheduler_records"]["streams"][0]["producer"] = "aicpu"
     elif mutation in ("dropped", "truncated", "committed"):
         raw["scheduler_records"]["streams"][0]["capture"][mutation] = 5
     elif mutation == "host":

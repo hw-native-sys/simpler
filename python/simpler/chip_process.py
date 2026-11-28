@@ -208,7 +208,6 @@ def _main(bootstrap_fd: int, tracker_fd: int, startup_fd: int) -> None:
             collect_across_runs=data["collect_across_runs"],
             pipeline_depth_request=data["pipeline_depth_request"],
             automatic_admission=data["automatic_admission"],
-            startup_deadline=data["deadline"],
             fork_inherited=False,
             expected_parent_pid=data["parent_pid"],
             shared_heap_files=data["shared_heap_files"],

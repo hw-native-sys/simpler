@@ -1,5 +1,7 @@
 # A5 Graph task 性能与自主迭代流程
 
+> **历史文档。** 本页保留旧版A5 HBG resident 调度设计及其测量。文中的“当前”指当时的版本。现行协议见 [A5 HBG 日历调度](../../../../src/a5/runtime/host_build_graph/README.md)。
+
 **共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
 
 本页记录用户指定的早期实施策略，属于[实施门禁](implementation.md)的历史背景；当前性能门禁以主设计为准。

@@ -20,7 +20,7 @@ import pytest
 
 @pytest.fixture
 def clock_guard(monkeypatch):
-    path = Path(__file__).resolve().parents[3] / "st/a5/host_build_graph/dfx/chip_swimlane/test_scheduler_phases.py"
+    path = Path(__file__).resolve().parents[3] / "st/a5/host_build_graph/dfx/chip_swimlane/test_clock_alignment.py"
     spec = importlib.util.spec_from_file_location("_hbg_clock_guard_fixture", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

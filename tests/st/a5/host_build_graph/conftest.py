@@ -7,83 +7,43 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Check that each marked A5 HBG run publishes its own resident selection.
-
-    pytestmark = pytest.mark.scheduler_mode("resident")
-
-A marked test must bind a graph and publish a fresh mode for its invocation.
-A successful output alone does not establish which runtime executed the graph.
-"""
+"""Check that marked A5 HBG runs publish a fresh calendar selection."""
 
 import json
-import os
 from pathlib import Path
 
 import pytest
 
-# Mirrors SCHEDULER_RUNTIME_MODE_* in
-# src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_layout.h.
-_MODE_NAMES = {
-    0: "none",
-    1: "resident (pending)",
-    2: "resident (ready)",
-}
-_RESIDENT_MODES = frozenset({1, 2})
-_EXPECTED = {"resident": _RESIDENT_MODES}
+_CALENDAR_MODE = 5
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "scheduler_mode(kind): assert this test ran on the resident A5 HBG scheduler",
+        "scheduler_mode(kind): assert this test ran on the A5 HBG calendar",
     )
-
-
-def _expected_kind(request):
-    marker = request.node.get_closest_marker("scheduler_mode")
-    if marker is None:
-        return None
-    kind = marker.args[0] if marker.args else None
-    if kind not in _EXPECTED:
-        raise pytest.UsageError(f"scheduler_mode expects 'resident', got {kind!r}")
-    return kind
 
 
 @pytest.fixture(autouse=True)
 def _assert_scheduler_mode(request, st_platform):
-    kind = _expected_kind(request)
-    # Discovery mode: report what every test selected instead of checking marks,
-    # so the marks can be written from the measured distribution rather than
-    # guessed. A wrong guess is a false failure, which is worse than no mark.
-    report = os.environ.get("SIMPLER_REPORT_SCHEDULER_MODE") == "1"
-    worker = None
-    before = 0
-    if (kind is not None or report) and st_platform.startswith("a5") and "st_worker" in request.fixturenames:
-        worker = request.getfixturevalue("st_worker")
-        before = worker.scheduler_mode_publish_count
-
-    yield
-
-    if worker is None:
+    marker = request.node.get_closest_marker("scheduler_mode")
+    if marker is None:
+        yield
+        return
+    kind = marker.args[0] if marker.args else None
+    if kind != "calendar":
+        raise pytest.UsageError(f"scheduler_mode expects 'calendar', got {kind!r}")
+    if not st_platform.startswith("a5") or "st_worker" not in request.fixturenames:
+        yield
         return
 
-    published = worker.scheduler_mode_publish_count - before
+    worker = request.getfixturevalue("st_worker")
+    before = worker.scheduler_mode_publish_count
+    yield
+
+    assert worker.scheduler_mode_publish_count > before, "this run did not publish a fresh calendar selection"
     mode = worker.scheduler_runtime_mode
-    name = _MODE_NAMES.get(mode, f"unknown ({mode})")
-
-    if report:
-        print(f"\n[SCHEDULER-MODE] {request.node.nodeid} mode={mode} ({name}) published={published}")
-        if kind is None:
-            return
-
-    assert published > 0, (
-        f"test declares scheduler_mode({kind!r}) but published no scheduler selection of its own "
-        f"(latch reads {name}); either it bound no graph or this build does not export the hook"
-    )
-    assert mode in _EXPECTED[kind], (
-        f"test declares scheduler_mode({kind!r}) but ran on {name}; "
-        f"the current A5 HBG contract requires resident execution"
-    )
+    assert mode == _CALENDAR_MODE, f"calendar expected, reported scheduler mode {mode}"
 
 
 def _swimlane_records(output_prefix):

@@ -11,13 +11,12 @@
 import json
 
 import pytest
-
-from simpler_setup.tools.hbg.native_protocol import has_native_graph
+import torch
 
 from .helpers import CONDITION_LIMIT, Case, CounterRunner, Scenario, error_log_cursor, failure_evidence, l3_case
 
 pytestmark = [
-    pytest.mark.manual,  # Acceptance contracts awaiting resident async integration; run with --manual include.
+    pytest.mark.manual,  # Extended async acceptance contracts; run with --manual include.
     pytest.mark.platforms(["a5sim", "a5"]),
     pytest.mark.runtime("host_build_graph"),
     pytest.mark.device_count(1),
@@ -58,21 +57,13 @@ def test_capacity_overflow_is_not_success(st_platform, st_device_ids, tmp_path, 
         if scenario == Scenario.GRAPH:
             captures = list(runner.capture.rglob("chip_swimlane_records.json"))
             assert len(captures) == 1, captures
-            protocol = json.loads(captures[0].read_text())["aicore_protocol"]
-            assert protocol["schema"] == "hbg-native-protocol"
-            assert has_native_graph(protocol)
-            assert protocol["graph_source"] and protocol["node_map"], "missing native Graph identity"
-            assert protocol["producer"] == "aicore" and protocol["scheduler_error"] != 0
-            controls = {row["task_ref"]: row for row in protocol["task_controls"]}
-            exits = [row["node_ref"] for row in protocol["node_map"] if row["kind"] == 4]
-            assert len(exits) == instances
-            assert all(controls[ref]["state"] == 0 for ref in exits), "overflow released a Graph EXIT"
-            consumers = [task["task_ref"] for task in protocol["tasks"] if task["kernel_ids"] == [65535, 5, 65535]]
-            assert len(consumers) == 2 * instances, "missing inner or post-EXIT consumer"
-            assert all(controls[ref]["state"] == controls[ref]["completed_subtasks"] == 0 for ref in consumers)
-            assert not any(row["task_ref"] in consumers for row in protocol["executions"]), (
-                "overflow executed a consumer"
-            )
+            raw = json.loads(captures[0].read_text())
+            assert raw["metadata"]["scheduler_model"] == "calendar"
+            events = raw["calendar_task_events"]
+            assert any(row["kind"] == "graph_ready_observed" for row in events["range_records"])
+            assert not events["dropped"] and not events["unmatched_deferred_updates"]
+            assert not torch.count_nonzero(runner.records[runner.slots : runner.slots + instances, 0])
+            assert not torch.count_nonzero(runner.records[-instances:, 0]), "overflow released a Graph successor"
         runner.close_after_expected_error()
 
 

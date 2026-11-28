@@ -9,7 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Graph Execution preserves MIX active slots and multi-block SPMD metadata."""
 
-import json
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -17,7 +17,8 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
-from simpler_setup.tools.hbg.native_protocol import has_native_graph
+from simpler_setup.tools._runtime_dispatch import CALENDAR_MODEL
+from simpler_setup.tools.swimlane_converter import read_perf_data
 
 FLOATS_PER_CACHE_LINE = 16
 SLOTS_PER_BLOCK = 3
@@ -25,7 +26,7 @@ MAX_CLUSTERS = 36
 TOTAL_FLOATS = MAX_CLUSTERS * SLOTS_PER_BLOCK * FLOATS_PER_CACHE_LINE
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestGraphExecutionMixSpmdHostBuildGraphA5(SceneTestCase):
     RTOL = 0
@@ -111,22 +112,23 @@ class TestGraphExecutionMixSpmdHostBuildGraphA5(SceneTestCase):
             return
         captures = list(Path(kwargs["output_prefix"]).rglob("chip_swimlane_records.json"))
         assert len(captures) == 1, captures
-        protocol = json.loads(captures[0].read_text())["aicore_protocol"]
-        assert protocol["schema"] == "hbg-native-protocol"
-        assert has_native_graph(protocol)
-        assert protocol["graph_source"] and protocol["node_map"], "missing native Graph identity"
-        cohorts = [task for task in protocol["tasks"] if task["active_mask"] == 7 and task["flags"] & 16]
-        assert len(cohorts) == 3, "every Graph instance must contain its own MIX sync cohort"
-        requested = case["params"].get("blocks", 0)
-        expected = requested or protocol["cluster_count"]
-        assert all(task["block_num"] == expected for task in cohorts)
-        expected_executions = {(block, lane) for block in range(expected) for lane in range(SLOTS_PER_BLOCK)}
-        for task in cohorts:
-            executions = [row for row in protocol["executions"] if row["task_ref"] == task["task_ref"]]
-            assert len(executions) == len(expected_executions)
-            assert {(row["block_idx"], row["subtask_slot"]) for row in executions} == expected_executions
-        if requested:
-            assert 1 < requested < protocol["cluster_count"], "the selected cohort was not partial"
+        data = read_perf_data(captures[0])
+        assert data["scheduler_model"] == CALENDAR_MODEL
+        ranges = data["calendar_task_events"]["range_records"]
+        observed_shells = {event["graph_shell_id"] for event in ranges if event["kind"] == "graph_ready_observed"}
+        assert len(observed_shells) == 3
+        cohorts = defaultdict(list)
+        for row in data["tasks"]:
+            cohorts[row["task_id"]].append(row)
+        assert len(cohorts) == 3, "each Graph instance must execute its own MIX sync cohort"
+        for cohort in cohorts.values():
+            blocks = {row["block_num"] for row in cohort}
+            assert len(blocks) == 1
+            (count,) = blocks
+            assert count == case["params"].get("blocks", count)
+            expected = {(block, lane) for block in range(count) for lane in range(SLOTS_PER_BLOCK)}
+            assert len(cohort) == len(expected)
+            assert {(row["block_idx"], row["cluster_lane"]) for row in cohort} == expected
 
 
 if __name__ == "__main__":

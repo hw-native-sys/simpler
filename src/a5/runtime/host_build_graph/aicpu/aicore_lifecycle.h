@@ -19,7 +19,6 @@
 #include "common/platform_config.h"
 
 class Runtime;
-struct AicpuThreadLifecycleTrace;
 class AicoreLifecycleTestPeer;
 
 class AicoreLifecycle {
@@ -27,12 +26,8 @@ public:
     int32_t pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base);
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
     int32_t validate_discovery();
-    int32_t post_handshake_init(Runtime *runtime);
-    void publish_context_partition(Runtime *runtime, int32_t thread_idx);
+    int32_t initialize_pmu(Runtime *runtime);
     void publish_lifecycle_start() const;
-    void begin_bootstrap_wait(int32_t thread_idx);
-    void end_bootstrap_wait(int32_t thread_idx);
-    int32_t wait_bootstrap_complete(Runtime *runtime);
     int32_t release_partition(Runtime *runtime, int32_t thread_idx, bool start_execution);
     void signal_shutdown_partition(int32_t thread_idx);
     int32_t finish_shutdown_partition(int32_t thread_idx, Runtime *runtime);
@@ -85,28 +80,17 @@ private:
         CoreType core_type;
     };
 
-    struct ThreadHandshakeTiming {
-        uint64_t start_cycles;
-        uint64_t end_cycles;
-    };
-
     struct alignas(64) ThreadWorkWindow {
         AicoreWorkWindowAccumulator summary;
     };
 
-    AicpuThreadLifecycleTrace *thread_lifecycle_trace(int32_t thread_idx);
-    void collect_run_swimlane_records(Runtime *runtime);
-    bool collect_run_pmu_records(Runtime *runtime, uint64_t *missing_out);
-
     CoreState cores_[kMaxWorkers]{};
     uint32_t physical_core_ids_[kMaxWorkers]{};
-    ThreadHandshakeTiming thread_handshake_timing_[PLATFORM_MAX_AICPU_THREADS]{};
     ThreadWorkWindow thread_work_windows_[PLATFORM_MAX_AICPU_THREADS]{};
     std::atomic<bool> handshake_failed_{false};
     // Cores this run proved are no longer executing, counted only after their
     // acknowledged release. A missing startup report supplies no such proof.
     std::atomic<int32_t> retired_core_count_{0};
-    AicpuThreadLifecycleTrace *lifecycle_traces_{nullptr};
     bool pmu_initialized_{false};
     bool peer_dmb_group_{false};
     int32_t core_count_{0};

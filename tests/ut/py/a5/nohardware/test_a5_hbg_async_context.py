@@ -30,7 +30,6 @@ def async_context_binary(tmp_path_factory):
     includes = [
         ROOT / "src/a5/runtime/host_build_graph/runtime",
         ROOT / "src/a5/runtime/host_build_graph/common",
-        ROOT / "src/a5/runtime/host_build_graph/host",
         ROOT / "src/a5/platform/include",
         ROOT / "src/common/platform/include",
         ROOT / "src/common/task_interface",
@@ -48,7 +47,6 @@ def async_context_binary(tmp_path_factory):
             "-O1",
             *[f"-I{path}" for path in includes],
             str(Path(__file__).with_name("a5_hbg_async_context.cpp")),
-            str(ROOT / "src/a5/runtime/host_build_graph/host/async_completion_plan.cpp"),
             "-o",
             str(binary),
         ],
@@ -60,7 +58,7 @@ def async_context_binary(tmp_path_factory):
     return binary
 
 
-@pytest.mark.parametrize("scenario", range(37))
-def test_kernel_context_preserves_resident_and_absent_group_boundaries(async_context_binary, scenario):
+@pytest.mark.parametrize("scenario", range(35))
+def test_kernel_context_preserves_lane_and_defer_group_boundaries(async_context_binary, scenario):
     result = subprocess.run([str(async_context_binary), str(scenario)], check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr

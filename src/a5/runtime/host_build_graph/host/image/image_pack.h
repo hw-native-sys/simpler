@@ -12,122 +12,137 @@
 #pragma once
 
 #include <cstring>
-#include <new>
 
 #include "host_build_graph/shared_memory.h"
-#include "host_build_graph/host/graph_argument_layout.h"
-#include "task_image_types.h"
-#include "../../aicpu/task_image_status.h"
+#include "host_build_graph/graph_execution.h"
+#include "task_image_layout.h"
+#include "dispatch_payload.h"
+
+static_assert(sizeof(ChipTaskStorage) == SCHEDULER_GRAPH_TASK_STORAGE_STRIDE);
+static_assert(offsetof(ChipTaskStorage, payload) == SCHEDULER_GRAPH_PAYLOAD_OFFSET);
+static_assert(offsetof(TaskPayload, predicate) == SCHEDULER_GRAPH_PREDICATE_OFFSET);
+static_assert(offsetof(SharedMemoryHeader, sched_error_code) == TASK_IMAGE_ERROR_CODE_OFFSET);
 
 namespace task_image {
-using Storage = TaskImageStorage;
-inline constexpr bool native_graph_plan = true;
-
-inline sm_layout::SegmentOffsets segments(const sm_layout::BindUsage &used) {
-    sm_layout::SegmentOffsets out{};
-    uint64_t cursor = sizeof(TaskImageStatus);
-    out.storage = cursor;
-    cursor +=
-        CHIP_ALIGN_UP(sm_layout::live_slot_pitch(used.submitted_tasks) * sizeof(TaskImageStorage), CHIP_ALIGN_SIZE);
-    out.fanin_pool = cursor;
-    cursor += CHIP_ALIGN_UP(used.fanin_elems * sizeof(int32_t), CHIP_ALIGN_SIZE);
-    out.tensor_pool = cursor;
-    cursor += CHIP_ALIGN_UP(used.tensor_elems * sizeof(simpler::hbg::Tensor), CHIP_ALIGN_SIZE);
-    out.scalar_pool = cursor;
-    cursor += CHIP_ALIGN_UP(used.scalar_elems * sizeof(uint64_t), CHIP_ALIGN_SIZE);
-    out.end = cursor;
-    return out;
+using Storage = ChipTaskStorage;
+inline sm_layout::SegmentOffsets layout(const char *source, uint64_t capacity, const sm_layout::BindUsage &used) {
+    always_assert(used.submitted_tasks <= capacity);
+    auto result = sm_layout::segment_offsets(sm_layout::image_extents(used));
+    const auto from = sm_layout::segment_offsets(capacity);
+    const auto *storage = reinterpret_cast<const ChipTaskStorage *>(source + from.storage);
+    uint64_t boundary_scalars = 0;
+    for (uint64_t i = 0; i < used.submitted_tasks; ++i) {
+        if (storage[i].slot.task_kind != TaskKind::GRAPH) continue;
+        const int32_t count = storage[i].payload.scalar_count;
+        always_assert(count >= 0 && static_cast<uint64_t>(count) <= GRAPH_MAX_SCALAR_ARGS);
+        boundary_scalars += static_cast<uint64_t>(count);
+    }
+    result.end =
+        result.scalar_pool +
+        CHIP_ALIGN_UP(
+            used.submitted_tasks * sizeof(DispatchPayload) + boundary_scalars * sizeof(uint64_t), CHIP_ALIGN_SIZE
+        );
+    always_assert(used.submitted_tasks <= capacity && result.end <= static_cast<uint64_t>(INT32_MAX));
+    return result;
 }
-
-inline sm_layout::SegmentOffsets layout(const char *, uint64_t, const sm_layout::BindUsage &used) {
-    return segments(used);
-}
-
 inline uint64_t pack(
     const char *source, uint64_t capacity, const sm_layout::BindUsage &used, const sm_layout::HeapRebase &heap,
-    char *out, uint64_t
+    char *out, uint64_t device_base
 ) {
     const auto limits = sm_layout::mirror_extents(capacity);
     always_assert(
-        used.submitted_tasks <= capacity && used.fanin_elems <= limits.fanin_elems &&
-        used.tensor_elems <= limits.tensor_elems && used.scalar_elems <= limits.scalar_elems
+        used.submitted_tasks <= capacity && used.tensor_elems <= limits.tensor_elems &&
+        used.scalar_elems <= limits.scalar_elems && used.fanin_elems <= limits.fanin_elems
     );
     const auto from = sm_layout::segment_offsets(capacity);
-    const auto to = segments(used);
-    always_assert(to.end <= static_cast<uint64_t>(INT32_MAX));
-    const uint64_t records_end = to.storage + used.submitted_tasks * sizeof(TaskImageStorage);
-    std::memset(out, 0, to.storage);
-    std::memset(out + records_end, 0, to.fanin_pool - records_end);
-    new (out) TaskImageStatus{};
-    const auto copy_pool = [&](uint64_t destination, uint64_t origin, uint64_t bytes) {
+    const auto to = layout(source, capacity, used);
+    const auto copy = [&](uint64_t destination, uint64_t origin, uint64_t bytes) {
         std::memcpy(out + destination, source + origin, static_cast<size_t>(bytes));
-        const uint64_t padding = CHIP_ALIGN_UP(bytes, CHIP_ALIGN_SIZE) - bytes;
-        if (padding != 0) std::memset(out + destination + bytes, 0, static_cast<size_t>(padding));
     };
-    copy_pool(to.fanin_pool, from.fanin_pool, used.fanin_elems * sizeof(int32_t));
-    copy_pool(to.tensor_pool, from.tensor_pool, used.tensor_elems * sizeof(simpler::hbg::Tensor));
-    copy_pool(to.scalar_pool, from.scalar_pool, used.scalar_elems * sizeof(uint64_t));
-    const auto *source_storage = reinterpret_cast<const ChipTaskStorage *>(source + from.storage);
+    copy(0, 0, to.storage);
+    auto &tasks = reinterpret_cast<SharedMemoryHeader *>(out)->tasks;
+    tasks.task_storage = nullptr;
+    tasks.task_states = nullptr;
+    copy(to.storage, from.storage, used.submitted_tasks * sizeof(ChipTaskStorage));
+    copy(to.task_states, from.task_states, used.submitted_tasks * sizeof(std::atomic<ChipTaskState>));
+    copy(to.fanin_pool, from.fanin_pool, used.fanin_elems * sizeof(int32_t));
+    copy(to.tensor_pool, from.tensor_pool, used.tensor_elems * sizeof(simpler::hbg::Tensor));
+    std::memset(out + to.scalar_pool, 0, static_cast<size_t>(to.end - to.scalar_pool));
+    const auto *input = reinterpret_cast<const ChipTaskStorage *>(source + from.storage);
     const auto *source_tensors = reinterpret_cast<const simpler::hbg::Tensor *>(source + from.tensor_pool);
     const auto *source_scalars = reinterpret_cast<const uint64_t *>(source + from.scalar_pool);
     const auto *source_fanins = reinterpret_cast<const int32_t *>(source + from.fanin_pool);
+    auto *storage = reinterpret_cast<ChipTaskStorage *>(out + to.storage);
     auto *tensors = reinterpret_cast<simpler::hbg::Tensor *>(out + to.tensor_pool);
-    auto *scalars = reinterpret_cast<uint64_t *>(out + to.scalar_pool);
     auto *fanins = reinterpret_cast<int32_t *>(out + to.fanin_pool);
-    auto *records = reinterpret_cast<TaskImageStorage *>(out + to.storage);
+    auto *arguments = reinterpret_cast<DispatchPayload *>(out + to.scalar_pool);
+    auto *boundary = reinterpret_cast<uint64_t *>(arguments + used.submitted_tasks);
     for (uint64_t i = 0; i < used.submitted_tasks; ++i) {
-        std::memset(&records[i], 0, sizeof(records[i]));
-        auto &record = *new (&records[i]) TaskImageStorage{};
-        const auto &input = source_storage[i];
-        const auto &payload = input.payload;
-        record.task.task_id = input.task.task_id;
-        for (uint32_t lane = 0; lane < 3; ++lane)
-            record.task.kernel_id[lane] = input.task.kernel_id[lane];
-        record.payload.tensor_count = payload.tensor_count;
-        record.payload.scalar_count = payload.scalar_count;
-        record.payload.fanin_count = payload.fanin_count;
-        const auto *input_tensors = payload.tensor_data();
-        const auto *input_scalars = payload.scalar_data();
-        const auto *input_fanins = payload.fanin_data();
+        const auto &src = input[i].payload;
+        auto &dst = storage[i].payload;
+        const bool graph = input[i].slot.task_kind == TaskKind::GRAPH;
+        always_assert(src.tensor_count >= 0 && src.scalar_count >= 0 && src.fanin_count >= 0);
+        always_assert(graph || (src.tensor_count <= MAX_TENSOR_ARGS && src.scalar_count <= MAX_SCALAR_ARGS));
+        const auto *input_tensors = src.tensor_data();
+        const auto *input_scalars = src.scalar_data();
+        const auto *input_fanins = src.fanin_data();
         always_assert(
-            input_tensors == nullptr ||
-            (input_tensors >= source_tensors && input_tensors <= source_tensors + used.tensor_elems &&
-             static_cast<uint64_t>(payload.tensor_count) <= used.tensor_elems - (input_tensors - source_tensors))
+            src.tensor_count == 0 ||
+            (input_tensors != nullptr && input_tensors >= source_tensors &&
+             static_cast<uint64_t>(input_tensors - source_tensors) + src.tensor_count <= used.tensor_elems)
         );
         always_assert(
-            input_scalars == nullptr ||
-            (input_scalars >= source_scalars && input_scalars <= source_scalars + used.scalar_elems &&
-             static_cast<uint64_t>(payload.scalar_count) <= used.scalar_elems - (input_scalars - source_scalars))
+            src.scalar_count == 0 ||
+            (input_scalars != nullptr && input_scalars >= source_scalars &&
+             static_cast<uint64_t>(input_scalars - source_scalars) + src.scalar_count <= used.scalar_elems)
         );
         always_assert(
-            input_fanins == nullptr ||
-            (input_fanins >= source_fanins && input_fanins <= source_fanins + used.fanin_elems &&
-             static_cast<uint64_t>(payload.fanin_count) <= used.fanin_elems - (input_fanins - source_fanins))
+            src.fanin_count == 0 ||
+            (input_fanins != nullptr && input_fanins >= source_fanins &&
+             static_cast<uint64_t>(input_fanins - source_fanins) + src.fanin_count <= used.fanin_elems)
         );
-        record.payload.bind_regions(
-            input_tensors == nullptr ? nullptr : tensors + (input_tensors - source_tensors),
-            input_scalars == nullptr ? nullptr : scalars + (input_scalars - source_scalars),
-            input_fanins == nullptr ? nullptr : fanins + (input_fanins - source_fanins)
+        auto *task_tensors = src.tensor_count == 0 ? nullptr : tensors + (input_tensors - source_tensors);
+        auto *task_scalars = graph ? boundary : arguments[i].args + src.tensor_count;
+        dst.bind_regions(
+            task_tensors, task_scalars, src.fanin_count == 0 ? nullptr : fanins + (input_fanins - source_fanins)
         );
-        record.payload.predicate.addr = sm_layout::rebased_heap_addr(payload.predicate.addr, heap);
-        record.payload.predicate.target = payload.predicate.target;
-        record.payload.predicate.elem_size = payload.predicate.elem_size;
-        record.payload.predicate.op = static_cast<uint8_t>(payload.predicate.op);
+        if (src.scalar_count != 0)
+            std::memcpy(task_scalars, input_scalars, static_cast<size_t>(src.scalar_count) * sizeof(uint64_t));
+        if (graph) boundary += src.scalar_count;
+        else
+            for (int32_t j = 0; j < src.tensor_count; ++j)
+                arguments[i].args[j] =
+                    device_base + static_cast<uint64_t>(reinterpret_cast<char *>(&task_tensors[j]) - out);
+        storage[i].task.packed_buffer_base = reinterpret_cast<void *>(
+            sm_layout::rebased_heap_addr(reinterpret_cast<uint64_t>(storage[i].task.packed_buffer_base), heap)
+        );
+        storage[i].task.packed_buffer_end = reinterpret_cast<void *>(
+            sm_layout::rebased_heap_addr(reinterpret_cast<uint64_t>(storage[i].task.packed_buffer_end), heap)
+        );
+        dst.predicate.addr = sm_layout::rebased_heap_addr(dst.predicate.addr, heap);
     }
     for (uint64_t i = 0; i < used.tensor_elems; ++i) {
-        const auto owner = tensors[i].owner_task_id;
+        const TaskId owner = tensors[i].owner_task_id;
         always_assert(!owner.is_valid() || owner.is_global());
         tensors[i].buffer.addr = sm_layout::rebased_heap_addr(tensors[i].buffer.addr, heap);
     }
     return to.end;
 }
-
-inline const TaskImagePayload &payload(const void *image, const sm_layout::SegmentOffsets &layout, uint64_t task) {
-    return (reinterpret_cast<const TaskImageStorage *>(static_cast<const char *>(image) + layout.storage) + task)
-        ->payload;
+inline const ChipTaskStorage &task_at(const void *image, const sm_layout::SegmentOffsets &layout, uint64_t task) {
+    return reinterpret_cast<const ChipTaskStorage *>(static_cast<const char *>(image) + layout.storage)[task];
 }
-
+inline const TaskPayload &payload(const void *image, const sm_layout::SegmentOffsets &layout, uint64_t task) {
+    return task_at(image, layout, task).payload;
+}
 inline bool graph_storage_bytes(const Graph &definition, uint64_t *bytes) {
-    return graph_native_argument_storage_bytes(definition, bytes);
+    GraphExecutionStorageLayout layout{};
+    if (!graph_execution_storage_layout(
+            definition.task_count, definition.tensor_arg_count, definition.scalar_arg_count, definition.edge_count,
+            &layout, GraphArgumentStorage::KERNEL_ARGUMENTS
+        ) ||
+        layout.total_bytes > static_cast<size_t>(INT32_MAX))
+        return false;
+    *bytes = layout.total_bytes;
+    return true;
 }
 }  // namespace task_image

@@ -85,10 +85,5 @@ class TestHostMteHbg(_HostMteDomain):
     pass
 
 
-@scene_test(level=3, runtime="percounter")
-class TestHostMtePercounter(_HostMteDomain):
-    pass
-
-
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)

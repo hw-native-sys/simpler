@@ -43,8 +43,18 @@ TaskId consume(const View &predicate, const View &payload, const View &out, int3
     args.set_predicate(condition);
     return (core == 0 ? rt_submit_aic_task(0, args) : rt_submit_aiv_task(1, args)).task_id();
 }
+template <typename Tag>
+void publish(const View &signal, const View &predicate, const View &payload, Tag tag, const TaskId *dependency) {
+    CoreTaskArgs args;
+    args.add_no_dep(signal, predicate, payload);
+    args.add_scalar(2, tag);
+    if (dependency != nullptr) args.set_dependencies(dependency, 1);
+    rt_submit_aic_task(0, args);
+}
 void graph_body(const GraphTaskArgs &args, const Config &config) {
-    const auto waited = wait(args.tensor(0).ref(), nullptr);
+    const auto &signal = args.tensor(0).ref();
+    const auto waited = wait(signal, nullptr);
+    publish(signal, args.tensor(1).ref(), args.tensor(2).ref(), args.scalar(0), nullptr);
     (void)consume(args.tensor(1).ref(), args.tensor(2).ref(), args.tensor(3).ref(), config.core, waited);
 }
 }  // namespace
@@ -83,16 +93,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             GraphTaskArgs call;
             call.add_input(signal, predicate, payload);
             call.add_inout(out);
+            call.add_scalar(static_cast<int64_t>(instance * 2 + target));
             consumed = rt_submit_graph(&graph_body, call, Config{core}).task_id;
         } else {
             const auto waited = wait(signal, &warmed);
+            publish(signal, predicate, payload, static_cast<int64_t>(instance * 2 + target), &warmed);
             consumed = consume(predicate, payload, out, core, waited);
         }
-        CoreTaskArgs publisher;
-        publisher.add_no_dep(signal, predicate, payload);
-        publisher.add_scalar(2, static_cast<int64_t>(instance * 2 + target));
-        publisher.set_dependencies(&warmed, 1);
-        (void)rt_submit_aiv_task(1, publisher);
         CoreTaskArgs tail;
         tail.add_no_dep(payload, payload, out);
         tail.set_dependencies(&consumed, 1);

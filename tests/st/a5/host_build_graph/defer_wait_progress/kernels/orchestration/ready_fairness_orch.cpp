@@ -26,7 +26,7 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
     CoreTaskArgs waiter_args;
     waiter_args.add_no_dep(out);
     waiter_args.add_scalar(0, 0, chain_width);
-    const TaskId waiter = rt_submit_aiv_task(0, waiter_args).task_id();
+    const TaskId waiter = rt_submit_aic_task(1, waiter_args).task_id();
     always_assert(waiter.local_id() == 0);
     CoreTaskArgs started_args;
     started_args.add_no_dep(out);
@@ -48,5 +48,5 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
     consumer.add_no_dep(out);
     consumer.add_scalar(2, 0, chain_width);
     consumer.set_dependencies(&waiter, 1);
-    (void)rt_submit_aiv_task(0, consumer);
+    (void)rt_submit_aic_task(1, consumer);
 }

@@ -49,7 +49,7 @@ first.
 
 from __future__ import annotations
 
-from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, PERCOUNTER_RUNTIME, get, resolve_runtime
+from simpler_setup.tools._runtime_dispatch import CALENDAR_MODEL, HBG_RUNTIME, get, resolve_runtime
 
 _DEFAULT_CLOCK_FREQ_HZ = 50_000_000
 # The arch a stream reports. Fixed because it is a label on the capture rather
@@ -74,7 +74,7 @@ def sched_record(*, phase, start, end, run_epoch=0, **fields):
     }
 
 
-def legal_phase_names(runtime_name, producer=None):
+def legal_phase_names(runtime_name, producer=None, scheduler_model=None):
     """Every phase name a capture of this runtime may carry, narrowed to one producer if given.
 
     Read from the runtime's own wire vocabulary (``PHASES`` / ``PHASES_BY_PRODUCER``)
@@ -90,7 +90,7 @@ def legal_phase_names(runtime_name, producer=None):
     Raises:
         ValueError: this runtime records no stream with that producer.
     """
-    runtime = get(runtime_name)
+    runtime = get(runtime_name, scheduler_model)
     if producer is None:
         return runtime.PHASES
     try:
@@ -109,12 +109,15 @@ class Capture:
         self,
         *,
         runtime,
+        scheduler_model=None,
         level=2,
         clock_freq_hz=_DEFAULT_CLOCK_FREQ_HZ,
         core_types=("aiv",),
         scheduler_producer="aicpu",
     ):
         self.runtime = resolve_runtime(runtime, source="Capture(runtime=...)")
+        get(self.runtime, scheduler_model)
+        self.scheduler_model = scheduler_model
         self.level = level
         self.clock_freq_hz = clock_freq_hz
         self.core_types = list(core_types)
@@ -125,7 +128,7 @@ class Capture:
         self._aicpu_orch_phases = {}
         self._host_uploads = []
         self._lifecycle_records = []
-        self._metadata_extra = {}
+        self._metadata_extra = {} if scheduler_model is None else {"scheduler_model": scheduler_model}
         # Who timed the per-task rows. Below the level that captures phase
         # streams this is all a capture says about its scheduler, so it is
         # stated here; adding an AICore stream sets it to match.
@@ -218,7 +221,7 @@ class Capture:
         if reg_task_id is None:
             self._next_reg_task_id += 1
         row = [core_id, task_id, reg, start, end, receive_to_start, run_epoch]
-        if self.runtime == "percounter":
+        if self.scheduler_model == CALENDAR_MODEL:
             row.extend((0, 1))
         self._aicore_rows.append(row)
         return self
@@ -253,7 +256,7 @@ class Capture:
             ValueError: this runtime's named producer does not record this phase, or
                 the thread's stream already belongs to a different producer.
         """
-        legal = legal_phase_names(self.runtime, producer)
+        legal = legal_phase_names(self.runtime, producer, self.scheduler_model)
         if phase not in legal:
             raise ValueError(
                 f"{self.runtime}'s {producer} producer does not record the phase {phase!r}; "
@@ -322,10 +325,10 @@ class Capture:
         Raises:
             ValueError: this runtime has no AICore scheduler.
         """
-        if self.runtime not in (HBG_RUNTIME, PERCOUNTER_RUNTIME):
+        if self.runtime != HBG_RUNTIME:
             raise ValueError(
                 f"{self.runtime} has no AICore scheduler, so it records no stream with producer 'aicore'. "
-                "host_build_graph and percounter schedule on AICore."
+                "host_build_graph on A5 schedules on AICore."
             )
         self.sched_phase(
             phase=phase,

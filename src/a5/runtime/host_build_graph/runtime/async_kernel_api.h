@@ -91,17 +91,18 @@ inline __aicore__ void defer_flush(AsyncCtx &ctx) {
 }  // namespace pto2::detail
 
 inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
+    // Mark before validation: failed or unfinished registration still needs sealing.
+    simpler::percounter::percounter_current_context()->async_touched = 1;
     AsyncCtx ctx{};
-    const auto *global =
-        reinterpret_cast<__gm__ const GlobalContext *>(static_cast<uintptr_t>(args[PAYLOAD_GLOBAL_CONTEXT_INDEX]));
-    ctx.resident_enabled = global->async_present;
+    const GlobalContext global = load_global_context(args);
+    ctx.resident_enabled = global.async_present;
     if (ctx.resident_enabled != 0) {
-        ctx.resident.image = reinterpret_cast<__gm__ uint8_t *>(global->async_image_address);
-        ctx.resident.image_bytes = global->async_image_bytes;
-        ctx.resident.run_epoch = global->async_run_epoch;
-        ctx.resident.group_offset = global->async_group_offset;
-        ctx.resident.group_index = global->async_group_index;
-        if (ctx.resident_enabled != 1 || global->async_output_capture_refused != 0) {
+        ctx.resident.image = reinterpret_cast<__gm__ uint8_t *>(global.async_image_address);
+        ctx.resident.image_bytes = global.async_image_bytes;
+        ctx.resident.run_epoch = global.async_run_epoch;
+        ctx.resident.group_offset = global.async_group_offset;
+        ctx.resident.group_index = global.async_group_index;
+        if (ctx.resident_enabled != 1 || global.async_output_capture_refused != 0) {
             pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
             ctx.resident_enabled = UINT32_MAX;
             return ctx;

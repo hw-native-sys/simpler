@@ -76,7 +76,7 @@ BARRIER_WAIT_MS = 1000
 COHORT_BLOCKS = 8
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestSpmdSyncStartMixAiv(SceneTestCase):
     RTOL = 0

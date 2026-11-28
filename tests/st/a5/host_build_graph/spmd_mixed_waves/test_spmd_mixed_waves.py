@@ -69,7 +69,7 @@ def _plan(rounds, width, seed):
     return plan
 
 
-@pytest.mark.scheduler_mode("resident")
+@pytest.mark.scheduler_mode("calendar")
 @scene_test(level=2, runtime="host_build_graph")
 class TestSpmdMixedWaves(SceneTestCase):
     RTOL = 0

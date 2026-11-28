@@ -20,7 +20,7 @@ import torch
 from simpler_setup import SceneTestCase
 from simpler_setup.scene_test import _discover_module_test_classes
 
-_FIXTURE_PATH = Path(__file__).resolve().parents[5] / "fdwic/pa_hbg/spmd/test_async_boundary.py"
+_FIXTURE_PATH = Path(__file__).resolve().parents[5] / "support/a5/host_build_graph/spmd/async_boundary.py"
 
 
 @pytest.fixture(scope="module")
@@ -35,7 +35,7 @@ def async_native():
         yield module
 
 
-def _invoke_fixture(monkeypatch, native, *, mode=2, increments=(1, 1, 1), rounds=1, corruption=None, skip=None):
+def _invoke_fixture(monkeypatch, native, *, mode=5, increments=(1, 1, 1), rounds=1, corruption=None, skip=None):
     test = native.TestHbgAsyncBoundary()
     case = {
         "name": "cpu_guard",
@@ -99,7 +99,7 @@ def test_async_golden_records_every_active_slot_and_preserves_satisfied_counters
                     assert torch.count_nonzero(row).item() == 0
 
 
-@pytest.mark.parametrize("mode", (1, 2))
+@pytest.mark.parametrize("mode", (5,))
 @pytest.mark.parametrize("rounds", (1, 2, 3, 5))
 def test_async_fixture_reuses_same_worker_and_callable_for_at_least_three_validated_rounds(
     monkeypatch, async_native, mode, rounds
@@ -113,9 +113,9 @@ def test_async_fixture_reuses_same_worker_and_callable_for_at_least_three_valida
     assert test._contract_publish_count == worker.scheduler_mode_publish_count == 10 + count
 
 
-@pytest.mark.parametrize("mode", (0, 3, 4, 5, -1))
-def test_async_fixture_rejects_nonresident_with_correct_records(monkeypatch, async_native, mode):
-    with pytest.raises(AssertionError, match="resident required"):
+@pytest.mark.parametrize("mode", (0, 2, 3, 4, -1))
+def test_async_fixture_rejects_noncalendar_with_correct_records(monkeypatch, async_native, mode):
+    with pytest.raises(AssertionError, match="calendar required"):
         _invoke_fixture(monkeypatch, async_native, mode=mode)
 
 

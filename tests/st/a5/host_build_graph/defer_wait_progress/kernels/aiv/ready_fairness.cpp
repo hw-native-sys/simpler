@@ -12,7 +12,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "async_kernel_api.h"
-#include "scheduler/scheduler_memory.h"
+#include "scheduler/gm.h"
 #include "tensor.h"
 
 namespace {
@@ -29,22 +29,19 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     auto ctx = get_async_ctx(args);
     if (role == 0) {
         save_expected_notification_counter(ctx, reinterpret_cast<__gm__ int32_t *>(out), 1);
-        scheduler_gm_store(out[kLineWords], UINT32_C(1));
+        percounter_gm_store(out[kLineWords], UINT32_C(1));
     } else if (role == 1) {
         // The first background task returns physically but stays logically
         // pending until the waiter-dependent consumer acknowledges it.
         if (index == 0)
             save_expected_notification_counter(ctx, reinterpret_cast<__gm__ int32_t *>(out + 3 * kLineWords), 1);
-        const bool predecessor_acknowledged =
-            index != chain_width || scheduler_gm_query_u32_pair(out + 3 * kLineWords) == 1;
-        scheduler_gm_store(out[(index + 4) * kLineWords], predecessor_acknowledged ? index + 1 : 0);
-        if (index == 0) scheduler_gm_store(out[0], UINT32_C(1));
+        const bool predecessor_acknowledged = index != chain_width || percounter_gm_read(out[3 * kLineWords]) == 1;
+        percounter_gm_store(out[(index + 4) * kLineWords], predecessor_acknowledged ? index + 1 : 0);
+        if (index == 0) percounter_gm_store(out[0], UINT32_C(1));
     } else if (role == 2) {
         // This dependency consumes the runtime's actual completion source.
-        scheduler_gm_store(
-            out[2 * kLineWords], static_cast<uint32_t>(scheduler_gm_query_u32_pair(out + 4 * kLineWords))
-        );
-        scheduler_gm_store(out[3 * kLineWords], static_cast<uint32_t>(scheduler_gm_query_u32_pair(out)));
+        percounter_gm_store(out[2 * kLineWords], percounter_gm_read(out[4 * kLineWords]));
+        percounter_gm_store(out[3 * kLineWords], percounter_gm_read(out[0]));
     } else if (role == 3) {
         save_expected_notification_counter(ctx, reinterpret_cast<__gm__ int32_t *>(out + kLineWords), 1);
     }

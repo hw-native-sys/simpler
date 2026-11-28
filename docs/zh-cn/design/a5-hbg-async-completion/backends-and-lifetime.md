@@ -1,5 +1,7 @@
 # A5 HBG 异步后端与资源生命周期
 
+> **历史文档。** 本页保留旧版A5 HBG resident 调度的异步完成设计及其验证。文中的“当前”指当时的版本。现行协议见 [A5 HBG 日历调度](../../../../src/a5/runtime/host_build_graph/README.md)。
+
 **共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
 
 [返回总览](../a5-hbg-async-completion.md)。延迟逻辑完成、资源持有、数据可见性是三个相互关联的要求，分别验证，优先复用现有机制。

@@ -20,7 +20,7 @@ import torch
 
 @pytest.fixture(scope="module")
 def native_cla():
-    path = Path(__file__).resolve().parents[5] / "fdwic/pa_hbg/spmd/test_cla_hbg.py"
+    path = Path(__file__).resolve().parents[5] / "support/a5/host_build_graph/spmd/cla_graph.py"
     spec = importlib.util.spec_from_file_location("_cla_hbg_fixture", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -85,14 +85,14 @@ def test_delaying_first_block_does_not_redefine_task_completion_as_last_index(na
     assert torch.count_nonzero(variant[:, 7]).item() == 0
 
 
-@pytest.mark.parametrize("mode", [0, 3, 4, 5])
+@pytest.mark.parametrize("mode", [0, 2, 3, 4])
 def test_native_gate_rejects_legacy_even_after_all_outputs_pass(native_cla, mode):
     test = native_cla.TestClaHbgContract()
     expected = test.generate_args({})
     test.compute_golden(expected, {})
     test._cla_worker = SimpleNamespace(scheduler_runtime_mode=mode, scheduler_mode_publish_count=2)
     test._cla_count = 1
-    with pytest.raises(AssertionError, match="resident required"):
+    with pytest.raises(AssertionError, match="calendar required"):
         test.compare_outputs(expected.clone(), expected, ["records"], {})
 
 
@@ -102,17 +102,17 @@ def test_early_consumer_sentinel_cannot_be_repaired_by_later_correct_outputs(nat
     test.compute_golden(expected, {})
     actual = expected.clone()
     actual.records[12] = 1
-    test._cla_worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=2)
+    test._cla_worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=2)
     test._cla_count = 1
     with pytest.raises(AssertionError, match="predecessors are incomplete"):
         test.compare_outputs(actual, expected, ["records"], {})
 
 
-def test_stale_resident_latch_is_not_a_pass(native_cla):
+def test_stale_calendar_latch_is_not_a_pass(native_cla):
     test = native_cla.TestClaHbgContract()
     args = test.generate_args({})
     test.compute_golden(args, {})
-    test._cla_worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=1)
+    test._cla_worker = SimpleNamespace(scheduler_runtime_mode=5, scheduler_mode_publish_count=1)
     test._cla_count = 1
     with pytest.raises(AssertionError, match="no fresh scheduler publication"):
         test.compare_outputs(args, args, ["records"], {})

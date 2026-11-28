@@ -422,7 +422,7 @@ def capture_windows(data):
     scheduler_tasks = data.get("scheduler_tasks") or {}
     for row in scheduler_tasks.get("records") or []:
         cycles.extend(int(value) for value in row[2:4])
-    for record in (data.get("percounter_task_events") or {}).get("records", []):
+    for record in (data.get("calendar_task_events") or {}).get("records", []):
         cycles.extend((record["cycles"], record.get("kernel_start_cycles", 0)))
     scheduler_streams = list(_scheduler_phase_streams(data))
     for _producer, records in scheduler_streams:

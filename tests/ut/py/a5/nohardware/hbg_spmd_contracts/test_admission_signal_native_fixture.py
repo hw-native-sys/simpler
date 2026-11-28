@@ -19,7 +19,7 @@ import pytest
 
 @pytest.fixture(scope="module")
 def native():
-    path = Path(__file__).resolve().parents[5] / "fdwic/pa_hbg/spmd/test_admission_signal_publication.py"
+    path = Path(__file__).resolve().parents[5] / "support/a5/host_build_graph/spmd/admission_signal_publication.py"
     with pytest.MonkeyPatch.context() as patch:
         patch.syspath_prepend(str(path.parent))
         spec = importlib.util.spec_from_file_location("_admission_signal_native_fixture", path)
@@ -74,8 +74,8 @@ def test_every_lane_record_and_guard_is_checked(native, word):
         native.validate_probe(controls, checks, params)
 
 
-@pytest.mark.parametrize("mode,count", ((3, 2), (4, 2), (0, 2), (2, 1)))
-def test_real_comparator_requires_fresh_resident_provenance(native, mode, count):
+@pytest.mark.parametrize("mode,count", ((3, 2), (4, 2), (0, 2), (5, 1)))
+def test_real_comparator_requires_fresh_calendar_provenance(native, mode, count):
     params = dict(blocks=1, rounds=1, shared=1, epoch=0)
     controls, checks = native.expected_probe(params)
     probe = native.TestHbgAdmissionSignalPublication()

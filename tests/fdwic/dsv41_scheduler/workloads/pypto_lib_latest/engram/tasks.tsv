@@ -1,4 +1,0 @@
-# source_task_id kernel_names lane_mask block_num deferred
-71	_engram_quantize	2	64	0
-72	_engram_project	1	32	0
-73	_engram_gate_native	2	64	0

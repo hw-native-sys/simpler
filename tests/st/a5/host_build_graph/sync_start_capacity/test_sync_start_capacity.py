@@ -10,9 +10,9 @@
 """Public sync_start normalization and capacity refusal through the real Host submit path."""
 
 import importlib.util
-import json
 import sys
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,14 +21,14 @@ import torch
 from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.tools.hbg.native_protocol import has_native_graph
+from simpler_setup.tools._runtime_dispatch import CALENDAR_MODEL
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 pytestmark = [
     pytest.mark.platforms(["a5sim", "a5"]),
     pytest.mark.device_count(1),
     pytest.mark.runtime("host_build_graph"),
-    pytest.mark.scheduler_mode("resident"),
+    pytest.mark.scheduler_mode("calendar"),
 ]
 
 # Each mask holds a device for a process of its own. A simulator run carries
@@ -46,7 +46,7 @@ def _mask_params():
 
 @pytest.fixture(scope="module")
 def sync_probe():
-    source = Path(__file__).resolve().parents[4] / "fdwic/pa_hbg/spmd/test_spmd_contract.py"
+    source = Path(__file__).resolve().parents[4] / "support/a5/host_build_graph/spmd/spmd_contract.py"
     spec = importlib.util.spec_from_file_location("_sync_capacity_probe", source)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -77,57 +77,23 @@ def _close_worker(worker, buffers):
 
 
 def _check_normalized_capture(path, mask):
-    parsed = read_perf_data(str(path))
-    assert parsed["protocol_audit"]["protocol_verified"], parsed["protocol_audit"]
-    raw = json.loads(path.read_text())
-    protocol = raw["aicore_protocol"]
-    assert protocol["producer"] == "aicore"
-    assert protocol.get("schema") == "hbg-native-protocol" and not has_native_graph(protocol)
-    tasks = [
-        task
-        for task in protocol["tasks"]
-        if any(kernel in (0, 1, 2) for kernel in task["kernel_ids"]) and task["active_mask"]
-    ]
-    assert len(tasks) == 2
-    normalized_mask = 2 if mask == 4 else mask
-    mixed = mask.bit_count() > 1
-    kernel_ids = [slot if mask & (1 << slot) else 65535 for slot in range(3)]
-    if mask == 4:
-        kernel_ids[1:3] = [2, 65535]
-    for task in tasks:
-        assert task["block_num"] == 1
-        assert task["active_mask"] == normalized_mask
-        assert task["kernel_ids"] == kernel_ids
-        assert task["flags"] & (8 | 16) == 0, "N=1 must not carry SPMD or SYNC_START metadata"
-        assert bool(task["flags"] & 4) == mixed
-    refs = {task["task_ref"] for task in tasks}
-    executions = [entry for entry in protocol["executions"] if entry["task_ref"] in refs]
-    expected = {(ref, 0, slot) for ref in refs for slot in range(3) if normalized_mask & (1 << slot)}
-    actual = [(entry["task_ref"], entry["block_idx"], entry["subtask_slot"]) for entry in executions]
-    assert len(actual) == len(expected) and set(actual) == expected
-    assert all(entry["block_num"] == 1 for entry in executions)
-    assert len(raw["aicore_tasks"]) == len(expected) + 1  # The final kernel checks real fanin.
-    assert protocol["sync_mix_task_count"] == 0
-    assert protocol["members"] == []
-    assert protocol["cooperative_task_count"] == protocol["mix_task_count"] == (2 if mixed else 0)
-    groups = [block for block in protocol["blocks"] if block["owner"]["task_ref"] in refs]
-    if mixed:
-        resource_lanes = {lane for lane in range(3) if mask & (1 << lane)}
-        workers = {row["index"]: row for row in protocol["workers"]}
-        assert len(groups) == 2
-        assert {group["owner"]["task_ref"] for group in groups} == refs
-        for group in groups:
-            assert len(group["lanes"]) == len(resource_lanes)
-            assert {lane["lane"] for lane in group["lanes"]} == resource_lanes
-            owner = group["owner"]
-            cluster_workers = workers[owner["worker_index"]]["cluster_workers"]
-            assert owner["worker_index"] == cluster_workers[1]
-            accountant = 1 if 1 in resource_lanes else min(resource_lanes)
-            assert owner["completion_worker"] == cluster_workers[accountant]
-            assert all(lane["resource_mask"] == mask for lane in group["lanes"])
-            assert all(lane["active_mask"] == mask for lane in group["lanes"])
-    else:
-        assert not groups
+    parsed = read_perf_data(path)
+    assert parsed["scheduler_model"] == CALENDAR_MODEL
+    cohorts = defaultdict(list)
+    for row in parsed["tasks"]:
+        cohorts[row["task_id"]].append(row)
+    assert len(cohorts) == 3  # Two roots and the fanin verifier.
+    roots = [cohort for _, cohort in sorted(cohorts.items())[:2]]
+    roles = {lane for lane in range(3) if mask & (1 << lane)}
+    for cohort in roots:
+        assert len(cohort) == len(roles)
+        assert all(row["block_idx"] == 0 and row["block_num"] == 1 for row in cohort)
+        assert len({row["cluster_index"] for row in cohort}) == 1
+        physical_lanes = {row["cluster_lane"] for row in cohort}
+        if roles in ({1}, {2}):
+            assert len(physical_lanes) == 1 and physical_lanes <= {1, 2}
+        else:
+            assert physical_lanes == roles
 
 
 @pytest.mark.parametrize("mask", _mask_params())
@@ -156,7 +122,7 @@ def test_single_block_sync_request_preserves_execution(st_platform, st_device_id
             config.output_prefix = str(prefix)
             before = worker.scheduler_mode_publish_count
             worker.run(handle, args, config)
-            sync_probe.require_fresh_resident(worker, before)
+            sync_probe.require_fresh_calendar(worker, before)
             for buffer, value in zip(buffers, values, strict=True):
                 worker.copy_from(value, buffer)
             torch.testing.assert_close(values[0], expected.records, rtol=0, atol=0)

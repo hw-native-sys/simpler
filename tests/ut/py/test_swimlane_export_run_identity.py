@@ -30,7 +30,7 @@ from pathlib import Path
 import pytest
 from _capture_builder import Capture
 
-from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, TMR_RUNTIME
+from simpler_setup.tools._runtime_dispatch import CALENDAR_MODEL, HBG_RUNTIME, TMR_RUNTIME
 from simpler_setup.tools.swimlane_converter import (
     generate_chrome_trace_json,
     read_perf_data,
@@ -141,10 +141,15 @@ def test_every_exported_row_carries_an_epoch(tmp_path, arch, runtime):
     path = _export_two_runs(tmp_path, arch, runtime)
     data = json.loads(path.read_text())
     assert data["metadata"]["runtime"] == runtime, "the exporter must name the runtime it was built for"
+    calendar = arch == "a5" and runtime == HBG_RUNTIME
+    columns = 9 if calendar else 7
+    assert data["metadata"].get("scheduler_model") == (CALENDAR_MODEL if calendar else None)
     assert len(data["aicore_tasks"]) == 6
     for row in data["aicore_tasks"]:
-        assert len(row) == 7, f"aicore_tasks row is not seven columns: {row}"
+        assert len(row) == columns, f"aicore_tasks row must have {columns} columns: {row}"
         assert row[6] in (7, 8), f"row carries an unexpected epoch: {row}"
+        if calendar:
+            assert row[7:] == [0, 1]
     for row in data["scheduler_tasks"]["records"]:
         assert len(row) == 5, f"scheduler_tasks row is not five columns: {row}"
         assert row[4] in (7, 8)

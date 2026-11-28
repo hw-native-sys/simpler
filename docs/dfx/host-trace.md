@@ -210,7 +210,7 @@ device-log lines. A phase that was never stamped
 (0 ns) is skipped — e.g. `so_load` is ~0 on a cached-callable run. See
 [device-phases.md](device-phases.md) for the device-side mechanism.
 
-The A5 HBG and percounter runtimes also emit `chip.run.runner_run.aicore_wall`, shown
+A5 HBG also emits `chip.run.runner_run.aicore_wall`, shown
 as `AICore` by `strace_timing --rounds-table`, independently of L1 collection.
 Each core records its first actual business-kernel begin and its latest
 business-kernel end, after the output store barrier. The chip window is

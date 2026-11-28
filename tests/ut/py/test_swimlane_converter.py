@@ -23,7 +23,7 @@ from _task_ids import tmr_task as _tmr
 
 from simpler_setup.tools import containment
 from simpler_setup.tools import swimlane_converter as sc
-from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, TMR_RUNTIME
+from simpler_setup.tools._runtime_dispatch import CALENDAR_MODEL, HBG_RUNTIME, TMR_RUNTIME
 from simpler_setup.tools.strace_timing import parse_spans, to_host_swimlane
 
 # Every capture names the runtime whose TaskId layout its ids follow — the collector
@@ -100,14 +100,17 @@ def _task_row(
 
 
 @pytest.mark.parametrize("recorded_window", [False, True])
-@pytest.mark.parametrize("runtime", [HBG_RUNTIME, "percounter", TMR_RUNTIME])
-def test_l1_worker_order_counts_idle_cores(tmp_path, runtime, recorded_window):
+@pytest.mark.parametrize(
+    "runtime,scheduler_model",
+    [(HBG_RUNTIME, None), (HBG_RUNTIME, CALENDAR_MODEL), (TMR_RUNTIME, None)],
+)
+def test_l1_worker_order_counts_idle_cores(tmp_path, runtime, scheduler_model, recorded_window):
     core_types = ["aic"] * 32 + ["aiv"] * 64
     workers = (2, 10, 31, 32, 42, 95)
-    if runtime == HBG_RUNTIME:
+    if runtime == HBG_RUNTIME and scheduler_model is None:
         core_types = ["aiv", "aic", "aiv"] * 32
         workers = (7, 31, 94, 0, 15, 95)
-    capture = Capture(runtime=runtime, level=1, core_types=core_types)
+    capture = Capture(runtime=runtime, scheduler_model=scheduler_model, level=1, core_types=core_types)
     for worker in reversed(workers):
         capture.aicore_task(task_id=worker, core_id=worker, start=10, end=20)
     if recorded_window:
@@ -117,6 +120,7 @@ def test_l1_worker_order_counts_idle_cores(tmp_path, runtime, recorded_window):
         data["tasks"],
         tmp_path / "trace.json",
         runtime_name=runtime,
+        scheduler_model=scheduler_model,
         chip_swimlane_level=1,
         timeline_metadata=data.get("timeline_metadata"),
     )
@@ -137,8 +141,8 @@ def test_l1_worker_order_counts_idle_cores(tmp_path, runtime, recorded_window):
     assert tuple(drawn[tid] for _, tid in order) == workers
 
 
-@pytest.mark.parametrize("runtime", [HBG_RUNTIME, "percounter"])
-def test_l2_worker_flows_through_unmeasured_dependency_only_tasks(tmp_path, runtime):
+@pytest.mark.parametrize("scheduler_model", [None, CALENDAR_MODEL])
+def test_l2_worker_flows_through_unmeasured_dependency_only_tasks(tmp_path, scheduler_model):
     # The second run has no timing for producer 16. Task 28 is a creator with no kernel row.
     rows = [_task_row(16, 0), _task_row(26, 1), _task_row(26, 1, run_epoch=1)]
     for epoch in (0, 1):
@@ -146,7 +150,8 @@ def test_l2_worker_flows_through_unmeasured_dependency_only_tasks(tmp_path, runt
     trace = _trace(
         rows,
         tmp_path / "controls.json",
-        runtime_name=runtime,
+        runtime_name=HBG_RUNTIME,
+        scheduler_model=scheduler_model,
         chip_swimlane_level=2,
         deps_edges={16: [25, 29], 25: [27], 26: [27], 27: [29], 28: [29]},
         deps_kernel_map={25: [-1, -1, -1], 27: [-1, -1, -1]},
@@ -166,27 +171,21 @@ def test_l2_worker_flows_through_unmeasured_dependency_only_tasks(tmp_path, runt
 
 
 @pytest.mark.parametrize("dropped,expected", [(0, [(16, 27), (27, 29)]), (1, [(16, 29)])])
-def test_percounter_control_completion_flow(tmp_path, dropped, expected):
-    issue = dict(
-        kind="completion_issue",
-        time_us=23,
-        cycles=23,
-        contribution=1,
-        task_id=27,
-        run_epoch=0,
-        block_index=0,
-        block_count=1,
-        worker_id=1,
-        cluster_index=0,
-        cluster_lane=1,
-    )
+def test_calendar_control_completion_flow(tmp_path, dropped, expected):
+    coordinates = dict(run_epoch=0, block_index=0, block_count=1, worker_id=1, cluster_index=0, cluster_lane=1)
+    issue = dict(**coordinates, kind="completion_issue", time_us=23, cycles=23, contribution=1, task_id=27)
+    timing = [
+        dict(**coordinates, task_id=29, kind=kind, time_us=ts, cycles=ts)
+        for kind, ts in (("row_begin", 22), ("inputs_ready", 28), ("ready", 29))
+    ]
     trace = _trace(
         [_task_row(16, 0), _task_row(29, 1, dispatch=30, receive=31, start=32, end=40)],
         tmp_path / "control.json",
-        runtime_name="percounter",
+        runtime_name=HBG_RUNTIME,
+        scheduler_model=CALENDAR_MODEL,
         chip_swimlane_level=2,
-        percounter_task_events={
-            "records": [issue],
+        calendar_task_events={
+            "records": [issue, *timing],
             "dropped": dropped,
             "unmatched_deferred_updates": 0,
             "folded_task_ids": [],
@@ -207,6 +206,13 @@ def test_percounter_control_completion_flow(tmp_path, dropped, expected):
     assert sorted((starts[e["id"]], bars[e["bind_id"]]) for e in events if e["ph"] == "f") == expected
     consumer = next(e for e in events if e["ph"] == "X" and e["args"]["taskId"] == 29)
     assert consumer["args"]["fanin-sources"] == "t27 (explicit), t28 (creator)"
+    spans = [e["args"] for e in trace["traceEvents"] if e["ph"] == "X" and e["cat"] == "calendar_task_timing"]
+    wait, finalize = spans
+    assert wait["kind"] == "input_wait"
+    assert wait["fanin-sources"] == consumer["args"]["fanin-sources"]
+    assert wait.get("kernel-fanin-via-control") == consumer["args"].get("kernel-fanin-via-control")
+    assert finalize["kind"] == "finalize_ready"
+    assert "fanin-sources" not in finalize
 
 
 def _count_dependency_flow_starts(trace_path, *, pid, tid=None):
@@ -2519,12 +2525,13 @@ def test_identify_spmd_task_ids_respects_authoritative_block_num_one():
     assert spmd_ids == {2}
 
 
-def test_percounter_l2_worker_labels_put_task_id_first():
+def test_calendar_l2_worker_labels_put_task_id_first():
     tasks = [_task_row(2, 1), _task_row(7, 0, "aic", func_id=1), _task_row(7, 2, func_id=2)]
     trace = _trace(
         tasks,
         None,
-        runtime_name="percounter",
+        runtime_name=HBG_RUNTIME,
+        scheduler_model=CALENDAR_MODEL,
         chip_swimlane_level=2,
         func_id_to_name={"0": "add", "1": "proj_aic", "2": "proj_aiv"},
         deps_block_map={2: 1, 7: 2},
@@ -3730,10 +3737,10 @@ def test_an_unpaired_retained_capture_converts_from_what_it_was_given(tmp_path, 
     assert "is not paired with a dispatch identity" in capsys.readouterr().err
 
 
-def test_percounter_l1_keeps_graph_task_identity_and_setup_interval(tmp_path):
+def test_calendar_l1_keeps_graph_task_identity_and_setup_interval(tmp_path):
     task = _task_row(_hbg_sub_task(7, 2), 0, start=11.0, end=20.0, receive=10.5, run_epoch=4)
-    output = tmp_path / "percounter.json"
-    sc.generate_chrome_trace_json([task], str(output), runtime_name="percounter")
+    output = tmp_path / "calendar.json"
+    sc.generate_chrome_trace_json([task], str(output), runtime_name=HBG_RUNTIME, scheduler_model=CALENDAR_MODEL)
     events = json.loads(output.read_text())["traceEvents"]
     worker = [e for e in events if e.get("ph") == "X" and e.get("pid") == 4]
     assert len(worker) == 1

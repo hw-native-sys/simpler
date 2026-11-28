@@ -1,5 +1,7 @@
 # A5 HBG 异步完成验证与性能验收
 
+> **历史文档。** 本页保留旧版A5 HBG resident 调度的异步完成设计及其验证。文中的“当前”指当时的版本。现行协议见 [A5 HBG 日历调度](../../../../src/a5/runtime/host_build_graph/README.md)。
+
 **共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
 
 [返回总览](../a5-hbg-async-completion.md)。本文定义测试方法和通过条件。抽象模型、CPU helper 测试、目标编译、仿真、真实设备和性能资格分别报告，不能互相替代。
@@ -136,7 +138,7 @@ SDMA 还须覆盖同核连续提交、多个公共完成 record、flag/SQ 压力
 | [共享 deferred_notify](../../../../tests/st/worker/comm_domain/deferred_notify/test_deferred_notify.py) | 两卡远端 payload、signal waiter 与消费者 | 保留原依赖，验证 A5 缓存可见性和 resident 完成；该入口本身不列 A5 onboard |
 | [共享 async_notify](../../../../tests/st/worker/comm_domain/async_notify/test_async_notify.py) | a2a3/A5 两卡通知 counter 和依赖结果 | 从 TMR 接到 HBG resident，增加饱和 waiter 与异核检查 |
 | [A5 SDMA deferred demo](../../../../examples/a5/tensormap_and_ringbuffer/sdma_async_completion_demo/test_sdma_async_completion_demo.py) | A5 通信域 SDMA 资源配置与两卡 golden | 复用 backend 配置，验证HBG resident 调度和既有生命周期 |
-| [HBG async boundary](../../../../tests/fdwic/pa_hbg/spmd/test_async_boundary.py) | 未提供合法异步上下文时的拒绝边界 | 保留适用负例；不能用不发起异步工作的边界测试替代真实通信 |
+| [HBG async boundary](../../../../tests/ut/py/hbg_spmd_contracts/test_async_boundary_fixture.py) | 未提供合法异步上下文时的拒绝边界 | 保留适用负例；不能用不发起异步工作的边界测试替代真实通信 |
 
 没有对应正例或故障判据的组合必须构造新增用例；不能只修改平台列表和 runtime 名称。新场景须验证实际运行的是 A5 HBG resident 及目标产物，不能由 legacy、TMR 或 kernel 内阻塞 fallback 获得通过。
 

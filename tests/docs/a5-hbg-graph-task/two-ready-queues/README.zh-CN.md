@@ -41,7 +41,7 @@ MoE 原冻结 wait ELF 使用旧 AsyncGroupData 布局；依据同源码重编�
 
 ## 2 功能与计时口径
 
-[生产 dsv41_scheduler](../../../fdwic/dsv41_scheduler/README.md) 使用原始模型任务、依赖、输入边界和 kernel。
+[生产 dsv41_scheduler](https://github.com/hw-native-sys/simpler/blob/1ea06c2aee35993c288887582cb7f802b2724546/tests/fdwic/dsv41_scheduler/README.md) 使用原始模型任务、依赖、输入边界和 kernel。
 原始输入是 72 valid tokens/rank、80 padded rows、零权重；验证覆盖该调度 workload 的数值一致性，
 不是已训练 checkpoint 的模型精度验收。
 Attention/Engram 只用设备 4；四个含通信的 MoE/19–21 层用设备 6、7，保留真实通信和 defer_wait。
@@ -177,7 +177,7 @@ raw 为未压缩 `chip_swimlane_records.json` 十次字节数的中位数，MB=1
 | `final-model-matrix-01/two-ready-queues-14cases-three-arms-L1-L3.zip` | 上述 84 张 JSON 泳道图及哈希清单 |
 
 泳道图选取各自最接近十次中位数的正式轮；original/atomic 使用冻结 reader，两队列使用当前 reader。
-复现需保留冻结输入及相应三臂 runtime，不能用当前 HEAD 替代旧版本。设置专用 `TMPDIR`，架构预检和
+复现需保留冻结输入及相应三臂 runtime。以下命令在包含旧套件的[历史版本](https://github.com/hw-native-sys/simpler/blob/1ea06c2aee35993c288887582cb7f802b2724546/tests/fdwic/dsv41_scheduler/production/run.sh)执行。设置专用 `TMPDIR`，架构预检和
 `task-submit` 锁定单卡后，分别执行：
 
 ```bash

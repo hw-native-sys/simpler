@@ -13,7 +13,7 @@ import pytest
 from .helpers import Case, Scenario, l3_case
 
 pytestmark = [
-    pytest.mark.manual,  # Acceptance contracts awaiting resident async integration; run with --manual include.
+    pytest.mark.manual,  # Extended async acceptance contracts; run with --manual include.
     pytest.mark.platforms(["a5sim", "a5"]),
     pytest.mark.runtime("host_build_graph"),
     pytest.mark.device_count(1),

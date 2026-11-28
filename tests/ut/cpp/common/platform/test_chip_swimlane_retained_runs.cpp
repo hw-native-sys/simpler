@@ -32,6 +32,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -353,6 +354,10 @@ struct RetainedRunsFixture {
             buf->records[slot].start_time = 1000 + static_cast<uint64_t>(i);
             buf->records[slot].end_time = 2000 + static_cast<uint64_t>(i);
             buf->records[slot].reg_task_id = static_cast<uint32_t>(i + 1);
+            if constexpr (std::string_view{CHIP_SWIMLANE_ARCHITECTURE_NAME} == "a5" &&
+                          std::string_view{SIMPLER_RUNTIME_NAME} == "host_build_graph") {
+                buf->records[slot].percounter_block_shape = 1u << 16;
+            }
         }
     }
 
@@ -386,14 +391,35 @@ struct RetainedRunsFixture {
     }
 };
 
-/** How many rows in this artifact carry `epoch` as their trailing column. */
-size_t rows_for_epoch(const std::string &body, uint64_t epoch) {
-    const std::string column = ", " + std::to_string(epoch) + "]";
-    size_t rows = 0;
-    for (size_t at = body.find(column); at != std::string::npos; at = body.find(column, at + 1)) {
-        rows++;
+/** How many task rows in this artifact carry the epoch. */
+size_t rows_for_epoch(std::string_view body, uint64_t epoch) {
+    const std::string value = std::to_string(epoch);
+    const std::string trailing = ", " + value + "]";
+    const auto count_trailing = [&](std::string_view records) {
+        size_t count = 0;
+        for (size_t at = records.find(trailing); at != std::string_view::npos; at = records.find(trailing, at + 1))
+            ++count;
+        return count;
+    };
+    constexpr std::string_view aicore_array = "\"aicore_tasks\": [";
+    const auto begin = body.find(aicore_array);
+    if (begin == std::string_view::npos || body.find("\"scheduler_model\": \"calendar\"") == std::string_view::npos)
+        return count_trailing(body);
+
+    const auto end = body.find("\n  \"", begin + aicore_array.size());
+    const auto tasks = body.substr(begin + aicore_array.size(), end - begin - aicore_array.size());
+    size_t count = count_trailing(body.substr(0, begin));
+    if (end != std::string_view::npos) count += count_trailing(body.substr(end));
+    // Calendar AICore tasks place the epoch in column 6, before block and block count.
+    for (size_t at = tasks.find('['); at != std::string_view::npos; at = tasks.find('[', at + 1)) {
+        auto row = tasks.substr(at + 1, tasks.find(']', at) - at - 1);
+        for (unsigned col = 0; col < 6; ++col) {
+            const auto delimiter = row.find(", ");
+            row.remove_prefix(delimiter == std::string_view::npos ? row.size() : delimiter + 2);
+        }
+        if (row.substr(0, row.find(',')) == value) ++count;
     }
-    return rows;
+    return count;
 }
 
 /**
@@ -525,12 +551,7 @@ TEST(ChipSwimlaneRetainedRunsTest, PredecessorRecordsSurviveSuccessorAdmission) 
             const std::string body = read_file(f);
             // Six AICore records, each a row in the aicore_tasks stream, and
             // the predecessor's own epoch on every one of them.
-            const std::string epoch_column = ", " + std::to_string(kFirst) + "]";
-            size_t rows = 0;
-            for (size_t at = body.find(epoch_column); at != std::string::npos; at = body.find(epoch_column, at + 1)) {
-                rows++;
-            }
-            EXPECT_EQ(rows, 6u) << "the predecessor's records did not reach its artifact";
+            EXPECT_EQ(rows_for_epoch(body, kFirst), 6u) << "the predecessor's records did not reach its artifact";
         }
     }
     EXPECT_TRUE(saw_first);
