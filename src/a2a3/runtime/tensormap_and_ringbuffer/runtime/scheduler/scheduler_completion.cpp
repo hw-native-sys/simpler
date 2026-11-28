@@ -110,8 +110,9 @@ void SchedulerContext::complete_slot_task(
 
     if (slot_state.payload != nullptr) {
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
-        int32_t slab_err = deferred_slab->error_code;
-        if (slab_err != SIMPLER_ERROR_NONE) {
+        const int32_t raw_error = deferred_slab->error_code;
+        if (raw_error != SIMPLER_ERROR_NONE) {
+            const int32_t slab_err = kernel_validation::code(raw_error);
             // Publish the primary fatal before diagnostics: a concurrent tensor
             // timeout must not win after this completion has reported failure.
             // Preserve a scheduler error that was already observed before us.
@@ -121,6 +122,14 @@ void SchedulerContext::complete_slot_task(
             if (sched_->sm_header->orch_error_code.compare_exchange_strong(
                     expected, primary_error, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
+                if (prior_sched_error == SIMPLER_ERROR_NONE && is_kernel_error(slab_err)) {
+                    kernel_validation::capture(
+                        sched_->sm_header->kernel_failure, raw_error, TaskId::to_uint64(slot_state.task->task_id),
+                        slot_state.task->kernel_id[static_cast<int32_t>(subslot)],
+                        payload_per_core_[core_id][expected_reg_task_id & 1].local_context.block_idx,
+                        deferred_slab->kernel_error_detail
+                    );
+                }
                 LOG_ERROR(
                     "Kernel failure: code=%d task=0x%llx func=%d block=%d core=%d primary_code=%d", slab_err,
                     (unsigned long long)TaskId::to_uint64(slot_state.task->task_id),

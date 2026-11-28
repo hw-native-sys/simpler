@@ -77,10 +77,11 @@ private:
         std::chrono::steady_clock::time_point last_health{};
         std::string terminal_error;
         bool shutdown_enqueued{false};
+        bool accepts_cancel{false};
     };
 
     void cancel_route(int32_t worker_id, const std::string &message);
-    void enqueue(int32_t worker_id, MpiDirectTag tag, const std::vector<uint8_t> &frame, double timeout_s);
+    bool enqueue(int32_t worker_id, MpiDirectTag tag, const std::vector<uint8_t> &frame, double timeout_s);
     std::optional<std::vector<uint8_t>>
     receive(int32_t worker_id, remote_l3::FrameType frame_type, uint64_t sequence, double timeout_s);
     void expect_hello_ready(int32_t worker_id, double timeout_s);
@@ -112,6 +113,7 @@ public:
     void submit_frame(const std::vector<uint8_t> &frame) override;
     std::vector<uint8_t> wait_for_reply(remote_l3::FrameType frame_type, uint64_t sequence) override;
     void submit_progress_frame(const std::vector<uint8_t> &frame) override;
+    void request_task_cancel(const remote_l3::FrameHeader &header) override;
     bool poll_progress_reply(remote_l3::FrameType frame_type, uint64_t sequence, std::vector<uint8_t> &reply) override;
     void shutdown() override;
 
@@ -121,6 +123,7 @@ private:
     double attach_timeout_s_{0.0};
     double runtime_timeout_s_{0.0};
     std::chrono::steady_clock::time_point progress_deadline_{};
+    std::vector<uint8_t> deferred_cancel_;
     std::atomic<bool> progress_active_{false};
     std::atomic<bool> closed_{false};
 };

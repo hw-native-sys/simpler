@@ -27,6 +27,7 @@ namespace remote_l3 {
 // `byte_offset`. Version 3 interprets those fields differently even though the wire layout is
 // identical, so the frame header rejects a peer that would decode the wrong semantics.
 static constexpr uint32_t PROTOCOL_VERSION = 4;
+inline constexpr uint64_t FEATURE_TASK_CANCEL = 1;
 inline constexpr size_t FRAME_HEADER_BYTES = 40;
 static constexpr uint32_t MAX_FRAME_PAYLOAD_BYTES = 16U * 1024U * 1024U;
 static constexpr uint32_t MAX_STRING_BYTES = 1024U;
@@ -48,6 +49,7 @@ enum class FrameType : uint32_t {
     COMPLETION = 5,
     HEALTH = 6,
     SHUTDOWN = 7,
+    CANCEL_TASK = 8,
 };
 
 enum class ControlName : uint32_t {
@@ -172,6 +174,7 @@ struct ReleaseImportRequest {
 };
 
 std::vector<uint8_t> encode_frame(const FrameHeader &header, const std::vector<uint8_t> &payload);
+FrameHeader decode_frame_header(const uint8_t *data, size_t size);
 DecodedFrame decode_frame(const uint8_t *data, size_t size);
 DecodedFrame decode_frame(const std::vector<uint8_t> &data);
 

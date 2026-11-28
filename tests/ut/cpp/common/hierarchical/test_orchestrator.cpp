@@ -904,6 +904,37 @@ TEST_F(OrchestratorFixture, SequentialRunsHaveDistinctIdsAndErrorsDoNotLeak) {
     orch.release_run(second);
 }
 
+TEST_F(OrchestratorFixture, ParentCancelBeforeCloseRejectsNewWorkAndRetiresQueuedSlots) {
+    orch.submit_next_level(C(82), single_tensor_args(0x8200, TensorArgType::OUTPUT), cfg, 0);
+    orch.request_parent_cancel(run_id);
+    EXPECT_FALSE(orch.run_done(run_id));
+    EXPECT_THROW(
+        orch.submit_next_level(C(83), single_tensor_args(0x8300, TensorArgType::OUTPUT), cfg, 0), std::runtime_error
+    );
+    orch.close_run_submission(run_id);
+    EXPECT_TRUE(orch.run_done(run_id));
+    EXPECT_THROW(orch.wait_run(run_id), std::runtime_error);
+    orch.release_run(run_id);
+    RunId next = orch.begin_run();
+    orch.request_parent_cancel(run_id);
+    orch.close_run_submission(next);
+    EXPECT_NO_THROW(orch.wait_run(next));
+    orch.release_run(next);
+}
+
+TEST_F(OrchestratorFixture, ParentCancelAfterCloseStillWaitsForDispatchedWork) {
+    auto result = orch.submit_next_level(C(82), single_tensor_args(0x8200, TensorArgType::OUTPUT), cfg, 0);
+    S(result.task_slot).state.store(TaskState::RUNNING);
+    orch.close_run_submission(run_id);
+    orch.request_parent_cancel(run_id);
+    EXPECT_FALSE(orch.run_done(run_id));
+    S(result.task_slot).state.store(TaskState::COMPLETED);
+    EXPECT_TRUE(orch.on_consumed(result.task_slot));
+    EXPECT_TRUE(orch.run_done(run_id));
+    EXPECT_THROW(orch.wait_run(run_id), std::runtime_error);
+    orch.release_run(run_id);
+}
+
 TEST_F(OrchestratorFixture, FailedSubmissionCompletesWithoutEnteringDeviceWork) {
     orch.fail_run_submission(run_id, std::make_exception_ptr(std::runtime_error("graph build failed")));
     EXPECT_TRUE(orch.run_done(run_id));
@@ -1106,6 +1137,76 @@ TEST_F(OrchestratorFixture, CancellationRetriesBeforeAnyPreparedFailureReleasesC
     EXPECT_EQ(S(producer.task_slot).state.load(std::memory_order_acquire), TaskState::CONSUMED);
     EXPECT_EQ(S(consumer.task_slot).state.load(std::memory_order_acquire), TaskState::CONSUMED);
     orch.release_run(run_id);
+}
+
+TEST_F(OrchestratorFixture, ParentCancelRetriesInterruptedReleaseAfterGraphClose) {
+    auto producer = orch.submit_next_level(C(77), single_tensor_args(0x7700, TensorArgType::OUTPUT), cfg, 0);
+    auto consumer = orch.submit_next_level(C(78), single_tensor_args(0x7700, TensorArgType::INPUT), cfg, 0);
+    ASSERT_EQ(S(producer.task_slot).state.load(), TaskState::READY);
+    ASSERT_EQ(S(consumer.task_slot).state.load(), TaskState::PENDING);
+    orch.close_run_submission(run_id);
+    int snapshots = 0;
+    orch.set_test_hook([&](OrchestratorTestPoint point) {
+        if (point == OrchestratorTestPoint::FAILURE_FANIN_SNAPSHOT && ++snapshots == 2) throw std::bad_alloc();
+    });
+    EXPECT_THROW(orch.request_parent_cancel(run_id), std::bad_alloc);
+    EXPECT_FALSE(orch.run_done(run_id));
+    for (auto slot : {producer.task_slot, consumer.task_slot}) {
+        EXPECT_TRUE(S(slot).failure_propagation_pending.load());
+        EXPECT_EQ(S(slot).fanout_released.load(), 0);
+    }
+    orch.set_test_hook({});
+    orch.request_parent_cancel(run_id);
+    ASSERT_TRUE(orch.run_done(run_id));
+    try {
+        orch.wait_run(run_id);
+        FAIL() << "parent cancellation reported success";
+    } catch (const std::runtime_error &exc) {
+        EXPECT_STREQ(exc.what(), "parent dispatch failed (peer error 108)");
+    }
+    orch.request_parent_cancel(run_id);
+    for (auto slot : {producer.task_slot, consumer.task_slot}) {
+        EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
+        EXPECT_FALSE(S(slot).failure_propagation_pending.load());
+        EXPECT_EQ(S(slot).fanout_released.load(), S(slot).fanout_total + 1);
+    }
+    orch.release_run(run_id);
+}
+
+TEST_F(OrchestratorFixture, UnsettledParentCancelWakesWaitersWithoutReleasingTheRun) {
+    auto producer = orch.submit_next_level(C(77), single_tensor_args(0x7700, TensorArgType::OUTPUT), cfg, 0);
+    auto consumer = orch.submit_next_level(C(78), single_tensor_args(0x7700, TensorArgType::INPUT), cfg, 0);
+    orch.close_run_submission(run_id);
+    const RunId queued = orch.begin_run();
+    orch.close_run_submission(queued);
+    orch.set_test_hook([](OrchestratorTestPoint point) {
+        if (point == OrchestratorTestPoint::FAILURE_FANIN_SNAPSHOT) throw std::bad_alloc();
+    });
+    EXPECT_THROW(orch.request_parent_cancel(run_id), std::bad_alloc);
+    EXPECT_THROW(orch.request_parent_cancel(run_id), std::bad_alloc);
+    auto waiter = std::async(std::launch::async, [&] {
+        return orch.wait_run_for(run_id, 2.0);
+    });
+    orch.abandon_parent_cancel(run_id);
+    EXPECT_EQ(waiter.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    try {
+        (void)waiter.get();
+        FAIL() << "unsettled run returned from wait without an error";
+    } catch (const ParentCancelCleanupFailed &exc) {
+        EXPECT_NE(std::string(exc.what()).find("peer error 108"), std::string::npos);
+        EXPECT_NE(std::string(exc.what()).find("cleanup failed"), std::string::npos);
+    }
+    EXPECT_THROW(orch.wait_run(queued), ParentCancelCleanupFailed);
+    EXPECT_THROW(orch.wait_run_accepted(run_id), ParentCancelCleanupFailed);
+    EXPECT_TRUE(orch.run_cancel_cleanup_failed(run_id));
+    EXPECT_TRUE(orch.run_cancel_cleanup_failed(queued));
+    EXPECT_FALSE(orch.run_done(run_id));
+    EXPECT_THROW(orch.release_run(run_id), std::logic_error);
+    EXPECT_THROW(orch.begin_run(), ParentCancelCleanupFailed);
+    for (auto slot : {producer.task_slot, consumer.task_slot}) {
+        EXPECT_NE(S(slot).state.load(), TaskState::CONSUMED);
+        EXPECT_EQ(S(slot).fanout_released.load(), 0);
+    }
 }
 
 TEST_F(OrchestratorFixture, FailedReverseEdgePublicationRollsBackTheProducerReference) {

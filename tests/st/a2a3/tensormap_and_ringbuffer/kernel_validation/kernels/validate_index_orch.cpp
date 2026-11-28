@@ -1,0 +1,31 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#include "orchestration_api.h"
+
+extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
+    return OrchestrationConfig{.expected_arg_count = 2};
+}
+
+extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &args) {
+    uint32_t shape[] = {1};
+    TensorCreateInfo info(shape, 1, DataType::INT32);
+    CoreTaskArgs producer;
+    producer.add_input(args.tensor(0).ref());
+    producer.add_output(info);
+    producer.add_scalar(int64_t{129280});
+    auto produced = rt_submit_aiv_task(219, producer);
+
+    CoreTaskArgs consumer;
+    consumer.add_input(produced.get_ref(0));
+    consumer.add_output(args.tensor(1).ref());
+    consumer.add_scalar(int64_t{129280});
+    rt_submit_aiv_task(112, consumer);
+}

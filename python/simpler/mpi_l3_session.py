@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from ._parent_cancel import SessionCancellation
 from .global_comm_domain import (
     GlobalDomainCommand,
     GlobalDomainPhase,
@@ -39,6 +40,7 @@ from .mpi_group_mailbox import (
     MailboxTarget,
     MpiGroupMailbox,
     MpiRankError,
+    _bounded_rank_error,
     open_rank_mailbox,
 )
 from .remote_l3_protocol import (
@@ -278,9 +280,9 @@ class _InMemoryCommandConnection:
     def feed(self, frame: bytes) -> None:
         self._incoming.put(bytes(frame))
 
-    def next_reply(self) -> bytes:
+    def next_reply(self, timeout: float | None = None) -> bytes:
         while True:
-            kind, value = self._events.get()
+            kind, value = self._events.get(timeout=timeout)
             if kind == "domain":
                 value.execute()
                 continue
@@ -441,6 +443,111 @@ def _select_mailbox_replies(
     return tuple(replies_by_rank[reply_rank] for reply_rank in sorted(replies_by_rank)) or (b"",)
 
 
+def _group_reply_errors(gathered, origin):
+    errors = [error for _, _, _, error in gathered if error is not None]
+    terminal = bool(errors)
+    for rank, executed, reply, _ in gathered:
+        if executed and reply:
+            decoded = _reply_error(reply)
+            if decoded is not None:
+                errors.append(MpiRankError(int(rank), *decoded))
+    if origin is not None:
+        errors = [origin, *(error for error in errors if _bounded_rank_error(error) != origin)]
+    return tuple(errors), terminal
+
+
+_GROUP_DONE_TAG = 1
+_GROUP_DECISION_TAG = 2
+
+
+def _group_signal(message, sequence):
+    received, failed = message
+    if received != sequence:
+        raise RuntimeError(f"MPI group expected sequence {sequence}, received {received}")
+    return failed
+
+
+def _coordinate_group_task(comm, sequence, poll_local, cancel_local, mailbox):
+    """Notify running peers on first failure and collect their actual terminal replies."""
+    peers = {p: comm.irecv(source=p, tag=_GROUP_DONE_TAG) for p in range(1, comm.Get_size())}
+    decision = None
+    origin = None
+    while True:
+        local = poll_local()
+        if local is not None and local[2] is not None and origin is None:
+            origin = local[2]
+            mailbox.publish_first_error(sequence, origin)
+        for peer, receive in list(peers.items()):
+            ready, message = receive.test()
+            if ready:
+                failure = _group_signal(message, sequence)
+                if failure is not None and origin is None:
+                    origin = failure
+                    mailbox.publish_first_error(sequence, origin)
+                del peers[peer]
+        cancel = origin is not None or mailbox.cancel_requested(sequence)
+        done = local is not None and not peers
+        if decision is None and (cancel or done):
+            decision = [
+                comm.isend((sequence, cancel), dest=p, tag=_GROUP_DECISION_TAG) for p in range(1, comm.Get_size())
+            ]
+            if cancel and local is None:
+                cancel_local()
+        if done:
+            assert decision is not None
+            for send in decision:
+                send.wait()
+            return local[0], local[1], origin
+        if local is not None:
+            time.sleep(0.001)
+
+
+def _group_task_reply(comm, rank, request, payload, manifest, connection, cancellation, mailbox, command_sequence):
+    """Keep MPI progress on the dispatch thread while the processor runs the local graph."""
+    sequence = request.sequence_id
+    result = (b"", None, None) if payload is None else None
+    if payload is not None:
+        try:
+            connection.feed(_rewrite_frame_identity(payload, manifest, sequence=command_sequence))
+        except Exception as exc:  # noqa: BLE001 -- all ranks must reach the terminal gather.
+            failure = _bounded_rank_error(MpiRankError(rank, type(exc).__name__, str(exc)))
+            result = b"", failure, failure
+
+    def poll_local():
+        nonlocal result
+        if result is None:
+            try:
+                reply = connection.next_reply(timeout=0.005)
+                decoded = _reply_error(reply)
+                failure = _bounded_rank_error(MpiRankError(rank, *decoded)) if decoded is not None else None
+                result = reply, None, failure
+            except queue.Empty:
+                pass
+            except Exception as exc:  # noqa: BLE001 -- report malformed replies as well as processor errors.
+                failure = _bounded_rank_error(MpiRankError(rank, type(exc).__name__, str(exc)))
+                result = b"", failure, failure
+        return result
+
+    def cancel_local():
+        cancellation.request(command_sequence)
+
+    if rank == 0:
+        return _coordinate_group_task(comm, sequence, poll_local, cancel_local, mailbox)
+    decision = comm.irecv(source=0, tag=_GROUP_DECISION_TAG)
+    while (local := poll_local()) is None:
+        if decision is not None:
+            ready, message = decision.test()
+            if ready:
+                decision = None
+                if _group_signal(message, sequence):
+                    cancel_local()
+    reply, error, failure = local
+    comm.send((sequence, failure), dest=0, tag=_GROUP_DONE_TAG)
+    if decision is not None:
+        _group_signal(decision.wait(), sequence)
+    return reply, error, None
+
+
 def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, gather, and teardown stay linear
     *,
     dispatch_comm: Any,
@@ -455,6 +562,7 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
     mailbox: MpiGroupMailbox | None = None
     inner_worker: Worker | None = None
     connection = _InMemoryCommandConnection()
+    cancellation = SessionCancellation()
     processor_thread: threading.Thread | None = None
     hook_state = None
     startup_error = ""
@@ -500,6 +608,7 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
                     dispatch_registry,
                     bridge.prepare_import,
                     getattr(hook_state, "task_completed", None),
+                    cancellation=cancellation,
                 )
             except BaseException as exc:  # noqa: BLE001
                 connection.events.put(("processor_error", (type(exc).__name__, str(exc))))
@@ -676,6 +785,7 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
             local_reply = b""
             local_error: MpiRankError | None = None
             payload = None
+            origin = None
             try:
                 payload = _payload_for_rank(request, rank)
                 if request.opcode is MailboxOpcode.PING:
@@ -683,6 +793,20 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
                 elif request.opcode is MailboxOpcode.SHUTDOWN:
                     assert payload is not None
                     connection.feed(_rewrite_frame_identity(payload, manifest))
+                elif request.opcode is MailboxOpcode.TASK:
+                    if payload is not None:
+                        local_command_sequence += 1
+                    local_reply, local_error, origin = _group_task_reply(
+                        dispatch_comm,
+                        rank,
+                        request,
+                        payload,
+                        manifest,
+                        connection,
+                        cancellation,
+                        mailbox,
+                        local_command_sequence,
+                    )
                 elif payload is not None:
                     local_command_sequence += 1
                     local_reply = connection.exchange(
@@ -695,29 +819,15 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
             terminal_dispatch_failure = False
             if rank == 0:
                 assert mailbox is not None and gathered is not None
-                transport_errors = tuple(item[3] for item in gathered if item[3] is not None)
-                application_errors: list[MpiRankError] = []
-                for result_rank, executed, reply, _error in gathered:
-                    if not executed or not reply:
-                        continue
-                    decoded_error = _reply_error(reply)
-                    if decoded_error is not None:
-                        error_type, message = decoded_error
-                        application_errors.append(MpiRankError(int(result_rank), error_type, message))
-                if transport_errors:
+                errors, terminal_dispatch_failure = _group_reply_errors(gathered, origin)
+                if errors:
                     mailbox.fail_request(
                         sequence_id=request.sequence_id,
-                        errors=transport_errors,
-                        terminal=True,
+                        errors=errors,
+                        terminal=terminal_dispatch_failure,
                     )
-                    exit_code = 1
-                    terminal_dispatch_failure = True
-                elif application_errors:
-                    mailbox.fail_request(
-                        sequence_id=request.sequence_id,
-                        errors=tuple(application_errors),
-                        terminal=False,
-                    )
+                    if terminal_dispatch_failure:
+                        exit_code = 1
                 elif request.opcode is MailboxOpcode.SHUTDOWN:
                     mailbox.complete_shutdown(sequence_id=request.sequence_id)
                     mailbox.publish_closed()

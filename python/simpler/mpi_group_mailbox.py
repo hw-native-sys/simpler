@@ -23,6 +23,7 @@ from typing import Any
 # fail the import instead of silently degrading to plain struct reads.
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     _mailbox_load_i32,
+    _mailbox_load_u64,
     _mailbox_store_i32,
     _mailbox_wait_i32,
 )
@@ -54,7 +55,9 @@ _OFF_ERROR_BYTES = 76
 # Header bytes [_OFF_RESERVED, MAILBOX_HEADER_BYTES) are reserved in protocol
 # version 1: the creator zeroes them and every attach path rejects non-zero
 # reserved bytes, so a future version can assign them.
-_OFF_RESERVED = 80
+_OFF_CANCEL_SEQUENCE = 80
+_OFF_FIRST_ERROR_BYTES = 88
+_OFF_RESERVED = 92
 
 # Per-rank error messages are capped before serializing so the gathered JSON
 # stays parseable inside MAILBOX_ERROR_BYTES instead of being clipped into
@@ -268,6 +271,17 @@ class MpiGroupMailbox:
     def request_state(self) -> MailboxRequestState:
         return MailboxRequestState(self._load_i32(_OFF_REQUEST_STATE))
 
+    def cancel_requested(self, sequence: int) -> bool:
+        return int(_mailbox_load_u64(self._address + _OFF_CANCEL_SEQUENCE)) == sequence
+
+    def publish_first_error(self, sequence: int, error: MpiRankError) -> None:
+        self._validate_active_sequence(sequence)
+        # A failed command has no successful response payload. Keep its first
+        # diagnostic here while the error area remains available for final gather.
+        data = _encode_rank_errors((error,))
+        self._write_bytes(MAILBOX_RESPONSE_OFFSET, data)
+        self._store_i32(_OFF_FIRST_ERROR_BYTES, len(data))
+
     def manifest(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -325,6 +339,7 @@ class MpiGroupMailbox:
         self._write_u32(_OFF_REQUEST_BYTES, len(data))
         self._write_u32(_OFF_RESPONSE_COUNT, 0)
         self._write_u32(_OFF_RESPONSE_BYTES, 0)
+        self._store_i32(_OFF_FIRST_ERROR_BYTES, 0)
         self._write_u32(_OFF_ERROR_BYTES, 0)
         ready_state = (
             MailboxRequestState.SHUTDOWN_READY
@@ -422,7 +437,19 @@ class MpiGroupMailbox:
         raise MpiGroupError(f"MPI group mailbox result is not ready (state={state.name})")
 
     def mark_terminal(self, reason: str) -> None:
+        if self.group_state is MailboxGroupState.TERMINAL:
+            return
         data = str(reason).encode("utf-8")[:MAILBOX_ERROR_BYTES]
+        state = self.request_state
+        prior = b""
+        if state is MailboxRequestState.TASK_ACCEPTED:
+            size = self._load_i32(_OFF_FIRST_ERROR_BYTES)
+            if 0 < size <= MAILBOX_ERROR_BYTES:
+                prior = self._read_bytes(MAILBOX_RESPONSE_OFFSET, size)
+        elif state is MailboxRequestState.TASK_FAILED:
+            prior = self._read_bytes(MAILBOX_ERROR_OFFSET, min(self._read_u32(_OFF_ERROR_BYTES), MAILBOX_ERROR_BYTES))
+        if prior:
+            data = (prior + b"; " + data)[:MAILBOX_ERROR_BYTES]
         self._write_bytes(MAILBOX_ERROR_OFFSET, data)
         self._write_u32(_OFF_ERROR_BYTES, len(data))
         self._store_i32(_OFF_GROUP_STATE, int(MailboxGroupState.TERMINAL))

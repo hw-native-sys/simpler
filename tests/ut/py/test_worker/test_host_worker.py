@@ -4118,6 +4118,10 @@ class TestRunHandle:
                 events.append("wait")
                 raise RuntimeError("native graph failure")
 
+            def _run_cancel_cleanup_failed(self, run_id):
+                assert run_id == 1
+                return False
+
             def _release_run(self, run_id):
                 assert run_id == 1
                 events.append("release")
@@ -8646,6 +8650,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
 
 class _StubOrch:
+    def _run_cancel_cleanup_failed(self, run_id: int) -> bool:
+        return False
+
     def _release_run(self, run_id: int) -> None:
         pass
 

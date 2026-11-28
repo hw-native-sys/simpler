@@ -37,6 +37,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -89,6 +90,11 @@ enum class OrchestratorTestPoint : int32_t {
 // ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
+
+class ParentCancelCleanupFailed : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class Orchestrator {
 public:
@@ -222,11 +228,14 @@ public:
     void note_endpoint_capacity(int32_t worker_id, uint32_t sets);
     void close_run_submission(RunId run_id);
     void fail_run_submission(RunId run_id, std::exception_ptr error = nullptr);
+    void request_parent_cancel(RunId run_id);
+    void abandon_parent_cancel(RunId run_id);
     void wait_run_accepted(RunId run_id);
     bool run_accepted(RunId run_id) const;
     void wait_run(RunId run_id);
     bool wait_run_for(RunId run_id, double timeout_seconds);
     bool run_done(RunId run_id) const;
+    bool run_cancel_cleanup_failed(RunId run_id) const;
     // Non-allocating query after endpoint publication, outside admission locks.
     bool run_observation_requested(RunId run_id) const noexcept;
     bool run_failed(RunId run_id) const;
@@ -369,6 +378,7 @@ private:
     NextLevelReadyQueues *ready_next_level_queues_ = nullptr;
 
     mutable std::mutex runs_mu_;
+    bool cancel_cleanup_failed_ = false;  // Protected by runs_mu_. Only whole-worker teardown can recover.
     std::condition_variable runs_cv_;
     std::unordered_map<RunId, std::shared_ptr<RunState>> runs_;
     std::deque<RunId> run_fifo_;

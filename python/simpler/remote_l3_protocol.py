@@ -31,6 +31,7 @@ from .task_interface import MAX_TENSOR_DIMS, CallConfig, DataType
 # non-zero ``byte_offset``. Version 3 interprets those fields differently even though the wire
 # layout is identical, so the frame header rejects a peer that would decode the wrong semantics.
 PROTOCOL_VERSION = 4
+FEATURE_TASK_CANCEL = 1
 MAX_STRING_BYTES = 1024
 MAX_ERROR_BYTES = 4096
 MAX_TENSORS = 4096
@@ -65,6 +66,7 @@ class FrameType(enum.IntEnum):
     COMPLETION = 5
     HEALTH = 6
     SHUTDOWN = 7
+    CANCEL_TASK = 8
 
 
 class ControlName(enum.IntEnum):

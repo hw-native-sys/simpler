@@ -125,7 +125,7 @@ void MpiDirectTransportHub::cancel_route(int32_t worker_id, const std::string &m
     cv_.notify_all();
 }
 
-void MpiDirectTransportHub::enqueue(
+bool MpiDirectTransportHub::enqueue(
     int32_t worker_id, MpiDirectTag tag, const std::vector<uint8_t> &frame, double timeout_s
 ) {
     if (!(timeout_s > 0.0) || !std::isfinite(timeout_s)) {
@@ -140,11 +140,15 @@ void MpiDirectTransportHub::enqueue(
     if (route_it == routes_by_worker_.end()) throw std::invalid_argument("MpiDirectTransportHub: unknown worker id");
     while (frame.size() > max_pending_frame_bytes_ - pending_frame_bytes_) {
         throw_if_route_terminal_locked(route_it->second);
+        // The scheduler is broadcasting cancellation to every live sibling.
+        // Let progress retry this route as soon as the MPI sender returns credit.
+        if (tag == MpiDirectTag::HEALTH) return false;
         if (cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
             raise_locked("timed out waiting for outbound frame credit");
         }
     }
     throw_if_route_terminal_locked(route_it->second);
+    if (tag == MpiDirectTag::HEALTH && !route_it->second.accepts_cancel) return true;
     MpiDirectOutboundFrame outbound;
     outbound.ticket = next_ticket_++;
     outbound.target_rank = route_it->second.mpi_rank;
@@ -154,6 +158,7 @@ void MpiDirectTransportHub::enqueue(
     outbound_.push_back(std::move(outbound));
     if (tag == MpiDirectTag::LIFECYCLE) route_it->second.shutdown_enqueued = true;
     cv_.notify_all();
+    return true;
 }
 
 std::optional<MpiDirectOutboundFrame> MpiDirectTransportHub::poll_outbound(double timeout_s) {
@@ -282,6 +287,7 @@ void MpiDirectTransportHub::expect_hello_ready(int32_t worker_id, double timeout
         hello.ready_state != remote_l3::ReadyState::READY || hello.comm_profile != route.comm_profile) {
         raise_locked("HELLO READY does not match manifest route");
     }
+    route.accepts_cancel = (hello.feature_flags & remote_l3::FEATURE_TASK_CANCEL) != 0;
 }
 
 size_t MpiDirectTransportHub::pending_frame_bytes() const {
@@ -354,6 +360,12 @@ std::vector<uint8_t> MpiDirectTransport::wait_for_reply(remote_l3::FrameType fra
     return *hub_->receive(worker_id_, frame_type, sequence, runtime_timeout_s_);
 }
 
+void MpiDirectTransport::request_task_cancel(const remote_l3::FrameHeader &header) {
+    auto frame = remote_l3::encode_frame(header, {});
+    if (!hub_->enqueue(worker_id_, MpiDirectTag::HEALTH, frame, runtime_timeout_s_))
+        deferred_cancel_ = std::move(frame);
+}
+
 void MpiDirectTransport::submit_progress_frame(const std::vector<uint8_t> &frame) {
     submit_frame(frame);
     progress_deadline_ = deadline_from_now(runtime_timeout_s_);
@@ -372,8 +384,12 @@ bool MpiDirectTransport::poll_progress_reply(
         hub_->fail("MpiDirectTransport: progress command timed out");
         throw std::runtime_error("MpiDirectTransport: progress command timed out");
     }
+    if (!deferred_cancel_.empty() &&
+        hub_->enqueue(worker_id_, MpiDirectTag::HEALTH, deferred_cancel_, runtime_timeout_s_))
+        deferred_cancel_.clear();
     auto result = hub_->receive(worker_id_, frame_type, sequence, 0.0);
     if (!result.has_value()) return false;
+    deferred_cancel_.clear();
     progress_active_.store(false, std::memory_order_release);
     reply = std::move(*result);
     return true;

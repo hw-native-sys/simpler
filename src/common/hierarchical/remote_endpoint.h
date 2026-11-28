@@ -34,6 +34,7 @@ public:
     virtual bool
     poll_progress_reply(remote_l3::FrameType frame_type, uint64_t sequence, std::vector<uint8_t> &reply) = 0;
     virtual bool supports_group_batch() const { return false; }
+    virtual void request_task_cancel(const remote_l3::FrameHeader &) {}
     virtual void submit_group_progress_frame(
         const std::vector<uint8_t> &frame, uint64_t task_slot, int32_t group_index, int32_t group_size
     );
@@ -49,6 +50,7 @@ public:
     ~RemoteL3SocketTransport() override;
 
     void expect_hello_ready(uint64_t session_id, int32_t worker_id, const std::string &comm_profile);
+    void request_task_cancel(const remote_l3::FrameHeader &header) override;
     void submit_frame(const std::vector<uint8_t> &frame) override;
     std::vector<uint8_t> wait_for_reply(remote_l3::FrameType frame_type, uint64_t sequence) override;
     void submit_progress_frame(const std::vector<uint8_t> &frame) override;
@@ -76,6 +78,8 @@ private:
     std::thread health_thread_;
     std::atomic<bool> health_stop_{false};
     std::atomic<bool> health_failed_{false};
+    std::atomic<uint64_t> cancel_sequence_{0};
+    bool accepts_cancel_{false};
     std::mutex health_mu_;
     std::string health_error_;
     std::vector<uint8_t> progress_write_;
@@ -110,6 +114,7 @@ public:
     std::vector<uint8_t>
     exchange_group_task(const std::vector<uint8_t> &frame, int32_t target_rank, uint64_t task_slot, int32_t group_size);
     void shutdown(const std::vector<uint8_t> &frame);
+    void request_task_cancel(int32_t rank, uint64_t command_sequence);
     bool terminal() const;
 
 private:
@@ -119,6 +124,13 @@ private:
     int mpirun_pid_{-1};
     double runtime_timeout_s_{30.0};
     uint64_t next_sequence_{1};
+    std::mutex cancel_mu_;
+    uint64_t active_task_sequence_{0};
+    struct RankCommand {
+        uint64_t active{0};
+        uint64_t cancelled{0};
+    };
+    std::vector<RankCommand> rank_commands_;
     bool shutdown_sent_{false};
     mutable std::mutex lane_mu_;
     std::mutex group_mu_;
@@ -160,6 +172,9 @@ public:
     void submit_progress_frame(const std::vector<uint8_t> &frame) override;
     bool poll_progress_reply(remote_l3::FrameType frame_type, uint64_t sequence, std::vector<uint8_t> &reply) override;
     bool supports_group_batch() const override { return true; }
+    void request_task_cancel(const remote_l3::FrameHeader &header) override {
+        channel_->request_task_cancel(target_rank_, header.sequence);
+    }
     void submit_group_progress_frame(
         const std::vector<uint8_t> &frame, uint64_t task_slot, int32_t group_index, int32_t group_size
     ) override;
@@ -205,6 +220,7 @@ public:
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
     void submit_progress(Ring *ring, const WorkerDispatch &dispatch) override;
+    void request_peer_cancel(RunId run_id) override;
     bool poll_progress(WorkerEndpointProgress &progress) override;
     void request_progress_stop() noexcept override;
     void report_progress_error(const std::string &reason) noexcept override;
@@ -253,6 +269,8 @@ private:
         bool occupied{false};
         WorkerDispatch dispatch{};
         uint64_t sequence{0};
+        RunId run_id{INVALID_RUN_ID};
+        bool cancel_sent{false};
     } pending_task_;
     bool progress_stop_requested_{false};
     std::string progress_stop_reason_;

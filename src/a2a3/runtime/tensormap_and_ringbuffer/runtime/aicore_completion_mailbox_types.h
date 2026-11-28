@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "constants.h"
+#include "kernel_error.h"
 
 // Types shared across the AICore↔AICPU boundary.
 //
@@ -58,7 +59,14 @@ struct alignas(CHIP_ALIGN_SIZE) DeferredCompletionSlab {
     volatile uint32_t count;
     volatile int32_t error_code;
     DeferredCompletionEntry entries[MAX_COMPLETIONS_PER_TASK];
+    KernelErrorDetail kernel_error_detail;
 };
+
+static_assert(
+    sizeof(DeferredCompletionSlab) ==
+    ((8 + MAX_COMPLETIONS_PER_TASK * sizeof(DeferredCompletionEntry) + CHIP_ALIGN_SIZE - 1) / CHIP_ALIGN_SIZE) *
+        CHIP_ALIGN_SIZE
+);
 
 static_assert(
     sizeof(DeferredCompletionSlab) % CHIP_ALIGN_SIZE == 0,

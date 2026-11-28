@@ -420,6 +420,10 @@ void RemoteL3SocketTransport::check_health() {
     throw std::runtime_error("RemoteL3SocketTransport: health lane failed: " + message);
 }
 
+void RemoteL3SocketTransport::request_task_cancel(const remote_l3::FrameHeader &header) {
+    if (accepts_cancel_) cancel_sequence_.store(header.sequence, std::memory_order_release);
+}
+
 void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t worker_id) {
     if (health_thread_.joinable()) return;
     // Health-connect is the last attach-phase op, so it shares attach_deadline_.
@@ -474,6 +478,23 @@ void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t 
                 }
                 if (decoded.header.session_id != session_id || decoded.header.worker_id != worker_id) {
                     throw std::runtime_error("HEALTH session or worker mismatch");
+                }
+                uint64_t sequence = cancel_sequence_.exchange(0, std::memory_order_acq_rel);
+                if (sequence != 0) {
+                    auto cancel = remote_l3::encode_frame(
+                        {remote_l3::FrameType::CANCEL_TASK, session_id, worker_id, sequence}, {}
+                    );
+                    auto deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                        std::chrono::duration<double>(timeout_s)
+                                    );
+                    for (size_t off = 0; off < cancel.size();) {
+                        (void)poll_socket(fd, POLLOUT, deadline, "timed out sending CANCEL_TASK", "poll failed");
+                        ssize_t n = send_no_sigpipe(fd, cancel.data() + off, cancel.size() - off);
+                        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+                        if (n <= 0) throw std::runtime_error("CANCEL_TASK send failed");
+                        off += static_cast<size_t>(n);
+                    }
                 }
             }
         } catch (const std::exception &e) {
@@ -596,6 +617,7 @@ void RemoteL3SocketTransport::expect_hello_ready(
     if (hello.comm_profile != comm_profile) {
         throw std::runtime_error("RemoteL3SocketTransport: HELLO comm profile mismatch");
     }
+    accepts_cancel_ = (hello.feature_flags & remote_l3::FEATURE_TASK_CANCEL) != 0;
     start_health_monitor(session_id, worker_id);
 }
 
@@ -722,6 +744,7 @@ MpiGroupMailboxChannel::MpiGroupMailboxChannel(
     if (mailbox_ == nullptr) throw std::invalid_argument("MpiGroupMailboxChannel: null mailbox");
     if (mailbox_bytes_ < MAILBOX_BYTES) throw std::invalid_argument("MpiGroupMailboxChannel: mailbox is too small");
     if (world_size_ <= 0) throw std::invalid_argument("MpiGroupMailboxChannel: world_size must be positive");
+    rank_commands_.resize(world_size_);
     if (!(runtime_timeout_s_ > 0.0)) {
         throw std::invalid_argument("MpiGroupMailboxChannel: runtime_timeout_s must be positive");
     }
@@ -803,6 +826,17 @@ bool MpiGroupMailboxChannel::terminal() const {
            static_cast<int32_t>(mpi_group_mailbox::GroupState::TERMINAL);
 }
 
+void MpiGroupMailboxChannel::request_task_cancel(int32_t rank, uint64_t command_sequence) {
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    auto &command = rank_commands_.at(rank);
+    command.cancelled = command_sequence;
+    if (command.active == command_sequence)
+        __atomic_store_n(
+            reinterpret_cast<uint64_t *>(mailbox_ + mpi_group_mailbox::OFF_CANCEL_SEQUENCE), active_task_sequence_,
+            __ATOMIC_RELEASE
+        );
+}
+
 std::vector<std::vector<uint8_t>> MpiGroupMailboxChannel::run_exchange(
     const std::vector<std::vector<uint8_t>> &frames, mpi_group_mailbox::Opcode opcode, mpi_group_mailbox::Target target,
     int32_t target_rank
@@ -838,6 +872,23 @@ std::vector<std::vector<uint8_t>> MpiGroupMailboxChannel::run_exchange(
     }
 
     const uint64_t sequence = next_sequence_++;
+    if (opcode == Opcode::TASK) {
+        // Translate each endpoint's ordered command number to the shared
+        // request number, including requests cancelled during group assembly.
+        std::lock_guard<std::mutex> lock(cancel_mu_);
+        active_task_sequence_ = sequence;
+        for (auto &command : rank_commands_)
+            command.active = 0;
+        uint64_t cancelled_sequence = 0;
+        for (size_t i = 0; i < frames.size(); ++i) {
+            auto &command = rank_commands_.at(target == Target::PER_RANK ? i : static_cast<size_t>(target_rank));
+            command.active = remote_l3::decode_frame_header(frames[i].data(), frames[i].size()).sequence;
+            if (command.active == command.cancelled) cancelled_sequence = sequence;
+        }
+        __atomic_store_n(
+            reinterpret_cast<uint64_t *>(mailbox_ + OFF_CANCEL_SEQUENCE), cancelled_sequence, __ATOMIC_RELEASE
+        );
+    }
     const uint32_t count = static_cast<uint32_t>(frames.size());
     std::memcpy(mailbox_ + REQUEST_OFFSET, &count, sizeof(count));
     size_t request_offset = REQUEST_OFFSET + 4;
@@ -858,6 +909,7 @@ std::vector<std::vector<uint8_t>> MpiGroupMailboxChannel::run_exchange(
     write_u32(OFF_REQUEST_BYTES, static_cast<uint32_t>(encoded_request_bytes));
     write_u32(OFF_RESPONSE_COUNT, 0);
     write_u32(OFF_RESPONSE_BYTES, 0);
+    store_i32(OFF_FIRST_ERROR_BYTES, 0);
     write_u32(OFF_ERROR_BYTES, 0);
     const RequestState ready_state =
         opcode == Opcode::SHUTDOWN ? RequestState::SHUTDOWN_READY : RequestState::REQUEST_READY;
@@ -924,9 +976,14 @@ std::vector<std::vector<uint8_t>> MpiGroupMailboxChannel::run_exchange(
             );
         }
         if (std::chrono::steady_clock::now() >= deadline) {
-            mark_terminal("MPI group mailbox request timed out at sequence " + std::to_string(sequence));
+            std::string reason = "MPI group mailbox request timed out at sequence " + std::to_string(sequence);
+            const int32_t bytes = load_i32(OFF_FIRST_ERROR_BYTES);
+            if (bytes > 0 && static_cast<size_t>(bytes) <= ERROR_BYTES) {
+                reason = std::string(reinterpret_cast<const char *>(mailbox_ + RESPONSE_OFFSET), bytes) + "; " + reason;
+            }
+            mark_terminal(reason);
             kill_mpirun_group();
-            throw std::runtime_error("MpiGroupMailboxChannel: request timed out");
+            throw std::runtime_error("MpiGroupMailboxChannel: " + reason);
         }
     }
 }
@@ -1032,27 +1089,21 @@ std::vector<uint8_t> MpiGroupMailboxChannel::exchange_group_task(
     while (!group_done_) {
         // A timed wait may reacquire the mutex after the leader has completed.
         if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout && !group_done_) {
-            if (!group_leader_running_) {
-                // No leader formed: withdraw this rank's frame so a later,
-                // correctly-targeted batch starts from a clean slate.
-                auto &rank_frame = group_frames_[static_cast<size_t>(target_rank)];
-                rank_frame.clear();
-                --group_arrived_;
-                if (group_arrived_ == 0) {
-                    group_active_ = false;
-                    group_done_ = false;
-                    group_replies_.clear();
-                    group_error_ = nullptr;
-                }
-            } else {
-                ++group_departed_;
-                if (group_departed_ == world_size_) {
-                    group_active_ = false;
-                    group_done_ = false;
-                    group_frames_.clear();
-                    group_replies_.clear();
-                    group_error_ = nullptr;
-                }
+            if (group_leader_running_) {
+                // All ranks arrived. Share the leader's bounded mailbox result,
+                // including any rank diagnostic published before a timeout.
+                group_cv_.wait(lock, [this] {
+                    return group_done_;
+                });
+                break;
+            }
+            // No leader formed: withdraw this rank's frame for the next batch.
+            group_frames_[static_cast<size_t>(target_rank)].clear();
+            --group_arrived_;
+            if (group_arrived_ == 0) {
+                group_active_ = false;
+                group_replies_.clear();
+                group_error_ = nullptr;
             }
             lock.unlock();
             group_cv_.notify_all();
@@ -1334,11 +1385,27 @@ void RemoteL3Endpoint::submit_progress(Ring *ring, const WorkerDispatch &dispatc
         pending_task_.occupied = true;
         pending_task_.dispatch = dispatch;
         pending_task_.sequence = sequence;
+        pending_task_.run_id = slot->run_id;
     } catch (...) {
         try {
             command_lane_.finish_reply(sequence);
         } catch (...) {}
         throw;
+    }
+}
+
+void RemoteL3Endpoint::request_peer_cancel(RunId run_id) {
+    std::lock_guard<std::mutex> lock(command_mu_);
+    if (!pending_task_.occupied || pending_task_.run_id != run_id || pending_task_.cancel_sent) return;
+    try {
+        transport_->request_task_cancel(
+            {remote_l3::FrameType::CANCEL_TASK, session_id_, caps_.worker_id, pending_task_.sequence}
+        );
+        pending_task_.cancel_sent = true;
+    } catch (const std::exception &e) {
+        // Keep the outstanding command and its resources until its own completion
+        // or the transport's existing failure/teardown path reports the outcome.
+        std::fprintf(stderr, "RemoteL3Endpoint cancel(worker_id=%d) failed: %s\n", caps_.worker_id, e.what());
     }
 }
 

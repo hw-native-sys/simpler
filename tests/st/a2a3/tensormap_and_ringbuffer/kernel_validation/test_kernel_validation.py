@@ -117,3 +117,54 @@ def test_kernel_validation(st_platform, st_device_ids, tmp_path, capfd, core_typ
         print(str(failure.value))
     else:
         assert "Kernel failure:" not in out + err
+
+
+@pytest.mark.parametrize("index", [-1, 129279, 129280, 1073741824])
+def test_input_index_reaches_host(st_platform, st_device_ids, capfd, index):
+    configure_logging("error")
+    compiler = KernelCompiler(st_platform)
+    binary = compiler.compile_incore(
+        str(HERE / "kernels/validate_index.cpp"),
+        core_type="aiv",
+        pto_isa_root=ensure_pto_isa_root(),
+        extra_include_dirs=compiler.get_orchestration_include_dirs(RUNTIME),
+    )
+    if not st_platform.endswith("sim"):
+        binary = extract_text_section(binary)
+    kernel = CoreCallable.build(signature=[D.IN, D.OUT], binary=binary)
+    call = ChipCallable.build(
+        signature=[D.IN, D.OUT],
+        func_name="aicpu_orchestration_entry",
+        binary=compiler.compile_orchestration(RUNTIME, str(HERE / "kernels/validate_index_orch.cpp")),
+        children=[(219, kernel), (112, kernel)],
+    )
+    worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
+    try:
+        handle = worker.register(call)
+        args = TaskArgsBuilder(
+            TensorArg("index", torch.tensor([index], dtype=torch.int32)),
+            TensorArg("output", torch.tensor([77], dtype=torch.int32)),
+        )
+        task_args, _keepalive = _build_l2_ref_args(args, [D.IN, D.OUT], worker)
+        worker.init()
+        config = CallConfig()
+        config.aicpu_thread_num = 2
+        config.enable_chip_swimlane = 0
+        if 0 <= index < 129280:
+            worker.run(handle, task_args, config)
+            assert args.output.item() == index
+            return
+        with pytest.raises(RuntimeError):
+            worker.run(handle, task_args, config)
+        assert args.output.item() == 77
+    finally:
+        worker.close()
+    # The failure can reach the caller before the Host finishes logging the epoch.
+    out, err = capfd.readouterr()
+    pattern = (
+        rf"Kernel validation: code=106 task=0x[0-9a-f]+ func=219 block=0 arg=0 value={index} range=\[0,129280\)"
+        r" epoch=[1-9]\d*"
+    )
+    match = re.search(pattern, out + err)
+    assert match, out + err
+    print(match.group())

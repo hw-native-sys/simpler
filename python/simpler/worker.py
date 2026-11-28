@@ -122,6 +122,8 @@ from _task_interface import (
 
 from . import _log as _simpler_log
 from . import buffer_export as _buffer_export
+from ._parent_cancel import RUN_CANCELLATION_ATTEMPTS as _RUN_CANCELLATION_ATTEMPTS
+from ._parent_cancel import MailboxCancellation, bind_parent_run
 from ._shared_memory import SharedMemoryAttachment
 from .buffer import (
     OWNER_INSTANCE_ID_BYTES,
@@ -829,10 +831,6 @@ _CLOSE_CANCEL_UNWIND_TIMEOUT_S = 60.0
 # terminal state and notifying), a parked waiter re-observes that state within
 # this interval instead of blocking forever.
 _RUN_HANDLE_WAIT_RECHECK_S = 1.0
-# Native cancellation may finish fallible fan-in preparation only on a retry.
-# Never turn that contract into an unbounded Python loop: one retry is enough
-# to either settle the fence or declare the worker unusable.
-_RUN_CANCELLATION_ATTEMPTS = 2
 
 
 def _copy_span_base(base: int, offset: int) -> int:
@@ -2822,7 +2820,10 @@ def _run_mailbox_loop(
             + (entry_index + 1) * MAILBOX_RUN_ENTRY_STRIDE
         ]
         try:
-            code, msg = handle_task(frame_buf, entry_buf)
+            if _mailbox_load_i32(entry_addr + _OFF_ENTRY_PEER_CANCEL_REQUESTED):
+                code, msg = 1, "parent dispatch failed before task entry (peer error 108)"
+            else:
+                code, msg = handle_task(frame_buf, entry_buf)
             # The payload is consumed, so the frame is the parent's again — before this run's own
             # result is published, because the two are independent and because the terminal state
             # is this side's last access to the entry the ACK is written through.
@@ -5080,6 +5081,8 @@ def _child_worker_loop(
     state_addr = _buffer_field_addr(buf, _OFF_STATE)
     global_comm_inits: dict[str, GlobalCommInitCommand] = {}
 
+    parent_cancel = MailboxCancellation(_mailbox_load_i32)
+
     def handle_task(task_buf, _entry_buf) -> tuple[int, str]:
         digest = _read_task_digest(task_buf)
         cid = identity_table.get(digest)
@@ -5092,7 +5095,9 @@ def _child_worker_loop(
             # pure forwarding to L2 carries no map cost.
             args = _reexport_args_from_mailbox(task_buf, inner_worker)
             cfg = _read_config_from_mailbox(task_buf, level_worker=inner_worker)
-            inner_worker.run(orch_fn, args, cfg)
+            cancel_addr = _buffer_field_addr(_entry_buf, _OFF_ENTRY_PEER_CANCEL_REQUESTED)
+            with parent_cancel.task(cancel_addr, inner_worker):
+                inner_worker.run(orch_fn, args, cfg)
         except Exception as e:  # noqa: BLE001
             return 1, _format_exc(f"child_worker level={inner_worker.level}", e)
         return 0, ""
@@ -5180,13 +5185,16 @@ def _child_worker_loop(
             return 1, _format_exc(f"child_worker level={inner_worker.level} {op}", e)
         return 0, ""
 
-    _run_mailbox_loop(
-        buf,
-        state_addr,
-        handle_task=handle_task,
-        handle_control=handle_control,
-        on_shutdown=inner_worker.close,
-    )
+    try:
+        _run_mailbox_loop(
+            buf,
+            state_addr,
+            handle_task=handle_task,
+            handle_control=handle_control,
+            on_shutdown=inner_worker.close,
+        )
+    finally:
+        parent_cancel.close()
 
 
 def _journal_child_survivors(  # noqa: PLR0913 -- one (shms, pids) pair per child kind, plus the report sink
@@ -15735,6 +15743,7 @@ class Worker:
             scope_open = True
             with _callback_run(run_id, self), contextlib.ExitStack() as domain_uses:
                 domain_uses.callback(self._enroll_domain_uses, resources)
+                bind_parent_run(self, self._orch, run_id)
                 if _host_spans_active():
                     graph_start_ns = time.monotonic_ns()
                     try:
@@ -15898,6 +15907,12 @@ class Worker:
         try:
             resources = handle._resources
             orch = self._orch
+            # Constructing the native diagnostic can itself fail. Its type cannot
+            # establish that this run has retired or that its mappings can be freed.
+            if native_error is not None and orch is not None and orch._run_cancel_cleanup_failed(run_id):
+                handle._cache_finalization_error(native_error)
+                self._publish_abandoned_run(handle, native_error)
+                return native_error
             try:
                 self._stop_run_ccu_domains(resources, native_error)
             except BaseException:

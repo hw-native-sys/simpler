@@ -489,6 +489,38 @@ with `-DCCE_AICORE_ARCH=dav-c220-cube` for AIC and once with
 `-DCCE_AICORE_ARCH=dav-c220-vec` for AIV; both findings need the
 AIC/AIV comparison to be meaningful.
 
+## Reporting invalid kernel data
+
+In A2/A3 TMR, check data-dependent indices before using them to compute a
+memory address, or before publishing a computed index as an output. Apply the
+operator's valid-row and mask rules before the check. Pass the argument number
+and bounds when the caller needs the offending value.
+
+```cpp
+#include "kernel_error_api.h"
+
+// Inside kernel_entry, after reading a valid row's signed index.
+if (index < 0 || index >= vocab_size) {
+    auto ctx = get_async_ctx(args);
+    KernelErrorDetail detail{index, 0, vocab_size, 0};  // argument 0, upper bound exclusive
+    report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE, detail);
+    return;
+}
+```
+
+The two-argument form reports just the error code. The scheduler associates
+the failure with its task, function and block before consumers can run. In
+Program mode the Host can read the original error from that execution's result.
+In Kernel mode the framework observes failure when it synchronizes the
+execution stream or replays the captured graph. A kernel waiting for a peer
+can poll `kernel_cancel_requested(ctx)` from `kernel_cancellation_api.h` and
+return when cancellation is requested.
+
+After a failed dispatch the caller stops submitting dependent work. The
+runtime retains buffers and communication resources while a participant or
+asynchronous request may still use them. Successful work on a new stream
+only establishes the health of that particular operation.
+
 ## 6. Related
 
 - [`docs/l2-cache-bypass.md`](l2-cache-bypass.md) — why native CANN's

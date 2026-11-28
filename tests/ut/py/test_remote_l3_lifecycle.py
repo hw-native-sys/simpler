@@ -24,6 +24,7 @@ import pytest
 from simpler import global_comm_domain as domain_wire
 from simpler import remote_l3_protocol as wire
 from simpler import remote_l3_session, remote_l3_worker
+from simpler._parent_cancel import SessionCancellation, bind_parent_run
 from simpler.buffer import (
     BackendKind,
     CanonicalIdentity,
@@ -34,7 +35,7 @@ from simpler.buffer import (
     remote_sidecar_tensor,
     wrap_vmm_window,
 )
-from simpler.task_interface import DataType
+from simpler.task_interface import CallConfig, DataType
 from simpler.worker import RunHandle, Worker, _RunResources, _SharedExclusiveLock
 
 
@@ -631,6 +632,89 @@ def test_run_session_uses_daemon_absolute_deadline_verbatim(monkeypatch):
 
     # Uses the daemon's absolute deadline verbatim (1042), not now()+something.
     assert captured["deadline"] == 1042.0
+
+
+def test_cancel_before_task_skips_callback_and_next_sequence_runs(monkeypatch):
+    digest = bytes(32)
+    entries = []
+    replies = []
+    session = SessionCancellation()
+    session.accept_frame(
+        wire.decode_frame(wire.encode_frame(wire.FrameHeader(wire.FrameType.CANCEL_TASK, 1, 0, 9), b"")), 1, 0
+    )
+    frames = iter(
+        [
+            SimpleNamespace(header=wire.FrameHeader(wire.FrameType.TASK, 1, 0, seq), payload=bytes([seq]))
+            for seq in (9, 10)
+        ]
+        + [SimpleNamespace(header=wire.FrameHeader(wire.FrameType.SHUTDOWN, 1, 0, 11))]
+    )
+    monkeypatch.setattr(remote_l3_session, "read_frame", lambda _conn: next(frames))
+    monkeypatch.setattr(
+        remote_l3_session,
+        "decode_task_payload",
+        lambda data: wire.TaskPayloadWire(digest, CallConfig(), wire.RemoteTaskArgsWire((), (), (data[0],), b"")),
+    )
+
+    def send(_conn, header, payload):
+        if header.frame_type is wire.FrameType.COMPLETION:
+            sequence, code = struct.unpack_from("<Qi", payload)
+            assert header.sequence == sequence
+            replies.append((sequence, code))
+
+    def record_entry(_orch, args, _config):
+        entries.append(args.scalar(0))
+
+    monkeypatch.setattr(remote_l3_session, "send_frame", send)
+    with Worker(level=3, num_sub_workers=1) as worker:
+        worker.init()
+        remote_l3_session._run_command_loop(
+            Mock(), _manifest(), worker, manifest_dispatch_registry={digest: record_entry}, cancellation=session
+        )
+    assert replies == [(9, 108), (10, 0)]
+    assert entries == [10]
+
+
+def test_active_cancel_retries_memory_error_and_ignores_retired_sequence():
+    cancel = SessionCancellation()
+    worker, orch = object(), Mock()
+    orch._request_parent_cancel.side_effect = (MemoryError(), None)
+    with cancel.task(9, worker):
+        bind_parent_run(worker, orch, 27)
+        cancel.request(9)
+    with cancel.task(10, worker):
+        bind_parent_run(worker, orch, 28)
+        cancel.request(9)
+    assert [call.args for call in orch._request_parent_cancel.call_args_list] == [(27,), (27,)]
+
+
+def test_live_task_can_receive_a_fragmented_cancel_on_tcp_health_lane():
+    worker, orch = object(), Mock()
+    cancelled = threading.Event()
+    orch._request_parent_cancel.side_effect = lambda _run: cancelled.set()
+    stop = threading.Event()
+    session = SessionCancellation()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    address = listener.getsockname()
+    reader = threading.Thread(target=remote_l3_session._health_loop, args=(listener, stop, 21, 3, session))
+    reader.start()
+    try:
+        with socket.create_connection(address, timeout=3) as parent, session.task(17, worker):
+            bind_parent_run(worker, orch, 44)
+            assert wire.read_frame(parent).header.frame_type == wire.FrameType.HEALTH
+            frame = wire.encode_frame(wire.FrameHeader(wire.FrameType.CANCEL_TASK, 21, 3, 17), b"")
+            parent.sendall(frame[:8])
+            assert wire.read_frame(parent).header.frame_type == wire.FrameType.HEALTH
+            orch._request_parent_cancel.assert_not_called()
+            parent.sendall(frame[8:])
+            assert cancelled.wait(2)
+            orch._request_parent_cancel.assert_called_once_with(44)
+    finally:
+        stop.set()
+        reader.join(3)
+    assert not reader.is_alive()
 
 
 def test_health_loop_closes_active_connection_on_stop():
