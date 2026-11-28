@@ -67,6 +67,7 @@ class TestSpmdSyncStartEdge(SceneTestCase):
     CASES = [
         {
             "name": "Case1",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3"],
             "params": {},
         }

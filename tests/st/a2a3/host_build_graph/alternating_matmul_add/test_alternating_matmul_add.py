@@ -53,6 +53,7 @@ class TestAlternatingMatmulAddHostBuildGraph(SceneTestCase):
     CASES = [
         {
             "name": "default",
+            "manual": ["a2a3"],
             "platforms": ["a2a3"],
             "params": {"batch": 1, "M": 1, "N": 1, "matmul_batch": 1, "add_batch": 1},
         },

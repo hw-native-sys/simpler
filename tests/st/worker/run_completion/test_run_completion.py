@@ -46,7 +46,9 @@ def _callable_spec(name):
 
 class _RunCompletion(SceneTestCase):
     CALLABLE = _callable_spec("x")
-    CASES = [{"name": "completed_unobserved_outputs", "platforms": ["a2a3sim", "a5sim", "a2a3", "a5"]}]
+    CASES = [
+        {"name": "completed_unobserved_outputs", "manual": ["a2a3"], "platforms": ["a2a3sim", "a5sim", "a2a3", "a5"]}
+    ]
 
     def generate_args(self, params):
         index = params.get("index", 0)

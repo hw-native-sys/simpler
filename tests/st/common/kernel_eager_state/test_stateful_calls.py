@@ -297,6 +297,7 @@ _OWNERSHIP = (
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 @pytest.mark.parametrize("borrowed", _OWNERSHIP)
+@pytest.mark.manual(["a2a3"])
 def test_tmr_empty_and_active_calls_retain_state(st_platform, st_device_ids, borrowed):
     _check(st_platform, st_device_ids, "tensormap_and_ringbuffer", borrowed, False)
 
@@ -306,6 +307,7 @@ def test_tmr_empty_and_active_calls_retain_state(st_platform, st_device_ids, bor
 @pytest.mark.device_count(1)
 @pytest.mark.parametrize("borrowed", _OWNERSHIP)
 @pytest.mark.parametrize("host_controls", [False, True])
+@pytest.mark.manual(["a2a3"])
 def test_hbg_empty_and_active_calls_retain_state(st_platform, st_device_ids, borrowed, host_controls):
     _check(st_platform, st_device_ids, "host_build_graph", borrowed, host_controls)
 

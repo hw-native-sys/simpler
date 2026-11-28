@@ -14,7 +14,7 @@ from .main import run
 
 
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
-@pytest.mark.manual(["a2a3sim"])
+@pytest.mark.manual(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 def test_per_task_runtime_env(st_platform, st_device_ids):

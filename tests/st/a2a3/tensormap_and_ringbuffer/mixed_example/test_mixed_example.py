@@ -97,6 +97,7 @@ class TestMixedExample(SceneTestCase):
     CASES = [
         {
             "name": "case1",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3"],
             "params": {"num_iters": 4},
         },

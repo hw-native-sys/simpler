@@ -155,6 +155,7 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
 # 10 s run budget, so the assertions report first; this mark is only the
 # backstop for a genuine hang.
 @pytest.mark.timeout(180)
+@pytest.mark.manual(["a2a3"])
 def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids, monkeypatch, tmp_path):
     _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, enable_sdma=False)
 

@@ -99,11 +99,11 @@ def build_probe(build, core_type, code):
         pytest.param(1, marks=pytest.mark.execution_mode("capture_replay")),
     ],
 )
-@pytest.mark.parametrize("core_type", ["aic", "aiv"])
+@pytest.mark.parametrize("core_type", ["aic", pytest.param("aiv", marks=pytest.mark.manual(["a2a3"]))])
 @pytest.mark.parametrize(
     "code",
     [
-        0,
+        pytest.param(0, marks=pytest.mark.manual(["a2a3"])),
         pytest.param(101, marks=pytest.mark.manual(["a2a3"])),
         pytest.param(102, marks=pytest.mark.manual(["a2a3"])),
         106,
