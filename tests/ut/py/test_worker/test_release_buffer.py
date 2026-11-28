@@ -21,13 +21,16 @@ own independent check in ``release_buffer``.
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from _task_interface import DataType, TensorArgType
-from simpler.buffer import AccessMode, create_host_shared_buffer, mint_owner_instance_id, wrap_device_malloc
+from simpler.buffer import AccessMode, create_host_shared_buffer, mint_owner_instance_id, re_export, wrap_device_malloc
 from simpler.orchestrator import Orchestrator
 from simpler.task_interface import CallConfig, TaskArgs
 from simpler.worker import RunHandle, Worker, _RunResources
@@ -486,3 +489,81 @@ class TestReleaseBufferImportBroadcast:
             buf = w.create_buffer(64)
             w.release_buffer(buf)
         assert "reported errors" not in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="checks each fork child's Linux shared-memory mapping")
+def test_release_inherited_upload_while_chip_workers_remain_live(monkeypatch):
+    torch = pytest.importorskip("torch")
+    with fake_chip_l3(monkeypatch, device_ids=(0, 1), num_sub_workers=1, init=False) as worker:
+        weights = torch.arange(24, dtype=torch.uint8).share_memory_()[3:19]
+        source = worker.register_upload_tensor(weights)
+        ptr = weights.data_ptr()
+        for line in Path("/proc/self/maps").read_text().splitlines():
+            bounds, _, _, device, inode, *_ = line.split()
+            start, stop = (int(addr, 16) for addr in bounds.split("-"))
+            if start <= ptr < stop:
+                break
+        else:
+            pytest.fail("shared weight mapping missing in the parent")
+        assert int(inode) != 0
+        del weights
+        other = worker.register_upload_tensor(torch.full((8,), 99, dtype=torch.uint8).share_memory_())
+        stale = re_export(source.to_descriptor())
+        worker.init()
+        pids = [os.getpid(), *worker._chip_pids]
+        assert len(pids) == 3
+
+        def has_mapping(pid):
+            entries = Path(f"/proc/{pid}/maps").read_text().splitlines()
+            return any(entry.split()[3:5] == [device, inode] for entry in entries)
+
+        assert all(has_mapping(pid) for pid in pids)
+        assert not has_mapping(worker._sub_pids[0])
+        resident = worker.alloc_child_tensor(0, (8,), DataType.UINT8)
+        worker.copy_to(resident, source, src_offset=4, nbytes=8)
+        worker.release_buffer(source)
+        # The second chip inherited the storage without ever importing or uploading it.
+        assert not any(has_mapping(pid) for pid in pids)
+        worker.release_buffer(source)
+        with pytest.raises(ValueError, match="unknown or released"):
+            worker.copy_to(resident, stale, nbytes=8)
+        result = worker.create_buffer(8)
+        worker.copy_from(result, resident)
+        with result.host_view() as view:
+            assert bytes(view) == bytes(range(7, 15))
+        worker.copy_to(resident, other)
+        worker.copy_from(result, resident)
+        with result.host_view() as view:
+            assert bytes(view) == bytes([99]) * 8
+        worker.release_buffer(other)
+        worker.release_buffer(result)
+        worker.free(resident)
+
+
+def test_upload_registration_uses_shared_contiguous_storage_before_init(monkeypatch):
+    torch = pytest.importorskip("torch")
+    with fake_chip_l3(monkeypatch, init=False) as worker:
+        with pytest.raises(ValueError, match="shared CPU"):
+            worker.register_upload_tensor(torch.zeros(8))
+        bank = torch.zeros(8).share_memory_()
+        with pytest.raises(ValueError, match="nonempty contiguous"):
+            worker.register_upload_tensor(bank[::2])
+        with pytest.raises(ValueError, match="nonempty contiguous"):
+            worker.register_upload_tensor(bank[:0])
+        source = worker.register_upload_tensor(bank)
+        with pytest.raises(ValueError, match="only valid as a copy_to source"):
+            source.tensor((1,), DataType.UINT8)
+        worker.release_buffer(source)
+        assert source.closed
+        assert bank.sum().item() == 0
+        worker.init()
+        with pytest.raises(RuntimeError, match=r"before init\(\)"):
+            worker.register_upload_tensor(bank)
+
+
+def test_close_retires_upload_registered_without_starting_workers():
+    torch = pytest.importorskip("torch")
+    worker = Worker(level=3, device_ids=[0], platform="a2a3sim", runtime="tensormap_and_ringbuffer")
+    source = worker.register_upload_tensor(torch.zeros(8).share_memory_())
+    worker.close()
+    assert source.closed

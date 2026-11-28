@@ -136,6 +136,7 @@ from .buffer import (
     ImportRegistry,
     LocalEndpointBufferIdentityAllocator,
     _DeviceBufferSource,
+    _ForkUploadBuffer,
     _wrap_heap_allocation,
     buffer_reference,
     capabilities_for_adapter,
@@ -3573,6 +3574,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
     fork_inherited: bool = True,
     expected_parent_pid: int | None = None,
     shared_heap_files: tuple[tuple[bytes, int, tuple[int, ...]], ...] = (),
+    fork_uploads: dict[CanonicalIdentity, _ForkUploadBuffer] | None = None,
 ) -> None:
     """Chip-process handlers for `_run_mailbox_loop`.
 
@@ -3601,6 +3603,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
     if provider_region_store is None:
         raise RuntimeError(f"chip_process dev={device_id}: ProviderRegionStore is required before INIT_READY")
     provider_transaction_table = ProviderTransactionTable()
+    fork_uploads = {} if fork_uploads is None else fork_uploads
     import_registry = ImportRegistry(
         ImportContext(
             deployment=DEVICE_AICPU,
@@ -3721,7 +3724,13 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                 # advanced. `_read_control_copy_request` has already bounded both spans.
                 dst_desc, src_desc, n, dst_off, src_off = _read_control_copy_request(mailbox_addr)
                 dst = _copy_span_base(import_registry.materialize(dst_desc).base, dst_off)
-                src = _copy_span_base(import_registry.materialize(src_desc).base, src_off)
+                if sub_cmd == _CTRL_COPY_TO and src_desc.backend_kind == BackendKind.FORK_UPLOAD:
+                    upload = fork_uploads.get(src_desc.identity)
+                    if upload is None:
+                        raise ValueError("copy_to: inherited upload storage is unknown or released")
+                    src = _copy_span_base(upload.copy_source(src_desc), src_off)
+                else:
+                    src = _copy_span_base(import_registry.materialize(src_desc).base, src_off)
                 if sub_cmd == _CTRL_COPY_TO:
                     cw.copy_to(dst, src, n)
                 else:
@@ -3941,7 +3950,11 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     cw.flush_diagnostics(min(int(timeout_ms), _MAX_FLUSH_TIMEOUT_MS))
                 _DFX_FLUSH_REPORT.pack_into(buf, _CTRL_OFF_RESULT, 0, 0, 0, 0)
             elif sub_cmd == _CTRL_IMPORT_RELEASE:
-                import_registry.unregister(_unpack_identity_wire(_read_control_digest(buf)))
+                identity = _unpack_identity_wire(_read_control_digest(buf))
+                import_registry.unregister(identity)
+                upload = fork_uploads.pop(identity, None)
+                if upload is not None:
+                    upload.close()
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_PREPARE:
                 _handle_ctrl_global_domain_prepare(cw, buf, global_domain_store)
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_IMPORT:
@@ -4706,6 +4719,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- chip-child entry receives binaries, 
     fork_inherited: bool = True,
     expected_parent_pid: int | None = None,
     shared_heap_files: tuple[tuple[bytes, int, tuple[int, ...]], ...] = (),
+    fork_uploads: dict[CanonicalIdentity, _ForkUploadBuffer] | None = None,
 ) -> None:
     """Run in the chip child and load host_runtime.so in its own address space.
 
@@ -4843,6 +4857,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- chip-child entry receives binaries, 
             fork_inherited=fork_inherited,
             expected_parent_pid=expected_parent_pid,
             shared_heap_files=shared_heap_files,
+            fork_uploads=fork_uploads,
         )
     finally:
         # After the teardown, whether or not it raised: the C++ side captured
@@ -10280,6 +10295,12 @@ class Worker:
         self._startup_ready_pids = set()
         self._startup_group_leader_pids = set()
 
+        fork_uploads = {
+            b.identity: b for b in self._buffers.values() if isinstance(b, _ForkUploadBuffer) and not b.closed
+        }
+        if fork_uploads and (self._exec_chip or not self._is_startup_root):
+            raise ValueError("registered upload tensors require local forked chip workers on a root L3")
+
         # Fork SubWorker processes (MUST be before any C++ threads)
         for i in range(n_sub):
             pid = os.fork()
@@ -10289,6 +10310,9 @@ class Worker:
                 _close_fork_child_fds(self._config.get("fork_child_close_fds", ()))
 
                 def _setup():
+                    # SUB workers never perform H2D and can drop their inherited upload references.
+                    for upload in fork_uploads.values():
+                        upload.close()
                     return _make_local_identity_tables(
                         identity_snapshot,
                         callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
@@ -10368,6 +10392,7 @@ class Worker:
                             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
                             pipeline_depth_request=chip_pipeline_depth_request,
                             automatic_admission=self._automatic_admission_requested,
+                            fork_uploads=fork_uploads,
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -14383,6 +14408,11 @@ class Worker:
         an interior address, because such a handle names no allocation at all.
         """
         host, src_addr, host_nbytes = self._host_side_of_copy(src, writing=False, api="copy_to")
+        if host is not None and host.backend_kind == BackendKind.FORK_UPLOAD:
+            with self._registry_lock:
+                upload = self._buffers.get(int(host.identity.buffer_id))
+                if not isinstance(upload, _ForkUploadBuffer) or upload.closed or upload.identity != host.identity:
+                    raise ValueError("copy_to: inherited upload storage is unknown or released")
         dst_offset, src_offset, nbytes = self._copy_extent(
             host_nbytes, dst_offset, src_offset, nbytes, host_side="src", api="copy_to"
         )
@@ -14491,8 +14521,29 @@ class Worker:
                     )
 
     # ------------------------------------------------------------------
-    # Post-fork zero-copy host buffers
+    # Shared host buffers
     # ------------------------------------------------------------------
+
+    def register_upload_tensor(self, tensor) -> Buffer:
+        """Retain a contiguous shared CPU tensor for H2D on a local forked L3.
+
+        Register before init(), and drop other tensor/storage aliases before fork if
+        release_buffer() should reclaim the backing while the chip workers remain live.
+        copy_to() offsets are relative to the registered tensor view.
+        """
+        if self.level != 3 or not self._config.get("device_ids"):
+            raise ValueError("register_upload_tensor requires an L3 with local chip workers")
+        with self._hierarchical_start_cv:
+            if self._lifecycle is not _Lifecycle.NEW or self._topology_parent is not None:
+                raise RuntimeError("register_upload_tensor requires a root L3 before init()")
+            if getattr(getattr(tensor, "device", None), "type", None) != "cpu" or not tensor.is_shared():
+                raise ValueError("register_upload_tensor requires a shared CPU tensor")
+            if not tensor.is_contiguous() or tensor.numel() == 0:
+                raise ValueError("register_upload_tensor requires a nonempty contiguous tensor")
+            buffer = _ForkUploadBuffer(self._burn_buffer_identity(), tensor)
+            with self._registry_lock:
+                self._buffers[int(buffer.identity.buffer_id)] = buffer
+            return buffer
 
     def create_buffer(self, nbytes: int) -> Buffer:
         """Allocate ordinary shared Host storage owned by this Worker."""
@@ -14763,6 +14814,20 @@ class Worker:
         collide with a registry key, and evicting the live entry it names would strand that
         backing."""
         _check_domain_initializer_context(self, "Worker.release_buffer")
+        if buffer.backend_kind == BackendKind.FORK_UPLOAD:
+            with self._hierarchical_start_cv:
+                if (
+                    not isinstance(buffer, _ForkUploadBuffer)
+                    or bytes(buffer.identity.owner_instance_id) != self._owner_instance_id
+                ):
+                    raise ValueError("release_buffer: inherited upload storage belongs to a different worker")
+                if self._lifecycle is _Lifecycle.INITIALIZING:
+                    raise RuntimeError("release_buffer: wait for init() to finish for an inherited upload")
+                if self._lifecycle is _Lifecycle.NEW:
+                    buffer.close()
+                    with self._registry_lock:
+                        self._buffers.pop(int(buffer.identity.buffer_id), None)
+                    return
         if not buffer.closed:
             # Exclusive, not shared: `shared()` would already exclude admission and so
             # satisfy the "never mid-callback" argument above, but this keeps the
@@ -16066,6 +16131,7 @@ class Worker:
         return (
             self._has_native_tree()
             or self._comm_generation is not None
+            or bool(self._buffers)
             or bool(self._sub_pids or self._chip_pids or self._next_level_pids)
             or bool(self._sub_shms or self._chip_shms or self._next_level_shms)
             or any(group.process is not None or group.ready_dir is not None for group in self._mpi_l3_groups)
@@ -16096,6 +16162,8 @@ class Worker:
         n_instances = len(self._region_instance_registry._instances)
         if n_instances:
             parts.append(f"{n_instances} region instance(s)")
+        if self._buffers:
+            parts.append(f"{len(self._buffers)} owner buffer(s)")
         if self._live_domains:
             parts.append(f"{len(self._live_domains)} comm domain(s)")
         if self._live_global_domains:

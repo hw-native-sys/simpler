@@ -2404,6 +2404,7 @@ NB_MODULE(_task_interface, m) {
 
     nb::enum_<BackendKind>(m, "BackendKind", nb::is_arithmetic())
         .value("FORK_SHM", BackendKind::FORK_SHM)
+        .value("FORK_UPLOAD", BackendKind::FORK_UPLOAD)
         .value("POSIX_SHM", BackendKind::POSIX_SHM)
         .value("VMM_WINDOW", BackendKind::VMM_WINDOW)
         .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)

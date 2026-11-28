@@ -110,13 +110,32 @@ run until graph destruction and checked cleanup. See the
 | `malloc(size) -> Buffer` | L2 only; allocates on this worker's chip |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Allocates on an L3 worker's chip child; use `Tensor(handle, shapes=shapes, dtype=dtype)` to name a task argument |
 | `free(handle)` | Releases a device `Buffer` returned by either allocation method |
-| `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
+| `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` or `register_upload_tensor` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
 | `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shapes=shapes, dtype=dtype)` |
+| `register_upload_tensor(tensor) -> Buffer` | Register a contiguous shared CPU tensor before starting a local forked L3. The handle names that view for synchronous H2D |
 | `Buffer.host_view()` | CPU view of the local Host backing. Release the view and its derivatives before closing the backing |
 | `release_buffer(buffer)` | Release Worker-owned storage after accepted uses retire. For a mapped Host Buffer, this also releases its cached registration |
 | `Buffer.shm.buf` | CPU bytes of shared Host storage. Host-source domain buffers expose the whole rank window; select slices with `domain.buffer_range(name)`. Device-source HBM buffers have `shm=None` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
+
+For pre-fork weights, register the shared tensor and drop other references to its
+storage **before** `init()`. This lets the parent and each chip worker retire
+their last reference independently after the final upload. Every tensor or slice
+still held elsewhere at fork also retains that storage in the child.
+
+```python
+source = worker.register_upload_tensor(weights)
+del weights
+worker.init()
+device_weights = worker.alloc_child_tensor(0, (source.nbytes,), DataType.UINT8)
+worker.copy_to(device_weights, source)
+worker.release_buffer(source)
+```
+
+`release_buffer` uses the usual best-effort child notification, including chips
+that never copied this source. Once the last reference is gone, PyTorch can
+reclaim the shared storage while the workers continue using the device weights.
 
 A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
 dst_offset=32, nbytes=16)`. A handle rebuilt at `base + 32` is not an interior view of that
