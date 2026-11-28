@@ -391,6 +391,11 @@ struct TaskInput {
     uint32_t active_mask{0};
 };
 
+inline size_t table_fanin_producer_id(uint64_t ref, uint64_t device_base, const PercounterLayout &layout) {
+    const uint64_t address = ref & ~PERCOUNTER_COMPLETION_NOTIFY;
+    return (address - device_base - layout.counters_offset) / sizeof(PercounterCounter);
+}
+
 // Fold only top-level joins with no payload, predicate or sync-start.
 inline bool percounter_fold_dependency_tasks(
     std::vector<TaskInput> &tasks, std::vector<std::vector<int32_t>> &rows, std::vector<int64_t> &folded

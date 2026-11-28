@@ -208,6 +208,11 @@ and Graph body joins retain their own counters and scheduling positions.
 The logical task table remains available to dependency export.
 
 The Host omits predecessors already complete at bind from device fanin rows.
+For top-level tables without Graph invocations, it also drops a direct wait
+when another input proves completion through unconditional ordinary tasks.
+After pruning, producers observed only by the same ordinary consumer or
+terminal entry frontier can share a CntNotify slot. Each subtask still
+publishes once, and the observer waits for their combined credit count.
 The logical DAG still determines ordering and sink discovery. A task-table
 fanin entry points to a GM counter or tags a CntNotify descriptor. Graph body
 fanin entries carry local producer indices. Ordinary slots and the MIX

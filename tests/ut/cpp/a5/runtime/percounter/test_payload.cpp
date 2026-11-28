@@ -14,7 +14,9 @@
 
 uint64_t get_aicore_report_epoch();
 #include "lane_loop.h"
+#include "fanin_reduction.h"
 #include "graph_template.h"
+#include "partial_join.h"
 #include "terminal_pipeline.h"
 #include "scheduler/argument_metadata.h"
 
@@ -837,6 +839,81 @@ TEST(PercounterAcquire, CntNotifyDoesNotReleaseFaninBeforeTheDeferredSubtask) {
         EXPECT_EQ(f.calls.size(), expected + 1) << mask;
         EXPECT_EQ(f.control->async_registered, 1U);
         EXPECT_EQ(f.control->async_settled, 1U);
+    }
+}
+
+TEST(PercounterAcquire, SerialTasksDoNotReserveJoinSlots) {
+    const int32_t edges[]{0, 1};
+    std::vector<TaskInput> inputs{task(1), task(1), task(1)};
+    inputs[1].fanin_ids = edges;
+    inputs[1].fanin_count = 1;
+    inputs[2].fanin_ids = edges + 1;
+    inputs[2].fanin_count = 1;
+    EXPECT_EQ(partial_join_slot_capacity(inputs), 0U);
+}
+
+TEST(PercounterAcquire, PartialJoinCombinesExclusiveInputsAndPreservesTheSharedProducer) {
+    const int32_t edges[]{0, 2, 1, 0};
+    std::vector<TaskInput> inputs{task(2, 2), task(2), task(2, 3), task(2, 2), task(1)};
+    inputs[3].fanin_count = 4;
+    inputs[3].fanin_ids = edges;
+    inputs[4].fanin_count = 1;
+    inputs[4].fanin_ids = edges + 1;
+    SchedulerCompletionCounterPlan plan;
+    std::string error;
+    ASSERT_TRUE(plan_percounter_completion_counters(inputs, &plan, &error));
+    alignas(32) uint32_t words[32]{};
+    std::vector<uint64_t> lease;
+    for (size_t i = 0; i <= plan.chains.size(); ++i)
+        lease.push_back(reinterpret_cast<uint64_t>(&words[8 * i]));
+    ExternalAddresses external{};
+    external.completion_plan = &plan;
+    external.completion_notify = lease.data();
+    external.completion_notify_count = plan.chains.size();
+    Fixture f(inputs, 2, external);
+    const auto shared = f.counters[2].completion_notify_address;
+    const auto stats = build_partial_joins(
+        inputs, f.layout, f.control, reinterpret_cast<uint64_t>(f.control), lease, plan.chains.size()
+    );
+    ASSERT_EQ(stats.groups, 1U);
+    EXPECT_EQ(stats.removed_refs, 2U);
+    EXPECT_EQ(stats.moved_from_gm, 1U);
+    EXPECT_EQ(f.resolve(3).fanin_count, 2);
+    EXPECT_EQ(f.counters[2].completion_notify_address, shared);
+    EXPECT_TRUE(percounter_completion_notify_head(f.counters[0], f.counters[0].value));
+    EXPECT_EQ(f.counters[1].completion_notify_target, 3U);
+    auto issue = [&](int id, uint32_t count) {
+        percounter_issue_completion(percounter_completion_address(f.cfg[0], id), count);
+    };
+    issue(2, 3);
+    issue(0, 2);
+    uint32_t cursor = 0;
+    uint64_t pending = 0, target = 0;
+    EXPECT_TRUE(percounter_probe_fanin(f.cfg[0], f.resolve(4), &cursor, &pending, &target));
+    cursor = 0;
+    EXPECT_FALSE(percounter_probe_fanin(f.cfg[0], f.resolve(3), &cursor, &pending, &target));
+    issue(1, 1);
+    EXPECT_TRUE(percounter_probe_fanin(f.cfg[0], f.resolve(3), &cursor, &pending, &target));
+}
+
+TEST(PercounterAcquire, ATransitiveWaitCanBeRemovedThroughAnOrdinaryProducerOnly) {
+    const int32_t edges[]{0, 1, 2};
+    std::vector<TaskInput> inputs{task(1), task(2), task(2), task(1)};
+    inputs[1].fanin_ids = edges;
+    inputs[1].fanin_count = 1;
+    inputs[3].fanin_ids = edges;
+    inputs[3].fanin_count = 3;
+    for (const bool conditional : {false, true}) {
+        inputs[1].has_predicate = conditional;
+        Fixture f(inputs);
+        const auto removed = reduce_table_waits(inputs, f.layout, f.control, reinterpret_cast<uint64_t>(f.control));
+        EXPECT_EQ(removed, conditional ? 0U : 1U);
+        const auto consumer = f.resolve(3);
+        EXPECT_EQ(consumer.fanin_count, conditional ? 3 : 2);
+        if (!conditional) {
+            EXPECT_EQ(percounter_producer(f.cfg[0], consumer, 0), reinterpret_cast<uint64_t>(&f.counters[1].value));
+            EXPECT_EQ(percounter_producer(f.cfg[0], consumer, 1), reinterpret_cast<uint64_t>(&f.counters[2].value));
+        }
     }
 }
 
@@ -2277,6 +2354,36 @@ TEST(PercounterAcquire, FoldedJoinStillWaitsForOffLaneCompletion) {
     f.drain();
     f.expect_completed(3);
     EXPECT_EQ(f.calls.size(), 2U);
+}
+
+TEST(PercounterAcquire, TerminalEntryJoinWaitsForBothPrefixBranches) {
+    const int32_t first = 0, vector_id = 2, last_inputs[]{1, 3};
+    std::vector<TaskInput> inputs{task(1, 2), task(2, 3), task(2, 4), task(7, 2), task(7, 2)};
+    inputs[2].fanin_ids = &first;
+    inputs[2].fanin_count = 1;
+    inputs[3].fanin_ids = &vector_id;
+    inputs[3].fanin_count = 1;
+    inputs[4].fanin_ids = last_inputs;
+    inputs[4].fanin_count = 2;
+    Fixture f(inputs, 2, {}, false, true, synchronous_task);
+    ASSERT_EQ(f.control->terminal.step_count, 3U);
+    ASSERT_EQ(f.control->terminal.prerequisite_count, 2U);
+    EXPECT_GE(partial_join_slot_capacity(inputs), 1U);
+    alignas(32) uint32_t notification{};
+    const auto stats = build_partial_joins(
+        inputs, f.layout, f.control, reinterpret_cast<uint64_t>(f.control), {reinterpret_cast<uint64_t>(&notification)},
+        0
+    );
+    ASSERT_EQ(stats.removed_terminal_refs, 1U);
+    ASSERT_EQ(f.control->terminal.prerequisite_count, 1U);
+    const auto id = f.control->terminal.prerequisites[0];
+    percounter_issue_completion(percounter_completion_address(f.cfg[0], 1), 3);
+    EXPECT_FALSE(f.completed(id));
+    percounter_issue_completion(percounter_completion_address(f.cfg[0], 0), 1);
+    EXPECT_FALSE(f.completed(id));
+    percounter_issue_completion(percounter_completion_address(f.cfg[0], 0), 1);
+    EXPECT_TRUE(f.completed(id));
+    EXPECT_FALSE(f.sinks_complete());
 }
 
 TEST(PercounterAcquire, TerminalPipelineRequiresClosedSuffixAndKeepsIndependentInput) {
