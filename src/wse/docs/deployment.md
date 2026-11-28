@@ -39,7 +39,9 @@ recording rejects synchronized SPMD in this version.
 In `wse_events.jsonl`, each synchronized member records `BLOCK_READY`
 (kind 18) once. The last arrival records one task-wide `SYNC_RELEASE`
 (kind 19). Every `BLOCK_BEGIN` for that task follows the release. Compare
-event sequence numbers to verify this ordering across Cores.
+event sequence numbers to verify this ordering across Cores. GO is recorded by
+the PE that completes device readiness. RUN_DONE is recorded by the PE that
+retires the last Core.
 
 A placement such as `{6}` runs on Core 6 with one Thread on PE 0 by default.
 Setting `launch.thread_num` selects the first one to four PEs on each Core.
@@ -69,7 +71,15 @@ a later Block's Tensor is not lost by looking only at the first Block's argument
 Native Graph definitions preserve Block placement, per-Block Tensor bindings,
 dynamic scalar origins and predicates. Rebinding changes addresses and values
 through the Graph boundary; it does not change the fixed device model. Cached
-Graph bindings must remain valid for the selected task layout. Predicate-false
+Graph bindings must remain valid for the selected task layout.
+
+A Graph boundary or dependency-only node connected to a kernel stores its
+state on the Core of the nearest placed kernel in the dependency DAG. The
+kernel task ID breaks distance ties. A disconnected component containing only
+dependency nodes retires in topological order during Host preparation. Its
+`TASK_DONE` events have `source="host_prepare"` and null `core` and `pe`.
+
+Predicate-false
 tasks retire without executing their kernel body and still satisfy dependents.
 
 SharedTile slots belong to the active Block. The last participating Thread

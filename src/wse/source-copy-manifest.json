@@ -45,12 +45,12 @@
     {
       "source": "src/a5/platform/sim/host/device_runner.cpp",
       "destination": "src/wse/platform/sim/host/device_runner.cpp",
-      "sha256": "29a42836ce207fa6d0761fcb9f80ac646833cc6a85c8fcef19007987c1758f07"
+      "sha256": "6333f08e81c4ff128a33b8f6c7f25e8c83ef764d030a3cab969853795ffa4655"
     },
     {
       "source": "src/a5/platform/sim/host/device_runner.h",
       "destination": "src/wse/platform/sim/host/device_runner.h",
-      "sha256": "134a0bcee1ca707f48e074f2fc1ef6a83073fd83425036c706292701525006a3"
+      "sha256": "fff5c7587f35e155473471ef4c0b686c11404c44c825d6fa25f60dbc6826069f"
     },
     {
       "source": "src/a5/platform/sim/host/runtime_c_api.cpp",

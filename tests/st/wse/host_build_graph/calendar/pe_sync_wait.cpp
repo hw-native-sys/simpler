@@ -72,23 +72,45 @@ int main(int argc, char **) {
         placement.thread_num = 1;
     wire.placements[2].core_id = 1;
     char error[256]{};
-    execution = wse_create_run_v2(&d, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
+    execution = wse_create_run_v3(&d, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
     if (!execution) {
         std::fprintf(stderr, "%s\n", error);
         return 1;
     }
     std::vector<std::thread> pes;
     std::array<int, 2 * WSE_PE_PER_CORE> results{};
-    for (size_t i = 0; i < results.size(); ++i)
+    const auto start = [&](size_t i) {
         pes.emplace_back([i, &results] {
             results[i] = wse_execute_pe(execution, i);
         });
+    };
+    const size_t last_pe = results.size() - 1;
+    for (size_t i = 0; i < last_pe; ++i)
+        start(i);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        {
+            std::lock_guard lock(execution->mutex);
+            if (execution->ready_pes == last_pe) break;
+        }
+        std::this_thread::yield();
+    }
+    start(last_pe);
     for (auto &pe : pes)
         pe.join();
     unsigned ready = 0, release = 0, begin = 0;
     uint64_t peer_ready_seq = UINT64_MAX, busy_end_seq = 0, release_seq = 0;
+    uint64_t last_retired_seq = 0;
+    uint32_t last_retired_core = UINT32_MAX, run_done_core = UINT32_MAX;
+    bool go_from_last_pe = false;
     for (const auto &stream : execution->events)
         for (const auto &e : stream) {
+            if (e.kind == WseEventKind::GO) go_from_last_pe = e.core * WSE_PE_PER_CORE + e.pe == last_pe;
+            if (e.kind == WseEventKind::CORE_RETIRED && e.sequence > last_retired_seq) {
+                last_retired_seq = e.sequence;
+                last_retired_core = e.core;
+            }
+            if (e.kind == WseEventKind::RUN_DONE) run_done_core = e.core;
             if (e.task == 0 && e.kind == WseEventKind::BLOCK_END) busy_end_seq = e.sequence;
             if (e.task != 1) continue;
             if (e.kind == WseEventKind::BLOCK_READY && e.block == 1) peer_ready_seq = e.sequence;
@@ -102,7 +124,9 @@ int main(int argc, char **) {
         return rc == expected_rc;
     });
     const bool ordered = fail ? busy_end_seq == 0 : peer_ready_seq < busy_end_seq && busy_end_seq < release_seq;
-    const bool valid = witnessed && all_retired && ordered && ready == (fail ? 1u : 2u) &&
+    const bool lifecycle =
+        go_from_last_pe && (fail || (last_retired_core != UINT32_MAX && last_retired_core == run_done_core));
+    const bool valid = lifecycle && witnessed && all_retired && ordered && ready == (fail ? 1u : 2u) &&
                        release == (fail ? 0u : 1u) && begin == (fail ? 0u : 2u);
     wse_destroy_run(execution);
     if (!valid) std::fprintf(stderr, "witness=%d, READY=%u, RELEASE=%u, BEGIN=%u\n", witnessed, ready, release, begin);

@@ -13,8 +13,24 @@
 #include "scheduler/scheduler_graph.h"
 
 namespace wse {
+// The last Block publishes completion here. For a Group, Block 0's explicitly
+// assigned Core owns the join and the optional sync-start arrival count.
+struct TaskSignal {
+    uint32_t remaining_blocks, remaining_arrivals, completed;
+};
+struct TaskDependency {
+    const TaskSignal *signal;
+};
+struct TaskRecord {
+    uint64_t ref, entry;
+    TaskSignal *signal;
+    TaskDependency *predecessors;
+    TaskRecord *next_control;
+    uint32_t blocks, has_predicate, predecessor_count;
+    SchedulerDispatchPredicate predicate;
+};
 struct Work {
-    uint64_t task;
+    TaskRecord *task;
     uint32_t block, thread_num;
     uint32_t thread_pes[PE_PER_CORE];
     uint32_t tensor_count, scalar_count;
@@ -26,26 +42,15 @@ struct Queue {
 enum class BlockState : uint32_t { IDLE, WAITING_FOR_SYNC, RUNNING };
 struct CoreControl {
     uint32_t initialized, ready, quiet, retired;
-    uint64_t expected_tasks;
+    uint64_t epoch, base;
     Queue queue;
+    SramAccess access;
+    TaskRecord *first_control;
     uint64_t block_epoch, block_serial;
     BlockState block_state;
     uint32_t started, finished, execute;
 };
-struct TaskRecord {
-    uint64_t entry, predecessors_offset;
-    uint32_t blocks, remaining_arrivals, has_predicate, predecessor_count;
-    uint32_t remaining_blocks, completed;
-    SchedulerDispatchPredicate predicate;
-};
-struct RunControl {
-    uint64_t epoch, expected_tasks, completed;
-    uint64_t tasks_offset, core_offsets_offset;
-    SramAccess access;
-    uint32_t core_count, task_count, configured, go, stop;
-    bool failed;
-};
-static_assert(std::is_standard_layout_v<RunControl> && std::is_trivially_copyable_v<RunControl>);
+static_assert(std::is_standard_layout_v<TaskSignal> && std::is_trivially_copyable_v<TaskSignal>);
 static_assert(std::is_standard_layout_v<TaskRecord> && std::is_trivially_copyable_v<TaskRecord>);
 static_assert(std::is_standard_layout_v<CoreControl> && std::is_trivially_copyable_v<CoreControl>);
 }  // namespace wse

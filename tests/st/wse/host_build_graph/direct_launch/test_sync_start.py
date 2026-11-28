@@ -34,30 +34,33 @@ def build(platform):
         platform,
         Path(__file__).parent / "kernels",
         "sync_start_orch.cpp",
-        [D.OUT] * 3 + [D.IN] * 4,
-        [("sync_start_member.cpp", [D.OUT] + [D.IN] * 3), ("sync_start_join.cpp", [D.IN, D.IN, D.OUT])],
+        [D.OUT] * 3 + [D.IN] * 5,
+        [("sync_start_member.cpp", [D.OUT] + [D.IN] * 4), ("sync_start_join.cpp", [D.IN, D.IN, D.OUT])],
     )
 
 
-def task_args(worker, sync, blocks, second_core, probe):
+def task_args(worker, sync, blocks, second_core, probe, producer_count=0):
     args = TaskArgs()
     buffers = []
-    for owner, count in enumerate((1, 4, 1)):
+    for owner, count in zip((second_core, 2, 3), (1, 4, 1), strict=True):
         view = layout_view(worker, 4 * count, core=owner)
         copy_to(worker, view, torch.full((count,), -1.0))
         args.add_tensor(view.tensor(shapes=(count,), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
         buffers.append(view)
-    for value in (sync, blocks, second_core, probe):
+    for value in (sync, blocks, second_core, probe, producer_count):
         args.add_scalar(int(value))
     return args, buffers
 
 
-def audit(path, worker, buffers, *, sync, second_core):
+def check_outputs(worker, buffers):
     for view, expected in zip(buffers, ([7.0], [10.0, 11.0, 20.0, 21.0], [69.0]), strict=True):
         output = torch.zeros(len(expected))
         copy_from(worker, output, view)
         assert output.tolist() == expected
 
+
+def audit(path, worker, buffers, *, sync, second_core):
+    check_outputs(worker, buffers)
     header, *events = map(json.loads, (path / "wse_events.jsonl").read_text().splitlines())
     assert header["expected_tasks"] == 3
     calendar = json.loads((path / "calendar.json").read_text())
@@ -183,5 +186,76 @@ def test_busy_core_failure_wakes_sync_waiters(tmp_path, st_platform):
         audit(tmp_path, worker, buffers, sync=True, second_core=6)
         for view in buffers:
             release_view(worker, view)
+    finally:
+        worker.close()
+
+
+def test_task_state_follows_explicit_core_placement(tmp_path, st_platform):
+    worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
+    try:
+        worker.init()
+        handle = worker.register(build(st_platform))
+
+        def run(producer_core, producer_count):
+            path = tmp_path / f"core-{producer_core}-ss-{producer_count}"
+            config = CallConfig()
+            config.output_prefix = str(path)
+            args, buffers = task_args(worker, True, 2, producer_core, False, producer_count)
+            try:
+                worker.run(handle, args, config)
+                check_outputs(worker, buffers)
+            finally:
+                for view in buffers:
+                    release_view(worker, view)
+
+            group = producer_count
+            waits = json.loads((path / "calendar.json").read_text())["waits"]
+            assert waits[group] == [group - 1] and group in waits[group + 1]
+            header, *events = map(json.loads, (path / "wse_events.jsonl").read_text().splitlines())
+            assert header["expected_tasks"] == group + 2
+
+            def matching(task, kind):
+                return sorted((e for e in events if e["task"] == task and e["kind"] == kind), key=lambda e: e["seq"])
+
+            (producer_done,) = matching(group - 1, TASK_DONE)
+            ready, begins, ends = (matching(group, kind) for kind in (BLOCK_READY, BLOCK_BEGIN, BLOCK_END))
+            (release,) = matching(group, SYNC_RELEASE)
+            (done,) = matching(group, TASK_DONE)
+            (join,) = matching(group + 1, BLOCK_BEGIN)
+            assert producer_done["core"] == producer_core and join["core"] == 3
+            for members in (ready, begins, ends):
+                assert sorted((e["block"], e["core"]) for e in members) == [(0, 2), (1, producer_core)]
+            assert producer_done["seq"] < ready[0]["seq"] <= ready[-1]["seq"] < release["seq"] < begins[0]["seq"]
+            assert ends[-1]["seq"] < done["seq"] < join["seq"]
+            return json.loads((path / "wse_sram.json").read_text())
+
+        one = run(producer_core=6, producer_count=1)
+        many = run(producer_core=6, producer_count=16)
+        swapped = run(producer_core=0, producer_count=16)
+
+        def usage(report, core):
+            return report["cores"][core]["runtime_used"]
+
+        assert usage(many, 6) > usage(one, 6)
+        for core in (0, 2):
+            assert usage(many, core) == usage(one, core)
+        assert usage(many, 6) == usage(swapped, 0)
+        assert usage(many, 0) == usage(swapped, 6)
+        for report, active in ((many, 6), (swapped, 0)):
+            owners = {}
+            signal_bytes = {}
+            for section in report["sections"]:
+                owner = section["owner"]
+                owners.setdefault(section["name"], set()).add(owner)
+                if section["name"] == "task_signal":
+                    signal_bytes[owner] = signal_bytes.get(owner, 0) + section["bytes"]
+            # Sixteen SS signals reside on their submitted Core. Only Block 0 owns the Group signal.
+            assert signal_bytes[active] == 16 * signal_bytes[2] and signal_bytes[2] == signal_bytes[3]
+            assert owners["core_control"] == set(range(len(report["cores"])))
+            assert owners["local_task"] == owners["task_signal"] == owners["block_queue"] == {2, 3, active}
+            assert owners["dependencies"] == {2, 3, active}
+            for core in range(len(report["cores"])):
+                if core not in {2, 3, active}:
+                    assert {s["name"] for s in report["sections"] if s["owner"] == core} == {"core_control"}
     finally:
         worker.close()

@@ -172,14 +172,18 @@ def test_native_graph_and_top_level_dependency_only_tasks(tmp_path, st_platform)
         x = torch.tensor([[1, -3], [2, 1]]).float()
         weight = torch.tensor([[2, 1], [-1, 2]]).float()
         header, events = run_graph(worker, handle, tmp_path, [([x, weight], [torch.relu(x @ weight)])])
-        # Enter → SS → inner dummy → exit → top-level dummy.
-        assert header["expected_tasks"] == 5
+        # The Graph chain runs on Core 7. The disconnected dummy pair has no execution placement.
+        assert header["expected_tasks"] == 7
         waits = assert_calendar_matches_dispatch(tmp_path, header, events)
-        assert waits == [[], [0], [1], [2], [3]]
+        assert waits == [[], [0], [1], [2], [3], [], [5]]
         starts = [(e["task"], e["block"], e["core"]) for e in events if e["kind"] == BLOCK_BEGIN]
         assert starts == [(1, 0, 7)]
-        done = sorted((e["seq"], e["task"]) for e in events if e["kind"] == TASK_DONE)
-        assert [task for _, task in done] == [0, 1, 2, 3, 4]
+        done = sorted((e for e in events if e["kind"] == TASK_DONE), key=lambda e: e["seq"])
+        assert [e["task"] for e in done if e["core"] == 7] == [0, 1, 2, 3, 4]
+        host = [e for e in done if e["core"] is None and e["pe"] is None and e["source"] == "host_prepare"]
+        assert [e["task"] for e in host] == [5, 6] and len(done) == 7
+        sram = json.loads((tmp_path / "wse_sram.json").read_text())
+        assert {s["owner"] for s in sram["sections"] if s["name"] == "local_task"} == {7}
         worker.unregister(handle)
     finally:
         worker.close()

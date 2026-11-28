@@ -36,4 +36,7 @@ extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     graph.add_output(args.tensor(2).ref());
     const auto result = rt_submit_graph(kernel_and_barrier, graph);
     if (!result.has_error) wait_for(result.task_id);
+    // This independent chain has no executing Block on either side.
+    CoreTaskArgs standalone;
+    wait_for(rt_submit_dummy_task(standalone).task_id());
 }

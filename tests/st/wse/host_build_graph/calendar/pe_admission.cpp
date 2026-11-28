@@ -50,15 +50,27 @@ int main() {
 
     const auto admit = [&](const char *name) {
         char error[256]{};
-        auto *run = wse_create_run_v2(&descriptor, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
+        auto *run = wse_create_run_v3(&descriptor, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
         std::printf("%s %s\n", name, run ? "accepted" : "rejected");
         if (!run) std::fprintf(stderr, "%s\n", error);
+        const auto idle_usage = run ? wse_runtime_used(run, 1) : 0;
         wse_destroy_run(run);
+        return idle_usage;
     };
-    admit("explicit_core_0");
+    const uint64_t idle_usage = admit("explicit_core_0");
     wire.indices[1] = 0;  // Move the calendar row to Core 1, keeping its explicit Core 0 placement.
     admit("wrong_calendar_core");
+
+    // Core 0 can reserve just enough for its own control record while Core 1 runs the SS.
+    const auto original = regions[0];
+    regions[0].reserve = idle_usage;
+    regions[0].runtime_base = original.base + original.capacity - idle_usage;
+    wire.placements[0].core_id = 1;
+    admit("idle_core_0_at_limit");
     wire.indices[1] = 1;
+    wire.placements[0].core_id = 0;
+    admit("active_core_0_over_limit");
+    regions[0] = original;
     wire.node.block_plan_count = 0;
     wire.node.block_plans_offset = 0;
     admit("missing_placement");

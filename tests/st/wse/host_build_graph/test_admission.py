@@ -130,16 +130,21 @@ def test_prebuilt_target_admission(arch, admission_artifacts):
 
 
 @pytest.mark.device_count(1)
-@pytest.mark.parametrize("legacy_abi", [False, True], ids=["missing_memory_sections", "legacy_descriptor"])
-def test_executor_rejects_incompatible_abi_before_create(tmp_path, st_platform, monkeypatch, legacy_abi):
+@pytest.mark.parametrize(
+    "create_name",
+    ["wse_create_run_v3", "wse_create_run_v2", "wse_create_run"],
+    ids=["missing_memory_sections", "centralized_task_state", "legacy_descriptor"],
+)
+def test_executor_rejects_incompatible_abi_before_create(tmp_path, st_platform, monkeypatch, create_name):
     from simpler.task_interface import ChipCallable, TaskArgs  # noqa: PLC0415
     from simpler.worker import Worker  # noqa: PLC0415
 
     marker = tmp_path / "create-called"
     source = tmp_path / "incomplete_executor.cpp"
-    create_name = "wse_create_run" if legacy_abi else "wse_create_run_v2"
-    # The old PE has every method the old Host required and ignores the sync_start word.
-    sections = "const void *wse_memory_sections(const void *, uint64_t *) { return nullptr; }\n" if legacy_abi else ""
+    # Supply every ancillary method for the older PEs, and omit one required method for v3.
+    sections = "const void *wse_memory_sections(const void *, uint64_t *) { return nullptr; }\n"
+    if create_name == "wse_create_run_v3":
+        sections = ""
     source.write_text(
         "#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n"
         'extern "C" {\n'
@@ -214,10 +219,13 @@ def test_pe_requires_explicit_core_matching_calendar_row(tmp_path, st_platform):
     assert result.stdout.splitlines() == [
         "explicit_core_0 accepted",
         "wrong_calendar_core rejected",
+        "idle_core_0_at_limit accepted",
+        "active_core_0_over_limit rejected",
         "missing_placement rejected",
         "synchronous_pair accepted",
         "split_sync_ticks rejected",
     ], result.stderr
+    assert "core=0 section=block_queue" in result.stderr
 
 
 def test_started_peer_waits_for_busy_core_completion_or_failure(tmp_path, st_platform):
