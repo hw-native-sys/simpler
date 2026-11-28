@@ -224,10 +224,12 @@ struct alignas(64) ChipTensorMapEntry {
         }
 
         // -------- L1: byte-range intersection (O(1) fast reject) --------
-        const uint64_t in_begin = input.start_offset;
-        const uint64_t in_end = input.start_offset + input.extent_elem();
-        const uint64_t ent_begin = start_offset;
-        const uint64_t ent_end = start_offset + effective_extent_elem();
+        const uint64_t input_width = get_element_size(input.dtype);
+        const uint64_t entry_width = get_element_size(dtype);
+        const uint64_t in_begin = input.start_offset * input_width;
+        const uint64_t in_end = in_begin + input.extent_elem() * input_width;
+        const uint64_t ent_begin = start_offset * entry_width;
+        const uint64_t ent_end = ent_begin + effective_extent_elem() * entry_width;
         Segment in_range_bytes{in_begin, in_end};
         Segment ent_range_bytes{ent_begin, ent_end};
         if (!in_range_bytes.line_segment_intersection(ent_range_bytes)) {

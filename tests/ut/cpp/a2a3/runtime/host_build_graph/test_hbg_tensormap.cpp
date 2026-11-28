@@ -326,3 +326,15 @@ TEST(HbgTensorMapReuse, FailedFirstAllocationLeavesAnEmptyOwnerAndCanBeRetried) 
         EXPECT_EQ(map.current_used(), 0);
     }
 }
+
+TEST(MixedWidthViews, CompareByteRanges) {
+    alignas(64) unsigned char storage[64]{};
+    uint32_t word_shape[] = {16}, byte_shape[] = {64};
+    auto words = simpler::hbg::make_tensor_external(storage, word_shape, 1, DataType::UINT32);
+    auto bytes = simpler::hbg::make_tensor_external(storage, byte_shape, 1, DataType::UINT8);
+    ChipTensorMapEntry entry{};
+    entry.copy_from_tensor(words.slice(0, 4, 5));
+    EXPECT_EQ(entry.check_overlap(bytes.slice(0, 16, 20)), OverlapStatus::OTHER);
+    EXPECT_EQ(entry.check_overlap(bytes.slice(0, 19, 21)), OverlapStatus::OTHER);
+    EXPECT_EQ(entry.check_overlap(bytes.slice(0, 20, 24)), OverlapStatus::NO_OVERLAP);
+}
