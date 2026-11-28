@@ -25,7 +25,7 @@ from tests.st.wse.host_build_graph.tile_operations.test_execution import load_ga
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
 
 BLOCK_BEGIN, BLOCK_END, TASK_DONE = 4, 5, 6
-BLOCK_READY, SYNC_RELEASE = 18, 19
+PE_ARRIVE, SYNC_RELEASE = 18, 19
 
 
 @lru_cache
@@ -80,17 +80,20 @@ def audit(path, worker, buffers, *, sync, second_core):
         pe_events = matching(1, kind)
         assert all(e["value"] == e["pe"] for e in pe_events)
         assert sorted((e["block"], e["core"], e["pe"]) for e in pe_events) == [
-            (block, core, pe) for block, core in ((0, 2), (1, second_core)) for pe in (0, 1)
+            (block, core, pe) for block, core in ((0, 2), (1, second_core)) for pe in (2, 3)
         ]
     start_by_block = {e["block"]: e["seq"] for e in starts}
     (busy_end_event,) = matching(0, BLOCK_END)
     assert busy_end_event["core"] == 2
     busy_end = busy_end_event["seq"]
+    pe_starts = {(e["block"], e["pe"]): e["seq"] for e in matching(1, 16)}
     if second_core != 2:
-        assert busy_end < start_by_block[0]
-    ready, release = matching(1, BLOCK_READY), matching(1, SYNC_RELEASE)
+        assert busy_end < pe_starts[0, 3]
+    ready, release = matching(1, PE_ARRIVE), matching(1, SYNC_RELEASE)
     if sync:
-        assert sorted((e["block"], e["core"]) for e in ready) == [(0, 2), (1, second_core)]
+        assert sorted((e["block"], e["core"], e["pe"]) for e in ready) == [
+            (b, core, pe) for b, core in ((0, 2), (1, second_core)) for pe in (2, 3)
+        ]
         assert len(release) == 1 and ready[-1]["seq"] < release[0]["seq"] < starts[0]["seq"]
         assert busy_end < release[0]["seq"]
     else:
@@ -100,7 +103,13 @@ def audit(path, worker, buffers, *, sync, second_core):
     ends, done = matching(1, BLOCK_END), matching(1, TASK_DONE)
     assert len(ends) == 2 and len(done) == 1
     if second_core == 2:
-        assert ends[0]["block"] == starts[0]["block"] and ends[0]["seq"] < starts[1]["seq"]
+        for pe in (2, 3):
+            lane = sorted(
+                (e for e in events if (e["core"], e["pe"]) == (2, pe) and e["kind"] in (16, 17)), key=lambda e: e["seq"]
+            )
+            assert [(e["task"], e["block"], e["kind"]) for e in lane] == [
+                (row["task"], row["block"], kind) for row in calendar["pes"][2][pe] for kind in (16, 17)
+            ]
     (join_begin,) = matching(2, BLOCK_BEGIN)
     assert join_begin["core"] == 3 and ends[-1]["seq"] < done[0]["seq"] < join_begin["seq"]
     assert sorted(e["task"] for e in events if e["kind"] == TASK_DONE) == [0, 1, 2]
@@ -110,7 +119,7 @@ def audit(path, worker, buffers, *, sync, second_core):
 def test_direct_spmd_start(tmp_path, st_platform, sync):
     # The ordinary launch must enter B1 on the free Core before the host releases the busy Core.
     # For sync_start the host itself releases T0 after acknowledgement, independently of B1.
-    gate = load_gate(tmp_path, "wse_sync_start_probe" if sync else "wse_independent_start_probe", 0 if sync else 2)
+    gate = load_gate(tmp_path, "wse_sync_start_probe" if sync else "wse_independent_start_probe", 0 if sync else 1 << 3)
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
         worker.init()
@@ -224,12 +233,15 @@ def test_task_state_follows_explicit_core_placement(tmp_path, st_platform):
                 return sorted((e for e in events if e["task"] == task and e["kind"] == kind), key=lambda e: e["seq"])
 
             (producer_done,) = matching(group - 1, TASK_DONE)
-            ready, begins, ends = (matching(group, kind) for kind in (BLOCK_READY, BLOCK_BEGIN, BLOCK_END))
+            ready, begins, ends = (matching(group, kind) for kind in (PE_ARRIVE, BLOCK_BEGIN, BLOCK_END))
             (release,) = matching(group, SYNC_RELEASE)
             (done,) = matching(group, TASK_DONE)
             (join,) = matching(group + 1, BLOCK_BEGIN)
             assert producer_done["core"] == producer_core and join["core"] == 3
-            for members in (ready, begins, ends):
+            assert sorted((e["block"], e["core"], e["pe"]) for e in ready) == [
+                (b, core, pe) for b, core in ((0, 2), (1, producer_core)) for pe in (2, 3)
+            ]
+            for members in (begins, ends):
                 assert sorted((e["block"], e["core"]) for e in members) == [(0, 2), (1, producer_core)]
             assert producer_done["seq"] < ready[0]["seq"] <= ready[-1]["seq"] < release["seq"] < begins[0]["seq"]
             assert ends[-1]["seq"] < done["seq"] < join["seq"]

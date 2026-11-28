@@ -57,7 +57,7 @@ int main() {
 
     const auto admit = [&](const char *name) {
         char error[256]{};
-        auto *run = wse_create_run_v7(&descriptor, 2, 1, regions, 2, nullptr, 0, 0, error, sizeof(error));
+        auto *run = wse_create_run_v8(&descriptor, 2, 1, regions, 2, nullptr, 0, 0, error, sizeof(error));
         std::printf("%s %s\n", name, run ? "accepted" : "rejected");
         if (!run) std::fprintf(stderr, "%s\n", error);
         const auto idle_usage = run ? wse_runtime_used(run, 1) : 0;

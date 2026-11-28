@@ -16,7 +16,7 @@ namespace wse {
 // The last Block publishes completion here. For a Group, Block 0's explicitly
 // assigned Core owns the join and the optional sync-start arrival count.
 struct TaskSignal {
-    uint32_t remaining_blocks, remaining_arrivals, completed;
+    uint32_t remaining_blocks, remaining_arrivals, expected_arrivals, completed;
 };
 struct TaskDependency {
     const TaskSignal *signal;
@@ -31,24 +31,25 @@ struct TaskRecord {
 };
 struct Work {
     TaskRecord *task;
-    uint32_t block, thread_num;
-    uint32_t thread_pes[PE_PER_CORE];
+    uint32_t block, row, thread_num, remaining_pes;
+    uint8_t abi_slots[PE_PER_CORE];
+    bool started, execute;
     uint32_t tensor_count, scalar_count;
     uint64_t tensors_offset, scalars_offset;
 };
-struct Queue {
-    uint64_t work_offset, capacity, head, tail;
+struct PeCalendar {
+    uint32_t *rows;
+    uint32_t head, size;
+    uint64_t active_row;
+    bool arrived;
 };
-enum class BlockState : uint32_t { IDLE, WAITING_FOR_SYNC, RUNNING };
 struct CoreControl {
     uint32_t initialized, ready, quiet, retired;
     uint64_t epoch, base;
-    Queue queue;
+    Work *blocks;
+    PeCalendar calendars[PE_PER_CORE];
     SramAccess access;
     TaskRecord *first_control;
-    uint64_t block_epoch, block_serial;
-    BlockState block_state;
-    uint32_t started, finished, execute;
 };
 static_assert(std::is_standard_layout_v<TaskSignal> && std::is_trivially_copyable_v<TaskSignal>);
 static_assert(std::is_standard_layout_v<TaskRecord> && std::is_trivially_copyable_v<TaskRecord>);

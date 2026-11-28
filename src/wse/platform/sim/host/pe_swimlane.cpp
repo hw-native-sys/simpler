@@ -123,10 +123,13 @@ struct TaskFlows {
     std::vector<uint64_t> arrived, released;
     std::vector<FlowRange> consumers;
     std::vector<uint64_t> predecessors;
-    uint64_t thread_count = 0, thread_index = 0;
+    uint64_t endpoint_count = 0, next_endpoint = 0;
     bool done = false;
 };
-// A global event sequence names exactly one arrival or one thread start in this trace.
+WseEventKind dependency_endpoint(bool sync_start) {
+    return sync_start ? WseEventKind::PE_ARRIVE : WseEventKind::THREAD_BEGIN;
+}
+// A global event sequence identifies a single arrival or kernel start in this trace.
 uint64_t flow_id(const WseEvent &event) { return event.sequence + 1; }
 struct Stream {
     const WseEvent *next, *end;
@@ -140,16 +143,18 @@ uint64_t block_key(const WseEvent &e) { return (e.task << 32) | e.block; }
 
 void add_flows(Message &event, const WseEvent &e, TaskFlows &flows, bool sync_start) {
     // TrackEvent.flow_ids starts a flow; terminating_flow_ids closes it on the receiving slice.
+    if (e.kind == dependency_endpoint(sync_start)) {
+        for (auto first : flows.predecessors)
+            fixed64(event, 48, first + flows.next_endpoint);
+        ++flows.next_endpoint;
+    }
     if (e.kind == WseEventKind::TASK_DONE) {
         for (const auto &range : flows.consumers)
             for (uint64_t i = 0; i < range.count; ++i)
                 fixed64(event, 47, range.first + i);
-    } else if (e.kind == WseEventKind::THREAD_BEGIN) {
-        for (auto first : flows.predecessors)
-            fixed64(event, 48, first + flows.thread_index);
-        ++flows.thread_index;
-        if (sync_start) fixed64(event, 48, flow_id(e));
-    } else if (sync_start && e.kind == WseEventKind::BLOCK_READY) {
+    } else if (sync_start && e.kind == WseEventKind::THREAD_BEGIN) {
+        fixed64(event, 48, flow_id(e));
+    } else if (sync_start && e.kind == WseEventKind::PE_ARRIVE) {
         fixed64(event, 47, flow_id(e));
     } else if (sync_start && e.kind == WseEventKind::SYNC_RELEASE) {
         for (auto id : flows.arrived)
@@ -171,8 +176,8 @@ void write_event(
             if (!flows || flows->consumers.empty()) return;
             marker = "TASK_DONE";
             break;
-        case Kind::BLOCK_READY:
-            marker = "BLOCK_READY";
+        case Kind::PE_ARRIVE:
+            marker = "PE_ARRIVE";
             break;
         case Kind::SYNC_RELEASE:
             marker = "SYNC_RELEASE";
@@ -211,7 +216,7 @@ void write_event(
 
 bool write_events(
     std::ostream &out, const WseGraphDescriptor &descriptor, uint64_t epoch, uint32_t cores, const WseRun *run,
-    decltype(&wse_run_events_v7) run_events
+    decltype(&wse_run_events_v8) run_events
 ) {
     using Kind = WseEventKind;
     const auto *nodes = reinterpret_cast<const WseNodePlan *>(descriptor.nodes_address);
@@ -233,10 +238,10 @@ bool write_events(
             if (e.kind == Kind::BLOCK_SKIPPED) skipped.insert(block_key(e));
             auto &task = tasks[e.task];
             if (e.kind == Kind::TASK_DONE) task.done = true;
-            if (e.kind == Kind::THREAD_BEGIN) ++task.thread_count;
-            if (nodes[e.task].sync_start && (e.kind == Kind::BLOCK_READY || e.kind == Kind::THREAD_BEGIN)) {
+            if (e.kind == dependency_endpoint(nodes[e.task].sync_start)) ++task.endpoint_count;
+            if (nodes[e.task].sync_start && (e.kind == Kind::PE_ARRIVE || e.kind == Kind::THREAD_BEGIN)) {
                 if (e.sequence >= UINT64_MAX - 1) return false;
-                (e.kind == Kind::BLOCK_READY ? task.arrived : task.released).push_back(flow_id(e));
+                (e.kind == Kind::PE_ARRIVE ? task.arrived : task.released).push_back(flow_id(e));
                 next_id = std::max(next_id, flow_id(e) + 1);
             }
         }
@@ -246,16 +251,16 @@ bool write_events(
     const auto *base = reinterpret_cast<const std::byte *>(&descriptor);
     for (size_t to = 0; to < tasks.size(); ++to) {
         auto &consumer = tasks[to];
-        if (!consumer.thread_count) continue;
+        if (!consumer.endpoint_count) continue;
         const auto *waits = reinterpret_cast<const uint32_t *>(base + nodes[to].waits_offset);
         for (uint32_t i = 0; i < nodes[to].wait_count; ++i) {
             if (waits[i] >= tasks.size()) return false;
             auto &producer = tasks[waits[i]];
             if (!producer.done) continue;
-            if (UINT64_MAX - next_id < consumer.thread_count) return false;
-            producer.consumers.push_back({next_id, consumer.thread_count});
+            if (UINT64_MAX - next_id < consumer.endpoint_count) return false;
+            producer.consumers.push_back({next_id, consumer.endpoint_count});
             consumer.predecessors.push_back(next_id);
-            next_id += consumer.thread_count;
+            next_id += consumer.endpoint_count;
         }
     }
     while (!streams.empty()) {
@@ -282,7 +287,7 @@ bool write_events(
 
 bool write_pe_swimlane(
     const std::filesystem::path &output_dir, const WseGraphDescriptor &descriptor, uint64_t epoch, uint32_t core_count,
-    const WseRun *run, decltype(&wse_run_events_v7) run_events
+    const WseRun *run, decltype(&wse_run_events_v8) run_events
 ) {
     const auto target = output_dir / "wse_swimlane.pftrace";
     // Readers see a complete run even when a later write to the same prefix fails.

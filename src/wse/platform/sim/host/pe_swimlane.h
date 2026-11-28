@@ -16,6 +16,6 @@
 namespace wse {
 bool write_pe_swimlane(
     const std::filesystem::path &output_dir, const WseGraphDescriptor &descriptor, uint64_t epoch, uint32_t core_count,
-    const WseRun *run, decltype(&wse_run_events_v7) run_events
+    const WseRun *run, decltype(&wse_run_events_v8) run_events
 );
 }  // namespace wse

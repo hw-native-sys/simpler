@@ -75,20 +75,17 @@ def test_one_to_four_pes_and_block_binding(tmp_path, st_platform, native):
                 first = int(native)
                 assert ends[first] < min(e["seq"] for e in events if e["kind"] == 4 and e["task"] == first + 1)
                 for core in range(2):
-                    active = None
-                    order = []
-                    for e in sorted(events, key=lambda e: e["seq"]):
-                        if e["core"] != core:
-                            continue
-                        if e["kind"] == 4:
-                            assert active is None
-                            active = (e["task"], e["block"])
-                            order.append(active)
-                        if e["kind"] == 5:
-                            assert active == (e["task"], e["block"])
-                            active = None
-                    assert active is None
-                    assert order == [(task, b) for task in (first, first + 1) for b in range(5) if b % 2 == core]
+                    for pe in participants:
+                        lane = sorted(
+                            (e for e in events if (e["core"], e["pe"]) == (core, pe) and e["kind"] in (16, 17)),
+                            key=lambda e: e["seq"],
+                        )
+                        assert [(e["task"], e["block"], e["kind"]) for e in lane] == [
+                            (task, block, kind)
+                            for task in (first, first + 1)
+                            for block in range(core, 5, 2)
+                            for kind in (16, 17)
+                        ]
                 release_view(worker, buffer)
         worker.unregister(handle)
     finally:
@@ -126,7 +123,9 @@ def test_block_end_invalidates_only_its_own_shared_tiles(tmp_path, st_platform):
         )
         ends = {e["block"]: e["seq"] for e in events if e["kind"] == 5}
         begins = {e["block"]: e["seq"] for e in events if e["kind"] == 4}
-        assert ends[0] < begins[2]
+        for pe in range(4):
+            sequence = [e["block"] for e in events if e["core"] == 0 and e["pe"] == pe and e["kind"] in (16, 17)]
+            assert sequence == [0, 0, 2, 2]
         assert begins[1] < ends[2]
         assert len([e for e in events if e["kind"] == 6]) == 1
         release_view(worker, buffer)

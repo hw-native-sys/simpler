@@ -342,7 +342,7 @@ def test_deployment_cached_binding_and_predicate(tmp_path, st_platform, native):
                 skipped = sorted(
                     (event["task"], event["core"], event["pe"]) for event in events[1:] if event["kind"] == 11
                 )
-                assert skipped == [(int(native), 39, 0), (int(native) + 1, 39, 0)]
+                assert skipped == [(int(native) + stage, *expected_target(0, 40, 3, stage)) for stage in range(2)]
                 expected = 4 if native else 2
                 assert sorted(event["value"] for event in events[1:] if event["kind"] == 6) == list(
                     range(1, expected + 1)

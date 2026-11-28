@@ -180,15 +180,15 @@ int DeviceRunner::ensure_binaries_loaded() {
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run_v7"));
+    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run_v8"));
     if (!create_run_) {
-        LOG_ERROR("WSE PE runtime ABI mismatch: expected wse_create_run_v7");
+        LOG_ERROR("WSE PE runtime ABI mismatch: expected wse_create_run_v8");
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     destroy_run_ = reinterpret_cast<decltype(destroy_run_)>(dlsym(aicore_so_handle_, "wse_destroy_run"));
     execute_pe_ = reinterpret_cast<decltype(execute_pe_)>(dlsym(aicore_so_handle_, "wse_execute_pe"));
-    run_events_ = reinterpret_cast<decltype(run_events_)>(dlsym(aicore_so_handle_, "wse_run_events_v7"));
+    run_events_ = reinterpret_cast<decltype(run_events_)>(dlsym(aicore_so_handle_, "wse_run_events_v8"));
     completed_tasks_ = reinterpret_cast<decltype(completed_tasks_)>(dlsym(aicore_so_handle_, "wse_completed_tasks"));
     runtime_used_ = reinterpret_cast<decltype(runtime_used_)>(dlsym(aicore_so_handle_, "wse_runtime_used"));
     memory_sections_ = reinterpret_cast<decltype(memory_sections_)>(dlsym(aicore_so_handle_, "wse_memory_sections"));

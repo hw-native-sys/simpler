@@ -66,8 +66,8 @@ for each Block. A Graph expresses dependencies between these launches.
 Every run uses all configured Cores. A task's logical Block count comes from
 `CoreTaskArgs.launch_spec.block_num()`, independently of the device width.
 Host submission supplies a Core ID for every Block. Cores with no work are
-idle, and Blocks assigned to the same Core queue there. A Core executes one Block at a
-time, and the task completes once all its Blocks have finished.
+idle. Each PE runs its assigned Blocks in calendar order. A task completes
+once every participating PE in every Block has finished.
 
 A Block runs on one to four distinct local PEs. Each PE reads its physical
 coordinates with `get_core_id()` and `get_pe_id()`. WSE
@@ -85,10 +85,11 @@ a dependent task can start, even when their Cores differ.
 
 The WSE planner adapts the Host scheduling policy from
 [A5 HBG #3262](https://github.com/hw-native-sys/simpler/pull/3262).
-The Host binds Graph instances and publishes one calendar per homogeneous
-Core. During admission, the PE runtime resolves each Block's arguments into
-Core SRAM. Each invocation of a Graph gets its own rows in the run's DAG.
-Its execution can overlap independent work subject to the DAG and Core order.
+The Host binds Graph instances and publishes each participating PE's rows
+in the order selected for its Core. During admission, the runtime resolves
+each Block's arguments into Core SRAM. Each PE advances its own calendar
+cursor and checks the producer signals for its current row. Independent
+Blocks placed on disjoint PEs can overlap on the same Core.
 
 Tensor access sets from all Blocks participate in dependency construction,
 including native Graph recording, rebinding and replay. Application Tensor
@@ -116,11 +117,10 @@ work for a physical PE. Each row gives the physical `core_id` and `pe_id`,
 the task and Block, its planned tick, and `waits` (direct producer task IDs).
 Idle PEs have an empty list. A Block placed on Core 2 using PEs 3 and 2
 appears in both `pes[2][3]` and `pes[2][2]`. Both inherit the Block's planned
-tick and the task's producers. The order on each Core and any Group start
-constraint also apply. The `cores` and top-level `waits` tables give the
-Block schedule and task dependency graph. Ticks use the unit-cost model.
-Execution advances on real Block completion. Sort `BLOCK_BEGIN` events by
-`seq` within each Core to compare actual dispatch with its planned rows. Dependency capture also emits `deps.json`.
+tick and the task's producers. The `cores` and top-level `waits` tables give
+the planned Block schedule and task dependency graph. Ticks use the unit-cost
+model. Compare the kernel starts on each physical PE with its rows in `pes`
+to check the actual execution order. Dependency capture also emits `deps.json`.
 `wse_prepare_error.txt` records a PE run-admission failure, including runtime SRAM
 capacity exhaustion, before the execution start gate opens. Device PMU, scope
 statistics and argument dumping are unsupported.
@@ -137,13 +137,17 @@ by Core 1 and its four PEs, in numeric order for every configured Core. Select a
 kernel interval to see its task, Block index, and physical `core_id` and `pe_id`. The time
 axis is the simulator's monotonic clock and includes host thread scheduling.
 
-For a Group with synchronized start, follow each Core's `BLOCK_READY` marker
-to the single `SYNC_RELEASE` and from that release to each participating PE's
-kernel start. This shows both the arrival order and how long each PE takes to start
-after the barrier. A `TASK_DONE` marker records the completion time of a task with an
-observed dependent start. Follow its flow to that PE. These flow endpoints and PE
-execution intervals make up the swimlane. For startup, shutdown and SharedTile
-diagnostics, use `wse_events.jsonl`. Match a visible event to its raw record by `seq`.
+For a synchronized Group, each participating PE records `PE_ARRIVE` on its
+own track when it reaches the Group row and its predecessors have completed.
+Producer `TASK_DONE` flows end at those arrivals. The arrivals converge on a
+single `SYNC_RELEASE` on the last arriving PE, with one outgoing flow to each
+participating PE's kernel start. The time from an early arrival to release
+shows how long that PE waited for its peers.
+
+With independent start, producer `TASK_DONE` flows lead directly to each
+dependent PE's kernel start. The swimlane displays completion markers only
+for observed dependencies. For startup, shutdown and SharedTile diagnostics,
+use `wse_events.jsonl`. Match a visible event to its raw record by `seq`.
 
 ## Implementation boundary
 

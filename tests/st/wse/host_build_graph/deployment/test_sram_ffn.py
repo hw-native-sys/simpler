@@ -200,18 +200,16 @@ def audit_ffn_events(path, instances, mode, *, native=True):
                     assert {e["pe"] for e in reads} == {e["pe"] for e in consumed} == set(range(4))
                     assert consumed_before < publish[0]["seq"] < min(e["seq"] for e in reads)
                     consumed_before = max(e["seq"] for e in consumed)
-    for core in range(40):
-        active = None
-        for e in sorted(events[1:], key=lambda event: event["seq"]):
-            if e["core"] != core:
-                continue
-            if e["kind"] == 4:
-                assert active is None
-                active = (e["task"], e["block"])
-            elif e["kind"] == 5:
-                assert active == (e["task"], e["block"])
-                active = None
-        assert active is None
+    active = {}
+    for event in sorted(events[1:], key=lambda event: event["seq"]):
+        lane = (event["core"], event["pe"])
+        work = (event["task"], event["block"])
+        if event["kind"] == 16:
+            assert lane not in active
+            active[lane] = work
+        elif event["kind"] == 17:
+            assert active.pop(lane) == work
+    assert not active
     return events[0]["epoch"]
 
 

@@ -19,13 +19,15 @@ extern "C" void kernel_entry(int64_t *args) {
     const bool member = args[1], sync = args[2];
     const int64_t probe = args[3];
     const int block = get_block_idx(args), pe = get_pe_id();
-    if (probe && pe == 0 && (!member || block == 1)) {
-        const char *name = probe == 2 ? "wse_sync_failure_probe" :
+    const int lane = pe - 2;
+    if (probe) {
+        const char *name = probe == 3 ? (sync ? "wse_sync_swimlane_probe" : "wse_independent_swimlane_probe") :
+                           probe == 2 ? "wse_sync_failure_probe" :
                            sync       ? "wse_sync_start_probe" :
                                         "wse_independent_start_probe";
         auto gate = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, name));
         if (!gate) throw std::runtime_error("missing SPMD start probe");
-        gate(member ? 1 : 0);
+        gate(member ? 1 + 2 * block + lane : 0);
         if (probe == 2 && !member) throw std::runtime_error("injected busy-Core failure");
     }
     if (!member) {
@@ -45,5 +47,5 @@ extern "C" void kernel_entry(int64_t *args) {
         if (!wse::make_sram_view(args, seed, view)) throw std::runtime_error("missing SS result in SRAM access map");
         base = *reinterpret_cast<const float *>(view.address) + 3.0f;
     }
-    out[block * 2 + pe] = base + 10 * block + pe;
+    out[block * 2 + lane] = base + 10 * block + lane;
 }
