@@ -130,6 +130,67 @@ constexpr std::chrono::seconds kHookParkBound{30};
 
 }  // namespace
 
+TEST(PendingQueue, ReleasingWithAnotherRegisteredRunDoesNotTakeTheSchedulerLock) {
+    std::mutex scheduler;
+    PendingQueueHarness h(2, 2);
+    h.orch.set_scheduler_loop_mutex(&scheduler);
+    const auto first = h.build_closed_run(100);
+    const auto second = h.build_closed_run(101);
+    h.complete(first.second);
+
+    std::unique_lock block_scheduler(scheduler);
+    auto release = std::async(std::launch::async, [&] {
+        h.orch.release_run(first.first);
+    });
+    const auto status = release.wait_for(std::chrono::seconds(2));
+    block_scheduler.unlock();
+    release.get();
+
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_NE(h.allocator.slot_state(second.second.task_slot), nullptr);
+    h.complete(second.second);
+    h.orch.release_run(second.first);
+    EXPECT_EQ(h.allocator.next_task_id(), 0);
+}
+
+TEST(PendingQueue, FinalReleaseRechecksRegistrationBeforeCompacting) {
+    std::mutex scheduler;
+    PendingQueueHarness h(2, 2);
+    h.orch.set_scheduler_loop_mutex(&scheduler);
+    const auto first = h.build_closed_run(100);
+    h.complete(first.second);
+
+    std::unique_lock block_scheduler(scheduler);
+    auto release = std::async(std::launch::async, [&] {
+        h.orch.release_run(first.first);
+    });
+    bool removed = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        try {
+            (void)h.orch.run_done(first.first);
+        } catch (const std::invalid_argument &) {
+            removed = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    if (!removed) {
+        block_scheduler.unlock();
+        release.get();
+        FAIL() << "The previous run was not erased before taking the scheduler mutex";
+    }
+
+    const auto second = h.build_closed_run(101);
+    block_scheduler.unlock();
+    release.get();
+    EXPECT_NE(h.allocator.slot_state(second.second.task_slot), nullptr);
+    EXPECT_EQ(h.allocator.active_count(), 1);
+    h.complete(second.second);
+    h.orch.release_run(second.first);
+    EXPECT_EQ(h.allocator.next_task_id(), 0);
+}
+
 // The separation itself: with a deeper logical queue than the native pool,
 // runs three and four are admitted and built while run one executes and run
 // two is prepared.

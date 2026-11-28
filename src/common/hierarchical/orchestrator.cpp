@@ -882,6 +882,7 @@ void Orchestrator::compact_if_quiescent() {
 void Orchestrator::release_run(RunId run_id) {
     int64_t terminal_ns = 0;
     PipelineSlotLease lease{};
+    bool may_compact;
     {
         std::lock_guard<std::mutex> lk(runs_mu_);
         auto it = runs_.find(run_id);
@@ -892,9 +893,10 @@ void Orchestrator::release_run(RunId run_id) {
         terminal_ns = it->second->trace_terminal_ns;
         lease = it->second->lease;
         runs_.erase(it);
+        may_compact = quiescent_locked();
     }
 
-    compact_if_quiescent();
+    if (may_compact) compact_if_quiescent();
 #if SIMPLER_HOST_STRACE
     if (terminal_ns != 0 && simpler::host_trace::enabled()) {
         std::ostringstream retire_attrs;
