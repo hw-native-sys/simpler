@@ -29,19 +29,21 @@ Blocks.
 An orchestration can submit a synchronously starting SPMD task directly on
 the outer task list. Set `task.launch_spec.set_require_sync_start(true)`
 and provide at least two Blocks with distinct Core IDs. The Host places all
-members at the same planned tick. At execution, each member's Core must have
-finished its previous Block and reached the task at its queue head. Only after
-all members are ready does the runtime release the task's PEs to enter the
-kernel. Completion still waits for every Block. For ordinary SPMD, the default
-`require_sync_start=false` lets each Core begin independently. Native Graph
-recording rejects synchronized SPMD in this version.
+members at the same planned tick. Each participating PE reaches the Group
+row on its own calendar, waits for its task's predecessors, then joins the
+Group barrier. The last arriving PE releases the Group. For ordinary SPMD,
+the default `require_sync_start=false` lets each PE start as soon as its
+own row is ready. Native Graph recording rejects synchronized SPMD in this
+version.
 
-In `wse_events.jsonl`, each synchronized member records `BLOCK_READY`
-(kind 18) once. The last arrival records one task-wide `SYNC_RELEASE`
-(kind 19). Every `BLOCK_BEGIN` for that task follows the release. Compare
-event sequence numbers to verify this ordering across Cores. GO is recorded by
-the PE that completes device readiness. RUN_DONE is recorded by the PE that
-retires the last Core.
+In `wse_events.jsonl`, each participating PE in a synchronized Group records
+one `PE_ARRIVE` (kind 18). The last arrival records the task-wide
+`SYNC_RELEASE` (kind 19). Every kernel start for that Group follows the
+release. For example, if both Core 2 and Core 6 use only PEs 2 and 3, the
+trace has four arrivals, a release on the last of those four PEs, and four
+kernel starts. Compare event sequence numbers to verify their order across
+Cores. GO is recorded by the PE that completes device readiness. RUN_DONE is
+recorded by the PE that retires the last Core.
 
 A placement such as `{6}` runs on PE 0 of Core 6 by default.
 Setting `launch.thread_num` selects the first one to four PEs on each Core.
@@ -49,11 +51,11 @@ An explicit local PE list, such as `{6, {2, 0}}`, selects the physical PEs for t
 Block. Duplicate or out-of-range PEs and unsupported synchronization requirements
 reject before launch.
 
-If `B < C`, some Cores have no task Blocks. If `B > C`, each Core executes
-its assigned Blocks in Host calendar order. Device initialization and run
-completion include all Cores and PEs. One Core runs at most one active Block.
-All participating PEs must finish before that Core advances. The task
-reports completion exactly once, after all its Blocks finish.
+If `B < C`, some Cores have no task Blocks. If several Blocks share a Core,
+each participating PE follows its own ordered rows. Finishing a row lets
+that PE advance while other PEs continue their work. The last participant
+finishes the Block. The task reports completion exactly once, after all its
+Blocks finish. Device initialization and run completion include all Cores and PEs.
 
 ## Fixed data ownership
 

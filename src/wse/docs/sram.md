@@ -63,14 +63,15 @@ registries.
 ## Runtime reservation
 
 Each Core stores its own `core_control` record. An idle Core needs only this
-record. A Core with work also stores its `block_queue`, the `local_task` record
+record, which holds the four PE calendar cursors. A Core with work also stores
+its Block records in `block_queue`, the per-PE row indices in `pe_calendar`, the `local_task` record
 for each distinct task it executes, and that task's `dependencies`. Each Block's
 Tensor and scalar descriptors reside with the Core that executes it. Task
 records contain references to their predecessors' completion signals.
 
 An SS stores its `task_signal` on its submitted Core. For a Group, the Core
 assigned to logical Block 0 holds one signal shared by all members. That signal
-counts unfinished Blocks and, for `sync_start`, members yet to arrive. The
+counts unfinished Blocks and, for `sync_start`, participating PEs yet to arrive. The
 last Block to finish publishes task completion, whichever Core executes it.
 
 Every Core executing a kernel holds a `region_map` of the fixed SRAM windows

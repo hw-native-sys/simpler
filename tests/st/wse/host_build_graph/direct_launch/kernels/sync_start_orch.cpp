@@ -19,7 +19,7 @@ extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     const uint32_t second_core = args.scalar<uint32_t>(2);
     const int64_t probe = args.scalar<int64_t>(3);
 
-    // Zero selects the independent busy-Core SS used to exercise queue-head readiness.
+    // Zero selects the independent SS that occupies one PE on Core 2.
     const int producer_count = args.scalar<int64_t>(4);
     const uint32_t producer_core = producer_count ? second_core : 2U;
     TaskId producer = TaskId::invalid();
@@ -31,7 +31,7 @@ extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &args) {
         busy.add_scalar(probe);
         busy.add_scalar(0);
         if (i) busy.set_dependencies(&producer, 1);
-        producer = rt_submit_wse_task(0, busy, {.placement = {{producer_core}}}).task_id();
+        producer = rt_submit_wse_task(0, busy, {.placement = {{producer_core, {3}}}}).task_id();
     }
 
     CoreTaskArgs members;
@@ -44,8 +44,8 @@ extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     if (producer_count) members.set_dependencies(&producer, 1);
     members.launch_spec.set_block_num(blocks);
     members.launch_spec.set_require_sync_start(sync);
-    WseLaunchSpec launch{.thread_num = 2, .placement = {{2}}};
-    if (blocks == 2) launch.placement.push_back({second_core});
+    WseLaunchSpec launch{.thread_num = 2, .placement = {{2, {2, 3}}}};
+    if (blocks == 2) launch.placement.push_back({second_core, {2, 3}});
     rt_submit_wse_task(0, members, launch);
 
     CoreTaskArgs join;

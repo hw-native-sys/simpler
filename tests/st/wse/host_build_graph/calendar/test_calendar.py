@@ -74,13 +74,14 @@ def assert_calendar_matches_dispatch(path, header, events):
     calendar = json.loads((path / "calendar.json").read_text())
     assert calendar["epoch"] == header["epoch"]
     assert len(calendar["cores"]) == header["core_count"]
-    block_events = sorted((e for e in events if e["kind"] in (BLOCK_BEGIN, BLOCK_END)), key=lambda e: e["seq"])
-    for core, rows in enumerate(calendar["cores"]):
-        actual = [(e["kind"], e["task"], e["block"]) for e in block_events if e["core"] == core]
-        expected = [(kind, row["task"], row["block"]) for row in rows for kind in (BLOCK_BEGIN, BLOCK_END)]
-        assert actual == expected
-        ticks = [row["tick"] for row in rows]
-        assert all(before < after for before, after in zip(ticks, ticks[1:]))
+    executions = sorted((e for e in events if e["kind"] in (16, 17)), key=lambda e: e["seq"])
+    for core, queues in enumerate(calendar["pes"]):
+        for pe, rows in enumerate(queues):
+            actual = [(e["kind"], e["task"], e["block"]) for e in executions if (e["core"], e["pe"]) == (core, pe)]
+            expected = [(kind, row["task"], row["block"]) for row in rows for kind in (16, 17)]
+            assert actual == expected
+            ticks = [row["tick"] for row in rows]
+            assert all(before < after for before, after in zip(ticks, ticks[1:]))
     return calendar["waits"]
 
 

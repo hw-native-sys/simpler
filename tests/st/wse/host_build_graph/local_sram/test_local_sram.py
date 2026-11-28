@@ -93,6 +93,7 @@ def test_sram_counter_replay_and_residency(tmp_path, st_platform):
             "dependencies",
             "core_control",
             "block_queue",
+            "pe_calendar",
             "allocations",
             "task_signal",
         }

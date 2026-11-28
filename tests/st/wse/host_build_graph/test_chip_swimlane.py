@@ -16,10 +16,11 @@ from simpler.worker import Worker
 
 from tests.st.wse.host_build_graph.deployment.test_sram_ffn import build_sram_ffn, check_ffn, prepare_ffn
 from tests.st.wse.host_build_graph.direct_launch.test_sync_start import build, check_outputs, task_args
+from tests.st.wse.host_build_graph.tile_operations.test_execution import load_gate
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
-TASK_DONE, THREAD_BEGIN, THREAD_END, BLOCK_READY, SYNC_RELEASE = 6, 16, 17, 18, 19
-INSTANTS = {TASK_DONE: "TASK_DONE", BLOCK_READY: "BLOCK_READY", SYNC_RELEASE: "SYNC_RELEASE"}
+TASK_DONE, THREAD_BEGIN, THREAD_END, PE_ARRIVE, SYNC_RELEASE = 6, 16, 17, 18, 19
+INSTANTS = {TASK_DONE: "TASK_DONE", PE_ARRIVE: "PE_ARRIVE", SYNC_RELEASE: "SYNC_RELEASE"}
 
 
 @pytest.fixture
@@ -105,7 +106,7 @@ def read_swimlane(path, proto):
     expected = [
         row["seq"]
         for row in raw
-        if row["kind"] in (THREAD_BEGIN, THREAD_END, BLOCK_READY, SYNC_RELEASE)
+        if row["kind"] in (THREAD_BEGIN, THREAD_END, PE_ARRIVE, SYNC_RELEASE)
         or (row["kind"] == TASK_DONE and row["task"] in waited_tasks)
     ]
     assert sorted(row["seq"] for row in events) == sorted(expected)
@@ -117,33 +118,65 @@ def read_swimlane(path, proto):
 @pytest.mark.parametrize("sync", [False, True], ids=["independent", "sync_start"])
 def test_group_swimlane(tmp_path, worker, st_platform, perfetto, sync):
     handle = worker.register(build(st_platform))
-    args, buffers = task_args(worker, sync, 2, 6, False)
+    gate = load_gate(
+        tmp_path, "wse_sync_swimlane_probe" if sync else "wse_independent_swimlane_probe", 0 if sync else 0b11010
+    )
+    args, buffers = task_args(worker, sync, 2, 6, 3)
     config = CallConfig()
     config.output_prefix = str(tmp_path)
     config.enable_chip_swimlane = 2 if sync else 1
-    worker.run(handle, args, config)
+    run = worker.submit(handle, args, config)
+    try:
+        assert gate.wait_probe(), "the busy SS and the expected Group PEs did not enter their kernels"
+    finally:
+        gate.release_probe()
+    run.wait(timeout=15)
     check_outputs(worker, buffers)
 
     events, edges = read_swimlane(tmp_path, perfetto)
     members = [e for e in events if e["task"] == 1]
     starts = [e for e in members if e["kind"] == THREAD_BEGIN]
-    assert sorted((e["core"], e["block"], e["value"]) for e in starts) == [(2, 0, 0), (2, 0, 1), (6, 1, 0), (6, 1, 1)]
-    core_pe = {(e["core"], e["pe"]) for e in starts}
-    assert core_pe == {(2, 0), (2, 1), (6, 0), (6, 1)}
-    arrivals = [e for e in members if e["kind"] == BLOCK_READY]
+    participants = [(core, block, pe) for core, block in ((2, 0), (6, 1)) for pe in (2, 3)]
+    assert sorted((e["core"], e["block"], e["pe"]) for e in starts) == participants
+    (busy_end,) = [e for e in events if e["task"] == 0 and e["kind"] == THREAD_END]
+    delayed = (busy_end["core"], busy_end["pe"])
+    assert delayed == (2, 3)
+    arrivals = [e for e in members if e["kind"] == PE_ARRIVE]
     releases = [e for e in members if e["kind"] == SYNC_RELEASE]
     if sync:
-        assert sorted((e["core"], e["pe"]) for e in arrivals) == [(2, 0), (6, 0)]
+        assert sorted((e["core"], e["block"], e["pe"]) for e in arrivals) == participants
+        (delayed_arrival,) = [e for e in arrivals if (e["core"], e["pe"]) == delayed]
+        assert busy_end["seq"] < delayed_arrival["seq"]
         (release,) = releases
         last_arrival = max(arrivals, key=lambda e: e["seq"])
         assert (release["core"], release["pe"]) == (last_arrival["core"], last_arrival["pe"])
+        assert last_arrival["seq"] < release["seq"] < min(e["seq"] for e in starts)
         assert {(a["seq"], release["seq"]) for a in arrivals} == {edge for edge in edges if edge[1] == release["seq"]}
         assert {(release["seq"], s["seq"]) for s in starts} == {edge for edge in edges if edge[0] == release["seq"]}
     else:
         assert not arrivals and not releases
-        member_starts = {e["seq"] for e in starts}
-        task_completions = {e["seq"] for e in events if e["kind"] == TASK_DONE}
-        assert all(src in task_completions for src, dst in edges if dst in member_starts)
+        for start in starts:
+            assert (start["seq"] > busy_end["seq"]) == ((start["core"], start["pe"]) == delayed)
+
+
+@pytest.mark.parametrize("sync", [False, True], ids=["independent", "sync_start"])
+def test_group_predecessor_flows(tmp_path, worker, st_platform, perfetto, sync):
+    handle = worker.register(build(st_platform))
+    args, buffers = task_args(worker, sync, 2, 6, False, producer_count=1)
+    config = CallConfig()
+    config.output_prefix = str(tmp_path)
+    config.enable_chip_swimlane = 1
+    worker.run(handle, args, config)
+    check_outputs(worker, buffers)
+    events, edges = read_swimlane(tmp_path, perfetto)
+    (producer,) = [e for e in events if e["task"] == 0 and e["kind"] == TASK_DONE]
+    group = [e for e in events if e["task"] == 1]
+    destinations = [e for e in group if e["kind"] == (PE_ARRIVE if sync else THREAD_BEGIN)]
+    assert sorted((e["core"], e["pe"]) for e in destinations) == [(2, 2), (2, 3), (6, 2), (6, 3)]
+    group_seqs = {e["seq"] for e in group}
+    assert {dst for src, dst in edges if src == producer["seq"] and dst in group_seqs} == {
+        e["seq"] for e in destinations
+    }
 
 
 def test_ffn_swimlane(tmp_path, worker, st_platform, perfetto):
@@ -166,4 +199,4 @@ def test_ffn_swimlane(tmp_path, worker, st_platform, perfetto):
         for start in starts:
             if stage in (2, 3):
                 assert (done[stage - 1], start["seq"]) in edges
-    assert not any(e["kind"] in (BLOCK_READY, SYNC_RELEASE) for e in events)
+    assert not any(e["kind"] in (PE_ARRIVE, SYNC_RELEASE) for e in events)

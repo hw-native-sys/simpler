@@ -140,6 +140,7 @@ def test_prebuilt_target_admission(arch, admission_artifacts):
 @pytest.mark.parametrize(
     "create_name",
     [
+        "wse_create_run_v8",
         "wse_create_run_v7",
         "wse_create_run_v6",
         "wse_create_run_v5",
@@ -150,6 +151,7 @@ def test_prebuilt_target_admission(arch, admission_artifacts):
     ],
     ids=[
         "missing_memory_sections",
+        "core_coordinated_arrivals",
         "untimed_physical_calendar",
         "two_word_pe_rows",
         "timestamp_executor",
@@ -166,9 +168,11 @@ def test_executor_rejects_incompatible_abi_before_create(tmp_path, st_platform, 
     source = tmp_path / "incomplete_executor.cpp"
     # Supply every ancillary method for older PEs and omit one required method for the current ABI.
     sections = "const void *wse_memory_sections(const void *, uint64_t *) { return nullptr; }\n"
-    if create_name == "wse_create_run_v7":
+    if create_name == "wse_create_run_v8":
         sections = ""
-    timing_param = "uint32_t, " if create_name in ("wse_create_run_v4", "wse_create_run_v7") else ""
+    timing_param = (
+        "uint32_t, " if create_name in ("wse_create_run_v4", "wse_create_run_v7", "wse_create_run_v8") else ""
+    )
     source.write_text(
         "#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n"
         'extern "C" {\n'
@@ -178,7 +182,7 @@ def test_executor_rejects_incompatible_abi_before_create(tmp_path, st_platform, 
         "  return nullptr;\n}\n"
         "void wse_destroy_run(void *) {}\n"
         "int wse_execute_pe(void *, uint32_t) { return 0; }\n"
-        "const void *wse_run_events_v7(const void *, uint32_t, uint64_t *count) { *count=0; return nullptr; }\n"
+        "const void *wse_run_events_v8(const void *, uint32_t, uint64_t *count) { *count=0; return nullptr; }\n"
         "uint64_t wse_completed_tasks(const void *) { return 0; }\n"
         "uint64_t wse_runtime_used(const void *, uint32_t) { return 0; }\n"
         "uint64_t wse_control_address(const void *, uint32_t) { return 0; }\n"
@@ -212,11 +216,13 @@ def test_executor_rejects_incompatible_abi_before_create(tmp_path, st_platform, 
         worker.close()
 
 
-def build_pe_probe(tmp_path, st_platform, source, extra_includes):
+def build_pe_probe(tmp_path, st_platform, source, extra_includes, *, with_swimlane=False):
     compiler = KernelCompiler(st_platform)
     binaries = RuntimeBuilder(st_platform).get_binaries("host_build_graph")
     assert binaries.sim_context_path is not None
     libraries = [binaries.aicore_path, binaries.sim_context_path]
+    if with_swimlane:
+        libraries.append(binaries.host_path)
     probe = tmp_path / source.removesuffix(".cpp")
     subprocess.run(
         [
@@ -264,7 +270,10 @@ def test_started_peer_waits_for_busy_core_completion_or_failure(tmp_path, st_pla
         tmp_path,
         st_platform,
         "pe_sync_wait.cpp",
-        ["src/wse/runtime/host_build_graph/pe", "src/common/platform/sim/sim_context"],
+        ["src/wse/runtime/host_build_graph/pe", "src/common/platform/sim/sim_context", "src/wse/platform/sim/host"],
+        with_swimlane=True,
     )
-    for args in ([], ["fail"]):
-        subprocess.run([str(probe), *args], check=True, timeout=20)
+    for mode in ("independent", "sync_start", "fail"):
+        output = tmp_path / mode
+        output.mkdir()
+        subprocess.run([str(probe), mode, str(output)], check=True, timeout=20)

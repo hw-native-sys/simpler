@@ -20,7 +20,7 @@
 #include <stdexcept>
 
 namespace wse::temporary {
-// Shared operation storage belongs to one Core's active Block, never to the process-global PTO table.
+// All participating PEs share one storage instance for the lifetime of their Block.
 class BlockOperationStorage {
 public:
     // Host and kernel DSOs may use different C++ standard libraries.

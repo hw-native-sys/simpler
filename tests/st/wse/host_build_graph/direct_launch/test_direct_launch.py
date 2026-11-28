@@ -56,7 +56,9 @@ def audit_events(path, cores, blocks):
     assert len(by_kind[7]) == 4 * cores and len(by_kind[8]) == cores
     assert max(e["seq"] for e in by_kind[8]) < by_kind[9][0]["seq"]
     if blocks >= cores:
-        assert {(e["core"], e["pe"]) for e in by_kind[4]} == {(c, 0) for c in range(cores)}
+        assert {e["core"] for e in by_kind[4]} == set(range(cores))
+        starts = {(e["block"], e["core"], e["pe"]) for e in events if e["kind"] == 16}
+        assert all((e["block"], e["core"], e["pe"]) in starts for e in by_kind[4])
 
 
 @pytest.mark.parametrize("blocks", [1, 4, 9, 39, 40, 159, 160, 161, 323])

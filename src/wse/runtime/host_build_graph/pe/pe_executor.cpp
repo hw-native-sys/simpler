@@ -174,19 +174,18 @@ struct WseRun {
             std::lock_guard lock(mutex);
             if (failed) return;
             failed = true;
+            for (auto *core : core_controls)
+                for (auto &calendar : core->calendars)
+                    __atomic_store_n(&calendar.active_row, uint64_t{0}, __ATOMIC_RELEASE);
         }
         changed.notify_all();
         std::fprintf(stderr, "WSE PE %u failed: %s\n", worker, reason);
         for (auto &storage : block_storage)
-            storage->cancel();
+            if (storage) storage->cancel();
     }
 
     wse::CoreControl &local(uint32_t core) const { return *core_controls[core]; }
     uint64_t completed_tasks() const { return completed.load(); }
-    wse::Work &head(uint32_t core) const {
-        const auto &c = local(core);
-        return reinterpret_cast<wse::Work *>(c.base + c.queue.work_offset)[c.queue.head];
-    }
     bool dependencies_ready(const wse::TaskRecord &task) const {
         for (uint32_t i = 0; i < task.predecessor_count; ++i)
             if (!task.predecessors[i].signal->completed) return false;
@@ -212,39 +211,37 @@ struct WseRun {
             }
         }
     }
-    int ready_thread(uint32_t worker) {
+    wse::Work *ready_work(uint32_t worker) {
         advance_controls(worker);
-        const uint32_t core = worker / WSE_PE_PER_CORE, pe = worker % WSE_PE_PER_CORE;
-        auto &c = local(core);
-        if (c.queue.head == c.queue.tail) return -1;
-        const auto &work = head(core);
+        auto &c = local(worker / WSE_PE_PER_CORE);
+        auto &calendar = c.calendars[worker % WSE_PE_PER_CORE];
+        if (calendar.head == calendar.size) return nullptr;
+        auto &work = c.blocks[calendar.rows[calendar.head]];
         auto &task = *work.task;
-        auto &signal = *task.signal;
-        if (c.block_state != wse::BlockState::RUNNING && pe == 0 && dependencies_ready(task)) {
-            if (signal.remaining_arrivals) {
-                if (c.block_state == wse::BlockState::WAITING_FOR_SYNC) return -1;
-                c.block_state = wse::BlockState::WAITING_FOR_SYNC;
-                record(worker, WseEventKind::BLOCK_READY, task.ref, work.block);
-                if (--signal.remaining_arrivals) return -1;
-                record(worker, WseEventKind::SYNC_RELEASE, task.ref, work.block, task.blocks);
-            }
-            c.block_state = wse::BlockState::RUNNING;
-            c.started = c.finished = 0;
-            c.execute = !task.has_predicate ||
-                        DispatchPredicate{
-                            task.predicate.addr, task.predicate.target, task.predicate.elem_size,
-                            static_cast<PredicateOp>(task.predicate.op)
-                        }
-                            .pass();
-            __atomic_store_n(&c.block_epoch, ++c.block_serial, __ATOMIC_RELEASE);
-            record(worker, WseEventKind::BLOCK_BEGIN, task.ref, work.block, work.thread_num);
-            if (!c.execute) record(worker, WseEventKind::BLOCK_SKIPPED, task.ref, work.block);
+        if (!dependencies_ready(task)) return nullptr;
+
+        auto &pending = task.signal->remaining_arrivals;
+        if (pending) {
+            if (calendar.arrived) return nullptr;
+            calendar.arrived = true;
+            record(worker, WseEventKind::PE_ARRIVE, task.ref, work.block);
+            if (--pending) return nullptr;
+            record(worker, WseEventKind::SYNC_RELEASE, task.ref, work.block, task.signal->expected_arrivals);
             changed.notify_all();
         }
-        if (c.block_state != wse::BlockState::RUNNING) return -1;
-        for (uint32_t t = 0; t < work.thread_num; ++t)
-            if (work.thread_pes[t] == pe && !(c.started & (1u << t))) return t;
-        return -1;
+        if (!work.started) {
+            work.started = true;
+            work.execute = !task.has_predicate ||
+                           DispatchPredicate{
+                               task.predicate.addr, task.predicate.target, task.predicate.elem_size,
+                               static_cast<PredicateOp>(task.predicate.op)
+                           }
+                               .pass();
+            if (work.execute) block_storage[work.row] = std::make_unique<wse::BlockOperationStorage>();
+            record(worker, WseEventKind::BLOCK_BEGIN, task.ref, work.block, work.thread_num);
+            if (!work.execute) record(worker, WseEventKind::BLOCK_SKIPPED, task.ref, work.block);
+        }
+        return &work;
     }
 
     WseRun(
@@ -255,8 +252,6 @@ struct WseRun {
         capture_timestamps(timestamp_events),
         application_base(storage->base),
         events(cores * WSE_PE_PER_CORE) {
-        for (uint32_t core = 0; core < cores; ++core)
-            block_storage.push_back(std::make_unique<wse::BlockOperationStorage>());
         const SchedulerGraphAccess graph(d->graph);
         if (!scheduler_graph_view_valid(graph)) throw std::invalid_argument("invalid WSE graph");
         const auto count = graph.task_count;
@@ -288,6 +283,7 @@ struct WseRun {
             }
         }
         if (expected_rows != d->calendar_row_count) throw std::invalid_argument("WSE calendar Block count mismatch");
+        block_storage.resize(d->calendar_row_count);
         ImageBuilder image(storage, region_count);
         const auto owners = task_owners(*d, source_plans, count, cores);
         std::vector<wse::TaskSignal *> signals(count);
@@ -304,10 +300,8 @@ struct WseRun {
             core_controls.push_back(c);
             c->epoch = epoch;
             c->base = storage[core].base;
-            auto &q = c->queue;
-            q.capacity = q.tail = end - begin;
-            q.work_offset = image.allocate<wse::Work>(core, q.capacity, WseSectionKind::BLOCK_QUEUE);
-            if (q.capacity) {
+            c->blocks = image.objects<wse::Work>(core, end - begin, WseSectionKind::BLOCK_QUEUE);
+            if (c->blocks) {
                 c->access.region_count = region_count;
                 auto *regions = image.objects<wse::SramRegion>(core, region_count, WseSectionKind::REGION_MAP);
                 c->access.regions_offset = reinterpret_cast<uint64_t>(regions) - application_base;
@@ -344,6 +338,13 @@ struct WseRun {
             }
             if (!std::equal(cursor.begin(), cursor.end(), pe_ranges + 1))
                 throw std::invalid_argument("extra WSE PE calendar row");
+            for (uint32_t pe = 0; pe < WSE_PE_PER_CORE; ++pe) {
+                auto &queue = c->calendars[pe];
+                queue.size = pe_ranges[pe + 1] - pe_ranges[pe];
+                queue.rows = image.objects<uint32_t>(core, queue.size, WseSectionKind::PE_CALENDAR);
+                for (uint32_t i = 0; i < queue.size; ++i)
+                    queue.rows[i] = pe_rows[pe_ranges[pe] + i] - begin;
+            }
         }
         std::vector<wse::SramAllocation> used_allocations;
         auto validate_storage = [&](uint64_t address, uint64_t bytes) {
@@ -384,7 +385,6 @@ struct WseRun {
             }
             signals[ref] = image.objects<wse::TaskSignal>(owners[ref], 1, WseSectionKind::TASK_SIGNAL);
             signals[ref]->remaining_blocks = source.blocks;
-            signals[ref]->remaining_arrivals = source.sync_start ? source.blocks : 0;
             const SchedulerDispatchPredicate *predicate = nullptr;
             if (source.entry && scheduler_bind_graph_arguments(graph, ref) != SchedulerGraphBindingError::NONE)
                 throw std::invalid_argument("invalid WSE graph argument binding");
@@ -456,12 +456,15 @@ struct WseRun {
                 const uint32_t row = task_calendar.row_by_block[b];
                 if (core >= cores || row < indices[core] || row >= indices[core + 1])
                     throw std::invalid_argument("WSE calendar Block missing or assigned to the wrong Core");
-                auto &work = image.at<wse::Work>(core, local(core).queue.work_offset)[row - indices[core]];
+                auto &work = local(core).blocks[row - indices[core]];
                 if (!local_tasks[core]) local_tasks[core] = make_local_task(core);
                 work.task = local_tasks[core];
                 work.block = b;
-                work.thread_num = placement.thread_num;
-                std::copy_n(placement.thread_pes, WSE_PE_PER_CORE, work.thread_pes);
+                work.row = row;
+                work.thread_num = work.remaining_pes = placement.thread_num;
+                for (uint32_t slot = 0; slot < placement.thread_num; ++slot)
+                    work.abi_slots[placement.thread_pes[slot]] = static_cast<uint8_t>(slot);
+                if (source.sync_start) signals[ref]->remaining_arrivals += placement.thread_num;
                 work.tensor_count = placement.tensor_count;
                 work.scalar_count = placement.scalar_count;
                 work.tensors_offset = image.allocate<Tensor>(core, work.tensor_count, WseSectionKind::TENSORS);
@@ -504,10 +507,11 @@ struct WseRun {
                     image.at<uint64_t>(core, work.scalars_offset)[i] = value;
                 }
             }
+            signals[ref]->expected_arrivals = signals[ref]->remaining_arrivals;
         }
         if (expected != d->expected_tasks) throw std::invalid_argument("WSE task count mismatch");
         for (uint32_t core = 0; core < cores; ++core) {
-            if (!local(core).queue.tail) continue;
+            if (!local(core).blocks) continue;
             // A kernel can resolve a peer buffer passed by scalar address. Keep
             // the existing kernel ABI's contiguous authorization table on each
             // executing Core; it scales with distinct buffers, not graph nodes.
@@ -557,7 +561,7 @@ static_assert(static_cast<uint32_t>(wse::OperationEvent::PUBLISH) == static_cast
 static_assert(static_cast<uint32_t>(wse::OperationEvent::CONSUMED) == static_cast<uint32_t>(WseEventKind::OP_CONSUMED));
 }  // namespace
 
-extern "C" WseRun *wse_create_run_v7(
+extern "C" WseRun *wse_create_run_v8(
     const WseGraphDescriptor *d, uint32_t cores, uint64_t epoch, const wse::SramRegion *regions, uint32_t region_count,
     const wse::SramAllocation *allocations, uint32_t allocation_count, uint32_t capture_timestamps, char *error,
     size_t error_size
@@ -590,7 +594,7 @@ extern "C" uint64_t wse_control_address(const WseRun *run, uint32_t core) {
 }
 extern "C" void wse_destroy_run(WseRun *run) { delete run; }
 extern "C" uint64_t wse_completed_tasks(const WseRun *run) { return run->completed_tasks(); }
-extern "C" const WseEvent *wse_run_events_v7(const WseRun *run, uint32_t worker, uint64_t *count) {
+extern "C" const WseEvent *wse_run_events_v8(const WseRun *run, uint32_t worker, uint64_t *count) {
     if (!run || !count || (worker != UINT32_MAX && worker >= run->events.size())) return nullptr;
     const auto &stream = worker == UINT32_MAX ? run->host_events : run->events[worker];
     *count = stream.size();
@@ -626,21 +630,21 @@ static void execute_pe(WseRun *run) {
     run->wait(lock, [&] {
         return run->go;
     });
+    auto &calendar = local.calendars[pe];
     while (true) {
-        int thread = -1;
+        wse::Work *current = nullptr;
         run->wait(lock, [&] {
-            thread = run->ready_thread(worker);
-            return thread >= 0 || run->completed_tasks() == run->expected_tasks;
+            current = run->ready_work(worker);
+            return current || run->completed_tasks() == run->expected_tasks;
         });
-        if (run->completed_tasks() == run->expected_tasks) break;
-        const wse::Work work = run->head(core);
-        local.started |= 1u << thread;
-        const bool execute = local.execute;
-        const uint64_t block_epoch = local.block_epoch;
+        if (!current) break;
+        auto &work = *current;
+        const uint64_t token = uint64_t{calendar.head} + 1;
+        __atomic_store_n(&calendar.active_row, token, __ATOMIC_RELEASE);
         lock.unlock();
         const auto &plan = *work.task;
         run->record(worker, WseEventKind::THREAD_BEGIN, plan.ref, work.block, pe);
-        if (execute) {
+        if (work.execute) {
             int64_t args[SPMD_GLOBAL_CONTEXT_INDEX + 1]{};
             int index = 0;
             const uint64_t core_base = local.base;
@@ -652,14 +656,10 @@ static void execute_pe(WseRun *run) {
             LocalContext context{};
             context.block_idx = work.block;
             context.block_num = plan.blocks;
-            context.legacy_abi_slot = thread;
+            context.legacy_abi_slot = work.abi_slots[pe];
             context.thread_num = work.thread_num;
             context.block_scope = {
-                &local.block_epoch,
-                block_epoch,
-                &local.epoch,
-                local.epoch,
-                run->block_storage[core].get(),
+                &calendar.active_row,           token, &local.epoch, local.epoch, run->block_storage[work.row].get(),
                 wse::BlockOperationStorage::get
             };
             GlobalContext global{};
@@ -676,14 +676,12 @@ static void execute_pe(WseRun *run) {
         run->record(worker, WseEventKind::THREAD_END, plan.ref, work.block, pe);
         lock.lock();
         if (run->failed) throw RunAborted{};
-        local.finished |= 1u << thread;
-        if (local.finished == (1u << work.thread_num) - 1) {
-            // Current CPU tile operations return only after their work drains.
-            __atomic_store_n(&local.block_epoch, uint64_t{0}, __ATOMIC_RELEASE);
-            run->block_storage[core]->clear();
+        __atomic_store_n(&calendar.active_row, uint64_t{0}, __ATOMIC_RELEASE);
+        ++calendar.head;
+        calendar.arrived = false;
+        if (--work.remaining_pes == 0) {
+            run->block_storage[work.row].reset();
             run->record(worker, WseEventKind::BLOCK_END, plan.ref, work.block);
-            local.block_state = wse::BlockState::IDLE;
-            ++local.queue.head;
             if (--work.task->signal->remaining_blocks == 0) run->complete_task(worker, *work.task);
         }
         run->changed.notify_all();
