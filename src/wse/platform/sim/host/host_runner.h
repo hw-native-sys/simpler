@@ -96,6 +96,13 @@ public:
     virtual const char *cpu_sim_target_family() const { return nullptr; }
 
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
+    // WSE records its own PE trace. Shared device diagnostic pools have no WSE producer.
+    static DfxRunConfig shared_collector_config(const CallConfig &config) {
+        auto dfx = DfxRunConfig::from(config);
+        dfx.chip_swimlane_level = ChipSwimlaneLevel::DISABLED;
+        return dfx;
+    }
+
     struct PreparedExecution {
         PreparedExecution(
             const NativeRunIdentity &identity_in, Runtime &runtime_in, const CallConfig &config_in,
@@ -104,7 +111,7 @@ public:
             identity(identity_in),
             runtime(&runtime_in),
             config(config_in),
-            dfx(DfxRunConfig::from(config_in)),
+            dfx(shared_collector_config(config_in)),
             scope_stats_capacity(runtime_in.scope_stats_capacity()),
             pipeline_slot(pipeline_slot_in) {
             // Device publication and host export share one resolved selection.
@@ -395,8 +402,6 @@ public:
     uint64_t last_task_slot_dispatch_ns(int slot) const { return task_slot_dispatch_ns_[slot]; }
     uint64_t last_task_slot_finish_ns(int slot) const { return task_slot_finish_ns_[slot]; }
 
-    void set_chip_swimlane_enabled(int level) { chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level); }
-    uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
     void set_pmu_enabled(bool enabled) { pmu_enabled_ = enabled; }
     /** The runner's applied PMU selection, used by legacy HostApi callers; see the onboard base. */
     bool pmu_enabled() const { return pmu_enabled_; }
@@ -418,9 +423,6 @@ public:
     }
     /** Hand this run's host-phase state to the resident collector, at launch. */
     void publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept;
-    bool host_clock_alignment_log_required(uint32_t pipeline_slot) const {
-        return pipeline_slot < host_phase_runs_.size() && host_phase_runs_[pipeline_slot].needs_clock_alignment();
-    }
     /**
      * This slot's own host-orchestration state, for a run that must not read
      * the collector's single resident copy.
@@ -878,7 +880,6 @@ protected:
     // Enablement flags. A run's own diagnostics configuration travels on its
     // PreparedExecution::dfx; the runner keeps only what a device-context query
     // answers from, plus the artifact root the host-phase pool arms against.
-    ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
-    bool pmu_enabled_{false};                                             // resolved from set_pmu_enabled()
-    std::string output_prefix_{};                                         // diagnostic artifact root directory
+    bool pmu_enabled_{false};      // resolved from set_pmu_enabled()
+    std::string output_prefix_{};  // diagnostic artifact root directory
 };

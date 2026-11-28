@@ -140,6 +140,7 @@ def test_prebuilt_target_admission(arch, admission_artifacts):
 @pytest.mark.parametrize(
     "create_name",
     [
+        "wse_create_run_v7",
         "wse_create_run_v6",
         "wse_create_run_v5",
         "wse_create_run_v4",
@@ -149,6 +150,7 @@ def test_prebuilt_target_admission(arch, admission_artifacts):
     ],
     ids=[
         "missing_memory_sections",
+        "untimed_physical_calendar",
         "two_word_pe_rows",
         "timestamp_executor",
         "core_calendar",
@@ -164,18 +166,19 @@ def test_executor_rejects_incompatible_abi_before_create(tmp_path, st_platform, 
     source = tmp_path / "incomplete_executor.cpp"
     # Supply every ancillary method for older PEs and omit one required method for the current ABI.
     sections = "const void *wse_memory_sections(const void *, uint64_t *) { return nullptr; }\n"
-    if create_name == "wse_create_run_v6":
+    if create_name == "wse_create_run_v7":
         sections = ""
+    timing_param = "uint32_t, " if create_name in ("wse_create_run_v4", "wse_create_run_v7") else ""
     source.write_text(
         "#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n"
         'extern "C" {\n'
         f"void *{create_name}(const void *, uint32_t, uint64_t, const void *, uint32_t, "
-        "const void *, uint32_t, char *, size_t) {\n"
+        f"const void *, uint32_t, {timing_param}char *, size_t) {{\n"
         f'  if (auto *f = std::fopen({json.dumps(str(marker))}, "w")) std::fclose(f);\n'
         "  return nullptr;\n}\n"
         "void wse_destroy_run(void *) {}\n"
         "int wse_execute_pe(void *, uint32_t) { return 0; }\n"
-        "const void *wse_run_events(const void *, uint32_t, uint64_t *count) { *count=0; return nullptr; }\n"
+        "const void *wse_run_events_v7(const void *, uint32_t, uint64_t *count) { *count=0; return nullptr; }\n"
         "uint64_t wse_completed_tasks(const void *) { return 0; }\n"
         "uint64_t wse_runtime_used(const void *, uint32_t) { return 0; }\n"
         "uint64_t wse_control_address(const void *, uint32_t) { return 0; }\n"

@@ -40,7 +40,6 @@
 #include "common/device_phase.h"
 #include "common/module_thread_value.h"
 #include "common/strace.h"
-#include "host/host_clock_alignment_log.h"
 #include "common/unified_log.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
@@ -342,11 +341,6 @@ get_run_result_wrapper(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_ep
     }
 }
 
-static uint32_t get_chip_swimlane_level(void *runner_ctx) {
-    if (runner_ctx == nullptr) return 0;
-    return static_cast<WseHostRunner *>(runner_ctx)->chip_swimlane_level();
-}
-
 static int get_pmu_enabled(void *runner_ctx) {
     if (runner_ctx == nullptr) return 0;
     return static_cast<WseHostRunner *>(runner_ctx)->pmu_enabled() ? 1 : 0;
@@ -484,7 +478,7 @@ static const HostApiOps g_host_api_ops = {
     .lookup_prebuilt_runtime_arena_cache = lookup_prebuilt_runtime_arena_cache_wrapper,
     .mark_prebuilt_runtime_arena_cached = mark_prebuilt_runtime_arena_cached_wrapper,
     .upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper,
-    .get_chip_swimlane_level = get_chip_swimlane_level,
+    .get_chip_swimlane_level = nullptr,
     .get_pmu_enabled = get_pmu_enabled,
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
@@ -1006,7 +1000,6 @@ int simpler_prepare_run(
         state->runner_claimed = true;
         state->trace_inv = trace_inv;
         state->trace_start_ns = trace_start_ns;
-        if (config->enable_chip_swimlane >= 3) state->clock_log_offset = host_clock_alignment_log_offset();
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
         // Refuse before bind or diagnostic allocation, but only after this
@@ -1029,7 +1022,9 @@ int simpler_prepare_run(
 
         runner->apply_call_config(state->config);
         // This run's host-phase state, before its bind records into it.
-        runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(state->config));
+        runner->begin_host_phase_run(
+            state->descriptor.pipeline_slot, WseHostRunner::shared_collector_config(state->config)
+        );
 
         {
             STRACE("chip.run.bind");
@@ -1200,8 +1195,6 @@ int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) 
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
         emit_native_run_runner_wall(state);
         emit_device_phase_markers(state->runner);
-        state->clock_alignment_log_required =
-            state->runner->host_clock_alignment_log_required(state->descriptor.pipeline_slot);
         const bool pending_outputs =
             state->runtime != nullptr && std::any_of(
                                              state->runtime->tensor_leases().begin(),
@@ -1286,10 +1279,8 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
-    const uint64_t clock_log_offset = state->clock_log_offset;
     const uint64_t run_epoch = state->descriptor.run_epoch;
     const bool no_submission = state->launch_not_started_proven;
-    const std::string output_prefix = state->config.output_prefix;
 
     STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
@@ -1373,10 +1364,6 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
         state->runner->abandon_prepared_execution(*state->prepared_execution);
     }
 
-    const bool export_clock_log =
-        launched && execution_rc == 0 && validation_rc == 0 &&
-        (state->execution_retired ? state->clock_alignment_log_required :
-                                    state->runner->host_clock_alignment_log_required(state->descriptor.pipeline_slot));
     if (state->runner_claimed) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;
@@ -1385,9 +1372,6 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     state->runner->release_run_result(state->descriptor.run_epoch);
     destroy_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
-    if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
     if (validation_rc != 0) return validation_rc;
     if (no_submission && !launched) publish_released_preparation(state, run_epoch);
     return launched ? execution_rc : 0;

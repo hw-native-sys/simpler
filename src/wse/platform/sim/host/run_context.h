@@ -44,7 +44,7 @@ struct NativeRunContext {
         descriptor(descriptor_in),
         host_api(
             runner_in, descriptor_in.pipeline_slot, banks, descriptor_in.run_epoch, host_api_ops,
-            HostApi::DiagnosticConfig{static_cast<uint32_t>(config_in.enable_chip_swimlane), config_in.enable_pmu > 0}
+            HostApi::DiagnosticConfig{0, config_in.enable_pmu > 0}
         ),
         trace_hid(trace_hid_in) {
         // Publish the storage tag only after every potentially-throwing member
@@ -77,7 +77,6 @@ struct NativeRunContext {
     uint64_t trace_inv{0};
     long long trace_start_ns{0};
     long long runner_trace_start_ns{0};
-    uint64_t clock_log_offset{0};
     int completion_rc{-1};
     bool result_observed{false};
     bool physical_complete{false};
@@ -85,8 +84,6 @@ struct NativeRunContext {
     // Captured while the actual arguments exist, before physical retirement
     // releases their Runtime. HOST views never acquire this entitlement.
     bool framework_transfer_eligible{false};
-    // This call's finished host-phase export requirement, retained across slot reuse.
-    bool clock_alignment_log_required{false};
     // Detached unmanaged HOST staging, owned until output delivery/release.
     void *retired_host_staging{nullptr};
     std::atomic<NativeRunPhase> phase{NativeRunPhase::Prepared};

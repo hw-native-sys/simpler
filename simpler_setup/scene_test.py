@@ -1403,6 +1403,8 @@ def _convert_rank_swimlanes(
     # retained artifact the capture's own dispatch identity names.
     captures = [path for path in _rank_capture_dirs(output_prefix) if _capture_records_paths(path)]
     if not captures:
+        if any((path / "wse_swimlane.pftrace").is_file() for path in _rank_capture_dirs(output_prefix)):
+            return
         logger.warning(f"[{case_label}] no Rank capture is present under {output_prefix}")
         return
 
@@ -1474,6 +1476,10 @@ def _convert_case_swimlane(
 
     perf_file = output_prefix / "chip_swimlane_records.json"
     if not perf_file.exists():
+        native_trace = output_prefix / "wse_swimlane.pftrace"
+        if native_trace.is_file():
+            logger.info("[%s] Perfetto trace: %s", case_label, native_trace)
+            return
         logger.warning(f"[{case_label}] {perf_file} not produced; skipping conversion")
         return
 

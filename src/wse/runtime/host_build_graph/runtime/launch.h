@@ -93,6 +93,7 @@ struct WseEvent {
     WseEventKind kind;
     uint32_t slot;
     uint64_t generation;
+    uint64_t monotonic_ns;
 };
 
 enum class WseSectionKind : uint32_t {
@@ -138,11 +139,11 @@ struct WseMemorySection {
 
 struct WseRun;
 extern "C" {
-// Version 6 stores each PE calendar entry as a Core Block row index.
+// Version 7 adds optional monotonic PE timestamps to the physical calendar executor.
 // A mismatched Host/PE pair must fail at load time.
-WseRun *wse_create_run_v6(
+WseRun *wse_create_run_v7(
     const WseGraphDescriptor *, uint32_t cores, uint64_t epoch, const wse::SramRegion *, uint32_t region_count,
-    const wse::SramAllocation *, uint32_t allocation_count, char *error, size_t error_size
+    const wse::SramAllocation *, uint32_t allocation_count, uint32_t capture_timestamps, char *error, size_t error_size
 );
 uint64_t wse_runtime_used(const WseRun *, uint32_t core);
 const WseMemorySection *wse_memory_sections(const WseRun *, uint64_t *count);
@@ -150,6 +151,6 @@ uint64_t wse_control_address(const WseRun *, uint32_t core);
 void wse_destroy_run(WseRun *);
 int wse_execute_pe(WseRun *, uint32_t worker);
 // UINT32_MAX selects logical completions emitted during host preparation.
-const WseEvent *wse_run_events(const WseRun *, uint32_t worker, uint64_t *count);
+const WseEvent *wse_run_events_v7(const WseRun *, uint32_t worker, uint64_t *count);
 uint64_t wse_completed_tasks(const WseRun *);
 }

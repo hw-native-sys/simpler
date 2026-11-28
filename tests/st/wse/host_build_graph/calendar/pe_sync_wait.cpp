@@ -78,7 +78,7 @@ int main(int argc, char **) {
         placement.thread_num = 1;
     wire.placements[2].core_id = 1;
     char error[256]{};
-    execution = wse_create_run_v6(&d, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
+    execution = wse_create_run_v7(&d, 2, 1, regions, 2, nullptr, 0, 0, error, sizeof(error));
     if (!execution) {
         std::fprintf(stderr, "%s\n", error);
         return 1;

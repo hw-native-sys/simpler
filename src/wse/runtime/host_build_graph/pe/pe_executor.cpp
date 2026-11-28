@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <time.h>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -146,6 +147,7 @@ struct WseRun {
     // execution state lives in the Core records, queues and signals below.
     std::vector<wse::CoreControl *> core_controls;
     const uint64_t expected_tasks;
+    const bool capture_timestamps;
     const uint64_t application_base;  // Kernel ABI origin for the whole application Buffer.
     std::atomic<uint64_t> completed{0};
     uint32_t ready_pes = 0, retired_cores = 0;
@@ -247,9 +249,10 @@ struct WseRun {
 
     WseRun(
         const WseGraphDescriptor *d, uint32_t cores, uint64_t epoch, const wse::SramRegion *storage,
-        uint32_t region_count, const wse::SramAllocation *allocations, uint32_t allocation_count
+        uint32_t region_count, const wse::SramAllocation *allocations, uint32_t allocation_count, bool timestamp_events
     ) :
         expected_tasks(d->expected_tasks),
+        capture_timestamps(timestamp_events),
         application_base(storage->base),
         events(cores * WSE_PE_PER_CORE) {
         for (uint32_t core = 0; core < cores; ++core)
@@ -374,7 +377,8 @@ struct WseRun {
                 // No path to a Block: every predecessor in this component has
                 // already settled in descriptor order. There is no PE dispatch.
                 host_events.push_back(
-                    {sequence++, ref, ++completed, UINT32_MAX, UINT32_MAX, 0, WseEventKind::TASK_DONE, 0, 0}
+                    {sequence++, ref, ++completed, UINT32_MAX, UINT32_MAX, 0, WseEventKind::TASK_DONE, 0, 0,
+                     event_time_ns()}
                 );
                 continue;
             }
@@ -519,13 +523,19 @@ struct WseRun {
         used = image.usage();
         sections = std::move(image.sections);
     }
+    uint64_t event_time_ns() const {
+        if (!capture_timestamps) return 0;
+        timespec t{};
+        if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) throw std::runtime_error("WSE monotonic clock unavailable");
+        return static_cast<uint64_t>(t.tv_sec) * 1000000000ull + t.tv_nsec;
+    }
     void record(
         uint32_t worker, WseEventKind kind, uint64_t task = UINT64_MAX, uint32_t block = 0, uint64_t value = 0,
         uint32_t slot = 0, uint64_t generation = 0
     ) {
         events[worker].push_back(
             {sequence.fetch_add(1), task, value, worker / WSE_PE_PER_CORE, worker % WSE_PE_PER_CORE, block, kind, slot,
-             generation}
+             generation, event_time_ns()}
         );
     }
 };
@@ -547,9 +557,10 @@ static_assert(static_cast<uint32_t>(wse::OperationEvent::PUBLISH) == static_cast
 static_assert(static_cast<uint32_t>(wse::OperationEvent::CONSUMED) == static_cast<uint32_t>(WseEventKind::OP_CONSUMED));
 }  // namespace
 
-extern "C" WseRun *wse_create_run_v6(
+extern "C" WseRun *wse_create_run_v7(
     const WseGraphDescriptor *d, uint32_t cores, uint64_t epoch, const wse::SramRegion *regions, uint32_t region_count,
-    const wse::SramAllocation *allocations, uint32_t allocation_count, char *error, size_t error_size
+    const wse::SramAllocation *allocations, uint32_t allocation_count, uint32_t capture_timestamps, char *error,
+    size_t error_size
 ) {
     try {
         if (!d || !cores || cores > region_count || region_count > wse::MAX_CORE_COUNT || !epoch || !regions)
@@ -558,7 +569,10 @@ extern "C" WseRun *wse_create_run_v6(
             throw std::invalid_argument("WSE descriptor lacks per-PE calendar header");
         if (d->pe_calendar_version != wse::PE_CALENDAR_VERSION)
             throw std::invalid_argument("incompatible WSE PE calendar version");
-        return new WseRun(d, cores, epoch, regions, region_count, allocations, allocation_count);
+        if (capture_timestamps > 1) throw std::invalid_argument("invalid WSE timestamp capture flag");
+        return new WseRun(
+            d, cores, epoch, regions, region_count, allocations, allocation_count, capture_timestamps != 0
+        );
     } catch (const std::exception &e) {
         if (error && error_size) std::snprintf(error, error_size, "%s", e.what());
         return nullptr;
@@ -576,7 +590,7 @@ extern "C" uint64_t wse_control_address(const WseRun *run, uint32_t core) {
 }
 extern "C" void wse_destroy_run(WseRun *run) { delete run; }
 extern "C" uint64_t wse_completed_tasks(const WseRun *run) { return run->completed_tasks(); }
-extern "C" const WseEvent *wse_run_events(const WseRun *run, uint32_t worker, uint64_t *count) {
+extern "C" const WseEvent *wse_run_events_v7(const WseRun *run, uint32_t worker, uint64_t *count) {
     if (!run || !count || (worker != UINT32_MAX && worker >= run->events.size())) return nullptr;
     const auto &stream = worker == UINT32_MAX ? run->host_events : run->events[worker];
     *count = stream.size();

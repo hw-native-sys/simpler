@@ -141,7 +141,7 @@ def test_wait_timeout_retains_buffer_until_real_completion(tmp_path, st_platform
         with pytest.raises(RuntimeError, match="failed with code"):
             worker.run(handle, args, bad_config)
         assert worker.scheduler_mode_publish_count == publications
-        for option in ("enable_chip_swimlane", "enable_dump_args", "enable_pmu", "enable_scope_stats"):
+        for option in ("enable_dump_args", "enable_pmu", "enable_scope_stats"):
             unsupported = CallConfig()
             unsupported.output_prefix = str(tmp_path / "unsupported")
             setattr(unsupported, option, True)
