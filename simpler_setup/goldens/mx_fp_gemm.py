@@ -154,11 +154,11 @@ def make_mx_fp8_case(m: int = 128, k: int = 64, n: int = 64, seed: int = 19):
         raise RuntimeError("torch.float8_e4m3fn / float8_e8m0fnu required")
     assert k % 64 == 0, "K must be multiple of 64 for single-tile MX sample"
     kmx = k // 32
-    torch.manual_seed(seed)
-    a = torch.randint(-10, 10, (m, k), dtype=torch.int64).to(torch.float32).to(torch.float8_e4m3fn)
-    b = torch.randint(-10, 10, (k, n), dtype=torch.int64).to(torch.float32).to(torch.float8_e4m3fn)
-    a_scale_u8 = torch.randint(127, 130, (m, kmx), dtype=torch.int64).to(torch.uint8)
-    b_scale_u8 = torch.randint(127, 130, (kmx, n), dtype=torch.int64).to(torch.uint8)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    a = torch.randint(-10, 10, (m, k), dtype=torch.int64, generator=generator).to(torch.float32).to(torch.float8_e4m3fn)
+    b = torch.randint(-10, 10, (k, n), dtype=torch.int64, generator=generator).to(torch.float32).to(torch.float8_e4m3fn)
+    a_scale_u8 = torch.randint(127, 130, (m, kmx), dtype=torch.int64, generator=generator).to(torch.uint8)
+    b_scale_u8 = torch.randint(127, 130, (kmx, n), dtype=torch.int64, generator=generator).to(torch.uint8)
     expected = mx_fp8_matmul_golden(a, b, a_scale_u8, b_scale_u8)
     a_s = _u8_e8m0_to_torch(convert_x1_scale_format(a_scale_u8), (m, kmx))
     b_s = _u8_e8m0_to_torch(convert_x2_scale_format(b_scale_u8), (kmx, n))
@@ -220,14 +220,14 @@ def make_mx_fp4_case(m: int = 128, k: int = 64, n: int = 64, seed: int = 19):
         raise RuntimeError("torch.float4_e2m1fn_x2 / float8_e8m0fnu required")
     assert k % 64 == 0 and n % 64 == 0, "K/N must be multiples of 64 for MXFP4 sample"
     kmx = k // 32
-    torch.manual_seed(seed)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
     # Logical nibble codes in a small finite set (matches pto-isa e2m1 range).
-    a_logical = torch.randint(0, 8, (m, k), dtype=torch.int64).to(torch.uint8)
-    b_logical = torch.randint(0, 8, (k, n), dtype=torch.int64).to(torch.uint8)
+    a_logical = torch.randint(0, 8, (m, k), dtype=torch.int64, generator=generator).to(torch.uint8)
+    b_logical = torch.randint(0, 8, (k, n), dtype=torch.int64, generator=generator).to(torch.uint8)
     a = _fp4_logical_to_torch_x2(a_logical)
     b = _fp4_logical_to_torch_x2(b_logical)
-    a_scale_u8 = torch.randint(127, 130, (m, kmx), dtype=torch.int64).to(torch.uint8)
-    b_scale_u8 = torch.randint(127, 130, (kmx, n), dtype=torch.int64).to(torch.uint8)
+    a_scale_u8 = torch.randint(127, 130, (m, kmx), dtype=torch.int64, generator=generator).to(torch.uint8)
+    b_scale_u8 = torch.randint(127, 130, (kmx, n), dtype=torch.int64, generator=generator).to(torch.uint8)
     expected = mx_fp4_matmul_golden(a, b, a_scale_u8, b_scale_u8)
     a_s = _u8_e8m0_to_torch(convert_x1_scale_format(a_scale_u8), (m, kmx))
     b_s = _u8_e8m0_to_torch(convert_x2_scale_format(b_scale_u8), (kmx, n))
