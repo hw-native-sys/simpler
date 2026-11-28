@@ -1112,7 +1112,7 @@ inline __aicore__ bool percounter_calendar_execute_range(
                 sample->end = cycles;
             }
         } else {
-            if (!percounter_run_task(cfg, *dispatch, extra, block, blocks, role, entry, sample, measurement, flags))
+            if (!percounter_run_task(cfg, *dispatch, extra, block, blocks, role, entry, sample, measurement))
                 return false;
             // A long kernel can return after the supervisor signals EXIT.
             // The rate-limited EXIT poll then suppresses late completion credit.

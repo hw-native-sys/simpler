@@ -195,10 +195,6 @@ inline bool decode_template(
                 if (result.joins[row.local_join].leader_lane != lane) wait_count = 0;
             }
             uint16_t flags = static_cast<uint16_t>(role);
-            if (input.timing_slot >= 0 && input.timing_slot < NUM_TASK_TIMING_SLOTS) {
-                flags |= calendar_task_timing_flag(input.timing_slot);
-                image.has_task_timing = true;
-            }
             if (input.sync_start) flags |= CALENDAR_EXEC_SYNC_START;
             if (input.has_predicate) flags |= CALENDAR_EXEC_PREDICATE;
             if (input.active_mask == 0) flags |= CALENDAR_EXEC_CONTROL;
@@ -637,8 +633,11 @@ inline bool build_range_calendar(
                      physical_task(producer, phase, body_base), 0}
                 );
             }
+            if (task_input.timing_slot >= 0 && task_input.timing_slot < NUM_TASK_TIMING_SLOTS)
+                image.has_task_timing = true;
             const uint32_t extra_offset = emit_execution_extra(
-                image, {global, phase.task_ids[task], shell, 0, 0}, peer_tasks.empty() ? nullptr : &peer_tasks[task]
+                image, {global, phase.task_ids[task], shell, task_input.timing_slot, 0, 0},
+                peer_tasks.empty() ? nullptr : &peer_tasks[task]
             );
             if (extra_offset == 0) return false;
             image.extras.push_back({extra_offset, global, shell});
