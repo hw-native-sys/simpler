@@ -820,6 +820,7 @@ private:
     SimplerJoinedLaunchFn enqueue_run_held_fn_ = nullptr;
     ReleaseExecutionGateFn release_execution_gate_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
+    SimplerNativeRunFn poll_run_observing_fn_ = nullptr;
     SimplerNativeRunFn query_run_completion_fn_ = nullptr;
     decltype(&simpler_bind_peer_cancel) peer_cancel_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;
@@ -1080,6 +1081,8 @@ private:
     );
     void submit_native_run_to_caller(const ChipWorkerNativeRun &run, void *caller_stream);
     void wait_native_run_completion(const ChipWorkerNativeRun &run);
+    int poll_native_run_progress(const ChipWorkerNativeRun &run, bool observing);
+    static std::runtime_error execution_wait_error(int code);
     void cleanup_native_runs_noexcept() noexcept;
     std::exception_ptr stop_and_cleanup_native_runs();
     void clear_runtime_binding(bool release_device_reservation = true);

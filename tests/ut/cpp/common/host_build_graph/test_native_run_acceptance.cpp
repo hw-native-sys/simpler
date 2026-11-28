@@ -167,3 +167,55 @@ TEST(NativeRunAcceptanceTest, UndeliveredCancellationAndExpiredWaitDoNotProveRet
         EXPECT_EQ(runner.drains, 1);
     }
 }
+
+TEST(NativeRunAcceptanceTest, ObservationKeepsTheFirstNativeDeadline) {
+    using Context = NativeRunContext<CancelRunner>;
+    CancelRunner runner;
+    runner.timeout_ms = 500;
+    int32_t request = 0;
+    Context context(&runner, CallConfig{}, 0, make_descriptor(nullptr), nullptr);
+    ASSERT_TRUE(context.bind_peer_cancel(&request));
+    const auto before = Context::ProgressClock::now();
+    context.start_observation();
+    const auto after = Context::ProgressClock::now();
+    ASSERT_TRUE(context.observation_deadline);
+    const auto deadline = *context.observation_deadline;
+    EXPECT_GE(deadline, before + std::chrono::milliseconds(500));
+    EXPECT_LE(deadline, after + std::chrono::milliseconds(500));
+
+    runner.timeout_ms = 100;
+    context.start_observation();
+    EXPECT_EQ(context.observation_deadline, deadline);
+}
+
+TEST(NativeRunAcceptanceTest, CleanupAfterAnExpiredObservationCanStillProveCompletion) {
+    using Context = NativeRunContext<CancelRunner>;
+    CancelRunner runner;
+    runner.timeout_ms = 0;
+    int32_t request = 0;
+    Context context(&runner, CallConfig{}, 0, make_descriptor(nullptr), nullptr);
+    context.active_execution = std::make_unique<CancelRunner::ActiveExecution>();
+    ASSERT_TRUE(context.bind_peer_cancel(&request));
+    context.start_observation();
+    ASSERT_TRUE(context.observation_expired());
+
+    runner.timeout_ms = 100;
+    runner.poll = [] {
+        return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    };
+    const auto timeout = context.drain_with_peer_cancel();
+    EXPECT_EQ(timeout.device_rc, SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE);
+    EXPECT_FALSE(timeout.physical_complete);
+    EXPECT_EQ(runner.drains, 0);
+
+    __atomic_store_n(&request, 1, __ATOMIC_RELEASE);
+    EXPECT_EQ(context.drain_with_peer_cancel().device_rc, SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE);
+    EXPECT_EQ(runner.requested_epoch, 11u);
+    runner.poll = [] {
+        return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    };
+    const auto retired = context.drain_with_peer_cancel();
+    EXPECT_EQ(retired.device_rc, -108);
+    EXPECT_TRUE(retired.physical_complete);
+    EXPECT_EQ(runner.drains, 1);
+}

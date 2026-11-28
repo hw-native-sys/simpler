@@ -1024,7 +1024,7 @@ struct ChipRunLaneState {
         }
     }
 
-    bool progress(const std::shared_ptr<ChipRunState> &target) {
+    bool progress(const std::shared_ptr<ChipRunState> &target, bool observing = false) {
         if (target->owner == ChipRunOwner::FrameworkObserver && target->error != nullptr)
             std::rethrow_exception(target->error);
         if (target->phase == ChipRunState::Phase::TERMINAL || target->phase == ChipRunState::Phase::ENDED) return true;
@@ -1033,7 +1033,7 @@ struct ChipRunLaneState {
         const auto front = execution_at(0);
         if (!front) throw std::runtime_error("chip run lane lost a nonterminal execution");
         if (front != target) {
-            (void)progress(front);
+            (void)progress(front, observing);
             if (target->phase == ChipRunState::Phase::TERMINAL || target->phase == ChipRunState::Phase::ENDED)
                 return true;
             if (execution_at(0) != target) return false;
@@ -1059,8 +1059,9 @@ struct ChipRunLaneState {
         }
         if (target->phase != ChipRunState::Phase::LAUNCHED) return false;
 
+        int result;
         try {
-            if (!worker->poll_native_run(target->native_run)) return false;
+            result = worker->poll_native_run_progress(target->native_run, observing);
         } catch (...) {
             const std::exception_ptr poll_error = std::current_exception();
             if (target->owner == ChipRunOwner::FrameworkObserver) {
@@ -1074,7 +1075,12 @@ struct ChipRunLaneState {
             launch_ready_prefix();
             return true;
         }
-        retire_execution(target);
+        if (result == SIMPLER_NATIVE_RUN_POLL_NOT_READY) return false;
+        if (result == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) {
+            fail_execution_wait(target, std::make_exception_ptr(ChipWorker::execution_wait_error(result)));
+        } else {
+            retire_execution(target);
+        }
         launch_ready_prefix();
         return true;
     }
@@ -1241,6 +1247,13 @@ struct ChipRunLaneState {
         return static_cast<int>(left);
     }
 
+    void fail_execution_wait(const std::shared_ptr<ChipRunState> &run, std::exception_ptr error) {
+        if (run->error == nullptr) run->error = std::move(error);
+        poison_with(run, run->error);
+        if (run->owner == ChipRunOwner::FrameworkObserver) std::rethrow_exception(run->error);
+        finish(run);
+    }
+
     // Block on the device for the launched front, for waiters with no deadline
     // to bound them. The front is the oldest launched run, and the device
     // executes the launched runs in queue order, so its completion is the next
@@ -1263,11 +1276,7 @@ struct ChipRunLaneState {
         try {
             wait_for_execution(front);
         } catch (...) {
-            const std::exception_ptr wait_error = std::current_exception();
-            if (front->error == nullptr) front->error = wait_error;
-            poison_with(front, front->error);
-            if (front->owner == ChipRunOwner::FrameworkObserver) std::rethrow_exception(front->error);
-            finish(front);
+            fail_execution_wait(front, std::current_exception());
         }
         launch_ready_prefix();
         return true;
@@ -1296,12 +1305,16 @@ ChipRun::ChipRun(std::shared_ptr<ChipRunLaneState> lane, std::shared_ptr<ChipRun
     lane_(std::move(lane)),
     run_(std::move(run)) {}
 
-bool ChipRun::done() {
+bool ChipRun::done() { return poll(false); }
+
+bool ChipRun::poll_observation() { return poll(true); }
+
+bool ChipRun::poll(bool observing) {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     if (run_->owner == ChipRunOwner::Caller) return run_->native_context_destroyed && run_->caller_last_use_proven;
-    return lane_->progress(run_);
+    return lane_->progress(run_, observing);
 }
 
 bool ChipRun::retire_framework(bool wait_for_own_completion, Deadline deadline) {

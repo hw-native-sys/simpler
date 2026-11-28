@@ -1347,6 +1347,39 @@ TEST(ChipRunLaneTest, PollFailureReportsTheTerminalNativeError) {
     worker.finalize();
 }
 
+TEST(ChipRunLaneTest, ObservationTimeoutKeepsTheBlockingWaitErrorAndNativeOwner) {
+    for (bool cooperative : {false, true}) {
+        ChipWorker worker;
+        prime_worker(worker);
+        worker.poll_run_observing_fn_ = poll_run;
+        ChipRunLane lane(worker);
+        ChipRun run = submit(lane, 101, 0);
+        g_wait_rc[0] = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+
+        if (cooperative) {
+            g_poll_rc[0] = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+            EXPECT_TRUE(run.poll_observation());
+        } else {
+            g_completion_wait_rc = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+        }
+        try {
+            (void)run.wait_until(ChipRunLane::Deadline::max());
+            FAIL() << "expected the native wait timeout";
+        } catch (const std::runtime_error &error) {
+            const std::string expected =
+                "wait_native_run_completion failed with code " + std::to_string(SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE);
+            EXPECT_NE(std::string(error.what()).find(expected), std::string::npos);
+        }
+        EXPECT_TRUE(run.owner_recovery_required());
+        EXPECT_TRUE(lane.poisoned());
+        EXPECT_THROW(lane.close(), std::runtime_error);
+        EXPECT_THROW(worker.finalize(), std::runtime_error);
+        // The test backend has no device to recover or owner-close entry.
+        worker.native_runs_.clear();
+        worker.finalize();
+    }
+}
+
 TEST(ChipRunLaneTest, CloseDrainsAndRejectsNewSubmissions) {
     ChipWorker worker;
     prime_worker(worker);

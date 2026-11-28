@@ -4697,9 +4697,12 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                         if _read_run_entry_identity(staged.entry_buf) != staged.identity:
                             raise RuntimeError("stale observation request identity")
                         if not staged.ended_published:
-                            # An explicit wait must reach the native bounded wait even
-                            # when a hung launch never reports physical END on its own.
-                            staged.chip_run.wait()
+                            if chip_platform == "a2a3" and chip_runtime == "tensormap_and_ringbuffer":
+                                if not staged.chip_run._poll_observation():
+                                    continue
+                            else:
+                                # The result observer must still reach the backend's bounded wait.
+                                staged.chip_run.wait()
                         code, msg = publish_completed_run(staged)
                         if code != 0 and (staged.chip_run.lane_poisoned or staged.ccu_started):
                             shutdown_message = msg

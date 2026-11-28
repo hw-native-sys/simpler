@@ -25,7 +25,6 @@
  */
 
 #include "host/host_dependency_capture_scope.h"
-#include <optional>
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
@@ -49,6 +48,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <pthread.h>
 #include <utility>
 #include <vector>
@@ -2784,7 +2784,7 @@ int simpler_bind_peer_cancel(DeviceContextHandle ctx, RuntimeHandle runtime, con
     }
 }
 
-int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
+static int poll_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool observing) {
     try {
         OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
         if (state == nullptr || state->caller_owns_submission) return SIMPLER_NATIVE_RUN_POLL_ERROR;
@@ -2795,12 +2795,21 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         }
         const int attach_rc = state->runner->enter_run_thread();
         if (attach_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (observing) state->start_observation();
         if (state->poll_peer_cancel() != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
-        return retire_completed_native_run(state);
+        const int progress = retire_completed_native_run(state);
+        if (observing && progress == SIMPLER_NATIVE_RUN_POLL_NOT_READY && state->observation_expired()) {
+            return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+        }
+        return progress;
     } catch (...) {
         return SIMPLER_NATIVE_RUN_POLL_ERROR;
     }
 }
+
+int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return poll_run(ctx, runtime, false); }
+
+int simpler_poll_run_observing(DeviceContextHandle ctx, RuntimeHandle runtime) { return poll_run(ctx, runtime, true); }
 
 int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) {
     try {

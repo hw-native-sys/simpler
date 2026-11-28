@@ -370,6 +370,7 @@ void ChipWorker::init(
         supports_execution_gate_fn_ =
             module->required<SupportsConcurrentNativePrepareFn>("supports_execution_gate_ctx");
         poll_run_fn_ = module->required<SimplerNativeRunFn>("simpler_poll_run");
+        poll_run_observing_fn_ = module->optional<SimplerNativeRunFn>("simpler_poll_run_observing");
         query_run_completion_fn_ = module->optional<SimplerNativeRunFn>("simpler_query_run_completion");
         peer_cancel_fn_ = module->optional<decltype(&simpler_bind_peer_cancel)>("simpler_bind_peer_cancel");
         wait_run_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run");
@@ -1015,6 +1016,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     release_execution_gate_fn_ = nullptr;
     supports_execution_gate_fn_ = nullptr;
     poll_run_fn_ = nullptr;
+    poll_run_observing_fn_ = nullptr;
     query_run_completion_fn_ = nullptr;
     peer_cancel_fn_ = nullptr;
     wait_run_fn_ = nullptr;
@@ -2163,6 +2165,10 @@ void ChipWorker::bind_peer_cancel(const ChipWorkerNativeRun &run, const int32_t 
 }
 
 bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
+    return poll_native_run_progress(run, false) == SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+}
+
+int ChipWorker::poll_native_run_progress(const ChipWorkerNativeRun &run, bool observing) {
     validate_execution_process();
     void *storage = nullptr;
     NativeRunOpLease held;
@@ -2170,21 +2176,25 @@ bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
     // Completion already established answers the question without a device call. A run another
     // operation is inside reads as "not yet": a poll reports progress and never holds a thread.
     if (lease == NativeRunLease::Acquired || lease == NativeRunLease::AlreadyComplete) validate_execution_context();
-    if (lease == NativeRunLease::AlreadyComplete) return true;
-    if (lease == NativeRunLease::Busy) return false;
+    if (lease == NativeRunLease::AlreadyComplete) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    if (lease == NativeRunLease::Busy) return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
     if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "poll_native_run");
+    if (observing && poll_run_observing_fn_ == nullptr) {
+        throw UnsupportedRuntimeOperation("runtime does not provide nonblocking result observation");
+    }
 
     int rc = SIMPLER_NATIVE_RUN_POLL_ERROR;
     std::exception_ptr failure;
     try {
-        rc = poll_run_fn_(device_ctx_, storage);
+        rc = (observing ? poll_run_observing_fn_ : poll_run_fn_)(device_ctx_, storage);
     } catch (...) {
         failure = std::current_exception();
     }
     // A completed poll proves last use, without observing the stream's execution status.
     if (failure == nullptr && rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
         note_native_run_completion(run.run_epoch, 0, false);
-    } else if (failure == nullptr && rc != SIMPLER_NATIVE_RUN_POLL_NOT_READY) {
+    } else if (failure == nullptr && rc != SIMPLER_NATIVE_RUN_POLL_NOT_READY &&
+               !(observing && rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE)) {
         failure = std::make_exception_ptr(
             std::runtime_error(
                 "poll_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
@@ -2192,7 +2202,11 @@ bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
         );
     }
     if (failure != nullptr) std::rethrow_exception(failure);
-    return rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    return rc;
+}
+
+std::runtime_error ChipWorker::execution_wait_error(int code) {
+    return std::runtime_error("wait_native_run_completion failed with code " + std::to_string(code));
 }
 
 void ChipWorker::wait_native_run_completion(const ChipWorkerNativeRun &run) {
@@ -2204,9 +2218,7 @@ void ChipWorker::wait_native_run_completion(const ChipWorkerNativeRun &run) {
     if (lease == NativeRunLease::AlreadyComplete) return;
     if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "wait_native_run_completion");
     const int rc = wait_run_completion_fn_(device_ctx_, storage);
-    if (rc != 0) {
-        throw std::runtime_error("wait_native_run_completion failed with code " + std::to_string(rc));
-    }
+    if (rc != 0) throw execution_wait_error(rc);
     note_native_run_completion(run.run_epoch, 0, false);
 }
 

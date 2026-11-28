@@ -41,6 +41,7 @@ public:
     ChipRun() = default;
 
     bool done();
+    bool poll_observation();
     bool retire_framework(bool wait_for_own_completion, Deadline deadline = Deadline::max());
     bool framework_transferred() const;
     bool wait_until(Deadline deadline);
@@ -79,6 +80,7 @@ private:
     friend class ChipRunLane;
     friend class ChipWorker;
     friend class NativeSubmissionState;
+    bool poll(bool observing);
     bool carrier_retired_for_submission() const;
     ChipRun(std::shared_ptr<ChipRunLaneState> lane, std::shared_ptr<ChipRunState> run);
 

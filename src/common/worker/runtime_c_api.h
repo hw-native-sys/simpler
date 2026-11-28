@@ -131,7 +131,7 @@ enum {
        remains whose retirement could supply them: either none ever held any, or
        this plan has already waited for every one that did. Terminal. */
     SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE = PTO_RUNTIME_ERR_BASE - 7,
-    /* Reserved for simpler_wait_run: this wait did not observe the result.
+    /* The native observation exhausted its progress budget before establishing completion.
        The run remains live and may be waited/finalized again. Never store this
        operation result as the execution's terminal error. */
     SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE = PTO_RUNTIME_ERR_BASE - 8,
@@ -1317,6 +1317,11 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /** Optional terminal preflight. Observe physical completion without retiring execution or releasing run storage. */
 int simpler_query_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/** Progress a result request without blocking. For a run bound to peer cancellation, the first request fixes
+ * its native deadline. An expired poll returns WAIT_INCOMPLETE and leaves its device ownership intact. */
+int simpler_poll_run_observing(DeviceContextHandle ctx, RuntimeHandle runtime);
+
 /** Bind a parent-owned cancellation word before launch. The word must remain
  * mapped until this native run is finalized; only its parent publishes 0 -> 1.
  * Unsupported backends leave the run unchanged. */
