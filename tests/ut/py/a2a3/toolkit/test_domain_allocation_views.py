@@ -24,6 +24,9 @@ def test_a3_domain_query_attests_owned_views_without_device(tmp_path):
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann"))
     if not (cann / "include/hccl/hccl_comm.h").exists():
         pytest.skip("native A3 metadata query fixture requires CANN headers, no device")
+    sdma = tmp_path / "pto/comm/async/sdma/sdma_workspace_manager.hpp"
+    sdma.parent.mkdir(parents=True)
+    sdma.write_text((ROOT / "tests/ut/py/support/unused_sdma_workspace_manager.h").read_text())
     log = tmp_path / "common/unified_log.h"
     log.parent.mkdir()
     log.write_text(
@@ -37,6 +40,7 @@ def test_a3_domain_query_attests_owned_views_without_device(tmp_path):
             "c++",
             "-std=c++17",
             "-UNDEBUG",
+            "-DPTO_NPU_ARCH_A2A3",
             "-ffunction-sections",
             "-fdata-sections",
             "-Wl,--gc-sections",

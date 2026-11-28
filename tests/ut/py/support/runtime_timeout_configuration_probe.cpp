@@ -17,6 +17,8 @@
 #include "device_runner.h"
 #include "common/host_log_state.h"
 #include "common/log_level.h"
+#include "host/executor_binary_abi.h"
+#include "support/native_admission/executor_elf.h"
 
 namespace {
 int setter_calls;
@@ -69,7 +71,10 @@ int main() {
     setenv("ASCEND_GLOBAL_LOG_LEVEL", "3", 1);
     setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", "2000", 1);
     setenv("SIMPLER_OP_EXECUTE_TIMEOUT_US", "3000000", 1);
-    const uint8_t binary[] = {1};
+    using namespace simpler::executor_abi;
+    using native_admission_test::executor_elf;
+    const auto aicpu = executor_elf(SHT_DYNSYM, {AICPU_ENTRY});
+    const auto aicore = executor_elf(SHT_SYMTAB, {AIC_ENTRY, AIV_ENTRY});
     for (int arm = 0; arm != 3; ++arm) {
         DeviceRunner runner;
         setter_calls = reset_calls = stream_calls = 0;
@@ -79,7 +84,7 @@ int main() {
         const int expected = arm == 1 ? -4321 : -776;
         auto initialize = [&]() {
             return simpler_init(
-                &runner, 0, binary, sizeof(binary), binary, sizeof(binary), nullptr, 0, nullptr, 0, nullptr, 0
+                &runner, 0, aicpu.data(), aicpu.size(), aicore.data(), aicore.size(), nullptr, 0, nullptr, 0, nullptr, 0
             );
         };
         const int init_rc = initialize();

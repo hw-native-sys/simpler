@@ -1788,9 +1788,12 @@ extern "C" int comm_query_domain_allocation(
     views.reserve(owner.peer_windows.size() + owner.host_windows.size() + 2);
     views.push_back({reinterpret_cast<uint64_t>(owner.device_ctx), sizeof(CommContext)});
     if (!owner.host_windows.empty()) {
+        const auto local = static_cast<size_t>(owner.rank);
+        if (local >= owner.host_windows.size() || !owner.host_windows[local].registered) return -1;
+        // Local MTE maps only this rank. Peer entries are populated when
+        // the host domain requests SDMA.
         for (const auto &window : owner.host_windows) {
-            if (!window.registered) return -1;
-            views.push_back({window.device_base, owner.host_window_size});
+            if (window.registered) views.push_back({window.device_base, owner.host_window_size});
         }
     } else {
         views.push_back({reinterpret_cast<uint64_t>(owner.local_window.base), owner.local_window.size});

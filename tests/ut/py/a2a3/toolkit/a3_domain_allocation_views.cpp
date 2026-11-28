@@ -58,7 +58,11 @@ int main() {
     assert(comm_query_domain_allocation(&handle, 77, views.data(), views.size(), &count) == 0);
     assert(count == 3 && views[1].addr == 0x60000 && views[1].bytes == 16384);
     assert(views[2].addr == 0x80000 && views[2].bytes == 16384);
-    owner->host_windows[1].registered = false;
+    owner->host_windows[0] = {};
+    owner->rank = 1;
+    assert(comm_query_domain_allocation(&handle, 77, views.data(), views.size(), &count) == 0);
+    assert(count == 2 && views[1].addr == 0x80000 && views[1].bytes == 16384);
+    owner->host_windows[1] = {};
     assert(comm_query_domain_allocation(&handle, 77, nullptr, 0, &count) != 0 && count == 0);
     owner->host_windows.clear();
     handle.domain_allocations.erase(77);
