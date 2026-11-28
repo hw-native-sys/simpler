@@ -1,27 +1,27 @@
 ---
 name: review-pr
-description: Review a GitHub PR, a fixed commit range, or commits on the current branch. Prioritize code quality, compare the code with its baseline, and self-audit each review pass against the review goal and all applicable requirements. Read-only by default.
+description: Review a GitHub PR, a fixed commit range, or commits on the current branch. Requires an active persistent Goal before collecting review evidence. Read-only by default. Compare with the baseline and self-audit code quality, feature requirements, and repository standards.
 ---
 
 # Review PR
 
 ## Mandatory rules for the reviewing agent
 
-1. **Preserve the requester's review intent.** Use their instructions and prior
+1. **Require an active persistent Goal before starting review work.** Follow
+   [the Goal prerequisite](#goal-prerequisite) before collecting evidence or
+   inspecting the change. This applies to read-only reviews and every review
+   depth.
+2. **Preserve the requester's review intent.** Use their instructions and prior
    context to establish the scope and stopping conditions. A short invocation
-   such as `review 3305` sets the target and invokes the full review workflow.
+   such as `review 3305` sets the target, invokes the full review workflow, and
+   authorizes direct creation of its persistent Goal.
    Base any decision to stop after one pass on the agreed completion conditions.
    Ask the requester to resolve any material ambiguity about when the review
-   ends, including whether the Goal requires follow-through on later revisions.
-2. **Start every review with a persistent Goal.** Create it for the agreed
-   objective before inspecting the diff. Use authorization already granted.
-   When explicit authorization is required and still outstanding, ask the
-   requester before starting the review. Report unavailable Goal tooling as
-   a blocker.
+   ends, including whether the review covers later revisions.
 3. **Complete the agreed review scope.** Treat a first pass and any early
    finding as interim results while required work remains. Continue through
-   the required checks, including follow-ups covered by the Goal, and run
-   the review self-audit before delivery.
+   the required checks and agreed follow-ups, and run the review self-audit
+   before delivery.
 4. **Report every review item to the requester.** Give each item a separate
    checklist entry with its result and evidence or verification limit. State
    whether the review Goal was achieved and why. If work remains, name the
@@ -50,24 +50,44 @@ and CI evidence.
   native read-only subagents. Load [independent review](references/independent-review.md)
   only when one of those options is requested. Record `gemini` as unsupported
   if supplied.
-- By default, read code and GitHub evidence and fetch refs as needed. Checkout,
-  edits, builds, tests, hardware runs, publication, and merge require separate
-  authorization. For requested verification use [testing](../testing/SKILL.md).
+- Once the Goal is active, read code and GitHub evidence and fetch refs as
+  needed. Checkout, edits, builds, tests, hardware runs, publication, and merge
+  require separate authorization. For requested verification use
+  [testing](../testing/SKILL.md).
   Route maintainer follow-through to [process-pr](../process-pr/SKILL.md) and
   author-side repairs to [fix-pr](../fix-pr/SKILL.md).
 
-### Create the review Goal
+### Goal prerequisite
 
-Once the target and scope are known, create a persistent Goal to deliver an
-evidence-based verdict after assessing the agreed scope and passing the
-[review self-audit](#review-self-audit). Continue the existing Goal for
-follow-ups within the same review scope while it is active.
+Before the Goal is active, read workflow instructions, interpret the request,
+and check Goal state. Wait to query PR metadata, discussion, or CI, resolve or
+fetch revisions, inspect source or diffs, or delegate any review work until a
+Goal for this review is active.
 
-Maintain a working checkpoint with the Goal, pinned base/head SHAs, changed call
-paths, stated requirements, quality dimensions, and repository checks. Add
-checks and evidence as you trace the change. Keep the checkpoint current through
-follow-ups and context changes. Use a task-specific directory under `~/tmp/` for
-scratch files as required by the workspace instructions.
+- **Matching active Goal.** Reuse it for work within the agreed scope. Restore
+  its checkpoint and continue with the next unfinished item.
+- **New Goal.** The `review-pr` invocation itself grants standing authorization
+  to create its review Goal. Establish the target and completion conditions
+  from the request and existing context, then create the Goal directly and
+  verify that it is active.
+- **Matching paused or blocked Goal.** Wait for the requester to resume the
+  Goal before continuing the review.
+- **Goal cannot become active.** If Goal tooling is unavailable, creation fails,
+  or another unfinished Goal prevents creation, report the specific blocker and
+  stop before collecting evidence. Only an active persistent Goal satisfies this
+  prerequisite.
+
+Keep the Goal objective to the target identifier and the obligation to confirm
+that the review satisfies every applicable requirement of this skill. For
+example, use “Complete the review of PR #3305 and verify through self-audit that
+it satisfies every applicable requirement of the `review-pr` skill.”
+
+Maintain a working checkpoint with the agreed scope and stopping conditions,
+pinned base/head SHAs, changed call paths, feature requirements, quality
+dimensions, and repository checks. Record evidence and unresolved review items
+as you trace the change. Keep the checkpoint current through follow-ups and
+context changes. Use a task-specific directory under `~/tmp/` for scratch files
+as required by the workspace instructions.
 
 ### Pin the diff
 
@@ -200,8 +220,8 @@ Apply these repository checks alongside the source review:
 
 ## Review self-audit
 
-After each pass, compare the findings and checkpoint against the review goal,
-the full quality guide, and the applicable requirements here. In particular:
+After each pass, audit the review against every applicable requirement of this
+skill and its required references. Use the findings and checkpoint as evidence.
 
 - Reconcile all changed call paths, goals, quality dimensions, Standards,
   and triggered checks. Record the evidence and its revision. Check that the
@@ -218,8 +238,9 @@ and repeat the self-audit before delivery. Finding a blocker settles the
 recommendation under the [merge rules](#5-merge-recommendation). Finish the
 remaining in-scope review and report all substantiated findings together.
 
-Mark the Goal complete only when the report accounts for every review item,
-the agreed scope is covered, and the verdict follows from the evidence.
+Mark the Goal complete only after the final self-audit confirms all applicable
+review requirements are satisfied, the report accounts for every review item,
+and the verdict follows from the evidence.
 If a blocker leaves any required work unresolved, report the confirmed findings,
 the review items still open, and that the Goal was not achieved.
 
