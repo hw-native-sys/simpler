@@ -296,6 +296,7 @@ from .orchestrator import (
     direct_control,
 )
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
+from .route3c_staging import StagingPriority
 from .startup_artifacts import StartupArtifactSpec
 from .startup_preparation import NodeStartupHook, normalize_startup_artifacts, normalize_startup_hooks
 from .task_interface import (
@@ -500,6 +501,7 @@ _TASK_FAILED = 10
 _ACTIVATE = 11
 _PREPARE_READY = 12
 _TASK_ENDED = 13
+_CANCEL_STAGED = 14
 
 
 def _assert_mailbox_wire_constants() -> None:
@@ -525,6 +527,7 @@ def _assert_mailbox_wire_constants() -> None:
         "FRAME_STAGED": _FRAME_STAGED,
         "TASK_LAUNCHED": _TASK_LAUNCHED,
         "TASK_ENDED": _TASK_ENDED,
+        "CANCEL_STAGED": _CANCEL_STAGED,
         "TASK_FAILED": _TASK_FAILED,
         "ACTIVATE": _ACTIVATE,
         "PREPARE_READY": _PREPARE_READY,
@@ -4201,6 +4204,11 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             release_request_frame(frame_index, entry_addr, frame_generation)
             return staged
 
+        staging_priority = None
+        priority_path = os.environ.get("ROUTE3C_STAGING_PRIORITY")
+        if priority_path:
+            staging_priority = StagingPriority(priority_path, device_id)
+
         def submit_run(staged: _StagedRun) -> None:
             _protocol, run_id, slot_id, generation, dispatch_id, _task_slot, _group_index, _group_size = staged.identity
             # The bytes were decoded into the wire TaskArgs while the frame was still held; those
@@ -4389,6 +4397,25 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             broke_on_activation = False
             for staged in list(staged_runs.values()):
                 entry_state = _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_STATE)
+                if entry_state == _CANCEL_STAGED:
+                    if (
+                        staged.activated
+                        or staged.native_activated
+                        or _read_run_entry_identity(staged.entry_buf) != staged.identity
+                    ):
+                        shutdown_message = f"chip_process dev={device_id}: stale staged cancellation"
+                        return False
+                    try:
+                        staged.chip_run.abandon()
+                        discard_unlaunched_ccu(staged)
+                        if import_registry.host_mappings is not None and not staged.chip_run._owner_recovery_required:
+                            import_registry.host_mappings.release(staged.identity)
+                    except Exception as e:
+                        shutdown_message = _format_exc("chip run cancellation", e)
+                        return False
+                    fail_run(staged, "predecessor failed before launch")
+                    staged_runs.pop(staged.index, None)
+                    continue
                 if staged.native_activated or (entry_state != _ACTIVATE and not staged.activated):
                     continue
                 if _read_run_entry_identity(staged.entry_buf) != staged.identity:
@@ -4617,6 +4644,10 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                         if _read_run_entry_identity(staged.entry_buf) != staged.identity:
                             raise RuntimeError("stale observation request identity")
                         if not staged.ended_published:
+                            if staging_priority is not None and staging_priority.defer_observation(
+                                staged.identity[1], staged_runs.values()
+                            ):
+                                continue
                             # An explicit wait must reach the native bounded wait even
                             # when a hung launch never reports physical END on its own.
                             staged.chip_run.wait()
@@ -5447,6 +5478,7 @@ class _RunResources:
     # admission depth; a run that acquires any of these degrades itself to
     # depth one. Set, never cleared.
     requires_ordered_cleanup: bool = False
+    retained_stage_key: str | None = None
 
 
 @dataclass
@@ -5573,6 +5605,8 @@ class RunHandle:
         # follows it has happened. A successor keyed on the native answer would
         # be admitted while that teardown is still outstanding.
         self._cleanup_published = False
+        self._retained_predecessor: RunHandle | None = None
+        self._held_successor_id: int | None = None
 
     @classmethod
     def _completed(cls, worker: Worker) -> RunHandle:
@@ -5592,6 +5626,8 @@ class RunHandle:
         handle._finalization_abandoned = False
         # Nothing was ever admitted, so there is no cleanup owing.
         handle._cleanup_published = True
+        handle._retained_predecessor = None
+        handle._held_successor_id = None
         return handle
 
     @staticmethod
@@ -5740,6 +5776,22 @@ class RunHandle:
         except BaseException:  # noqa: BLE001
             return self._recover_and_publish_terminal(error)
 
+    def _resolve_retained_predecessor(self, deadline: float | None) -> None:
+        predecessor = self._retained_predecessor
+        if predecessor is None:
+            return
+        remaining = None if deadline is None else max(0.0, deadline - _monotonic())
+        try:
+            predecessor.wait(remaining)
+        except Exception:
+            if not predecessor._terminal:
+                raise
+        run_id = self._run_id
+        orch = self._worker._orch
+        if run_id is not None and orch is not None:
+            orch._resolve_held_run(run_id, predecessor._error is None)
+        self._retained_predecessor = None
+
     def wait(self, timeout: float | None = None) -> None:  # noqa: PLR0912 -- one owner spans fence through publication
         """Wait for completion, raising ``TimeoutError`` or the run's error."""
         # One owner spans the native fence through finalization. An interruption
@@ -5748,6 +5800,7 @@ class RunHandle:
         # ownership. Terminal fields are monotonic, and parked waiters use
         # bounded re-checks when notification itself is interrupted.
         deadline = self._deadline(timeout)
+        self._resolve_retained_predecessor(deadline)
         elected = False
         finalization_started = False
         final_error: BaseException | None = None
@@ -5776,6 +5829,10 @@ class RunHandle:
                 boundary_hook("after_election")
 
             assert run_id is not None
+            priority = getattr(self._worker, "_route3c_staging_priority", None)
+            if priority is not None and priority[0] and self._held_successor_id is not None:
+                struct.pack_into("<Q", priority, 16, self._held_successor_id)
+                struct.pack_into("<Q", priority, 8, run_id)
             remaining = None if deadline is None else max(0.0, deadline - _monotonic())
             try:
                 completed = self._worker._wait_run_handle(run_id, remaining)
@@ -5830,6 +5887,10 @@ class RunHandle:
                 preferred_error = final_error if final_error is not None else exc
             published_error = self._recover_and_publish_terminal(preferred_error)
 
+        successor_id = self._held_successor_id
+        orch = self._worker._orch
+        if successor_id is not None and orch is not None:
+            orch._resolve_held_run(successor_id, published_error is None)
         self._teardown_delegated_fatal_after_wait(published_error)
         if published_error is not None:
             raise published_error
@@ -5871,6 +5932,7 @@ class RunHandle:
 
     def _wait_for_acceptance(self) -> None:
         """Wait until this run's dispatches cross their acceptance boundary."""
+        self._resolve_retained_predecessor(None)
         elected = False
         acceptance_completed = False
         try:
@@ -6416,6 +6478,7 @@ class Worker:
         # L2 handles are installed before the submission lease ends. Retirement
         # follows fence-owned cleanup, so close() drains the exact accepted set.
         self._accepted_run_handles: set[RunHandle] = set()
+        self._retained_graph_error: BaseException | None = None
         # A nonterminal cancellation or ambiguous finalization boundary has no
         # fence-owned cleanup Python can safely replay. Keep that run's callback
         # and resource references alive outside close()'s drain set; whole-tree
@@ -15096,7 +15159,16 @@ class Worker:
         submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
         self.submit(callable, args=args, config=config, **submit_options).wait()
 
-    def _submit_locked(self, callable, args, config, *, caller_stream: int | None = None) -> RunHandle:
+    def _submit_retained_decode(self, graph, key: str) -> RunHandle:
+        """Submit one of the prepared local decode graphs under a success fence."""
+        if self.level != 3:
+            raise ValueError("Retained decode staging requires a local L3 Worker")
+        with self._operation_lease("submit"):
+            return self._submit_locked(graph, None, None, retained_stage_key=key)
+
+    def _submit_locked(
+        self, callable, args, config, *, caller_stream: int | None = None, retained_stage_key: str | None = None
+    ) -> RunHandle:
         cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
@@ -15111,9 +15183,32 @@ class Worker:
         while True:
             with self._submit_mu.exclusive():
                 predecessor = self._cleanup_bearing_predecessor()
+                with self._hierarchical_start_cv:
+                    if self._retained_graph_error is not None:
+                        raise RuntimeError(
+                            "Dependent retained graph failed. Close this Worker."
+                        ) from self._retained_graph_error
                 if predecessor is None:
                     self._require_no_ordered_cleanup_failure("submit")
-                    return self._submit_l3_locked(callable, args, cfg)
+                    if retained_stage_key is None:
+                        return self._submit_l3_locked(callable, args, cfg)
+                    return self._submit_l3_locked(callable, args, cfg, retained_stage_key=retained_stage_key)
+                if retained_stage_key is not None:
+                    with self._hierarchical_start_cv:
+                        stage = (
+                            len(self._accepted_run_handles) == 1
+                            and predecessor in self._accepted_run_handles
+                            and predecessor._resources.retained_stage_key == retained_stage_key
+                        )
+                    if stage:
+                        self._require_no_ordered_cleanup_failure("submit")
+                        return self._submit_l3_locked(
+                            callable,
+                            args,
+                            cfg,
+                            retained_stage_key=retained_stage_key,
+                            retained_predecessor=predecessor,
+                        )
             # Finalization can drop keepalives whose destructors acquire this serializer.
             predecessor._wait_for_handoff()
 
@@ -15776,15 +15871,24 @@ class Worker:
         mappings = self._l3_host_mappings() if has_map or supported else self._host_group_mappings
         return host_args, mappings
 
-    def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
+    def _submit_l3_locked(  # noqa: PLR0912 -- submission and rollback share the run resources
+        self,
+        callable,
+        args,
+        cfg: CallConfig,
+        *,
+        retained_stage_key: str | None = None,
+        retained_predecessor: RunHandle | None = None,
+    ) -> RunHandle:
         host_args, mappings = self._prepare_l3_host_args(args)
         assert self._orch is not None
         assert self._worker is not None
         if getattr(cfg, "output_prefix", ""):
             _bind_host_log_session_directory()
-        run_id = self._orch._begin_run()
-        resources = _RunResources()
+        run_id = self._orch._begin_run(retained_predecessor is not None)
+        resources = _RunResources(retained_stage_key=retained_stage_key)
         handle = RunHandle(self, run_id, (callable, args, cfg), resources)
+        handle._retained_predecessor = retained_predecessor
         with self._hierarchical_start_cv:
             self._accepted_run_handles.add(handle)
             self._hierarchical_start_cv.notify_all()
@@ -15835,7 +15939,10 @@ class Worker:
                 failure_text = _format_exc("orchestration", e)
                 for _ in range(_RUN_CANCELLATION_ATTEMPTS):
                     try:
-                        self._orch._fail_run_submission(run_id, failure_text)
+                        if retained_predecessor is None:
+                            self._orch._fail_run_submission(run_id, failure_text)
+                        else:
+                            self._orch._resolve_held_run(run_id, False)
                     except BaseException as exc:  # noqa: BLE001
                         cancellation_error = exc
                     else:
@@ -15848,6 +15955,7 @@ class Worker:
                 # unsettled cancellation.
                 self._building_run_resources = None
                 if cancellation_error is None:
+                    handle._retained_predecessor = None
                     handle._wait_for_serialization()
                 else:
                     self._abandon_unsettled_run(
@@ -15859,6 +15967,10 @@ class Worker:
             raise
         finally:
             self._building_run_resources = None
+        if retained_predecessor is not None:
+            retained_predecessor._held_successor_id = run_id
+            if retained_predecessor._terminal:
+                self._orch._resolve_held_run(run_id, retained_predecessor._error is None)
         return handle
 
     def _run_handle_done(self, run_id: int) -> bool:
@@ -15983,7 +16095,11 @@ class Worker:
             def _release_native_run() -> None:
                 if orch is None:
                     raise RuntimeError("RunHandle cleanup lost its native Orchestrator")
-                orch._release_run(run_id)
+                priority = getattr(self, "_route3c_staging_priority", None)
+                if priority is not None and priority[0] == 1 and handle._held_successor_id is not None:
+                    orch._release_run(run_id, skip_busy_compaction=True)
+                else:
+                    orch._release_run(run_id)
 
             cursor = _RunFinalizationCursor(
                 steps=(
@@ -16006,7 +16122,13 @@ class Worker:
                     ("pending_domains", lambda: self._execute_pending_domain_releases(resources)),
                     (
                         "live_domains",
-                        lambda: self._release_all_live_domains(resources, include_retained=native_error is not None),
+                        # A retained decode successor can already own a staged descriptor.
+                        # Failure keeps that allocation owned by the Worker until close drains
+                        # every run, including cancellation acknowledgements from all endpoints.
+                        lambda: self._release_all_live_domains(
+                            resources,
+                            include_retained=native_error is not None and resources.retained_stage_key is None,
+                        ),
                     ),
                     ("retire_domains", lambda: self._retire_run_domains(resources)),
                     ("native_run", _release_native_run),
@@ -16063,6 +16185,12 @@ class Worker:
                             self._abandoned_run_handles.append(handle)
                     elif cleanup_error is not None and self._ordered_cleanup_error is None:
                         self._ordered_cleanup_error = cleanup_error
+                    if (
+                        result is not None
+                        and handle._resources.retained_stage_key is not None
+                        and self._retained_graph_error is None
+                    ):
+                        self._retained_graph_error = result
                     handle._cleanup_published = True
                     self._accepted_run_handles.discard(handle)
                     self._hierarchical_start_cv.notify_all()

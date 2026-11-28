@@ -1007,8 +1007,11 @@ class Orchestrator:
     def _scope_end(self) -> None:
         self._o._scope_end()
 
-    def _begin_run(self) -> int:
-        return int(self._o._begin_run())
+    def _begin_run(self, hold_activation: bool = False) -> int:
+        return int(self._o._begin_run(hold_activation))
+
+    def _resolve_held_run(self, run_id: int, success: bool) -> None:
+        self._o._resolve_held_run(run_id, success)
 
     def _close_run_submission(self, run_id: int) -> None:
         self._o._close_run_submission(run_id)
@@ -1031,5 +1034,5 @@ class Orchestrator:
     def _run_done(self, run_id: int) -> bool:
         return bool(self._o._run_done(run_id))
 
-    def _release_run(self, run_id: int) -> None:
-        self._o._release_run(run_id)
+    def _release_run(self, run_id: int, *, skip_busy_compaction: bool = False) -> None:
+        self._o._release_run(run_id, skip_busy_compaction)

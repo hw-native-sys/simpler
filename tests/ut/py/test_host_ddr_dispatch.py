@@ -20,6 +20,7 @@ from simpler.callable_identity import CallableHandle
 from simpler.comm_endpoints import DEVICE_AICPU
 from simpler.host_ddr_l3 import ChildHostMappings, _decode
 from simpler.orchestrator import Orchestrator
+from simpler.prepared_local import PreparedLocalChipTask
 from simpler.task_interface import DataType, TaskArgs, TensorTransfer, _materialize_chip_task_args
 from simpler.worker import _COMM_INIT_HEADER, _CTRL_HOST_DDR, Worker, WorkerType, _callback_frame_for, _Lifecycle
 
@@ -60,7 +61,8 @@ def l3(monkeypatch):
         chips.append(chip)
     transport = MagicMock()
     native_orch = MagicMock()
-    native_orch._begin_run.side_effect = itertools.count(1).__next__
+    run_ids = itertools.count(1)
+    native_orch._begin_run.side_effect = lambda _hold_activation=False: next(run_ids)
     native_orch._wait_run_for.return_value = True
     worker._worker = transport
     worker._orch = Orchestrator(native_orch, worker)
@@ -123,7 +125,7 @@ def l3(monkeypatch):
         for args, rank in zip(args_list, ranks, strict=True):
             submit(digest, kind, namespace, args, config, rank)
 
-    def release_run(run_id):
+    def release_run(run_id, _skip_busy_compaction=False):
         for rank, key in dispatches.pop(run_id, ()):
             children[rank].release(key)
 
@@ -166,7 +168,8 @@ def dispatch_both(l3):
 
 
 @pytest.mark.parametrize(("platform", "outer_none"), [("a5", False), ("a5", True), ("a2a3", False)])
-def test_child_map_does_not_require_outer_map(l3, platform, outer_none):
+@pytest.mark.parametrize("prepared", [False, True])
+def test_child_map_does_not_require_outer_map(l3, platform, outer_none, prepared):
     l3.worker._config["platform"] = platform
     outer = TaskArgs()
     if outer_none:
@@ -174,7 +177,11 @@ def test_child_map_does_not_require_outer_map(l3, platform, outer_none):
 
     def callback(orch, _outer, config):
         assert not any(chip._map_host_ddr.called for chip in l3.chips)
-        orch.submit_next_level(l3.handle, _args(l3.native), config, worker=0)
+        args = _args(l3.native)
+        if prepared:
+            PreparedLocalChipTask(orch, l3.handle, args, 0).submit(orch, config)
+        else:
+            orch.submit_next_level(l3.handle, args, config, worker=0)
 
     pending = l3.worker.submit(callback, outer)
     l3.native_orch.submit_next_level.assert_called_once()

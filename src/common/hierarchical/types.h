@@ -163,6 +163,9 @@ struct RunState {
     bool submission_closed{false};
     bool submission_failed{false};
     bool lease_released{false};
+    // Protected by runs_mu_. A held successor may stage but cannot activate
+    // until the facade publishes semantic and cleanup success.
+    bool activation_held{false};
     // Protected by completion_mu. Physical ends release execution admission;
     // semantic active_tasks and IO references remain until normal delivery.
     struct PhysicalTask {
