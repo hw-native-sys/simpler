@@ -14,7 +14,7 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "runtime.h"
 
-extern "C" int simpler_aicpu_exec(void *);
+extern "C" int simpler_aicpu_exec_abi2(void *);
 namespace {
 PlatformEntryArgs received;
 int calls = 0;
@@ -41,7 +41,7 @@ TEST(EntryCacheProjection, ActualKernelEntryPreservesEveryPolicy) {
         args.entry_cache_maintenance = static_cast<uint32_t>(policy);
         const int before = calls;
         const int resets_before = resets;
-        ASSERT_EQ(simpler_aicpu_exec(&args), 0);
+        ASSERT_EQ(simpler_aicpu_exec_abi2(&args), 0);
         ASSERT_EQ(calls, before + 1);
         EXPECT_EQ(resets, resets_before + 1);
         EXPECT_EQ(received.args_base, &args);
