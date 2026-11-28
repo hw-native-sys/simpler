@@ -69,7 +69,7 @@ class TestMultiRoundPagedAttention(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": ["a5sim", "a5"],
             "params": {
                 "batch": 1,
                 "num_heads": 16,

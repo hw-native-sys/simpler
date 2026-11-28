@@ -51,12 +51,12 @@ class TestVectorExample(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": ["a5sim", "a5"],
             "params": {},
         },
     ]
 
-    CASES += [{**CASES[0], "name": "child_memory", "params": {"child_memory": True}}]
+    CASES += [{**CASES[0], "name": "child_memory", "manual": ["a5sim"], "params": {"child_memory": True}}]
 
     def generate_args(self, params):
         child_memory = params.get("child_memory", False)

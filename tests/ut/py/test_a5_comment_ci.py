@@ -116,7 +116,7 @@ def _execute(job, fixture, workflow="ci-a5-comment", step_index=0):
     return json.loads(result.stdout)
 
 
-def test_a5_ut_and_framework_run_automatically_only_for_affected_changes():
+def test_a5_hardware_jobs_run_automatically_only_for_affected_changes():
     ci = _workflow("ci")["jobs"]
     job = ci["ut-a5"]
     assert job["needs"] == ["detect-changes", "pre-commit"]
@@ -126,7 +126,10 @@ def test_a5_ut_and_framework_run_automatically_only_for_affected_changes():
     assert job["uses"] == "./.github/workflows/_ut-npu-a5.yml"
     assert json.loads(job["with"]["runs_on"]) == ["self-hosted", "a5"]
     assert job["with"]["include_cann_examples"] == "true"
-    assert "st-onboard-a5" not in ci
+    onboard = ci["st-onboard-a5"]
+    assert onboard["uses"] == "./.github/workflows/_st-npu-a5.yml"
+    assert json.loads(onboard["with"]["runs_on"]) == ["self-hosted", "a5"]
+    assert onboard["with"]["include_dfx_smokes"] == "true"
     framework = ci["st-framework-a5"]
     assert framework["needs"] == ["detect-changes", "pre-commit"]
     assert framework["if"] == (
@@ -149,7 +152,7 @@ def test_authorized_topology_pins_all_suites_and_keeps_reporting_permission_sepa
     jobs = workflow["jobs"]
     assert set(jobs) == {"gate-and-resolve", "report", *_SUITES}
     gate = jobs["gate-and-resolve"]
-    assert "github.event.issue.pull_request" in gate["if"]
+    assert gate["if"] == "false && github.event.issue.pull_request && contains(github.event.comment.body, '/run-a5')"
     assert gate["runs-on"] == jobs["report"]["runs-on"] == "ubuntu-24.04"
     assert gate["permissions"] == {"contents": "read", "pull-requests": "read"}
     for name in ("ready", "repository", "ref", "pr_number"):

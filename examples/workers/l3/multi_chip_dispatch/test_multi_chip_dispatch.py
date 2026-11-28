@@ -23,7 +23,7 @@ from .main import N_COLS, N_ROWS, build_chip_callable
 
 
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
-@pytest.mark.manual(["a2a3sim", "a5sim", "a2a3"])
+@pytest.mark.manual(["a2a3sim", "a5sim", "a2a3", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 def test_multi_chip_dispatch(st_platform, st_device_ids):
@@ -39,6 +39,7 @@ def test_multi_chip_dispatch(st_platform, st_device_ids):
     )
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a2a3sim", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)

@@ -312,8 +312,8 @@ class _Item:
         self.function = None
         self._markers = {m.name: m for m in markers}
 
-    def iter_markers(self):
-        return iter(self._markers.values())
+    def iter_markers(self, name=None):
+        return (marker for marker in self._markers.values() if name is None or marker.name == name)
 
     def get_closest_marker(self, name):
         return self._markers.get(name)

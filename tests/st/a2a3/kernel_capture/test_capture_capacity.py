@@ -64,7 +64,7 @@ def test_finite_workspace_refusal_preserves_graphs(tmp_path, request, runtime):
         pytest.param("host_build_graph", marks=pytest.mark.runtime("host_build_graph")),
         pytest.param(
             "tensormap_and_ringbuffer",
-            marks=[pytest.mark.runtime("tensormap_and_ringbuffer"), pytest.mark.manual(["a2a3"])],
+            marks=[pytest.mark.runtime("tensormap_and_ringbuffer"), pytest.mark.manual(["a2a3", "a5"])],
         ),
     ],
 )

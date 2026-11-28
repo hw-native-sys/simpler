@@ -33,15 +33,18 @@ pytestmark = [
 
 # Each mask holds a device for a process of its own. A simulator run carries
 # the single-AIV-lane mask, which the capacity accounting special-cases, and
-# all three lanes together; the silicon keeps the full sweep.
+# all three lanes together. Daily covers the full matrix on silicon.
 _SIM_MASKS = (4, 7)
 
 
 def _mask_params():
-    return [
-        pytest.param(mask, marks=[] if mask in _SIM_MASKS else [pytest.mark.platforms(["a5"])])
-        for mask in (1, 2, 4, 3, 5, 6, 7)
-    ]
+    params = []
+    for mask in (1, 2, 4, 3, 5, 6, 7):
+        marks = [] if mask in _SIM_MASKS else [pytest.mark.platforms(["a5"])]
+        if mask not in (1, 4, 7):
+            marks.append(pytest.mark.manual(["a5"]))
+        params.append(pytest.param(mask, marks=marks))
+    return params
 
 
 @pytest.fixture(scope="module")

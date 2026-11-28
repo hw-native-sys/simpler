@@ -56,12 +56,12 @@ source /usr/local/Ascend/cann/set_env.sh
 pip install --no-build-isolation -e '.[test]' --config-settings=build.targets=build_package_a5
 python -m simpler_setup.tools.scene_test_compile \
   tests/st/a5/tensormap_and_ringbuffer/urma_deferred_completion \
-  --platform a5 --require-pto-isa --compile-workers 4
+  --platform a5 --manual include --require-pto-isa --compile-workers 4
 mkdir -p outputs/urma/ascend
 export ASCEND_PROCESS_LOG_PATH="$PWD/outputs/urma/ascend"
 .claude/skills/onboard-arch-precheck/check.sh a5
 task-submit --device auto --device-num 3 --timeout 1800 --max-time 1800 \
-  --run ".venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/urma_deferred_completion --platform a5 --device \$TASK_DEVICE --require-pto-isa --pto-session-timeout 1200 -v"
+  --run ".venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/urma_deferred_completion --platform a5 --manual include --device \$TASK_DEVICE --require-pto-isa --pto-session-timeout 1200 -v"
 ```
 
 `TestUrmaChunkedFetch` is temporarily skipped after a device scheduler timeout in
@@ -72,9 +72,9 @@ under `outputs/urma/`.
 
 ## Validation scope
 
-The main PR CI workflow does not include an A5 onboard job. Hardware validation
-of these transfers and lifecycle cases requires a separate A5 run using the
-three-device command above. RDMA remains OFF by default.
+The A5 onboard PR job exercises Gather PUT and Scatter GET. Daily includes
+the manual transfer and lifecycle cases. Use the three-device command above
+to run the same selection locally. RDMA remains OFF by default.
 
 These cases request `workspace_engines=("urma",)` and obtain a checked context
 with `handle.device_context(rank, workspace_engines=("urma",))`. Kernels read

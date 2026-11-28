@@ -43,7 +43,7 @@ Single device:
 pytest examples/workers/l3/worker_chip_message_queue --platform a2a3sim
 pytest examples/workers/l3/worker_chip_message_queue --platform a5sim
 pytest examples/workers/l3/worker_chip_message_queue --platform a2a3 --device <id>
-pytest examples/workers/l3/worker_chip_message_queue --platform a5 --device <id>
+pytest examples/workers/l3/worker_chip_message_queue --platform a5 --manual include --device <id>
 ```
 
 The test file is also the example — `run_worker_chip_message_queue_example(platform,

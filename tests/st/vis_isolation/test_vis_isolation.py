@@ -79,6 +79,7 @@ def _remapped_visible(st_device_ids):
     return visible
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(2)
 @pytest.mark.runtime(RUNTIME)
@@ -110,6 +111,7 @@ def test_chip_init_under_visible_devices(st_platform, st_device_ids):
     )
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(2)
 @pytest.mark.runtime(RUNTIME)

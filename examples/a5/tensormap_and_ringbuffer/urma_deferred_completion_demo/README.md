@@ -47,7 +47,7 @@ source .venv/bin/activate
 pip install --no-build-isolation -e .
 .claude/skills/onboard-arch-precheck/check.sh a5
 task-submit --device auto --device-num 2 --timeout 1800 --max-time 1800 \
-  --run ".venv/bin/python -m pytest examples/a5/tensormap_and_ringbuffer/urma_deferred_completion_demo --platform a5 --device \$TASK_DEVICE"
+  --run ".venv/bin/python -m pytest examples/a5/tensormap_and_ringbuffer/urma_deferred_completion_demo --platform a5 --manual include --device \$TASK_DEVICE"
 ```
 
 ## See also

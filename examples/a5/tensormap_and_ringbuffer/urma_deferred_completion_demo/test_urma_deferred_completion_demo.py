@@ -96,6 +96,7 @@ class TestUrmaDeferredCompletionDemo(SceneTestCase):
         {
             "name": "peer_fetch",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "config": {"device_count": NRANKS, "num_sub_workers": 0},
             "params": {},
         }

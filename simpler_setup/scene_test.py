@@ -1177,6 +1177,41 @@ def is_manual_for_platform(manual, platform: str | None) -> bool:
     return bool(manual)
 
 
+def manual_marker_applies(marker, platform: str | None) -> bool:
+    if marker is None:
+        return False
+
+    import pytest  # noqa: PLC0415
+
+    unknown_kwargs = set(marker.kwargs) - {"platforms"}
+    if unknown_kwargs:
+        names = ", ".join(sorted(unknown_kwargs))
+        raise pytest.UsageError(f"@pytest.mark.manual got unsupported keyword argument(s): {names}")
+    if marker.args and "platforms" in marker.kwargs:
+        raise pytest.UsageError(
+            "@pytest.mark.manual platforms must be passed either positionally or by keyword, not both"
+        )
+
+    if "platforms" in marker.kwargs:
+        platforms = marker.kwargs["platforms"]
+    elif marker.args:
+        platforms = marker.args[0] if len(marker.args) == 1 else marker.args
+    else:
+        return True
+    if platforms is None or platform is None:
+        return True
+    return is_manual_for_platform(platforms, platform)
+
+
+def is_manual_item(item, platform):
+    return any(manual_marker_applies(marker, platform) for marker in item.iter_markers("manual"))
+
+
+def is_manual_scene_case(item, case, platform):
+    """A pytest method or parameter may move all its matching scene cases to Daily."""
+    return is_manual_for_platform(case.get("manual"), platform) or is_manual_item(item, platform)
+
+
 def _select_cases(test_classes, platform: str, selectors: list[tuple], manual_mode: str):
     """Resolve (class, case) pairs to run. Validates selectors strictly.
 
@@ -2495,7 +2530,7 @@ class SceneTestCase:
                 continue
             if not _match_selectors(cls_name, case["name"], selectors):
                 continue
-            is_manual = is_manual_for_platform(case.get("manual"), st_platform)
+            is_manual = is_manual_scene_case(request.node, case, st_platform)
             if manual_mode == "exclude" and is_manual:
                 continue
             if manual_mode == "only" and not is_manual:

@@ -58,7 +58,7 @@ class TestVectorExampleHostBuildGraphA5(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": ["a5sim", "a5"],
             "params": {},
         },
     ]

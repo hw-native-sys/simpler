@@ -100,7 +100,7 @@ class TestSpmdSyncStartStress(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": ["a5sim", "a5"],
             "params": {},
         }
     ]

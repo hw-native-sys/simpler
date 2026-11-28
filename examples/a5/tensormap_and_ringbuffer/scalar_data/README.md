@@ -60,7 +60,7 @@ comparison would fail nondeterministically.
 ## Run
 
 ```bash
-pytest examples/a5/tensormap_and_ringbuffer/scalar_data --platform a5 --device 0
+pytest examples/a5/tensormap_and_ringbuffer/scalar_data --platform a5 --manual include --device 0
 ```
 
 Onboard only. Wrap in `task-submit` on a shared box.

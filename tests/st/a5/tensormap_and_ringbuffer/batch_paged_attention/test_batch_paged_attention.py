@@ -64,6 +64,7 @@ class TestBatchPagedAttention(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -108,6 +109,7 @@ class TestBatchPagedAttention(SceneTestCase):
         {
             "name": "CaseSmall1",
             "platforms": ["a5sim", "a5"],
+            "manual": ["a5"],
             "params": {
                 "batch": 1,
                 "num_heads": 16,

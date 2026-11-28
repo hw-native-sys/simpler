@@ -79,6 +79,7 @@ def test_architecture_flags_from_actual_detector(tmp_path, files, arches, catego
     _, a5, wse = arches
     st, ut = categories
     assert ("ut" in selected) == ut
+    assert ("st-onboard-a5" in selected) == (a5 and st)
     assert ("st-framework-a5" in selected) == (a5 and st)
     assert ("st-sim-a5" in selected) == (a5 and st)
     assert ("st-sim-wse" in selected) == (wse and st)

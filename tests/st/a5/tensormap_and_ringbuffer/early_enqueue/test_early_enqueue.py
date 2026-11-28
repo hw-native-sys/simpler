@@ -97,6 +97,8 @@ from simpler.worker import (
 from simpler_setup import SceneTestCase, scene_test
 from simpler_setup.tools.strace_timing import parse_spans
 
+pytestmark = pytest.mark.manual(["a5"])
+
 #: The point-in-time host span one joined launch publishes, carrying both run identities and
 #: carrying `observed` separately from `unfired` so a failed query reads as a failed query.
 _JOIN_SPAN = "chip.run.joined_launch"
@@ -1495,6 +1497,7 @@ class TestA5TmrEarlyEnqueueDepthOneControl(_A5TmrEarlyEnqueueBase):
         {
             "name": "a5_tmr_early_enqueue_depth_one",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "config": {"device_count": 1, "num_sub_workers": 0},
             "params": {},
         },
@@ -1783,6 +1786,7 @@ class TestA5TmrCapacityBeyondTheOldCeiling(_A5TmrEarlyEnqueueBase):
         {
             "name": "a5_tmr_capacity_beyond_the_old_ceiling",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,
@@ -1938,6 +1942,7 @@ class TestA5TmrWideFailureAttribution(_A5TmrEarlyEnqueueBase):
         {
             "name": "a5_tmr_wide_failure_attribution",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,
@@ -2144,6 +2149,7 @@ class TestA5TmrWorkedCapacityExample(_A5TmrEarlyEnqueueBase):
         {
             "name": "a5_tmr_worked_capacity_example",
             "platforms": ["a5"],
+            "manual": ["a5"],
             "config": {
                 "device_count": 1,
                 "num_sub_workers": 0,

@@ -293,6 +293,7 @@ _OWNERSHIP = (
 )
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
@@ -315,13 +316,20 @@ def test_hbg_empty_and_active_calls_retain_state(st_platform, st_device_ids, bor
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.parametrize(
-    "runtime",
+    ("budget", "runtime"),
     [
-        pytest.param("host_build_graph", marks=pytest.mark.runtime("host_build_graph")),
-        pytest.param("tensormap_and_ringbuffer", marks=pytest.mark.runtime("tensormap_and_ringbuffer")),
+        pytest.param(
+            budget,
+            runtime,
+            id=f"{label}-{runtime}",
+            marks=[pytest.mark.runtime(runtime), pytest.mark.manual(["a5"])]
+            if label == "unlimited" or (runtime == "tensormap_and_ringbuffer" and label == "bounded")
+            else [pytest.mark.runtime(runtime)],
+        )
+        for label, budget in [("unlimited", 0), ("refused", 1024), ("bounded", 128 << 20)]
+        for runtime in ("host_build_graph", "tensormap_and_ringbuffer")
     ],
 )
-@pytest.mark.parametrize("budget", [0, 1024, 128 << 20], ids=["unlimited", "refused", "bounded"])
 @pytest.mark.runtime_product("kernel")
 @pytest.mark.execution_mode("eager")
 def test_borrowed_workspace_budget_preserves_caller_resources(st_platform, st_device_ids, runtime, budget):

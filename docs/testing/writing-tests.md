@@ -204,8 +204,10 @@ still gets checked, whereas a skipped case only proves the run didn't crash.
 | `--case A::x --case B::y` | multiple selectors (repeatable) |
 
 `--manual exclude` (default) skips `manual: True` cases and standalone tests
-marked `@pytest.mark.manual`; `--manual include` runs them alongside normal
-tests; `--manual only` runs only manual tests. The `only` filter applies to the
+marked `@pytest.mark.manual`. A marked pytest scene method or parameter also
+moves all of its cases on the specified platforms. When marks apply at multiple
+levels, their platform lists are combined. `--manual include` runs manual and
+ordinary tests together; `--manual only` runs only manual tests. The `only` filter applies to the
 entire pytest session, so it also deselects ordinary standalone tests without a
 `manual` marker. These compose orthogonally with `--case`: explicit selectors
 still respect the manual filter — to run a manual case by name, pass

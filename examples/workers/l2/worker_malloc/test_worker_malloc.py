@@ -13,6 +13,7 @@ import pytest
 from .main import run
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)

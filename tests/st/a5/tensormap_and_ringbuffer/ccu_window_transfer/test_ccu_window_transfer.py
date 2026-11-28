@@ -26,6 +26,7 @@ def test_ccu_real_window_transfer(st_platform, st_device_ids, tmp_path, request)
     _exercise_window_transfer(st_platform, st_device_ids[:2], tmp_path, request, (0, 1))
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(3)
@@ -34,6 +35,7 @@ def test_ccu_all_peer_channels_and_subset_rank_mapping(st_platform, st_device_id
     _exercise_window_transfer(st_platform, st_device_ids[:3], tmp_path, request, members)
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(3)
@@ -41,6 +43,7 @@ def test_ccu_shared_context_across_distinct_window_members(st_platform, st_devic
     _exercise_window_transfer(st_platform, st_device_ids[:3], tmp_path, request, (0, 1), member_sets=((0, 1), (0, 2)))
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)

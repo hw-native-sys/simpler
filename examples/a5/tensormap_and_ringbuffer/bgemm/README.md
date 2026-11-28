@@ -48,7 +48,7 @@ hold.
 
 ```bash
 pytest examples/a5/tensormap_and_ringbuffer/bgemm --platform a5sim
-pytest examples/a5/tensormap_and_ringbuffer/bgemm --platform a5 --device 0
+pytest examples/a5/tensormap_and_ringbuffer/bgemm --platform a5 --manual include --device 0
 ```
 
 One case, `default`, on both `a5sim` and `a5` — one of the few a5 examples you

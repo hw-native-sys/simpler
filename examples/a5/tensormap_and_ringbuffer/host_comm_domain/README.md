@@ -35,7 +35,7 @@ cache that pytest reads on the target machine.
 ```bash
 .venv/bin/python -m simpler_setup.tools.scene_test_compile \
   examples/a5/tensormap_and_ringbuffer/host_comm_domain \
-  --platform a5 --exclude-level 4 --require-pto-isa --manual exclude
+  --platform a5 --exclude-level 4 --require-pto-isa --manual include
 ```
 
 Run all four combinations of serial or staged submissions with one or four AIV
@@ -45,7 +45,7 @@ blocks on the allocated devices:
 task-submit --device auto --device-num 2 --run \
   'bash .claude/skills/onboard-arch-precheck/check.sh a5 &&
    .venv/bin/python -m pytest examples/a5/tensormap_and_ringbuffer/host_comm_domain \
-     --platform a5 --device "$TASK_DEVICE" -v'
+     --platform a5 --device "$TASK_DEVICE" --manual include -v'
 ```
 
 Staged execution submits two runs with independent output slices and checks both

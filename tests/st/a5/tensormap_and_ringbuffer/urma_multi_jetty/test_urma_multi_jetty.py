@@ -61,10 +61,13 @@ def multi_jetty_orch(orch, callables, task_args, config):
         orch.submit_next_level(callables.multi_jetty, args, config, worker=0)
 
 
-def _case(name, *, jetties=2, elems=CHUNK_ELEMS + TILE_ELEMS, put=0, waves=2, repeats=1, slots=1, **extra):
+def _case(
+    name, *, manual=False, jetties=2, elems=CHUNK_ELEMS + TILE_ELEMS, put=0, waves=2, repeats=1, slots=1, **extra
+):
     case = {
         "name": name,
         "platforms": ["a5"],
+        "manual": manual,
         "config": {"device_count": 2, "num_sub_workers": 0},
         "params": {
             "jetties": jetties,
@@ -268,7 +271,13 @@ class _UrmaMultiJetty(SceneTestCase):
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestUrmaMultiJettyBoundaries(_UrmaMultiJetty):
     CASES = [
-        _case(f"{'put' if put else 'get'}_{boundary}_j{jetties}", jetties=jetties, elems=elems, put=put)
+        _case(
+            f"{'put' if put else 'get'}_{boundary}_j{jetties}",
+            jetties=jetties,
+            elems=elems,
+            put=put,
+            manual=(put, jetties, boundary) != (0, 2, "above"),
+        )
         for put in (0, 1)
         for jetties in (1, 2)
         for boundary, elems in (
@@ -283,18 +292,19 @@ class TestUrmaMultiJettyBoundaries(_UrmaMultiJetty):
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestUrmaMultiJettySmallRequests(_UrmaMultiJetty):
     CASES = [
-        _case(f"small_{'put' if put else 'get'}", elems=TILE_ELEMS, put=put, repeats=16, waves=4) for put in (0, 1)
+        _case(f"small_{'put' if put else 'get'}", elems=TILE_ELEMS, put=put, repeats=16, waves=4, manual=True)
+        for put in (0, 1)
     ]
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestUrmaMultiJettySenders(_UrmaMultiJetty):
-    CASES = [_case("two_senders", slots=2, put=1, repeats=4, waves=3)]
+    CASES = [_case("two_senders", slots=2, put=1, repeats=4, waves=3, manual=True)]
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestUrmaMultiJettyDepth(_UrmaMultiJetty):
-    CASES = [_case("explicit_sq_depth", elems=TILE_ELEMS, put=1, repeats=16, waves=4, sq_depth=1024)]
+    CASES = [_case("explicit_sq_depth", elems=TILE_ELEMS, put=1, repeats=16, waves=4, sq_depth=1024, manual=True)]
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")

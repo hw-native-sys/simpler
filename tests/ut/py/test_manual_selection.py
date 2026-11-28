@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from simpler_setup.scene_test import SceneTestCase, is_manual_for_platform
+from simpler_setup.scene_test import SceneTestCase, is_manual_for_platform, manual_marker_applies
 
 _ROOT = Path(__file__).resolve().parents[3]
 _SPEC = importlib.util.spec_from_file_location("_root_conftest_for_manual_selection_tests", _ROOT / "conftest.py")
@@ -120,21 +120,21 @@ def test_manual_mode_matches(is_manual, manual_mode, expected):
     ],
 )
 def test_manual_marker_applies(marker, platform, expected):
-    assert root_conftest._manual_marker_applies(marker, platform) is expected
+    assert manual_marker_applies(marker, platform) is expected
 
 
 def test_manual_marker_rejects_positional_and_keyword_platforms():
     marker = _FakeMarker("manual", ["a2a3sim"], platforms=["a5sim"])
 
     with pytest.raises(pytest.UsageError, match="either positionally or by keyword"):
-        root_conftest._manual_marker_applies(marker, "a2a3sim")
+        manual_marker_applies(marker, "a2a3sim")
 
 
 def test_manual_marker_rejects_unknown_keyword_arguments():
     marker = _FakeMarker("manual", platforms=["a2a3sim"], reason="slow")
 
     with pytest.raises(pytest.UsageError, match=r"unsupported keyword argument\(s\): reason"):
-        root_conftest._manual_marker_applies(marker, "a2a3sim")
+        manual_marker_applies(marker, "a2a3sim")
 
 
 @pytest.mark.parametrize(
@@ -177,8 +177,31 @@ def test_collection_filters_platform_scoped_manual_tests(platform, manual_mode, 
     ],
 )
 def test_scene_case_selection_matches_run_filters(manual_mode, selectors, expected):
-    request = SimpleNamespace(config=_FakeConfig(manual=manual_mode, case=selectors))
+    request = SimpleNamespace(node=_FakeItem("scene::test_run"), config=_FakeConfig(manual=manual_mode, case=selectors))
 
     matched = _SelectionScene()._matching_cases("a2a3sim", request)
 
     assert [case["name"] for case in matched] == expected
+
+
+@pytest.mark.parametrize(("mode", "selected"), [("exclude", False), ("include", True), ("only", True)])
+def test_manual_scene_method_and_parameter_combine_platforms(mode, selected):
+    item = _FakeItem(
+        "scene::test_method[param]",
+        markers=[_FakeMarker("manual", ["a5sim"]), _FakeMarker("manual", ["a5"])],
+    )
+
+    class Scene(SceneTestCase):
+        _st_level = 3
+        _st_runtime = "host_build_graph"
+        CASES = [{"name": "ordinary", "platforms": ["a5"], "config": {"device_count": 2}}]
+
+    item.cls = Scene
+    config = _FakeConfig(platform="a5", manual=mode)
+    items = [item]
+    root_conftest.pytest_collection_modifyitems(None, config, items)
+    jobs = root_conftest._collect_resource_jobs(items, "a5", mode)
+    cases = Scene()._matching_cases("a5", SimpleNamespace(node=item, config=config))
+    assert items == ([item] if selected else [])
+    assert [job.device_count for job in jobs] == ([2] if selected else [])
+    assert cases == (Scene.CASES if selected else [])

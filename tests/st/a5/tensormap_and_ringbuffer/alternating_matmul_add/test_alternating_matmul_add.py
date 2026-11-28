@@ -54,7 +54,7 @@ class TestAlternatingMatmulAdd(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": ["a5sim", "a5"],
             "params": {"batch": 1, "M": 1, "N": 1, "matmul_batch": 1, "add_batch": 1},
         },
         {
