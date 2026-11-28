@@ -1063,6 +1063,29 @@ TEST(ChipRunLaneJoinedLaunchTest, AThrowingJoinedLaunchPoisonsUnobservedRunsAndK
 // does when taking the reference fails.
 // ---------------------------------------------------------------------------
 
+TEST(ChipRunLaneCallerBuffersTest, AddressOnlyBackendPreparesWithoutBorrowButKeepsLaunchOrdered) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.supports_concurrent_native_prepare_fn_ = [](void *) -> int {
+        return PTO_NATIVE_PREPARE_DEVICE_ADDRESS_ONLY;
+    };
+    ChipRunLane lane(worker);
+
+    ChipRun first = submit(lane, 101, 0, true, device_args());
+    ChipRun second = submit(lane, 102, 1, false, device_args());
+    EXPECT_EQ(second.preparation_disposition(), ChipRunPreparationDisposition::NATIVE_PREPARED);
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1"}));
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.launched());
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1", "launch1"}));
+    lane.close();
+    worker.finalize();
+}
+
 TEST(ChipRunLaneCallerBuffersTest, ABorrowedDeviceArgumentReachesTheDeviceEarly) {
     ChipWorker worker;
     prime_worker(worker);

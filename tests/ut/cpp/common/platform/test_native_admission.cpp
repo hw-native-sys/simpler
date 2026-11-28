@@ -2837,6 +2837,15 @@ TEST_F(NativeAdmissionTest, ParkResultFreeFailureEndsThePlanInsteadOfReportingWa
     runner.retire(0, 10);
 }
 
+TEST_F(NativeAdmissionTest, NativePrepareModeReflectsDeviceArgumentAccess) {
+    Runner runner;
+    const bool hbg = std::string_view(SIMPLER_RUNTIME_NAME) == "host_build_graph";
+    const bool a5 = std::string_view(SIMPLER_PLATFORM_NAME) == "a5sim";
+    const int expected = a5 && hbg ? PTO_NATIVE_PREPARE_DEVICE_ADDRESS_ONLY : PTO_NATIVE_PREPARE_CONCURRENT;
+    EXPECT_EQ(supports_concurrent_native_prepare_ctx(&runner), expected);
+    EXPECT_EQ(supports_concurrent_native_prepare_ctx(nullptr), PTO_NATIVE_PREPARE_UNAVAILABLE);
+}
+
 TEST_F(NativeAdmissionTest, ShippedArenaTopologiesAreServiceable) {
     Runner runner;
     Attempt attempt(runner, 0, 1);

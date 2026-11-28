@@ -1235,9 +1235,13 @@ int ChipWorker::abort_run_plan(uint32_t pipeline_slot, uint64_t run_epoch) {
     return abort_run_plan_fn_(device_ctx_, pipeline_slot, run_epoch);
 }
 
+int ChipWorker::native_prepare_mode() const {
+    if (!initialized_ || pipeline_contract_.pipeline_depth <= 1) return PTO_NATIVE_PREPARE_UNAVAILABLE;
+    return supports_concurrent_native_prepare_fn_(device_ctx_);
+}
+
 bool ChipWorker::supports_concurrent_native_prepare() const {
-    return initialized_ && pipeline_contract_.pipeline_depth > 1 &&
-           supports_concurrent_native_prepare_fn_(device_ctx_) > 0;
+    return native_prepare_mode() > PTO_NATIVE_PREPARE_UNAVAILABLE;
 }
 
 bool ChipWorker::supports_joined_native_launch() const {

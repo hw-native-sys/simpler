@@ -352,19 +352,15 @@ struct ChipRunLaneState {
      * host-orchestration phase state is held per pipeline slot, and everything
      * it hands to the resident collector is published under this claim.
      *
-     * The predecessor's shape does. A successor's preparation runs its own host
-     * graph build, which may read the bytes of a device argument, and what keeps
-     * that read off bytes this run has not produced is this run's declaration of
-     * what it produces — which covers only spans whose owner it could prove. A
-     * predecessor holding no borrow over every device span it names has no such
-     * proof, so it carries no preparation either: its successor prepares at the
-     * front, after it has retired. That is the same condition `joinable_shape`
-     * puts on the launch, applied to the earlier boundary.
+     * When preparation can inspect application DEVICE values, every predecessor
+     * span needs a borrow so its pending writes can be tracked. A backend that
+     * only binds their addresses can prepare behind the same FIFO head.
      */
     bool permits_native_successor(const ChipRunState &predecessor) const {
-        if (!worker->supports_concurrent_native_prepare()) return false;
         if (predecessor.phase != ChipRunState::Phase::LAUNCHED) return false;
-        return joinable_shape(predecessor);
+        const int mode = worker->native_prepare_mode();
+        if (mode <= PTO_NATIVE_PREPARE_UNAVAILABLE) return false;
+        return mode == PTO_NATIVE_PREPARE_DEVICE_ADDRESS_ONLY || joinable_shape(predecessor);
     }
 
     void prepare(const std::shared_ptr<ChipRunState> &run) {

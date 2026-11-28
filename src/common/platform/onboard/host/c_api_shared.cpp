@@ -1493,7 +1493,7 @@ static void emit_native_run_runner_wall(OnboardNativeRunContext *state) {
 }
 
 int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx) {
-    return ctx != nullptr && concurrent_native_prepare_supported_impl() != 0 ? 1 : 0;
+    return ctx != nullptr ? concurrent_native_prepare_supported_impl() : PTO_NATIVE_PREPARE_UNAVAILABLE;
 }
 
 /**
@@ -1953,7 +1953,8 @@ static int prepare_native_run(
             static_cast<unsigned long long>(state->descriptor.generation),
             static_cast<unsigned long long>(state->descriptor.run_epoch)
         );
-        const bool allow_prepared_successor = concurrent_native_prepare_supported_impl() != 0;
+        const bool allow_prepared_successor =
+            supports_concurrent_native_prepare_ctx(ctx) > PTO_NATIVE_PREPARE_UNAVAILABLE;
         if (!runner->try_reserve_native_run(
                 state, state->descriptor.pipeline_slot, state->descriptor.arena_bank, allow_prepared_successor,
                 independent_preparation, state->identity()

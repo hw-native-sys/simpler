@@ -172,8 +172,9 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
 }
 
 extern "C" int concurrent_native_prepare_supported_impl(void) {
-    // Each prepare assembles its own host image.
-    return 1;
+    // Each prepare binds DEVICE addresses into a fresh image. Host orchestration can
+    // access tensor values only through explicitly registered HOST/NONE arguments.
+    return PTO_NATIVE_PREPARE_DEVICE_ADDRESS_ONLY;
 }
 
 extern "C" int
