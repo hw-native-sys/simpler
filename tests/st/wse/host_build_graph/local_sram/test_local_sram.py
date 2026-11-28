@@ -66,8 +66,18 @@ def test_sram_counter_replay_and_residency(tmp_path, st_platform):
     for path in records:
         record = json.loads(path.read_text())
         assert record["configuration"][:2] == [40, 4]
-        kinds = {section["kind"] for section in record["sections"]}
-        assert {1, 2, 3, 4, 5, 6, 7, 8, 9, 10} <= kinds
+        names = {s["name"] for s in record["sections"]}
+        assert names == {
+            "local_task",
+            "region_map",
+            "tensors",
+            "scalars",
+            "dependencies",
+            "core_control",
+            "block_queue",
+            "allocations",
+            "task_signal",
+        }
         for owner, core in enumerate(record["cores"]):
             sections = sorted((v for v in record["sections"] if v["owner"] == owner), key=lambda v: v["address"])
             end = core["runtime_base"]
@@ -149,7 +159,9 @@ def test_sram_runtime_capacity_rejects_before_go_and_recovers(tmp_path, st_platf
             worker.run(handle, args, counter.config_for(rejected))
         report = rejected / "wse_prepare_error.txt"
         assert report.is_file(), "\n".join(log.read_text() for log in _bound_host_logs())
-        assert "WSE Runtime SRAM capacity exhausted" in report.read_text()
+        error = report.read_text()
+        assert "WSE Runtime SRAM capacity exhausted" in error and "core=1 " in error
+        assert "section=" in error and "required=" in error and "available=" in error and "reserve=" in error
         assert not (rejected / "wse_events.jsonl").exists()
         for window in windows:
             release_view(worker, window)

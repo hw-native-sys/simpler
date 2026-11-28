@@ -135,9 +135,9 @@ int DeviceRunner::ensure_binaries_loaded() {
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run_v2"));
+    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run_v3"));
     if (!create_run_) {
-        LOG_ERROR("WSE PE runtime ABI mismatch: expected wse_create_run_v2");
+        LOG_ERROR("WSE PE runtime ABI mismatch: expected wse_create_run_v3");
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -266,13 +266,16 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         std::ofstream trace(std::filesystem::path(config.output_prefix) / "wse_events.jsonl");
         trace << "{\"epoch\":" << active_run_->epoch << ",\"expected_tasks\":" << active_run_->expected
               << ",\"core_count\":" << active.prepared->num_aicore / WSE_PE_PER_CORE << "}\n";
-        for (uint32_t worker = 0; worker < active_run_->threads.size(); ++worker) {
+        for (size_t stream = 0; stream <= active_run_->threads.size(); ++stream) {
+            const bool host = stream == active_run_->threads.size();
             uint64_t count = 0;
-            const auto *events = run_events_(active_run_->state, worker, &count);
+            const auto *events = run_events_(active_run_->state, host ? UINT32_MAX : stream, &count);
             for (uint64_t i = 0; i < count; ++i) {
                 const auto &e = events[i];
                 trace << "{\"seq\":" << e.sequence << ",\"kind\":" << static_cast<uint32_t>(e.kind)
-                      << ",\"core\":" << e.core << ",\"pe\":" << e.pe << ",\"task\":" << e.task
+                      << ",\"core\":" << (host ? "null" : std::to_string(e.core))
+                      << ",\"pe\":" << (host ? "null" : std::to_string(e.pe))
+                      << (host ? ",\"source\":\"host_prepare\"" : "") << ",\"task\":" << e.task
                       << ",\"block\":" << e.block << ",\"value\":" << e.value << ",\"slot\":" << e.slot
                       << ",\"generation\":" << e.generation << "}\n";
             }
@@ -296,8 +299,10 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         const auto *sections = memory_sections_(active_run_->state, &section_count);
         for (uint64_t i = 0; i < section_count; ++i) {
             const auto &section = sections[i];
-            memory << (i ? "," : "") << "{\"owner\":" << section.owner << ",\"kind\":" << section.kind
-                   << ",\"address\":" << section.address << ",\"bytes\":" << section.bytes << "}";
+            memory << (i ? "," : "") << "{\"owner\":" << section.owner
+                   << ",\"kind\":" << static_cast<uint32_t>(section.kind) << ",\"name\":\""
+                   << wse_section_name(section.kind) << '"' << ",\"address\":" << section.address
+                   << ",\"bytes\":" << section.bytes << "}";
         }
         memory << "]}";
         if (!memory) return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);

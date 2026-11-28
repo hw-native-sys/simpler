@@ -72,16 +72,37 @@ one Worker cannot be substituted into another Worker's ownership registry.
 
 ## Runtime reservation
 
-Each run uses private Core control records, task tables, Block queues and other
-execution metadata placed in the fixed runtime windows. Preparation rejects if
-any required section exceeds its Core's reservation. This happens before the
-start gate opens. A rejected preparation must release its temporary state and
-permit a later valid run.
+Each Core stores its own `core_control` record. An idle Core needs only this
+record. A Core with work also stores its `block_queue`, the `local_task` record
+for each distinct task it executes, and that task's `dependencies`. Each Block's
+Tensor and scalar descriptors reside with the Core that executes it. Task
+records contain references to their predecessors' completion signals.
 
-`wse_sram.json` records application `base`, total `capacity`, `reserve`,
-`runtime_base`, runtime usage and the locations of its typed sections. Compare
-runtime addresses against `[runtime_base, runtime_base + reserve)`, not against
-an assumed suffix of the application's virtual address window.
+An SS stores its `task_signal` on its submitted Core. For a Group, the Core
+assigned to logical Block 0 holds one signal shared by all members. That signal
+counts unfinished Blocks and, for `sync_start`, members yet to arrive. The
+last Block to finish publishes task completion, whichever Core executes it.
 
-All runs use the configured Core count. There is no per-run reduced-width
-configuration and no memory-owner reassignment when task placement changes.
+Every Core executing a kernel holds a `region_map` of the fixed SRAM windows
+and the `allocations` admitted for this run's Tensor arguments. A kernel can
+resolve an address in another Core's admitted window, including an address
+passed as a scalar. Preparing these lookup tables does not copy Tensor data.
+
+Set `CallConfig.output_prefix` to obtain `wse_sram.json`. In `sections`, each
+entry gives its `name`, numeric `kind`, owning Core, address and byte length.
+In `cores`, compare each `runtime_used` with its `reserve`. The valid runtime
+address interval is `[runtime_base, runtime_base + reserve)`.
+
+As an example, place one SS on Core 6, its synchronized Group on Cores 2 and
+6, and a final SS on Core 3. Each of the three participating Cores holds its
+own task records. Core 2 holds the Group signal when Block 0 is assigned there.
+Adding SS tasks on Core 6 grows Core 6's task state. Core 0 remains at its fixed
+control-record size. The same rules apply when the caller assigns work to Core 0.
+
+Admission checks each Core against its own reservation before GO. On overflow,
+`wse_prepare_error.txt` identifies the Core and section, the requested bytes,
+remaining bytes and configured reservation. Releasing the rejected run's state
+allows a later valid submission on the same Worker.
+
+All runs use the configured Core count. Tensor ownership remains fixed when
+task placement changes.

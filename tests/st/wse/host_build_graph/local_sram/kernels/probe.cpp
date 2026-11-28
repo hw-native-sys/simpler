@@ -31,7 +31,7 @@ extern "C" void kernel_entry(int64_t *args) {
     log[1] = out.owner;
     log[2] = get_core_id(args);
     log[3] = get_pe_id(args);
-    if (stage == 1 && b == 0) {
+    if (stage == 1 && (b == 0 || b == get_block_num(args) - 1)) {
         Tensor bad = input;
         bad.start_offset = input.buffer.size / 8;
         wse::SramView rejected;
@@ -40,6 +40,7 @@ extern "C" void kernel_entry(int64_t *args) {
         const auto *global = reinterpret_cast<const GlobalContext *>(args[SPMD_GLOBAL_CONTEXT_INDEX]);
         const auto &access = *reinterpret_cast<const wse::SramAccess *>(global->sram_base + global->sram_access_offset);
         const auto *regions = reinterpret_cast<const wse::SramRegion *>(global->sram_base + access.regions_offset);
+        if (global->sram_base != regions[0].base) y[b * output.strides[0]] = 0;
         bad = input;
         bad.buffer.addr = regions[0].runtime_base;
         bad.buffer.size = 8;

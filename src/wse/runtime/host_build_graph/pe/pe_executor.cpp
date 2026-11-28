@@ -27,8 +27,6 @@
 #include <stdexcept>
 #include <vector>
 
-static_assert(alignof(wse::RunControl) >= alignof(uint64_t));
-
 namespace {
 class ImageBuilder {
 public:
@@ -38,14 +36,15 @@ public:
             cursor_.push_back(r.reserve);
     }
     template <class T>
-    uint64_t allocate(uint32_t core, uint64_t count = 1, uint32_t kind = 0) {
+    uint64_t allocate(uint32_t core, uint64_t count, WseSectionKind kind) {
         const auto &r = regions_.at(core);
         if (count > SIZE_MAX / sizeof(T)) throw std::invalid_argument("WSE SRAM layout multiplication overflow");
         const uint64_t bytes = count * sizeof(T);
-        if (bytes > cursor_[core]) exhausted(core, bytes);
+        if (!bytes) return 0;
+        if (bytes > cursor_[core]) exhausted(core, bytes, kind);
         const auto offset = (cursor_[core] - bytes) & ~(uint64_t{alignof(T)} - 1);
         cursor_[core] = offset;
-        if (bytes) sections.push_back({r.runtime_base + offset, bytes, core, kind});
+        sections.push_back({r.runtime_base + offset, bytes, core, kind});
         auto *objects = reinterpret_cast<T *>(r.runtime_base + offset);
         for (uint64_t i = 0; i < count; ++i)
             new (objects + i) T{};
@@ -54,6 +53,10 @@ public:
     template <class T>
     T *at(uint32_t core, uint64_t offset) {
         return reinterpret_cast<T *>(regions_[core].base + offset);
+    }
+    template <class T>
+    T *objects(uint32_t core, uint64_t count, WseSectionKind kind) {
+        return count ? at<T>(core, allocate<T>(core, count, kind)) : nullptr;
     }
     std::vector<WseMemorySection> sections;
     std::vector<uint64_t> usage() const {
@@ -65,10 +68,11 @@ public:
     }
 
 private:
-    [[noreturn]] void exhausted(uint32_t core, uint64_t required) const {
+    [[noreturn]] void exhausted(uint32_t core, uint64_t required, WseSectionKind kind) const {
         throw std::runtime_error(
-            "WSE Runtime SRAM capacity exhausted: core=" + std::to_string(core) +
-            " required=" + std::to_string(required) + " available=" + std::to_string(regions_[core].reserve)
+            "WSE Runtime SRAM capacity exhausted: core=" + std::to_string(core) + " section=" + wse_section_name(kind) +
+            " required=" + std::to_string(required) + " available=" + std::to_string(cursor_[core]) +
+            " reserve=" + std::to_string(regions_[core].reserve)
         );
     }
     std::vector<wse::SramRegion> regions_;
@@ -96,12 +100,55 @@ struct TaskCalendar {
     uint64_t finish_tick = 0;
 };
 
+// A logical Graph boundary has no Block placement of its own. Choose the closest
+// explicitly placed neighbor in the dependency DAG (ties follow node ID). A
+// component with no kernel has no device work or SRAM owner and settles at bind.
+std::vector<uint32_t>
+task_owners(const WseGraphDescriptor &d, const WseNodePlan *plans, uint32_t count, uint32_t cores) {
+    std::vector<uint32_t> owners(count, UINT32_MAX), queue;
+    std::vector<std::vector<uint32_t>> neighbors(count);
+    for (uint32_t ref = 0; ref < count; ++ref) {
+        const auto &plan = plans[ref];
+        if (plan.host_done && plan.wait_count) throw std::invalid_argument("host-completed WSE task has waits");
+        if (plan.entry) {
+            const auto *blocks = descriptor_table<WseBlockPlan>(d, plan.block_plans_offset, plan.block_plan_count);
+            if (blocks[0].core_id >= cores) throw std::invalid_argument("invalid WSE Block Core");
+            owners[ref] = blocks[0].core_id;
+            queue.push_back(ref);
+        }
+        const auto *waits = descriptor_table<uint32_t>(d, plan.waits_offset, plan.wait_count);
+        for (uint32_t i = 0; i < plan.wait_count; ++i) {
+            const uint32_t producer = waits[i];
+            if (producer >= ref || plans[producer].host_done) throw std::invalid_argument("invalid WSE calendar wait");
+            if (plan.entry && plans[producer].entry) continue;
+            neighbors[ref].push_back(producer);
+            neighbors[producer].push_back(ref);
+        }
+    }
+    for (size_t i = 0; i < queue.size(); ++i) {
+        const uint32_t ref = queue[i];
+        for (uint32_t neighbor : neighbors[ref]) {
+            if (owners[neighbor] != UINT32_MAX) continue;
+            owners[neighbor] = owners[ref];
+            queue.push_back(neighbor);
+        }
+    }
+    return owners;
+}
+
 struct RunAborted {};
 }  // namespace
 
 struct WseRun {
-    uint64_t base;
-    wse::RunControl *control;
+    // The simulator binds worker IDs to actual Core SRAM. All graph-sized
+    // execution state lives in the Core records, queues and signals below.
+    std::vector<wse::CoreControl *> core_controls;
+    const uint64_t expected_tasks;
+    const uint64_t application_base;  // Kernel ABI origin for the whole application Buffer.
+    std::atomic<uint64_t> completed{0};
+    uint32_t ready_pes = 0, retired_cores = 0;
+    bool configured = false, go = false, stop = false, failed = false;
+    std::vector<WseEvent> host_events;
     std::mutex mutex;
     std::condition_variable changed;
     std::atomic<uint64_t> sequence{0};
@@ -113,16 +160,16 @@ struct WseRun {
     template <class Predicate>
     void wait(std::unique_lock<std::mutex> &lock, Predicate ready) {
         changed.wait(lock, [&] {
-            return control->failed || ready();
+            return failed || ready();
         });
-        if (control->failed) throw RunAborted{};
+        if (failed) throw RunAborted{};
     }
 
     void abort(uint32_t worker, const char *reason) {
         {
             std::lock_guard lock(mutex);
-            if (control->failed) return;
-            control->failed = true;
+            if (failed) return;
+            failed = true;
         }
         changed.notify_all();
         std::fprintf(stderr, "WSE PE %u failed: %s\n", worker, reason);
@@ -130,42 +177,35 @@ struct WseRun {
             storage->cancel();
     }
 
-    template <class T>
-    T *at(uint64_t offset) const {
-        return reinterpret_cast<T *>(base + offset);
-    }
-    const wse::SramRegion *regions() const { return at<wse::SramRegion>(control->access.regions_offset); }
-    wse::CoreControl &local(uint32_t core) const {
-        return *reinterpret_cast<wse::CoreControl *>(
-            regions()[core].base + at<uint64_t>(control->core_offsets_offset)[core]
-        );
-    }
-    wse::TaskRecord *plans() const { return at<wse::TaskRecord>(control->tasks_offset); }
-    uint64_t completed_tasks() const { return __atomic_load_n(&control->completed, __ATOMIC_ACQUIRE); }
+    wse::CoreControl &local(uint32_t core) const { return *core_controls[core]; }
+    uint64_t completed_tasks() const { return completed.load(); }
     wse::Work &head(uint32_t core) const {
-        const auto &q = local(core).queue;
-        return reinterpret_cast<wse::Work *>(regions()[core].base + q.work_offset)[q.head];
+        const auto &c = local(core);
+        return reinterpret_cast<wse::Work *>(c.base + c.queue.work_offset)[c.queue.head];
     }
     bool dependencies_ready(const wse::TaskRecord &task) const {
-        const auto *predecessors = at<uint32_t>(task.predecessors_offset);
         for (uint32_t i = 0; i < task.predecessor_count; ++i)
-            if (!plans()[predecessors[i]].completed) return false;
+            if (!task.predecessors[i].signal->completed) return false;
         return true;
     }
-    void complete_task(uint32_t worker, uint64_t ref) {
-        auto &task = plans()[ref];
-        if (task.completed) throw std::logic_error("WSE duplicate Graph-node completion");
-        task.completed = 1;
-        const uint64_t count = __atomic_fetch_add(&control->completed, uint64_t{1}, __ATOMIC_ACQ_REL) + 1;
-        record(worker, WseEventKind::TASK_DONE, ref, 0, count);
+    void complete_task(uint32_t worker, wse::TaskRecord &task) {
+        if (task.signal->completed) throw std::logic_error("WSE duplicate Graph-node completion");
+        task.signal->completed = 1;
+        record(worker, WseEventKind::TASK_DONE, task.ref, 0, ++completed);
         changed.notify_all();
     }
     void advance_controls(uint32_t worker) {
-        // Controls have no Block queue. The lock gives each ready node one executor,
-        // without a waiting Graph exit trapping an independent Graph entry behind it.
-        for (uint32_t i = 0; i < control->task_count; ++i) {
-            auto &task = plans()[i];
-            if (!task.entry && !task.completed && dependencies_ready(task)) complete_task(worker, i);
+        auto &first = local(worker / WSE_PE_PER_CORE).first_control;
+        // A blocked exit cannot trap an independent entry behind it. Unlink
+        // completed boundaries so later wake-ups only visit outstanding work.
+        for (auto **link = &first; *link;) {
+            auto &task = **link;
+            if (dependencies_ready(task)) {
+                *link = task.next_control;
+                complete_task(worker, task);
+            } else {
+                link = &task.next_control;
+            }
         }
     }
     int ready_thread(uint32_t worker) {
@@ -174,14 +214,15 @@ struct WseRun {
         auto &c = local(core);
         if (c.queue.head == c.queue.tail) return -1;
         const auto &work = head(core);
-        auto &task = plans()[work.task];
+        auto &task = *work.task;
+        auto &signal = *task.signal;
         if (c.block_state != wse::BlockState::RUNNING && pe == 0 && dependencies_ready(task)) {
-            if (task.remaining_arrivals) {
+            if (signal.remaining_arrivals) {
                 if (c.block_state == wse::BlockState::WAITING_FOR_SYNC) return -1;
                 c.block_state = wse::BlockState::WAITING_FOR_SYNC;
-                record(worker, WseEventKind::BLOCK_READY, work.task, work.block);
-                if (--task.remaining_arrivals) return -1;
-                record(worker, WseEventKind::SYNC_RELEASE, work.task, work.block, task.blocks);
+                record(worker, WseEventKind::BLOCK_READY, task.ref, work.block);
+                if (--signal.remaining_arrivals) return -1;
+                record(worker, WseEventKind::SYNC_RELEASE, task.ref, work.block, task.blocks);
             }
             c.block_state = wse::BlockState::RUNNING;
             c.started = c.finished = 0;
@@ -192,8 +233,8 @@ struct WseRun {
                         }
                             .pass();
             __atomic_store_n(&c.block_epoch, ++c.block_serial, __ATOMIC_RELEASE);
-            record(worker, WseEventKind::BLOCK_BEGIN, work.task, work.block, work.thread_num);
-            if (!c.execute) record(worker, WseEventKind::BLOCK_SKIPPED, work.task, work.block);
+            record(worker, WseEventKind::BLOCK_BEGIN, task.ref, work.block, work.thread_num);
+            if (!c.execute) record(worker, WseEventKind::BLOCK_SKIPPED, task.ref, work.block);
             changed.notify_all();
         }
         if (c.block_state != wse::BlockState::RUNNING) return -1;
@@ -206,7 +247,8 @@ struct WseRun {
         const WseGraphDescriptor *d, uint32_t cores, uint64_t epoch, const wse::SramRegion *storage,
         uint32_t region_count, const wse::SramAllocation *allocations, uint32_t allocation_count
     ) :
-        base(storage[0].base),
+        expected_tasks(d->expected_tasks),
+        application_base(storage->base),
         events(cores * WSE_PE_PER_CORE) {
         for (uint32_t core = 0; core < cores; ++core)
             block_storage.push_back(std::make_unique<wse::BlockOperationStorage>());
@@ -236,26 +278,27 @@ struct WseRun {
         }
         if (expected_rows != d->calendar_row_count) throw std::invalid_argument("WSE calendar Block count mismatch");
         ImageBuilder image(storage, region_count);
-        control = image.at<wse::RunControl>(0, image.allocate<wse::RunControl>(0, 1, 1));
-        control->epoch = epoch;
-        control->expected_tasks = d->expected_tasks;
-        control->core_count = cores;
-        control->task_count = count;
-        control->tasks_offset = image.allocate<wse::TaskRecord>(0, count, 2);
-        control->core_offsets_offset = image.allocate<uint64_t>(0, cores, 3);
-        control->access.region_count = region_count;
-        control->access.regions_offset = image.allocate<wse::SramRegion>(0, region_count, 4);
-        std::copy(storage, storage + region_count, at<wse::SramRegion>(control->access.regions_offset));
+        const auto owners = task_owners(*d, source_plans, count, cores);
+        std::vector<wse::TaskSignal *> signals(count);
+        std::vector<wse::TaskRecord *> control_tails(cores);
         std::vector<TaskCalendar> calendar(count);
         for (uint32_t core = 0; core < cores; ++core) {
             const uint32_t begin = indices[core], end = indices[core + 1];
             if (begin > end || end > d->calendar_row_count)
                 throw std::invalid_argument("invalid WSE Core calendar range");
-            const auto offset = image.allocate<wse::CoreControl>(core, 1, 8);
-            at<uint64_t>(control->core_offsets_offset)[core] = offset;
-            auto &q = local(core).queue;
+            auto *c = image.objects<wse::CoreControl>(core, 1, WseSectionKind::CORE_CONTROL);
+            core_controls.push_back(c);
+            c->epoch = epoch;
+            c->base = storage[core].base;
+            auto &q = c->queue;
             q.capacity = q.tail = end - begin;
-            q.work_offset = image.allocate<wse::Work>(core, q.capacity, 9);
+            q.work_offset = image.allocate<wse::Work>(core, q.capacity, WseSectionKind::BLOCK_QUEUE);
+            if (q.capacity) {
+                c->access.region_count = region_count;
+                auto *regions = image.objects<wse::SramRegion>(core, region_count, WseSectionKind::REGION_MAP);
+                c->access.regions_offset = reinterpret_cast<uint64_t>(regions) - application_base;
+                std::copy_n(storage, region_count, regions);
+            }
             for (uint32_t i = begin; i < end; ++i) {
                 const auto &row = rows[i];
                 if (row.task >= count || (i > begin && row.tick <= rows[i - 1].tick))
@@ -296,19 +339,22 @@ struct WseRun {
         uint64_t expected = 0;
         for (uint64_t ref = 0; ref < count; ++ref) {
             const auto &source = source_plans[ref];
-            auto &task = plans()[ref];
-            task.entry = source.entry;
-            task.blocks = source.blocks;
-            task.remaining_arrivals = source.sync_start ? source.blocks : 0;
-            task.has_predicate = source.has_predicate;
-            task.completed = source.host_done;
-            if (source.host_done) {
-                if (source.wait_count) throw std::invalid_argument("host-completed WSE task has waits");
-                continue;
-            }
+            if (source.host_done) continue;
             ++expected;
             if (!source.blocks || source.blocks > INT16_MAX)
                 throw std::invalid_argument("invalid WSE task block count");
+            if (owners[ref] == UINT32_MAX) {
+                // No path to a Block: every predecessor in this component has
+                // already settled in descriptor order. There is no PE dispatch.
+                host_events.push_back(
+                    {sequence++, ref, ++completed, UINT32_MAX, UINT32_MAX, 0, WseEventKind::TASK_DONE, 0, 0}
+                );
+                continue;
+            }
+            signals[ref] = image.objects<wse::TaskSignal>(owners[ref], 1, WseSectionKind::TASK_SIGNAL);
+            signals[ref]->remaining_blocks = source.blocks;
+            signals[ref]->remaining_arrivals = source.sync_start ? source.blocks : 0;
+            const SchedulerDispatchPredicate *predicate = nullptr;
             if (source.entry && scheduler_bind_graph_arguments(graph, ref) != SchedulerGraphBindingError::NONE)
                 throw std::invalid_argument("invalid WSE graph argument binding");
             if (source.entry) {
@@ -316,30 +362,45 @@ struct WseRun {
                 if (scheduler_parse_task_payload_arguments(graph, ref, &args) != SchedulerGraphResult::OK)
                     throw std::invalid_argument("invalid WSE task arguments");
                 if (source.has_predicate) {
-                    const auto *predicate = scheduler_node_predicate(graph, ref);
+                    predicate = scheduler_node_predicate(graph, ref);
                     if (!predicate || !scheduler_dispatch_predicate_metadata_valid(
                                           predicate->addr, predicate->elem_size, predicate->op
                                       ))
                         throw std::invalid_argument("invalid WSE predicate");
-                    task.predicate = *predicate;
-                    validate_storage(predicate->addr, predicate->elem_size);
                 }
             }
             const auto *waits = descriptor_table<uint32_t>(*d, source.waits_offset, source.wait_count);
-            task.predecessor_count = source.wait_count;
-            task.predecessors_offset = image.allocate<uint32_t>(0, source.wait_count, 7);
             uint64_t ready_tick = 0;
-            for (uint32_t i = 0; i < source.wait_count; ++i) {
-                const uint32_t producer = waits[i];
-                if (producer >= ref || source_plans[producer].host_done)
-                    throw std::invalid_argument("invalid WSE calendar wait");
-                at<uint32_t>(task.predecessors_offset)[i] = producer;
-                ready_tick = std::max(ready_tick, calendar[producer].finish_tick);
-            }
+            for (uint32_t i = 0; i < source.wait_count; ++i)
+                ready_tick = std::max(ready_tick, calendar[waits[i]].finish_tick);
+            auto make_local_task = [&](uint32_t core) {
+                auto *task = image.objects<wse::TaskRecord>(core, 1, WseSectionKind::LOCAL_TASK);
+                task->ref = ref;
+                task->entry = source.entry;
+                task->blocks = source.blocks;
+                task->signal = signals[ref];
+                task->predecessor_count = source.wait_count;
+                task->predecessors =
+                    image.objects<wse::TaskDependency>(core, source.wait_count, WseSectionKind::DEPENDENCIES);
+                for (uint32_t i = 0; i < source.wait_count; ++i)
+                    task->predecessors[i].signal = signals[waits[i]];
+                if (predicate) {
+                    task->has_predicate = true;
+                    task->predicate = *predicate;
+                    validate_storage(predicate->addr, predicate->elem_size);
+                }
+                return task;
+            };
             // Controls advance at their predecessors' join. Kernel rows must be
             // reachable in both the Core order and the whole-task wait order.
             auto &task_calendar = calendar[ref];
             if (!source.entry) {
+                const auto owner = owners[ref];
+                auto *task = make_local_task(owner);
+                auto *&tail = control_tails[owner];
+                if (tail) tail->next_control = task;
+                else local(owner).first_control = task;
+                tail = task;
                 task_calendar.finish_tick = ready_tick;
                 continue;
             }
@@ -355,7 +416,8 @@ struct WseRun {
             const bool child = graph.native_header_offset && scheduler_native_node_checked(graph, ref, &native_node) &&
                                native_node.binding->kind == SchedulerNodeKind::CHILD_KERNEL;
             if (source.sync_start && child) throw std::invalid_argument("WSE sync-start requires an outer task list");
-            for (uint32_t b = 0; b < task.blocks; ++b) {
+            std::vector<wse::TaskRecord *> local_tasks(cores);
+            for (uint32_t b = 0; b < source.blocks; ++b) {
                 const auto &placement = block_plans[b];
                 const uint32_t core = placement.core_id;
                 if (core >= cores || !placement.thread_num || placement.thread_num > WSE_PE_PER_CORE ||
@@ -372,14 +434,15 @@ struct WseRun {
                 if (row < indices[core] || row >= indices[core + 1])
                     throw std::invalid_argument("WSE calendar Block missing or assigned to the wrong Core");
                 auto &work = image.at<wse::Work>(core, local(core).queue.work_offset)[row - indices[core]];
-                work.task = ref;
+                if (!local_tasks[core]) local_tasks[core] = make_local_task(core);
+                work.task = local_tasks[core];
                 work.block = b;
                 work.thread_num = placement.thread_num;
                 std::copy_n(placement.thread_pes, WSE_PE_PER_CORE, work.thread_pes);
                 work.tensor_count = placement.tensor_count;
                 work.scalar_count = placement.scalar_count;
-                work.tensors_offset = image.allocate<Tensor>(core, work.tensor_count, 5);
-                work.scalars_offset = image.allocate<uint64_t>(core, work.scalar_count, 6);
+                work.tensors_offset = image.allocate<Tensor>(core, work.tensor_count, WseSectionKind::TENSORS);
+                work.scalars_offset = image.allocate<uint64_t>(core, work.scalar_count, WseSectionKind::SCALARS);
                 const auto *tensor_bytes =
                     descriptor_region(*d, placement.tensors_offset, work.tensor_count, sizeof(Tensor), alignof(Tensor));
                 for (uint32_t i = 0; i < work.tensor_count; ++i) {
@@ -420,12 +483,20 @@ struct WseRun {
             }
         }
         if (expected != d->expected_tasks) throw std::invalid_argument("WSE task count mismatch");
-        control->access.allocation_count = used_allocations.size();
-        control->access.allocations_offset = image.allocate<wse::SramAllocation>(0, used_allocations.size(), 10);
-        std::copy(
-            used_allocations.begin(), used_allocations.end(),
-            at<wse::SramAllocation>(control->access.allocations_offset)
-        );
+        for (uint32_t core = 0; core < cores; ++core) {
+            if (!local(core).queue.tail) continue;
+            // A kernel can resolve a peer buffer passed by scalar address. Keep
+            // the existing kernel ABI's contiguous authorization table on each
+            // executing Core; it scales with distinct buffers, not graph nodes.
+            auto &access = local(core).access;
+            access.allocation_count = used_allocations.size();
+            if (!used_allocations.empty()) {
+                auto *bindings =
+                    image.objects<wse::SramAllocation>(core, used_allocations.size(), WseSectionKind::ALLOCATIONS);
+                access.allocations_offset = reinterpret_cast<uint64_t>(bindings) - application_base;
+                std::copy(used_allocations.begin(), used_allocations.end(), bindings);
+            }
+        }
         used = image.usage();
         sections = std::move(image.sections);
     }
@@ -437,16 +508,6 @@ struct WseRun {
             {sequence.fetch_add(1), task, value, worker / WSE_PE_PER_CORE, worker % WSE_PE_PER_CORE, block, kind, slot,
              generation}
         );
-    }
-    void bootstrap() {
-        clear_cpu_sim_shared_storage();
-        for (uint32_t i = 0; i < control->task_count; ++i) {
-            auto &task = plans()[i];
-            task.remaining_blocks = task.blocks;
-        }
-        __atomic_store_n(&control->completed, uint64_t{0}, __ATOMIC_RELAXED);
-        record(0, WseEventKind::CONFIG_READY, UINT64_MAX, 0, control->expected_tasks);
-        control->configured = true;
     }
 };
 
@@ -467,7 +528,7 @@ static_assert(static_cast<uint32_t>(wse::OperationEvent::PUBLISH) == static_cast
 static_assert(static_cast<uint32_t>(wse::OperationEvent::CONSUMED) == static_cast<uint32_t>(WseEventKind::OP_CONSUMED));
 }  // namespace
 
-extern "C" WseRun *wse_create_run_v2(
+extern "C" WseRun *wse_create_run_v3(
     const WseGraphDescriptor *d, uint32_t cores, uint64_t epoch, const wse::SramRegion *regions, uint32_t region_count,
     const wse::SramAllocation *allocations, uint32_t allocation_count, char *error, size_t error_size
 ) {
@@ -488,77 +549,61 @@ extern "C" uint64_t wse_runtime_used(const WseRun *run, uint32_t core) {
     return core < run->used.size() ? run->used[core] : 0;
 }
 extern "C" uint64_t wse_control_address(const WseRun *run, uint32_t core) {
-    return core < run->control->core_count ? reinterpret_cast<uint64_t>(&run->local(core)) : 0;
+    return core < run->core_controls.size() ? reinterpret_cast<uint64_t>(&run->local(core)) : 0;
 }
 extern "C" void wse_destroy_run(WseRun *run) { delete run; }
 extern "C" uint64_t wse_completed_tasks(const WseRun *run) { return run->completed_tasks(); }
 extern "C" const WseEvent *wse_run_events(const WseRun *run, uint32_t worker, uint64_t *count) {
-    if (!run || !count || worker >= run->events.size()) return nullptr;
-    *count = run->events[worker].size();
-    return run->events[worker].data();
+    if (!run || !count || (worker != UINT32_MAX && worker >= run->events.size())) return nullptr;
+    const auto &stream = worker == UINT32_MAX ? run->host_events : run->events[worker];
+    *count = stream.size();
+    return stream.data();
 }
 
 static void execute_pe(WseRun *run, uint32_t worker) {
     const uint32_t core = worker / WSE_PE_PER_CORE;
     const uint32_t pe = worker % WSE_PE_PER_CORE;
     std::unique_lock lock(run->mutex);
-    if (worker == 0) {
-        run->bootstrap();
-        run->changed.notify_all();
+    if (!run->configured) {
+        clear_cpu_sim_shared_storage();
+        run->record(worker, WseEventKind::CONFIG_READY, UINT64_MAX, 0, run->expected_tasks);
+        run->configured = true;
     }
-    run->wait(lock, [&] {
-        return run->control->configured;
-    });
     auto &local = run->local(core);
-    if (pe == 0) {
-        local.queue.head = 0;
-        local.ready = 0;
-        local.quiet = 0;
-        local.retired = false;
-        local.expected_tasks = run->control->expected_tasks;
+    if (!local.initialized) {
         local.initialized = true;
-        run->record(worker, WseEventKind::CORE_INIT, UINT64_MAX, 0, local.expected_tasks);
-        run->changed.notify_all();
+        run->record(worker, WseEventKind::CORE_INIT, UINT64_MAX, 0, run->expected_tasks);
     }
-    run->wait(lock, [&] {
-        return local.initialized;
-    });
     sim_context_set_cluster_id(core);
     sim_context_set_subblock_id(0);
     run->record(worker, WseEventKind::PE_READY);
     ++local.ready;
-    run->changed.notify_all();
-    if (worker == 0) {
-        run->wait(lock, [&] {
-            for (uint32_t c = 0; c < run->control->core_count; ++c)
-                if (run->local(c).ready != WSE_PE_PER_CORE) return false;
-            return true;
-        });
+    if (++run->ready_pes == run->events.size()) {
         run->record(worker, WseEventKind::GO);
-        run->control->go = true;
+        run->go = true;
         run->changed.notify_all();
     }
     run->wait(lock, [&] {
-        return run->control->go;
+        return run->go;
     });
     while (true) {
         int thread = -1;
         run->wait(lock, [&] {
             thread = run->ready_thread(worker);
-            return thread >= 0 || run->completed_tasks() == local.expected_tasks;
+            return thread >= 0 || run->completed_tasks() == run->expected_tasks;
         });
-        if (run->completed_tasks() == local.expected_tasks) break;
+        if (run->completed_tasks() == run->expected_tasks) break;
         const wse::Work work = run->head(core);
         local.started |= 1u << thread;
         const bool execute = local.execute;
         const uint64_t block_epoch = local.block_epoch;
         lock.unlock();
-        run->record(worker, WseEventKind::THREAD_BEGIN, work.task, work.block, thread);
-        const auto &plan = run->plans()[work.task];
+        const auto &plan = *work.task;
+        run->record(worker, WseEventKind::THREAD_BEGIN, plan.ref, work.block, thread);
         if (execute) {
             int64_t args[SPMD_GLOBAL_CONTEXT_INDEX + 1]{};
             int index = 0;
-            const uint64_t core_base = run->regions()[core].base;
+            const uint64_t core_base = local.base;
             for (uint32_t i = 0; i < work.tensor_count; ++i)
                 args[index++] =
                     reinterpret_cast<int64_t>(reinterpret_cast<Tensor *>(core_base + work.tensors_offset) + i);
@@ -572,66 +617,47 @@ static void execute_pe(WseRun *run, uint32_t worker) {
             context.block_scope = {
                 &local.block_epoch,
                 block_epoch,
-                &run->control->epoch,
-                run->control->epoch,
+                &local.epoch,
+                local.epoch,
                 run->block_storage[core].get(),
                 wse::BlockOperationStorage::get
             };
             GlobalContext global{};
             global.core_id = core;
             global.pe_id = pe;
-            global.sram_base = run->base;
-            global.sram_access_offset = reinterpret_cast<uint64_t>(&run->control->access) - run->base;
-            OperationBinding binding{run, worker, work.task, work.block};
+            global.sram_base = run->application_base;
+            global.sram_access_offset = reinterpret_cast<uint64_t>(&local.access) - global.sram_base;
+            OperationBinding binding{run, worker, plan.ref, work.block};
             global.operation_trace = {&binding, operation_trace};
             args[SPMD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&context);
             args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&global);
             reinterpret_cast<void (*)(int64_t *)>(plan.entry)(args);
         }
-        run->record(worker, WseEventKind::THREAD_END, work.task, work.block, thread);
+        run->record(worker, WseEventKind::THREAD_END, plan.ref, work.block, thread);
         lock.lock();
-        if (run->control->failed) throw RunAborted{};
+        if (run->failed) throw RunAborted{};
         local.finished |= 1u << thread;
         if (local.finished == (1u << work.thread_num) - 1) {
             // Current CPU tile operations return only after their work drains.
             __atomic_store_n(&local.block_epoch, uint64_t{0}, __ATOMIC_RELEASE);
             run->block_storage[core]->clear();
-            run->record(worker, WseEventKind::BLOCK_END, work.task, work.block);
+            run->record(worker, WseEventKind::BLOCK_END, plan.ref, work.block);
             local.block_state = wse::BlockState::IDLE;
             ++local.queue.head;
-            auto &node = run->plans()[work.task];
-            if (--node.remaining_blocks == 0) run->complete_task(worker, work.task);
+            if (--work.task->signal->remaining_blocks == 0) run->complete_task(worker, *work.task);
         }
         run->changed.notify_all();
     }
-    if (worker == 0) {
+    if (!run->stop) {
         run->record(worker, WseEventKind::STOP);
-        run->control->stop = true;
-        run->changed.notify_all();
+        run->stop = true;
     }
-    run->wait(lock, [&] {
-        return run->control->stop;
-    });
     run->record(worker, WseEventKind::QUIESCENT);
-    ++local.quiet;
-    run->changed.notify_all();
-    if (pe == 0) {
-        run->wait(lock, [&] {
-            return local.quiet == WSE_PE_PER_CORE;
-        });
+    if (++local.quiet == WSE_PE_PER_CORE) {
         local.retired = true;
         run->record(worker, WseEventKind::CORE_RETIRED);
-        run->changed.notify_all();
-    }
-    if (worker == 0) {
-        run->wait(lock, [&] {
-            for (uint32_t c = 0; c < run->control->core_count; ++c)
-                if (!run->local(c).retired) return false;
-            return true;
-        });
-        run->record(
-            worker, WseEventKind::RUN_DONE, UINT64_MAX, 0, __atomic_load_n(&run->control->completed, __ATOMIC_SEQ_CST)
-        );
+        if (++run->retired_cores == run->core_controls.size())
+            run->record(worker, WseEventKind::RUN_DONE, UINT64_MAX, 0, run->completed_tasks());
     }
 }
 

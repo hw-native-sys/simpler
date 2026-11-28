@@ -10,7 +10,7 @@
  */
 #include <dlfcn.h>
 #include <stdexcept>
-#include "intrinsic.h"
+#include "sram_args.h"
 #include "tensor.h"
 
 extern "C" void kernel_entry(int64_t *args) {
@@ -28,6 +28,22 @@ extern "C" void kernel_entry(int64_t *args) {
         gate(member ? 1 : 0);
         if (probe == 2 && !member) throw std::runtime_error("injected busy-Core failure");
     }
-    if (member) out[block * 2 + thread] = 10 * (block + 1) + thread;
-    else out[0] = 7;
+    if (!member) {
+        out[0] = 7;
+        return;
+    }
+
+    float base = 10.0f;
+    if (args[4]) {
+        // This Block receives the SS result by address only. Its Tensor descriptor belongs to a different task.
+        Tensor seed = tensor;
+        seed.buffer.addr = static_cast<uint64_t>(args[4]);
+        seed.buffer.size = sizeof(float);
+        seed.start_offset = 0;
+        seed.shapes[0] = 1;
+        wse::SramView view;
+        if (!wse::make_sram_view(args, seed, view)) throw std::runtime_error("missing SS result in SRAM access map");
+        base = *reinterpret_cast<const float *>(view.address) + 3.0f;
+    }
+    out[block * 2 + thread] = base + 10 * block + thread;
 }

@@ -91,17 +91,52 @@ struct WseEvent {
     uint64_t generation;
 };
 
+enum class WseSectionKind : uint32_t {
+    LOCAL_TASK = 2,
+    REGION_MAP = 4,
+    TENSORS = 5,
+    SCALARS = 6,
+    DEPENDENCIES = 7,
+    CORE_CONTROL = 8,
+    BLOCK_QUEUE = 9,
+    ALLOCATIONS = 10,
+    TASK_SIGNAL = 11,
+};
+inline const char *wse_section_name(WseSectionKind kind) {
+    switch (kind) {
+    case WseSectionKind::LOCAL_TASK:
+        return "local_task";
+    case WseSectionKind::REGION_MAP:
+        return "region_map";
+    case WseSectionKind::TENSORS:
+        return "tensors";
+    case WseSectionKind::SCALARS:
+        return "scalars";
+    case WseSectionKind::DEPENDENCIES:
+        return "dependencies";
+    case WseSectionKind::CORE_CONTROL:
+        return "core_control";
+    case WseSectionKind::BLOCK_QUEUE:
+        return "block_queue";
+    case WseSectionKind::ALLOCATIONS:
+        return "allocations";
+    case WseSectionKind::TASK_SIGNAL:
+        return "task_signal";
+    }
+    return "unknown";
+}
 struct WseMemorySection {
     uint64_t address;
     uint64_t bytes;
     uint32_t owner;
-    uint32_t kind;
+    WseSectionKind kind;
 };
 
 struct WseRun;
 extern "C" {
-// Version 2 interprets WseNodePlan::sync_start. A mismatched Host/PE pair must fail at load time.
-WseRun *wse_create_run_v2(
+// Version 3 publishes per-Core SRAM sections and a separate Host event stream.
+// A mismatched Host/PE pair must fail at load time.
+WseRun *wse_create_run_v3(
     const WseGraphDescriptor *, uint32_t cores, uint64_t epoch, const wse::SramRegion *, uint32_t region_count,
     const wse::SramAllocation *, uint32_t allocation_count, char *error, size_t error_size
 );
@@ -110,6 +145,7 @@ const WseMemorySection *wse_memory_sections(const WseRun *, uint64_t *count);
 uint64_t wse_control_address(const WseRun *, uint32_t core);
 void wse_destroy_run(WseRun *);
 int wse_execute_pe(WseRun *, uint32_t worker);
+// UINT32_MAX selects logical completions emitted during host preparation.
 const WseEvent *wse_run_events(const WseRun *, uint32_t worker, uint64_t *count);
 uint64_t wse_completed_tasks(const WseRun *);
 }
