@@ -11,6 +11,7 @@
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import cast
 
 import pytest
 from simpler.worker import ExecutionContextRefused, RunHandle, Worker
@@ -60,7 +61,7 @@ def chain(worker):
 @pytest.mark.parametrize("error_type", [KeyboardInterrupt, ExecutionContextRefused])
 def test_finalized_distinguishes_interrupted_wait_from_terminal_failure(error_type):
     worker = FenceWorker()
-    handle = RunHandle(worker, 1, ())
+    handle = RunHandle(cast(Worker, worker), 1, ())
     interrupt = error_type("interrupted native wait")
     worker.native_error = interrupt
     with pytest.raises(error_type):
@@ -156,6 +157,60 @@ def test_interrupted_finalization_still_runs_outer_cleanup_once_and_cancels_succ
         handles[0].result()
     assert caught.value is failure
     assert callbacks == [failure]
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_cached_callback_interrupt_allows_successor_to_drain(error_type):
+    worker = FenceWorker()
+    first, second, third = chain(worker)
+    failure = error_type("outer callback interrupted")
+
+    def completion(_error):
+        raise failure
+
+    first._completion_callback = completion
+    with pytest.raises((RuntimeError, error_type)) as cancelled:
+        third.result()
+    assert isinstance(cancelled.value, RuntimeError)
+    assert "predecessor failed" in str(cancelled.value)
+    assert all(handle.finalized for handle in (first, second, third))
+    assert [event for event in worker.events if event[0] == "cleanup"] == [
+        ("cleanup", 1),
+        ("cleanup", 2),
+        ("cleanup", 3),
+    ]
+    with pytest.raises(error_type) as caught:
+        first.result()
+    assert caught.value is failure
+
+
+def test_successor_snapshot_can_outlive_worker_close():
+    worker = Worker(level=3, num_sub_workers=0)
+    worker.init()
+    first = worker.submit(lambda *_args: None)
+    second = worker.submit(lambda *_args: None, success_predecessor=first)
+    close_started = False
+
+    class CloseOnSnapshot(list[int]):
+        def __iter__(self):
+            nonlocal close_started
+            snapshot = tuple(super().__iter__())
+            if snapshot and not close_started:
+                close_started = True
+                # Drain the successor and close the native tree after the original
+                # waiter has captured its run ID.
+                worker.close()
+            return iter(snapshot)
+
+    first._success_successors = CloseOnSnapshot(first._success_successors)
+    try:
+        first.result(timeout=3)
+        assert close_started
+        assert second.finalized
+        assert worker._orch is None
+        second.result(timeout=0)
+    finally:
+        worker.close()
 
 
 @pytest.mark.parametrize("background_wait", [False, True])
@@ -255,13 +310,15 @@ def test_close_cancels_empty_completion_wait_and_drains_its_native_lease(monkeyp
     entered = threading.Event()
     completed = threading.Event()
     failures = []
-    original = worker._orch._wait_any_run
+    orch = worker._orch
+    assert orch is not None
+    original = orch._wait_any_run
 
     def observed_wait(*args):
         entered.set()
         return original(*args)
 
-    monkeypatch.setattr(worker._orch, "_wait_any_run", observed_wait)
+    monkeypatch.setattr(orch, "_wait_any_run", observed_wait)
 
     def wait():
         try:

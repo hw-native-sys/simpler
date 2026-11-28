@@ -5867,19 +5867,19 @@ class RunHandle:
         remaining = None if deadline is None else max(0.0, deadline - _monotonic())
         try:
             predecessor.wait(remaining)
-        except Exception:
-            if not predecessor._terminal:
+        except BaseException as error:  # noqa: BLE001 -- distinguish a cached failure from a wait interruption
+            if not predecessor._terminal or error is not predecessor._error:
                 raise
         run_id = self._run_id
         if run_id is not None:
-            self._worker._orch._resolve_held_run(run_id, predecessor._error is None)
+            self._worker._resolve_held_run(run_id, predecessor._error is None)
         self._success_predecessor = None
 
     def _resolve_success_successors(self) -> None:
         with self._cv:
             successors = tuple(self._success_successors)
         for run_id in successors:
-            self._worker._orch._resolve_held_run(run_id, self._error is None)
+            self._worker._resolve_held_run(run_id, self._error is None)
             with self._cv:
                 if run_id in self._success_successors:
                     self._success_successors.remove(run_id)
@@ -11657,18 +11657,25 @@ class Worker:
         resources.declared_comm_domains.update((handle.allocation_id, handle) for handle in handles)
 
     def _seal_comm_resources(self, run_id: int, resources: _RunResources) -> None:
+        orch = self._orch
+        assert orch is not None
         declared = resources.declared_comm_domains
-        complete = declared is not None and not (
-            resources.requires_ordered_cleanup or resources.live_global_domains or resources.ccu_domains
-        )
-        if complete:
-            complete = all(
+        complete = (
+            declared is not None
+            and not (resources.requires_ordered_cleanup or resources.live_global_domains or resources.ccu_domains)
+            and all(
                 declared.get(handle.allocation_id) is handle
                 and not handle.released
                 and self._live_domains.get(handle.name) is handle
                 for handle in resources.live_domains.values()
             )
-        self._orch._seal_run_resources(run_id, list(declared or ()), complete)
+        )
+        orch._seal_run_resources(run_id, list(declared or ()), complete)
+
+    def _set_comm_execution_fence(self, allocation_id: int, active: bool) -> None:
+        orch = self._orch
+        assert orch is not None
+        orch._set_comm_execution_fence(allocation_id, active)
 
     def _use_domain(self, handle, *, config=None) -> None:
         handle._require_ready()
@@ -12143,7 +12150,7 @@ class Worker:
                 # sweep aborts these unpublished allocations. RPC success alone
                 # cannot identify the ranks that still hold resources.
                 if len(workers) > 1:
-                    self._orch._set_comm_execution_fence(allocation_id, True)
+                    self._set_comm_execution_fence(allocation_id, True)
                 dispatch_started = True
                 try:
                     self._dispatch_control_domain(
@@ -12208,7 +12215,7 @@ class Worker:
                     if not committed:
                         if all(_domain_reply_ownership(reply_shms[w]) == _DOMAIN_REPLY_REJECTED for w in workers):
                             if len(workers) > 1:
-                                self._orch._set_comm_execution_fence(allocation_id, False)
+                                self._set_comm_execution_fence(allocation_id, False)
                             with self._alloc_id_lock:
                                 self._comm_domain_alloc_errors.pop(allocation_id, None)
                         if self._live_domains.get(name) is handle:
@@ -12219,7 +12226,7 @@ class Worker:
             except BaseException:  # noqa: BLE001
                 if handle is not None and not dispatch_started:
                     if len(workers) > 1:
-                        self._orch._set_comm_execution_fence(allocation_id, False)
+                        self._set_comm_execution_fence(allocation_id, False)
                     if self._live_domains.get(name) is handle:
                         self._live_domains.pop(name)
                     if resources.live_domains.get(name) is handle:
@@ -12558,7 +12565,7 @@ class Worker:
 
         def retire_live_handle() -> None:
             if handle._domain_size > 1:
-                self._orch._set_comm_execution_fence(handle.allocation_id, False)
+                self._set_comm_execution_fence(handle.allocation_id, False)
             if handle._allocation_pending:
                 with self._alloc_id_lock:
                     self._comm_domain_alloc_errors.pop(handle.allocation_id, None)
@@ -15415,8 +15422,11 @@ class Worker:
         with ``simpler_setup.tools.strace_timing`` (see
         ``docs/dfx/host-trace.md``).
         """
-        submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
-        self.submit(callable, args=args, config=config, **submit_options).wait()
+        if caller_stream is None:
+            handle = self.submit(callable, args=args, config=config)
+        else:
+            handle = self.submit(callable, args=args, config=config, caller_stream=caller_stream)
+        handle.wait()
 
     def _submit_locked(
         self,
@@ -16234,8 +16244,16 @@ class Worker:
             if not terminal:
                 predecessor._success_successors.append(run_id)
         if terminal:
-            assert self._orch is not None
-            self._orch._resolve_held_run(run_id, predecessor._error is None)
+            self._resolve_held_run(run_id, predecessor._error is None)
+
+    def _resolve_held_run(self, run_id: int, success: bool) -> None:
+        # Close checks this same accepted set before tearing down the tree.
+        # Keep the check and native resolution together. A stale snapshot can
+        # reach here after another waiter has retired the last accepted run.
+        with self._hierarchical_start_cv:
+            orch = self._orch
+            if orch is not None and self._accepted_run_handles:
+                orch._resolve_held_run(run_id, success)
 
     def _invoke_completion_callback(self, callback, error: BaseException | None) -> None:
         tid = threading.get_ident()

@@ -162,7 +162,6 @@ reference acknowledgements before returning its bank and bucket. A failed
 proof or acknowledgement retains the unresolved ownership. Other device
 profiling channels do not use this gate path.
 
-
 Keep those channels distinct. The bootstrap ABI still uses the `DeviceArgs`
 name because the dispatcher really reads that structure. The platform per-task
 ABI passes only the front-less `KernelArgs` and carries no CANN launch front.

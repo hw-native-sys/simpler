@@ -7137,7 +7137,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
         handle = resources.live_domains["d"]
         assert handle.workers == owners
-        assert worker._orch.active_fences == {handle.allocation_id}
+        orch = worker._orch
+        assert orch is not None
+        assert orch.active_fences == {handle.allocation_id}
         assert handle.contexts == {}, "failed initialization must not publish usable contexts"
         assert worker._live_domains["d"] is handle
         assert resources.requires_ordered_cleanup, "a leaked window did not degrade the successor"
@@ -7159,7 +7161,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         monkeypatch.setattr(worker, "_dispatch_control_domain", capture_release)
         worker._release_domain_claimed(handle)
         assert not worker._comm_domain_alloc_errors
-        assert not worker._orch.active_fences
+        assert not orch.active_fences
         assert (worker._comm_domain_error is not None) is (unknown_reply and not failed_rank_owns)
 
         assert release_headers == {
@@ -7291,7 +7293,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         assert "d" not in worker._live_domains
         assert not resources.requires_ordered_cleanup
         assert bool(worker._comm_domain_alloc_errors) is not acknowledged
-        assert worker._orch.active_fences == (set() if acknowledged else set(attempted))
+        orch = worker._orch
+        assert orch is not None
+        assert orch.active_fences == (set() if acknowledged else set(attempted))
         with pytest.raises(RuntimeError, match="no rank committed" if acknowledged else "admission stopped"):
             worker._allocate_domain(name="retry", workers=(0, 1, 2), window_size=64, buffers=[])
         assert len(attempted) == (2 if acknowledged else 1)

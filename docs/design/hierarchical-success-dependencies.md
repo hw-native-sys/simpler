@@ -14,7 +14,12 @@ earlier error exists. The callback remains owned through close and cannot close
 its own Worker recursively. A failed predecessor cancels unactivated staged
 successors; their leases remain live until cancellation is acknowledged.
 Waiting for a successor also resolves its predecessor, so reverse wait order
-does not bypass the success condition.
+does not bypass the success condition. An exception stored as the predecessor's
+final result cancels its successor, including a callback-raised
+`KeyboardInterrupt` or `SystemExit`. An interruption while observing the
+predecessor can propagate to the waiter without authorizing the successor.
+Close drains the accepted runs before tearing down the native tree. A waiter
+that reaches successor resolution after that drain skips the stale run ID.
 
 Native preparation conservatively retains every eligible communication domain,
 including contexts passed through scalar arguments. The Python lifetime records
