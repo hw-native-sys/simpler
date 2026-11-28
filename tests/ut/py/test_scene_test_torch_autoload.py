@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import importlib
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 
@@ -31,8 +33,8 @@ class _MinimalCase(SceneTestCase):
 
 
 @pytest.fixture(autouse=True)
-def _reset_record():
-    scene_test._log_torch_backend_autoload_once.cache_clear()
+def _reset_record(monkeypatch):
+    monkeypatch.setattr(scene_test, "_autoload_claimed", False)
 
 
 def _set_modules(monkeypatch, *, torch_loaded: bool, torch_npu_loaded: bool) -> None:
@@ -214,3 +216,27 @@ def test_l3_records_after_rehost_before_run(monkeypatch):
     )
 
     assert events == ["golden", "rehost", "record", "run", "release"]
+
+
+def test_overlapping_first_calls_emit_one_record(monkeypatch, caplog):
+    entered, release = Event(), Event()
+    logger = scene_test.logging.getLogger("simpler")
+    emit = logger.log
+
+    def pause_first(*args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        emit(*args, **kwargs)
+
+    monkeypatch.setattr(logger, "log", pause_first)
+    caplog.set_level(TIMING, logger="simpler")
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(scene_test.log_torch_backend_autoload_once)
+        try:
+            assert entered.wait(5)
+            pool.submit(scene_test.log_torch_backend_autoload_once).result(5)
+        finally:
+            release.set()
+        first.result(5)
+    assert len(_messages(caplog)) == 1

@@ -33,8 +33,8 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
-from functools import cache
 from pathlib import Path
+from threading import Lock
 from typing import Any, NamedTuple
 
 from .compile_pool import compile_slot, current_compile_workers
@@ -128,8 +128,27 @@ def effective_diagnostic_options(
     return _DiagnosticOptions(0, 0, 0, False, False, False)
 
 
-@cache
+_autoload_lock = Lock()
+_autoload_claimed = False
+
+
 def _log_torch_backend_autoload_once() -> None:
+    global _autoload_claimed
+    with _autoload_lock:
+        if _autoload_claimed:
+            return
+        _autoload_claimed = True
+
+    # Logging handlers may call back into this function.
+    try:
+        _emit_torch_backend_autoload()
+    except BaseException:
+        with _autoload_lock:
+            _autoload_claimed = False
+        raise
+
+
+def _emit_torch_backend_autoload() -> None:
     """Record torch backend autoload configuration and module state once."""
     raw_setting = os.environ.get(_TORCH_BACKEND_AUTOLOAD_ENV)
     if raw_setting is None:
