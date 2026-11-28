@@ -5,6 +5,28 @@ description: Review a GitHub PR, a fixed commit range, or commits on the current
 
 # Review PR
 
+## Mandatory rules for the reviewing agent
+
+1. **Preserve the requester's review intent.** Use their instructions and prior
+   context to establish the scope and stopping conditions. A short invocation
+   such as `review 3305` sets the target and invokes the full review workflow.
+   Base any decision to stop after one pass on the agreed completion conditions.
+   Ask the requester to resolve any material ambiguity about when the review
+   ends, including whether the Goal requires follow-through on later revisions.
+2. **Start every review with a persistent Goal.** Create it for the agreed
+   objective before inspecting the diff. Use authorization already granted.
+   When explicit authorization is required and still outstanding, ask the
+   requester before starting the review. Report unavailable Goal tooling as
+   a blocker.
+3. **Complete the agreed review scope.** Treat a first pass and any early
+   finding as interim results while required work remains. Continue through
+   the required checks, including follow-ups covered by the Goal, and run
+   the review self-audit before delivery.
+4. **Report every review item to the requester.** Give each item a separate
+   checklist entry with its result and evidence or verification limit. State
+   whether the review Goal was achieved and why. If work remains, name the
+   open items and the blocker.
+
 **Code quality takes priority over completing the feature as proposed.**
 Verify functional correctness and judge how the design affects the next
 supported change. When a routine feature needs extensive coordination,
@@ -34,6 +56,19 @@ and CI evidence.
   Route maintainer follow-through to [process-pr](../process-pr/SKILL.md) and
   author-side repairs to [fix-pr](../fix-pr/SKILL.md).
 
+### Create the review Goal
+
+Once the target and scope are known, create a persistent Goal to deliver an
+evidence-based verdict after assessing the agreed scope and passing the
+[review self-audit](#review-self-audit). Continue the existing Goal for
+follow-ups within the same review scope while it is active.
+
+Maintain a working checkpoint with the Goal, pinned base/head SHAs, changed call
+paths, stated requirements, quality dimensions, and repository checks. Add
+checks and evidence as you trace the change. Keep the checkpoint current through
+follow-ups and context changes. Use a task-specific directory under `~/tmp/` for
+scratch files as required by the workspace instructions.
+
 ### Pin the diff
 
 | Target | Action |
@@ -52,20 +87,6 @@ that revision's files. Read large diffs by subsystem.
 
 Before delivery recheck a PR's head. If it moved, reconcile the new diff and
 rerun affected checks, or label the result with the reviewed head and its limits.
-
-### Set the review goal
-
-After pinning the review, set a goal to deliver an evidence-based verdict after
-assessing the full agreed scope and passing the [review self-audit](#review-self-audit).
-Record the goal, base/head SHAs, changed call paths, stated requirements, quality
-dimensions, and applicable checks in a working checkpoint. Add relevant checks
-as you trace the change. Keep the checkpoint current
-through follow-ups and context changes. Use a task-specific directory under
-`~/tmp/` for scratch files as required by the workspace instructions.
-
-When the user has explicitly authorized a persistent Goal and the tool is
-available, use it for this review. Apply the same completion conditions
-before marking it complete. An unresolved scope gap leaves the goal unfinished.
 
 Use [change breakdown](references/repository-checks.md#change-breakdown) to
 classify churn and flag oversized PRs. Use a brief review for a single file with
@@ -95,7 +116,7 @@ explain the unmet behavior. If no coherent spec is available, record that limit.
 
 Describe the actual behavior from the diff and its callers, then compare it
 with the stated goal in both directions. Check for unmet requirements and
-extra behavior or obligations. Capture each in the [evidence table](#3-implementation-and-evidence).
+extra behavior or obligations. Capture each in the [review checklist](#3-implementation-and-evidence).
 An independently observed quality improvement belongs in the quality
 assessment when it fits the agreed scope.
 
@@ -197,22 +218,25 @@ and repeat the self-audit before delivery. Finding a blocker settles the
 recommendation under the [merge rules](#5-merge-recommendation). Finish the
 remaining in-scope review and report all substantiated findings together.
 
-The review is complete when the report accounts for every applicable item and
-the verdict follows from the evidence. If an external blocker prevents review
-of material code, deliver the confirmed findings and identify the partial
-scope and blocker.
+Mark the Goal complete only when the report accounts for every review item,
+the agreed scope is covered, and the verdict follows from the evidence.
+If a blocker leaves any required work unresolved, report the confirmed findings,
+the review items still open, and that the Goal was not achieved.
 
 ## Deliver the review
 
-For a full review, use §§0–5 below. For a brief review, §§0, 4, and 5 can
-carry the same essentials. Include review limits and the applicable appendices
-at either depth.
+For a full review, use §§0–5 below. A brief review may condense the background
+and solution. Include the review checklist, Goal outcome, review limits, and
+applicable appendices at either depth.
 
 ### 0. Summary
 
 Lead with the verdict and the quality findings or trade-offs driving it.
 Name the reviewed base/head and summarize coverage of **Quality**, **Spec**,
 and **Standards**, with the material evidence limits.
+State **Review Goal achieved** or **Review Goal not achieved** and give the
+reason. A fully substantiated **Request changes** verdict can satisfy the
+review Goal. Report the change's acceptance criteria in the checklist.
 
 ### 1. Background and problem
 
@@ -228,17 +252,14 @@ benefits and costs. Keep the design brief proportional to the review depth.
 
 ### 3. Implementation and evidence
 
-Use one Markdown table to trace goals and quality dimensions to the diff.
-
-| Goal or dimension | Design or code location | Before → after | Benefit or cost | Assessment and evidence |
-| ----------------- | ----------------------- | -------------- | --------------- | ----------------------- |
-
-Cover every applicable dimension and requirement. A combined row must name
-each item and give its own assessment. State whether the implementation matches
-the claims. Flag partial or missing requirements and extra obligations, and
-record test and performance evidence limits. Use short cells and numbered
-notes below the table for material details. Keep the author's claims and
-reviewer observations clearly attributed.
+Give the requester a Markdown checklist grouped under **Quality**, **Spec**,
+and **Standards**. List each quality dimension, acceptance criterion, and
+repository check individually. For each item, give its result, cite supporting
+evidence or state what is missing, and explain the material impact. For code
+changes, summarize the relevant difference from the baseline. Include items
+with no findings and use the self-audit statuses for unverified, unreviewed, or
+inapplicable items. Keep the author's claims and reviewer observations clearly
+attributed.
 
 ### 4. Findings and risks
 
