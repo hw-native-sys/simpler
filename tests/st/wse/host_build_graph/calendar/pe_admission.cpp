@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include <cstdio>
+#include <array>
 #include "launch.h"
 #include "calendar_plan.h"
 
@@ -19,6 +20,8 @@ struct Wire {
     WseBlockPlan placements[2]{};
     uint32_t indices[3]{0, 1, 1};
     wse::CalendarRow rows[2]{{0, 0, 0}, {0, 1, 0}};
+    std::array<uint32_t, 9> pe_indices{0, 1, 1, 1, 1, 1, 1, 1, 1};
+    uint32_t pe_rows[2]{0, 1};
 };
 
 void kernel(int64_t *) {}
@@ -42,6 +45,10 @@ int main() {
     descriptor.calendar_core_count = 2;
     descriptor.calendar_indices_offset = offsetof(Wire, indices);
     descriptor.calendar_rows_offset = offsetof(Wire, rows);
+    descriptor.pe_calendar_indices_offset = offsetof(Wire, pe_indices);
+    descriptor.pe_calendar_rows_offset = offsetof(Wire, pe_rows);
+    descriptor.pe_calendar_row_count = 1;
+    descriptor.pe_calendar_version = wse::PE_CALENDAR_VERSION;
     wire.node.entry = reinterpret_cast<uintptr_t>(kernel);
     wire.node.blocks = wire.node.block_plan_count = 1;
     wire.node.block_plans_offset = offsetof(Wire, placements);
@@ -50,7 +57,7 @@ int main() {
 
     const auto admit = [&](const char *name) {
         char error[256]{};
-        auto *run = wse_create_run_v3(&descriptor, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
+        auto *run = wse_create_run_v6(&descriptor, 2, 1, regions, 2, nullptr, 0, error, sizeof(error));
         std::printf("%s %s\n", name, run ? "accepted" : "rejected");
         if (!run) std::fprintf(stderr, "%s\n", error);
         const auto idle_usage = run ? wse_runtime_used(run, 1) : 0;
@@ -58,6 +65,22 @@ int main() {
         return idle_usage;
     };
     const uint64_t idle_usage = admit("explicit_core_0");
+    descriptor.nodes_address =
+        reinterpret_cast<uintptr_t>(&wire) + offsetof(WseGraphDescriptor, pe_calendar_indices_offset);
+    admit("old_descriptor");
+    descriptor.nodes_address = reinterpret_cast<uintptr_t>(&wire.node);
+    descriptor.pe_calendar_version = 0;  // The v5 producer zero-initializes this header word.
+    admit("old_pe_calendar_version");
+    descriptor.pe_calendar_version = wse::PE_CALENDAR_VERSION;
+    wire.pe_indices[1] = 0;  // Put the Block on PE 1 while its placement selects PE 0.
+    admit("wrong_calendar_pe");
+    wire.pe_indices[1] = 1;
+    wire.pe_rows[0] = UINT32_MAX;
+    admit("invalid_block_row_index");
+    wire.pe_rows[0] = 0;
+    descriptor.pe_calendar_rows_offset = sizeof(wire);
+    admit("truncated_pe_rows");
+    descriptor.pe_calendar_rows_offset = offsetof(Wire, pe_rows);
     wire.indices[1] = 0;  // Move the calendar row to Core 1, keeping its explicit Core 0 placement.
     admit("wrong_calendar_core");
 
@@ -66,9 +89,11 @@ int main() {
     regions[0].reserve = idle_usage;
     regions[0].runtime_base = original.base + original.capacity - idle_usage;
     wire.placements[0].core_id = 1;
+    wire.pe_indices = {0, 0, 0, 0, 0, 1, 1, 1, 1};
     admit("idle_core_0_at_limit");
     wire.indices[1] = 1;
     wire.placements[0].core_id = 0;
+    wire.pe_indices = {0, 1, 1, 1, 1, 1, 1, 1, 1};
     admit("active_core_0_over_limit");
     regions[0] = original;
     wire.node.block_plan_count = 0;
@@ -76,12 +101,17 @@ int main() {
     admit("missing_placement");
 
     descriptor.calendar_row_count = wire.indices[2] = 2;
+    descriptor.pe_calendar_row_count = 2;
+    wire.pe_indices = {0, 1, 1, 1, 1, 2, 2, 2, 2};
     wire.node.blocks = wire.node.block_plan_count = 2;
     wire.node.block_plans_offset = offsetof(Wire, placements);
     wire.placements[1].core_id = 1;
     wire.placements[1].thread_num = 1;
     wire.node.sync_start = 1;
     admit("synchronous_pair");
+    std::swap(wire.pe_rows[0], wire.pe_rows[1]);
+    admit("wrong_block_row");
+    std::swap(wire.pe_rows[0], wire.pe_rows[1]);
     wire.rows[1].tick = 1;
     admit("split_sync_ticks");
 
@@ -97,4 +127,18 @@ int main() {
         const auto &right = calendar.rows[i + 2];
         if (left.task != i || right.task != i || left.tick != right.tick || left.block == right.block) return 1;
     }
+    const wse::CoreCalendar placed{{0, 2, 2}, {{0, 0, 0}, {1, 0, 1}}};
+    std::vector<std::vector<WseBlockPlan>> blocks(2, std::vector<WseBlockPlan>(1));
+    blocks[0][0].thread_num = 2;
+    blocks[0][0].thread_pes[0] = 3;
+    blocks[0][0].thread_pes[1] = 2;
+    blocks[1][0].thread_num = 1;
+    blocks[1][0].thread_pes[0] = 3;
+    wse::PeCalendar per_pe;
+    if (!wse::build_pe_calendar(placed, blocks, per_pe) ||
+        per_pe.indices != std::vector<uint32_t>{0, 0, 0, 1, 3, 3, 3, 3, 3} ||
+        per_pe.rows != std::vector<uint32_t>{0, 0, 1})
+        return 1;
+    blocks[0][0].thread_pes[1] = 3;
+    if (wse::build_pe_calendar(placed, blocks, per_pe)) return 1;
 }

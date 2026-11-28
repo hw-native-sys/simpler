@@ -18,8 +18,8 @@ extern "C" void kernel_entry(int64_t *args) {
     auto *out = reinterpret_cast<float *>(tensor.buffer.addr) + tensor.start_offset;
     const bool member = args[1], sync = args[2];
     const int64_t probe = args[3];
-    const int block = get_block_idx(args), thread = get_thread_idx(args);
-    if (probe && thread == 0 && (!member || block == 1)) {
+    const int block = get_block_idx(args), pe = get_pe_id();
+    if (probe && pe == 0 && (!member || block == 1)) {
         const char *name = probe == 2 ? "wse_sync_failure_probe" :
                            sync       ? "wse_sync_start_probe" :
                                         "wse_independent_start_probe";
@@ -45,5 +45,5 @@ extern "C" void kernel_entry(int64_t *args) {
         if (!wse::make_sram_view(args, seed, view)) throw std::runtime_error("missing SS result in SRAM access map");
         base = *reinterpret_cast<const float *>(view.address) + 3.0f;
     }
-    out[block * 2 + thread] = base + 10 * block + thread;
+    out[block * 2 + pe] = base + 10 * block + pe;
 }

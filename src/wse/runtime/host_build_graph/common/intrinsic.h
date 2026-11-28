@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "wse/operation_trace.h"
+#include "wse/pe_identity.h"
 #include "wse/block_scope.h"
 
 #include "aicore_completion_mailbox_types.h"
@@ -43,7 +44,7 @@ static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDE
 // Kernel-call identity; the observation callback is valid until this invocation returns.
 struct GlobalContext {
     int32_t sub_block_id;
-    int32_t core_id;
+    int32_t core_id;  // ABI slots read by previously compiled WSE kernels.
     int32_t pe_id;
     wse::OperationTrace operation_trace;
     uint64_t sram_base;
@@ -78,11 +79,11 @@ struct AsyncCtx {
  *
  */
 struct LocalContext {
-    int32_t block_idx;  // Logical block index within the task [0, block_num)
-    int32_t block_num;  // Original logical block count, including multi-wave execution.
-                        // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
-                        // which controls how many physical cores the runtime launches.
-    int32_t thread_idx;
+    int32_t block_idx;        // Logical block index within the task [0, block_num)
+    int32_t block_num;        // Original logical block count, including multi-wave execution.
+                              // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
+                              // which controls how many physical cores the runtime launches.
+    int32_t legacy_abi_slot;  // Preserve the argument layout of already compiled WSE kernels.
     int32_t thread_num;
     wse::BlockScope block_scope;
     AsyncCtx async_ctx;
@@ -95,12 +96,8 @@ static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t *args) {
     return ctx->sub_block_id;
 }
 
-static __aicore__ inline int32_t get_core_id(__gm__ int64_t *args) {
-    return reinterpret_cast<GlobalContext *>(args[SPMD_GLOBAL_CONTEXT_INDEX])->core_id;
-}
-static __aicore__ inline int32_t get_pe_id(__gm__ int64_t *args) {
-    return reinterpret_cast<GlobalContext *>(args[SPMD_GLOBAL_CONTEXT_INDEX])->pe_id;
-}
+static __aicore__ inline int32_t get_core_id(__gm__ int64_t *) { return get_core_id(); }
+static __aicore__ inline int32_t get_pe_id(__gm__ int64_t *) { return get_pe_id(); }
 
 /**
  * Return the logical block index assigned to the current worker.
@@ -130,9 +127,6 @@ static inline wse::OperationTrace get_wse_operation_trace(int64_t *args) {
     return reinterpret_cast<GlobalContext *>(args[SPMD_GLOBAL_CONTEXT_INDEX])->operation_trace;
 }
 
-static inline int32_t get_thread_idx(int64_t *args) {
-    return reinterpret_cast<LocalContext *>(args[SPMD_LOCAL_CONTEXT_INDEX])->thread_idx;
-}
 static inline int32_t get_thread_num(int64_t *args) {
     return reinterpret_cast<LocalContext *>(args[SPMD_LOCAL_CONTEXT_INDEX])->thread_num;
 }

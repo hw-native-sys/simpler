@@ -56,7 +56,7 @@ extern "C" void kernel_entry(int64_t *args) {
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(gc, result);
-    pointer(3)[2 * block] = get_core_id(args);
-    pointer(3)[2 * block + 1] = get_pe_id(args);
+    pointer(3)[2 * block] = get_core_id();
+    pointer(3)[2 * block + 1] = get_pe_id();
     pipe_sync();
 }

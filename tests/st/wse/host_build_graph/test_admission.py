@@ -132,8 +132,22 @@ def test_prebuilt_target_admission(arch, admission_artifacts):
 @pytest.mark.device_count(1)
 @pytest.mark.parametrize(
     "create_name",
-    ["wse_create_run_v3", "wse_create_run_v2", "wse_create_run"],
-    ids=["missing_memory_sections", "centralized_task_state", "legacy_descriptor"],
+    [
+        "wse_create_run_v6",
+        "wse_create_run_v5",
+        "wse_create_run_v4",
+        "wse_create_run_v3",
+        "wse_create_run_v2",
+        "wse_create_run",
+    ],
+    ids=[
+        "missing_memory_sections",
+        "two_word_pe_rows",
+        "timestamp_executor",
+        "core_calendar",
+        "centralized_task_state",
+        "legacy_descriptor",
+    ],
 )
 def test_executor_rejects_incompatible_abi_before_create(tmp_path, st_platform, monkeypatch, create_name):
     from simpler.task_interface import ChipCallable, TaskArgs  # noqa: PLC0415
@@ -141,9 +155,9 @@ def test_executor_rejects_incompatible_abi_before_create(tmp_path, st_platform, 
 
     marker = tmp_path / "create-called"
     source = tmp_path / "incomplete_executor.cpp"
-    # Supply every ancillary method for the older PEs, and omit one required method for v3.
+    # Supply every ancillary method for older PEs and omit one required method for the current ABI.
     sections = "const void *wse_memory_sections(const void *, uint64_t *) { return nullptr; }\n"
-    if create_name == "wse_create_run_v3":
+    if create_name == "wse_create_run_v6":
         sections = ""
     source.write_text(
         "#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n"
@@ -218,11 +232,17 @@ def test_pe_requires_explicit_core_matching_calendar_row(tmp_path, st_platform):
     result = subprocess.run([str(probe)], capture_output=True, text=True, timeout=60, check=True)
     assert result.stdout.splitlines() == [
         "explicit_core_0 accepted",
+        "old_descriptor rejected",
+        "old_pe_calendar_version rejected",
+        "wrong_calendar_pe rejected",
+        "invalid_block_row_index rejected",
+        "truncated_pe_rows rejected",
         "wrong_calendar_core rejected",
         "idle_core_0_at_limit accepted",
         "active_core_0_over_limit rejected",
         "missing_placement rejected",
         "synchronous_pair accepted",
+        "wrong_block_row rejected",
         "split_sync_ticks rejected",
     ], result.stderr
     assert "core=0 section=block_queue" in result.stderr

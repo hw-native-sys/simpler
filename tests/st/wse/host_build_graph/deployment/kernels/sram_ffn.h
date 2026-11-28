@@ -33,19 +33,21 @@ inline wse::TensorView ffn_tile(int64_t *args, int index, size_t offset, bool tr
 }
 inline void sram_ffn(int64_t *args, int stage) {
     const auto block = get_block_idx(args);
-    const size_t row = get_thread_idx(args);
     const int tensors = stage == 1 ? 3 : 7;
+    const auto pe = static_cast<uint32_t>(get_pe_id());
+    // The deployment assigns matrix row tile 0 to the weight publisher. Rows cycle across the four physical PEs.
     const auto publisher = static_cast<uint32_t>(args[tensors]);
+    const size_t row = (pe + 4 - publisher) % 4;
     const uint64_t generation = 1, instance = args[tensors + 1];
     const auto record_view = ffn_sram(args, tensors - 1);
-    const uint64_t record_offset = row * 20;
+    const uint64_t record_offset = pe * 20;
     if (record_offset + 20 > record_view.bytes / 8) throw std::out_of_range("FFN record extent");
     auto *record = reinterpret_cast<uint64_t *>(record_view.address) + record_offset;
     std::fill_n(record, 20, UINT64_MAX);
     const int output_index = stage == 1 ? 1 : 5;
     const auto output = ffn_sram(args, output_index);
-    record[0] = get_core_id(args);
-    record[1] = get_pe_id(args);
+    record[0] = get_core_id();
+    record[1] = pe;
     record[2] = output.owner;
     record[3] = output.address + row * 4096;
     record[6] = publisher;
@@ -65,12 +67,12 @@ inline void sram_ffn(int64_t *args, int stage) {
         record[8] = weight.owner;
         record[9] = weight.address;
         wse::SharedTile<Tile> weights(
-            get_pe_id(args), stage == 0 ? 0 : 1, publisher, 15, get_wse_block_scope(args), get_wse_operation_trace(args)
+            pe, stage == 0 ? 0 : 1, publisher, 15, get_wse_block_scope(args), get_wse_operation_trace(args)
         );
         const size_t chunks = stage == 0 ? 1 : 4;
         for (size_t k = 0; k < chunks; ++k) {
             if (generation > UINT64_MAX - k) throw std::overflow_error("FFN generation overflow");
-            if (row == 0) {
+            if (pe == publisher) {
                 Tile w;
                 wse::TLOAD(w, ffn_tile(args, 4, k * 1024, true));
                 weights.publish(generation + k, w);

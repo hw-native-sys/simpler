@@ -39,12 +39,13 @@ struct WseNodePlan {
 };
 
 namespace wse {
-// One row dispatches every Thread of a logical Block on its assigned Core.
+// One row schedules one Block on its assigned Core.
 struct CalendarRow {
     uint32_t task, block;
     // Unit-cost earliest start. This is an ordering witness, independent of wall time.
     uint32_t tick;
 };
+inline constexpr uint32_t PE_CALENDAR_VERSION = 6;
 }  // namespace wse
 
 struct WseGraphDescriptor {
@@ -55,6 +56,9 @@ struct WseGraphDescriptor {
     uint32_t calendar_core_count, calendar_row_count;
     // Descriptor-relative offsets to Core row boundaries and packed rows.
     uint64_t calendar_indices_offset, calendar_rows_offset;
+    // Each (Core, PE) queue holds uint32_t indices into the Core Block rows.
+    uint64_t pe_calendar_indices_offset, pe_calendar_rows_offset;
+    uint32_t pe_calendar_row_count, pe_calendar_version;
 };
 
 enum class WseEventKind : uint32_t {
@@ -134,9 +138,9 @@ struct WseMemorySection {
 
 struct WseRun;
 extern "C" {
-// Version 3 publishes per-Core SRAM sections and a separate Host event stream.
+// Version 6 stores each PE calendar entry as a Core Block row index.
 // A mismatched Host/PE pair must fail at load time.
-WseRun *wse_create_run_v3(
+WseRun *wse_create_run_v6(
     const WseGraphDescriptor *, uint32_t cores, uint64_t epoch, const wse::SramRegion *, uint32_t region_count,
     const wse::SramAllocation *, uint32_t allocation_count, char *error, size_t error_size
 );

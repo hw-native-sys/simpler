@@ -13,15 +13,15 @@
 #include <stdexcept>
 extern "C" void kernel_entry(int64_t *args) {
     auto &tensor = *reinterpret_cast<Tensor *>(args[0]);
-    auto *record = reinterpret_cast<uint64_t *>(tensor.buffer.addr) + tensor.start_offset + get_thread_idx(args) * 8;
+    const auto pe = get_pe_id();
+    auto *record = reinterpret_cast<uint64_t *>(tensor.buffer.addr) + tensor.start_offset + pe * 8;
     const uint64_t stage = args[1], token = args[2];
-    if (stage && (record[0] != 0 || record[6] != token)) throw std::runtime_error("Graph predecessor was not complete");
+    if (stage && (record[0] != 0 || record[5] != token)) throw std::runtime_error("Graph predecessor was not complete");
     record[0] = stage;
     record[1] = get_block_idx(args);
-    record[2] = get_thread_idx(args);
-    record[3] = get_thread_num(args);
-    record[4] = get_core_id(args);
-    record[5] = get_pe_id(args);
-    record[6] = token;
-    record[7] = reinterpret_cast<uint64_t>(record);
+    record[2] = get_core_id();
+    record[3] = pe;
+    record[4] = get_thread_num(args);
+    record[5] = token;
+    record[6] = reinterpret_cast<uint64_t>(record);
 }

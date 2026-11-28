@@ -143,7 +143,7 @@ def test_waiting_thread_holds_its_block_but_not_other_cores(tmp_path, st_platfor
         config = CallConfig()
         config.output_prefix = str(tmp_path)
         run = worker.submit(handle, args, config)
-        assert gate.wait_probe(), "sibling Threads and another Core did not progress while Thread 0 was held"
+        assert gate.wait_probe(), "sibling PEs and another Core did not progress while PE 0 was held"
         with pytest.raises(TimeoutError):
             run.wait(timeout=0.01)
         gate.release_probe()
@@ -152,15 +152,12 @@ def test_waiting_thread_holds_its_block_but_not_other_cores(tmp_path, st_platfor
         torch.testing.assert_close(tensors[1], torch.relu(tensors[0] @ tensors[0]).expand(320, 2, 2), rtol=0, atol=0)
         events = [json.loads(line) for line in (tmp_path / "wse_events.jsonl").read_text().splitlines()][1:]
         end = {e["block"]: e["seq"] for e in events if e["kind"] == 5}
-        first_thread_end = next(e["seq"] for e in events if e["kind"] == 17 and e["block"] == 0 and e["value"] == 0)
+        first_pe_end = next(e["seq"] for e in events if e["kind"] == 17 and e["block"] == 0 and e["pe"] == 0)
         assert all(
-            next(e["seq"] for e in events if e["kind"] == 16 and e["block"] == 0 and e["value"] == thread)
-            < first_thread_end
-            for thread in (1, 2, 3)
+            next(e["seq"] for e in events if e["kind"] == 16 and e["block"] == 0 and e["pe"] == pe) < first_pe_end
+            for pe in (1, 2, 3)
         )
-        assert (
-            next(e["seq"] for e in events if e["kind"] == 16 and e["block"] == 1 and e["value"] == 0) < first_thread_end
-        )
+        assert next(e["seq"] for e in events if e["kind"] == 16 and e["block"] == 1 and e["pe"] == 0) < first_pe_end
         assert next(e["seq"] for e in events if e["kind"] == 4 and e["block"] == 40) > end[0]
         for b in buffers:
             release_view(worker, b)

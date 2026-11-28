@@ -27,13 +27,12 @@ inline void probe_trace(void *owner, wse::OperationEvent event, uint32_t slot, u
         notify(p.pe);
     }
 }
-inline void shared_block_compute(int64_t *args, bool producer) {
-    if (get_core_id(args) != 0) return;
-    const auto pe = get_pe_id(args);
-    if (!producer && pe == 0) return;
+inline void shared_block_compute(int64_t *args) {
+    if (get_core_id() != 0) return;
+    const auto pe = get_pe_id();
     ProbeTrace trace{get_wse_operation_trace(args), static_cast<uint32_t>(pe)};
     wse::SharedTile<wse::Tile<2, 2>> shared(pe, 2, 0, 14, get_wse_block_scope(args), {&trace, probe_trace});
-    if (producer) {
+    if (pe == 0) {
         auto gate = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "wse_shared_probe"));
         if (!gate) std::abort();
         gate(0);
@@ -45,7 +44,7 @@ inline void shared_block_compute(int64_t *args, bool producer) {
     } else {
         auto value = shared.read(1);
         auto *t = reinterpret_cast<Tensor *>(args[1]);
-        auto *out = reinterpret_cast<float *>(t->buffer.addr) + t->start_offset + get_thread_idx(args) * 4;
+        auto *out = reinterpret_cast<float *>(t->buffer.addr) + t->start_offset + pe * 4;
         wse::TSTORE({out, 4, 2, 2, 2, 1}, value);
     }
 }

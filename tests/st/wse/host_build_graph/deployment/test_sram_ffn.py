@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Forty AICore Blocks with local SRAM shards and four cooperating Threads."""
+"""Forty Blocks with local SRAM shards and four cooperating PEs."""
 
 import json
 from functools import lru_cache
@@ -67,8 +67,8 @@ def prepare_ffn(worker, seed, mode, instances=1, *, native=True):
     return args, buffers, tensors, goldens
 
 
-def target(block, mode, thread=0):
-    return ((block + 1) % 40 if mode in (1, 2) else block, (thread + int(mode == 2)) % 4)
+def target_core(block, mode):
+    return (block + 1) % 40 if mode in (1, 2) else block
 
 
 def check_ffn(worker, path, buffers, tensors, goldens, mode, *, native=True):
@@ -92,13 +92,15 @@ def check_ffn(worker, path, buffers, tensors, goldens, mode, *, native=True):
             records.append(logs)
             assert tensors[owner_base + 1][240:].tolist() == [999] * 16
             for stage, offset in enumerate((0x6000, 0xA000, 0xE000)):
-                for thread, log in enumerate(logs[stage]):
-                    input_core = block // 4 * 4 + thread if stage == 0 else block if stage == 1 else block // 4 * 4
-                    input_offset = 0 if stage == 0 else (0x6000 if stage == 1 else 0xA000) + thread * 4096
+                for pe, log in enumerate(logs[stage]):
+                    row = (pe - int(mode == 2)) % 4
+                    input_core = block // 4 * 4 + row if stage == 0 else block if stage == 1 else block // 4 * 4
+                    input_offset = 0 if stage == 0 else (0x6000 if stage == 1 else 0xA000) + row * 4096
                     assert log[:4] == [
-                        *target(block, mode, thread),
+                        target_core(block, mode),
+                        pe,
                         block,
-                        buffers[owner_base].base + offset + thread * 4096,
+                        buffers[owner_base].base + offset + row * 4096,
                     ]
                     assert log[4:8] == [
                         input_core,
@@ -114,7 +116,7 @@ def check_ffn(worker, path, buffers, tensors, goldens, mode, *, native=True):
                             source = block // 4 * 4 + k
                             assert log[12 + 2 * k : 14 + 2 * k] == [
                                 source,
-                                buffers[base + source * 2].base + 0xA000 + thread * 4096,
+                                buffers[base + source * 2].base + 0xA000 + row * 4096,
                             ]
     epoch = audit_ffn_events(path, instances, mode, native=native)
     memory = json.loads((path / "wse_sram.json").read_text())
@@ -169,11 +171,12 @@ def audit_ffn_events(path, instances, mode, *, native=True):
             assert sorted(e["block"] for e in by_kind[4]) == sorted(e["block"] for e in by_kind[5]) == list(range(40))
             assert previous < min(e["seq"] for e in by_kind[4])
             for kind in (16, 17):
-                assert sorted((e["block"], e["value"]) for e in by_kind[kind]) == [
-                    (b, t) for b in range(40) for t in range(4)
+                assert sorted((e["block"], e["pe"]) for e in by_kind[kind]) == [
+                    (block, pe) for block in range(40) for pe in range(4)
                 ]
                 for e in by_kind[kind]:
-                    assert (e["core"], e["pe"]) == target(e["block"], mode, e["value"])
+                    assert e["core"] == target_core(e["block"], mode)
+                    assert e["value"] == e["pe"]
             for block in range(40):
                 begin = next(e["seq"] for e in by_kind[4] if e["block"] == block)
                 end = next(e["seq"] for e in by_kind[5] if e["block"] == block)

@@ -67,7 +67,8 @@ Host submission supplies a Core ID for every Block. Cores with no work are
 idle, and Blocks assigned to the same Core queue there. A Core executes one Block at a
 time, and the task completes once all its Blocks have finished.
 
-A Block has one to four logical Threads placed on distinct local PEs. WSE
+A Block runs on one to four distinct local PEs. Each PE reads its physical
+coordinates with `get_core_id()` and `get_pe_id()`. WSE
 orchestration specifies Block placement and may provide per-Block arguments. The
 Python caller still uses ordinary `worker.submit(...)` or `worker.run(...)`.
 See [Block deployment](deployment.md).
@@ -108,11 +109,16 @@ Linx backend. PTO-ISA #418 is an operation-level integration reference, not a
 replacement for WSE scheduling, SRAM ownership or Worker lifetime management.
 
 With `CallConfig.output_prefix`, WSE emits `calendar.json`, `wse_events.jsonl`
-and `wse_sram.json`. The calendar groups planned `task`, `block` and `tick`
-rows by Core and lists each node's producer IDs in `waits`. A tick is the
-earliest start under the unit-cost model. Execution advances on real Block
-completion. Sort `BLOCK_BEGIN` events by `seq` within each Core to compare
-actual dispatch with its planned rows. Dependency capture also emits `deps.json`.
+and `wse_sram.json`. Read `pes[core][pe]` in `calendar.json` to see the ordered
+work for a physical PE. Each row gives the physical `core_id` and `pe_id`,
+the task and Block, its planned tick, and `waits` (direct producer task IDs).
+Idle PEs have an empty list. A Block placed on Core 2 using PEs 3 and 2
+appears in both `pes[2][3]` and `pes[2][2]`. Both inherit the Block's planned
+tick and the task's producers. The order on each Core and any Group start
+constraint also apply. The `cores` and top-level `waits` tables give the
+Block schedule and task dependency graph. Ticks use the unit-cost model.
+Execution advances on real Block completion. Sort `BLOCK_BEGIN` events by
+`seq` within each Core to compare actual dispatch with its planned rows. Dependency capture also emits `deps.json`.
 `wse_prepare_error.txt` records a PE run-admission failure, including runtime SRAM
 capacity exhaustion, before the execution start gate opens. Legacy device PMU,
 chip swimlane, scope-stat and argument-dump collectors are unsupported.

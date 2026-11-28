@@ -9,4 +9,4 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "shared_block.h"
-extern "C" void kernel_entry(int64_t *args) { shared_block_compute(args, get_thread_idx(args) == 0); }
+extern "C" void kernel_entry(int64_t *args) { shared_block_compute(args); }

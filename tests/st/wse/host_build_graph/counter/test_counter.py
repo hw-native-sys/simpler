@@ -24,6 +24,7 @@ from tests.st.wse.host_build_graph.tile_operations.test_execution import load_ga
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
 HERE = Path(__file__).parent
+PES_PER_CORE = 4
 PRODUCERS, CONSUMERS, ROUNDS = 2, 2, 3
 
 
@@ -39,11 +40,7 @@ def build_counter(platform):
 
 
 def prepare(worker, base, split, gated=False, *, owners=None):
-    tensors = [
-        torch.tensor([991, 992, base, 0, 0, 993], dtype=torch.uint64),
-        torch.zeros(PRODUCERS, dtype=torch.uint64),
-        torch.full((PRODUCERS + CONSUMERS, ROUNDS, 6), 99999, dtype=torch.uint64),
-    ]
+    tensors = prepare_values(base)
     args, buffers = TaskArgs(), []
     for index, tensor in enumerate(tensors):
         buffer = layout_view(worker, tensor.nbytes, core=owners[index] if owners is not None else len(buffers) % 40)
@@ -65,7 +62,11 @@ def check(worker, buffers, tensors, base, cores, path, split, *, placements=None
     for buffer, tensor in zip(buffers, tensors, strict=True):
         copy_from(worker, tensor, buffer)
     assert tensors[0].tolist() == [991, 992, base + ROUNDS * PRODUCERS, ROUNDS * CONSUMERS, CONSUMERS, 993]
-    assert tensors[1].tolist() == [base + ROUNDS * 100 + p for p in range(PRODUCERS)]
+    if placements is None:
+        placements = [[0, 0], [0, 1], [1, 0], [1, 1]]
+    producer_rows = [pe for _, pe in placements[:PRODUCERS]]
+    consumer_rows = [PES_PER_CORE + pe for _, pe in placements[PRODUCERS:]]
+    assert tensors[1].tolist() == [base + ROUNDS * 100 + pe if pe in producer_rows else 0 for pe in range(PES_PER_CORE)]
     (path / "counter-results.json").write_text(
         json.dumps(
             {
@@ -81,20 +82,28 @@ def check(worker, buffers, tensors, base, cores, path, split, *, placements=None
     )
     rows = tensors[2].tolist()
     for g in range(1, ROUNDS + 1):
-        for b, rounds in enumerate(rows):
-            row = rounds[g - 1]
-            assert row[:2] == (placements[b] if placements is not None else [b // 2, b % 2])
+        for row_index, placement in zip(producer_rows + consumer_rows, placements, strict=True):
+            row = rows[row_index][g - 1]
+            assert row[:2] == placement
             assert row[4] == row[3] + 1
-            expected = base + g * 100 + b if b < PRODUCERS else sum(base + g * 100 + p for p in range(PRODUCERS))
-            assert row[5] == expected
-        assert sorted(rows[p][g - 1][4] for p in range(PRODUCERS)) == list(
+            if row_index in producer_rows:
+                assert row[5] == base + g * 100 + placement[1]
+            else:
+                assert row[5] == sum(base + g * 100 + pe for pe in producer_rows)
+        assert sorted(rows[p][g - 1][4] for p in producer_rows) == list(
             range(base + (g - 1) * PRODUCERS + 1, base + g * PRODUCERS + 1)
         )
-        assert sorted(rows[c][g - 1][4] for c in range(PRODUCERS, PRODUCERS + CONSUMERS)) == list(
+        assert sorted(rows[c][g - 1][4] for c in consumer_rows) == list(
             range((g - 1) * CONSUMERS + 1, g * CONSUMERS + 1)
         )
-    assert all(rows[c][0][2] == 1 for c in range(PRODUCERS, PRODUCERS + CONSUMERS))
+    assert all(rows[c][0][2] == 1 for c in consumer_rows)
+    for index in set(range(2 * PES_PER_CORE)) - set(producer_rows + consumer_rows):
+        assert rows[index] == [[99999] * 6 for _ in range(ROUNDS)]
     events = [json.loads(line) for line in (path / "wse_events.jsonl").read_text().splitlines()]
+    for kind in (16, 17):
+        pe_events = [e for e in events[1:] if e["kind"] == kind]
+        assert all(e["value"] == e["pe"] for e in pe_events)
+        assert sorted((e["core"], e["pe"]) for e in pe_events) == sorted(map(tuple, placements))
     completed = [e for e in events[1:] if e["kind"] == 6]
     assert len(completed) == events[0]["expected_tasks"] == (4 if split else 3)
     assert sorted(e["value"] for e in completed) == list(range(1, len(completed) + 1))
@@ -147,13 +156,13 @@ def test_counter_graph_rebind_and_reuse(tmp_path, st_platform, cores, split):
 def prepare_values(base):
     return [
         torch.tensor([991, 992, base, 0, 0, 993], dtype=torch.uint64),
-        torch.zeros(PRODUCERS, dtype=torch.uint64),
-        torch.full((PRODUCERS + CONSUMERS, ROUNDS, 6), 99999, dtype=torch.uint64),
+        torch.zeros(PES_PER_CORE, dtype=torch.uint64),
+        torch.full((2 * PES_PER_CORE, ROUNDS, 6), 99999, dtype=torch.uint64),
     ]
 
 
 def test_counter_wait_timeout_and_close(tmp_path, st_platform):
-    gate = load_gate(tmp_path, "wse_counter_probe", 12)
+    gate = load_gate(tmp_path, "wse_counter_probe", 0b110)
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
         worker.init()
@@ -223,8 +232,8 @@ def test_counter_rejects_round_target_overflow(tmp_path, st_platform):
         for buffer, tensor in zip(buffers, tensors, strict=True):
             copy_from(worker, tensor, buffer)
         assert tensors[0].tolist() == [991, 992, base, 0, 0, 993]
-        assert tensors[1].tolist() == [0, 0]
-        assert all(row[0][0] == (1 << 64) - 4 for row in tensors[2].tolist())
+        assert tensors[1].tolist() == [0] * PES_PER_CORE
+        assert [row[0][0] for row in tensors[2].tolist()] == [(1 << 64) - 4, (1 << 64) - 4, 99999, 99999] * 2
         for buffer in buffers:
             release_view(worker, buffer)
         worker.unregister(handle)

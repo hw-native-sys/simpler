@@ -11,6 +11,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <queue>
@@ -31,6 +32,11 @@ struct CalendarTask {
 struct CoreCalendar {
     std::vector<uint32_t> indices;
     std::vector<CalendarRow> rows;
+};
+
+struct PeCalendar {
+    std::vector<uint32_t> indices;
+    std::vector<uint32_t> rows;
 };
 
 namespace calendar_detail {
@@ -215,6 +221,40 @@ inline bool build_core_calendar(const std::vector<CalendarTask> &tasks, uint32_t
         calendar.rows.insert(calendar.rows.end(), core.rows.begin(), core.rows.end());
     }
     calendar.indices.push_back(row_count);
+    out = std::move(calendar);
+    return true;
+}
+
+// Append each scheduled Block to the queues of its selected PEs.
+inline bool build_pe_calendar(
+    const CoreCalendar &cores, const std::vector<std::vector<WseBlockPlan>> &placements, PeCalendar &out
+) {
+    if (cores.indices.size() < 2 || cores.indices.size() > MAX_CORE_COUNT + 1 || cores.indices.front() ||
+        cores.indices.back() != cores.rows.size() || !std::is_sorted(cores.indices.begin(), cores.indices.end()))
+        return false;
+    PeCalendar calendar;
+    calendar.indices.push_back(0);
+    for (size_t core = 0; core + 1 < cores.indices.size(); ++core) {
+        std::array<std::vector<uint32_t>, WSE_PE_PER_CORE> queues;
+        for (uint32_t index = cores.indices[core]; index < cores.indices[core + 1]; ++index) {
+            const auto &row = cores.rows[index];
+            if (row.task >= placements.size() || row.block >= placements[row.task].size()) return false;
+            const auto &block = placements[row.task][row.block];
+            if (block.core_id != core || !block.thread_num || block.thread_num > WSE_PE_PER_CORE) return false;
+            uint32_t occupied = 0;
+            for (uint32_t thread = 0; thread < block.thread_num; ++thread) {
+                const uint32_t pe = block.thread_pes[thread];
+                if (pe >= WSE_PE_PER_CORE || (occupied & (1u << pe))) return false;
+                occupied |= 1u << pe;
+                queues[pe].push_back(index);
+            }
+        }
+        for (const auto &queue : queues) {
+            if (queue.size() > UINT32_MAX - calendar.rows.size()) return false;
+            calendar.rows.insert(calendar.rows.end(), queue.begin(), queue.end());
+            calendar.indices.push_back(calendar.rows.size());
+        }
+    }
     out = std::move(calendar);
     return true;
 }

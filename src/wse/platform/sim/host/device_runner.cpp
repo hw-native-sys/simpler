@@ -28,6 +28,8 @@ bool write_calendar(const std::filesystem::path &directory, const WseGraphDescri
     const auto *base = reinterpret_cast<const std::byte *>(&descriptor);
     const auto *indices = reinterpret_cast<const uint32_t *>(base + descriptor.calendar_indices_offset);
     const auto *rows = reinterpret_cast<const wse::CalendarRow *>(base + descriptor.calendar_rows_offset);
+    const auto *pe_indices = reinterpret_cast<const uint32_t *>(base + descriptor.pe_calendar_indices_offset);
+    const auto *pe_rows = reinterpret_cast<const uint32_t *>(base + descriptor.pe_calendar_rows_offset);
     const auto *nodes = reinterpret_cast<const WseNodePlan *>(descriptor.nodes_address);
     std::ofstream out(directory / "calendar.json");
     out << "{\"epoch\":" << epoch << ",\"cores\":[";
@@ -40,14 +42,36 @@ bool write_calendar(const std::filesystem::path &directory, const WseGraphDescri
         }
         out << "]";
     }
-    out << "],\"waits\":[";
-    for (uint64_t task = 0; task < descriptor.graph.task_count; ++task) {
+    auto write_waits = [&](uint64_t task) {
         const auto &node = nodes[task];
         const auto *waits = reinterpret_cast<const uint32_t *>(base + node.waits_offset);
-        out << (task ? ",[" : "[");
+        out << "[";
         for (uint32_t i = 0; i < node.wait_count; ++i)
             out << (i ? "," : "") << waits[i];
         out << "]";
+    };
+    out << "],\"pes\":[";
+    for (uint32_t core = 0; core < descriptor.calendar_core_count; ++core) {
+        out << (core ? ",[" : "[");
+        for (uint32_t pe = 0; pe < WSE_PE_PER_CORE; ++pe) {
+            const uint32_t lane = core * WSE_PE_PER_CORE + pe;
+            out << (pe ? ",[" : "[");
+            for (uint32_t i = pe_indices[lane]; i < pe_indices[lane + 1]; ++i) {
+                const auto &row = rows[pe_rows[i]];
+                out << (i == pe_indices[lane] ? "" : ",") << "{\"core_id\":" << core << ",\"pe_id\":" << pe
+                    << ",\"task\":" << row.task << ",\"block\":" << row.block << ",\"tick\":" << row.tick
+                    << ",\"waits\":";
+                write_waits(row.task);
+                out << "}";
+            }
+            out << "]";
+        }
+        out << "]";
+    }
+    out << "],\"waits\":[";
+    for (uint64_t task = 0; task < descriptor.graph.task_count; ++task) {
+        if (task) out << ",";
+        write_waits(task);
     }
     out << "]}\n";
     out.close();
@@ -152,9 +176,9 @@ int DeviceRunner::ensure_binaries_loaded() {
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run_v3"));
+    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run_v6"));
     if (!create_run_) {
-        LOG_ERROR("WSE PE runtime ABI mismatch: expected wse_create_run_v3");
+        LOG_ERROR("WSE PE runtime ABI mismatch: expected wse_create_run_v6");
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
