@@ -13,7 +13,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <map>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -139,15 +142,24 @@ public:
      */
     void record(void *base, std::size_t bytes) {
         if (base == nullptr || bytes == 0) return;
+        const uint64_t key = reinterpret_cast<uint64_t>(base);
+        if (!valid_span(key, bytes)) throw std::runtime_error("invalid caller allocation extent");
         std::scoped_lock lk(mu_);
-        allocations_[reinterpret_cast<uint64_t>(base)] = Entry{static_cast<uint64_t>(bytes)};
+        for (const auto &[existing, entry] : allocations_) {
+            if (overlaps(key, bytes, existing, entry.bytes) &&
+                (existing != key || entry.domain_managed || used_locked(existing))) {
+                throw std::runtime_error("caller allocation overlaps a live or retained owner");
+            }
+        }
+        allocations_[key] = Entry{static_cast<uint64_t>(bytes)};
     }
 
     /** Whether `base` is a recorded caller mint. */
     bool recorded(void *base) const {
         if (base == nullptr) return false;
         std::scoped_lock lk(mu_);
-        return allocations_.count(reinterpret_cast<uint64_t>(base)) != 0;
+        const auto found = allocations_.find(reinterpret_cast<uint64_t>(base));
+        return found != allocations_.end() && !found->second.domain_managed;
     }
 
     /**
@@ -180,6 +192,9 @@ public:
         for (std::size_t i = 0; i < count; ++i) {
             Allocation allocation;
             if (resolve_locked(spans[i].addr, spans[i].bytes, &allocation)) {
+                if (allocations_.at(allocation.base).revoked) {
+                    throw std::runtime_error("device span belongs to a revoked native domain");
+                }
                 taken.push_back(allocation.base);
             } else {
                 all_resolved = false;
@@ -301,6 +316,7 @@ public:
                     if (unresolved_out != nullptr) ++*unresolved_out;
                     continue;
                 }
+                if (allocations_.at(allocation.base).revoked) return false;
                 written.push_back(allocation.base);
             }
             if (written.empty()) {
@@ -334,7 +350,7 @@ public:
         Allocation allocation;
         if (!resolve_locked(addr, bytes, &allocation)) return false;
         const auto entry = allocations_.find(allocation.base);
-        if (entry != allocations_.end() && entry->second.write_unproven) return true;
+        if (entry != allocations_.end() && (entry->second.write_unproven || entry->second.revoked)) return true;
         for (const auto &[writer, written] : writes_) {
             if (writer == Identity(identity) || (identity != 0 && written.active_alias == identity)) continue;
             for (const uint64_t one : written.bases) {
@@ -364,6 +380,8 @@ public:
         if (base == nullptr) return false;
         const uint64_t key = reinterpret_cast<uint64_t>(base);
         std::scoped_lock lk(mu_);
+        const auto entry = allocations_.find(key);
+        if (entry != allocations_.end() && entry->second.domain_managed) return false;
         if (borrowed_locked(key)) return false;
         if (!release()) return false;
         allocations_.erase(key);
@@ -400,10 +418,171 @@ public:
         return count;
     }
 
-    /** Recorded caller mints. */
+    /** All registered storage extents. */
     std::size_t allocation_count() const {
         std::scoped_lock lk(mu_);
         return allocations_.size();
+    }
+
+    std::size_t caller_allocation_count() const {
+        std::scoped_lock lk(mu_);
+        std::size_t count = 0;
+        for (const auto &[base, entry] : allocations_) {
+            (void)base;
+            if (!entry.domain_managed) ++count;
+        }
+        return count;
+    }
+
+    /** Register all native views backed by one communication allocation. */
+    bool register_domain_owner(uint64_t session, uint64_t allocation, const Span *spans, std::size_t count) {
+        if (session == 0 || spans == nullptr || count == 0) return false;
+        std::scoped_lock lk(mu_);
+        if (domain_session_releases_.find(session) != domain_session_releases_.end()) return false;
+        const auto key = std::make_pair(session, allocation);
+        if (domain_owners_.find(key) != domain_owners_.end()) return false;
+        try {
+            DomainOwner owner;
+            owner.bases.reserve(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto &span = spans[i];
+                if (!valid_span(span.addr, span.bytes)) return false;
+                for (const auto &[base, entry] : allocations_) {
+                    if (overlaps(span.addr, span.bytes, base, entry.bytes)) return false;
+                }
+                for (std::size_t j = 0; j < i; ++j) {
+                    if (overlaps(span.addr, span.bytes, spans[j].addr, spans[j].bytes)) return false;
+                }
+                owner.bases.push_back(span.addr);
+            }
+            auto allocations = allocations_;
+            auto domains = domain_owners_;
+            for (std::size_t i = 0; i < count; ++i) {
+                Entry entry{spans[i].bytes};
+                entry.domain_managed = true;
+                allocations.emplace(spans[i].addr, entry);
+            }
+            domains.emplace(key, std::move(owner));
+            allocations_.swap(allocations);
+            domain_owners_.swap(domains);
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    /** Revoke new uses, then reserve the sole platform release when no consumer remains. */
+    bool begin_domain_release(uint64_t session, uint64_t allocation) {
+        std::scoped_lock lk(mu_);
+        if (domain_session_releases_.find(session) != domain_session_releases_.end()) return false;
+        const auto found = domain_owners_.find(std::make_pair(session, allocation));
+        if (found == domain_owners_.end()) return false;
+        auto &owner = found->second;
+        if (owner.state == DomainReleaseState::RELEASING || owner.state == DomainReleaseState::UNCONFIRMED)
+            return false;
+        owner.state = DomainReleaseState::REVOKED;
+        for (uint64_t base : owner.bases)
+            allocations_.at(base).revoked = true;
+        if (domain_busy_locked(owner)) return false;
+        owner.state = DomainReleaseState::RELEASING;
+        return true;
+    }
+
+    /** Forget only an owner whose reserved platform release was confirmed successful. */
+    bool finish_domain_release(uint64_t session, uint64_t allocation) {
+        std::scoped_lock lk(mu_);
+        const auto found = domain_owners_.find(std::make_pair(session, allocation));
+        if (found == domain_owners_.end() || found->second.state != DomainReleaseState::RELEASING) return false;
+        if (domain_busy_locked(found->second)) return false;
+        for (uint64_t base : found->second.bases)
+            allocations_.erase(base);
+        domain_owners_.erase(found);
+        return true;
+    }
+
+    /** An ambiguous platform outcome cannot authorize a retry, new loan, or address reuse. */
+    bool mark_domain_release_unconfirmed(uint64_t session, uint64_t allocation) {
+        std::scoped_lock lk(mu_);
+        const auto found = domain_owners_.find(std::make_pair(session, allocation));
+        if (found == domain_owners_.end() || found->second.state != DomainReleaseState::RELEASING) return false;
+        found->second.state = DomainReleaseState::UNCONFIRMED;
+        for (uint64_t base : found->second.bases) {
+            auto &entry = allocations_.at(base);
+            entry.revoked = true;
+            entry.release_refused = true;
+            entry.write_unproven = true;
+        }
+        return true;
+    }
+
+    /** Whether an allocation was enrolled, including revoked or quarantined owners. */
+    bool has_domain_owner(uint64_t session, uint64_t allocation) const {
+        std::scoped_lock lk(mu_);
+        return domain_owners_.find(std::make_pair(session, allocation)) != domain_owners_.end();
+    }
+
+    /** Revoke a whole session before one implicit backend destruction.
+     * Reservation is all-or-none; a busy session remains revoked until its users retire.
+     * An individually reserved or ambiguous release cannot be consumed a second time.
+     */
+    bool begin_domain_session_release(uint64_t session) {
+        if (session == 0) return false;
+        std::scoped_lock lk(mu_);
+        const auto pending = domain_session_releases_.find(session);
+        if (pending != domain_session_releases_.end() && pending->second != DomainReleaseState::REVOKED) return false;
+        for (const auto &[key, owner] : domain_owners_) {
+            if (key.first == session &&
+                (owner.state == DomainReleaseState::RELEASING || owner.state == DomainReleaseState::UNCONFIRMED))
+                return false;
+        }
+        // Allocate the reservation before changing any owner.
+        domain_session_releases_[session] = DomainReleaseState::REVOKED;
+        bool busy = false;
+        for (auto &[key, owner] : domain_owners_) {
+            if (key.first != session) continue;
+            owner.state = DomainReleaseState::REVOKED;
+            for (uint64_t base : owner.bases)
+                allocations_.at(base).revoked = true;
+            busy = domain_busy_locked(owner) || busy;
+        }
+        if (busy) return false;
+        for (auto &[key, owner] : domain_owners_) {
+            if (key.first == session) owner.state = DomainReleaseState::RELEASING;
+        }
+        domain_session_releases_.at(session) = DomainReleaseState::RELEASING;
+        return true;
+    }
+
+    /** A failed/ambiguous backend close quarantines all grants without retry. */
+    bool finish_domain_session_release(uint64_t session, bool confirmed) {
+        std::scoped_lock lk(mu_);
+        const auto pending = domain_session_releases_.find(session);
+        if (pending == domain_session_releases_.end() || pending->second != DomainReleaseState::RELEASING) return false;
+        for (const auto &[key, owner] : domain_owners_) {
+            if (key.first == session && (owner.state != DomainReleaseState::RELEASING || domain_busy_locked(owner)))
+                return false;
+        }
+        for (auto it = domain_owners_.begin(); it != domain_owners_.end();) {
+            if (it->first.first != session) {
+                ++it;
+                continue;
+            }
+            if (confirmed) {
+                for (uint64_t base : it->second.bases)
+                    allocations_.erase(base);
+                it = domain_owners_.erase(it);
+            } else {
+                it->second.state = DomainReleaseState::UNCONFIRMED;
+                for (uint64_t base : it->second.bases) {
+                    auto &entry = allocations_.at(base);
+                    entry.revoked = entry.release_refused = entry.write_unproven = true;
+                }
+                ++it;
+            }
+        }
+        if (confirmed) domain_session_releases_.erase(pending);
+        else pending->second = DomainReleaseState::UNCONFIRMED;
+        return true;
     }
 
 private:
@@ -431,7 +610,7 @@ private:
         writes_.erase(written);
     }
 
-    /** One recorded caller mint: its extent, and the two facts that can outlive every run. */
+    /** One registered extent, its owner kind and facts that can outlive every run. */
     struct Entry {
         uint64_t bytes{0};
         // The allocation may never be released: a run that could still reach it ended without its
@@ -440,14 +619,45 @@ private:
         // Its bytes may never be read on the host: a run that had declared it produces them ended
         // the same way, so nothing can establish that the write completed.
         bool write_unproven{false};
+        bool domain_managed{false};
+        bool revoked{false};
     };
 
-    // Linear over the recorded mints, under the leaf mutex. The set is only what a caller minted
-    // through this context — not its workspace, retained temporaries or arena banks — so it is
-    // small, and every question is asked on a bind or a free rather than per task. One path pays
-    // it per element: a `get_tensor_data` loop over a child-memory region whose platform host view
-    // was refused (issue #1531) resolves again on each element read.
+    enum class DomainReleaseState { ACTIVE, REVOKED, RELEASING, UNCONFIRMED };
+    struct DomainOwner {
+        std::vector<uint64_t> bases;
+        DomainReleaseState state{DomainReleaseState::ACTIVE};
+    };
+
+    static bool valid_span(uint64_t addr, uint64_t bytes) {
+        return addr != 0 && bytes != 0 && bytes <= std::numeric_limits<uint64_t>::max() - addr;
+    }
+
+    static bool overlaps(uint64_t a, uint64_t bytes_a, uint64_t b, uint64_t bytes_b) {
+        return a <= b ? b - a < bytes_a : a - b < bytes_b;
+    }
+
+    bool used_locked(uint64_t base) const {
+        if (borrowed_locked(base)) return true;
+        for (const auto &[identity, written] : writes_) {
+            (void)identity;
+            for (uint64_t one : written.bases) {
+                if (one == base) return true;
+            }
+        }
+        return false;
+    }
+
+    bool domain_busy_locked(const DomainOwner &owner) const {
+        for (uint64_t base : owner.bases) {
+            if (used_locked(base)) return true;
+        }
+        return false;
+    }
+
+    // Linear over caller allocations and granted communication views, under the leaf mutex.
     bool resolve_locked(uint64_t addr, uint64_t bytes, Allocation *out) const {
+        if (addr == 0 || bytes == 0) return false;
         for (const auto &[base, entry] : allocations_) {
             if (addr < base) continue;
             // Both halves matter: the span has to start inside the allocation and end inside it,
@@ -484,6 +694,8 @@ private:
 
     mutable std::mutex mu_;
     std::unordered_map<uint64_t, Entry> allocations_;
+    std::map<std::pair<uint64_t, uint64_t>, DomainOwner> domain_owners_;
+    std::map<uint64_t, DomainReleaseState> domain_session_releases_;
     std::unordered_map<Identity, Records, IdentityHash> borrows_;
     // Which allocations each run has said it produces. Separate from `borrows_` because the two
     // answer different questions and are established at different moments: the borrow at

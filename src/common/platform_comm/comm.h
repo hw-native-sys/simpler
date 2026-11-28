@@ -79,6 +79,22 @@ enum { COMM_DOMAIN_ADMISSION_STOPPED = -8 };
 // Allocation reply ownership: zero means no result has been reported yet.
 enum { COMM_DOMAIN_OWNED = 1, COMM_DOMAIN_REJECTED = 2 };
 
+/** One published byte extent backed by a native communication allocation. */
+typedef struct CommAllocationSpan {
+    uint64_t addr;
+    uint64_t bytes;
+} CommAllocationSpan;
+
+/**
+ * Query all published context/window views of one live domain allocation.
+ * A null spans with zero capacity queries the required count. Insufficient
+ * capacity reports that count without writing any spans. Other failures set
+ * count_out to zero. The caller serializes this query with allocation/release.
+ */
+int comm_query_domain_allocation(
+    CommHandle h, uint64_t allocation_id, CommAllocationSpan *spans, size_t capacity, size_t *count_out
+);
+
 #define COMM_GLOBAL_DOMAIN_VERSION 2U
 #define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
 #define COMM_GLOBAL_DOMAIN_DESCRIPTOR_BYTES 288U
@@ -466,4 +482,8 @@ int comm_destroy(CommHandle h);
 
 #ifdef __cplusplus
 }
+static_assert(
+    std::is_trivially_copyable_v<CommAllocationSpan> && std::is_standard_layout_v<CommAllocationSpan> &&
+    sizeof(CommAllocationSpan) == 16
+);
 #endif

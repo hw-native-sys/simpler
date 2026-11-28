@@ -34,10 +34,16 @@ def test_default_ci_sweep_collects_all_fifo_cases():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     nodes = [line for line in result.stdout.splitlines() if line.startswith("tests/st/") and "::" in line]
-    assert len(nodes) == 8
+    assert len(nodes) == 11
     assert sum("independent-input" in node for node in nodes) == 2
     assert sum("shared-read-only-input" in node for node in nodes) == 2
-    assert any("::TestWorkerAsyncWholeRunFifoTmrMultiRank::test_run" in node for node in nodes)
+    for multi_rank in (
+        fifo.TestWorkerAsyncWholeRunFifoTmrMultiRank,
+        fifo.TestWorkerAsyncWholeRunFifoHbgMultiRank,
+        fifo.TestWorkerAsyncRetainedDomainFifoHbgMultiRank,
+        fifo.TestWorkerAsyncRetainedDomainFifoTmrMultiRank,
+    ):
+        assert sum(f"::{multi_rank.__name__}::test_run" in node for node in nodes) == 1
     assert any("::test_incompatible_runtime_env_falls_back_to_depth_one" in node for node in nodes)
     assert sum("::test_a_run_whose_cleanup_touches_the_device_degrades_to_depth_one" in node for node in nodes) == 2
 

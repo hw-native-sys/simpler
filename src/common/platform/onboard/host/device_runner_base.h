@@ -531,6 +531,33 @@ public:
     /** Drop `identity`'s borrow, or keep it for good when its last consumer is unproven. */
     void release_caller_buffers(uint64_t identity, bool keep);
 
+    bool register_domain_buffer_owner(
+        uint64_t session, uint64_t allocation, const CallerDeviceBuffers::Span *spans, std::size_t count
+    ) {
+        return caller_device_buffers_.register_domain_owner(session, allocation, spans, count);
+    }
+
+    bool has_domain_buffer_owner(uint64_t session, uint64_t allocation) const {
+        return caller_device_buffers_.has_domain_owner(session, allocation);
+    }
+
+    bool begin_domain_session_release(uint64_t session) {
+        return caller_device_buffers_.begin_domain_session_release(session);
+    }
+
+    bool finish_domain_session_release(uint64_t session, bool confirmed) {
+        return caller_device_buffers_.finish_domain_session_release(session, confirmed);
+    }
+
+    bool begin_domain_buffer_release(uint64_t session, uint64_t allocation) {
+        return caller_device_buffers_.begin_domain_release(session, allocation);
+    }
+
+    bool finish_domain_buffer_release(uint64_t session, uint64_t allocation, bool confirmed) {
+        return confirmed ? caller_device_buffers_.finish_domain_release(session, allocation) :
+                           caller_device_buffers_.mark_domain_release_unconfirmed(session, allocation);
+    }
+
     /** Detach only the exact currently reserved capture carrier from its retained references. */
     bool retire_caller_buffer_carrier(const void *owner, const NativeRunIdentity &identity);
 
@@ -553,7 +580,7 @@ public:
     }
 
     /** The caller allocations this context has recorded, for teardown reporting and tests. */
-    std::size_t caller_buffer_count() const { return caller_device_buffers_.allocation_count(); }
+    std::size_t caller_buffer_count() const { return caller_device_buffers_.caller_allocation_count(); }
     std::size_t caller_buffer_borrow_count() const { return caller_device_buffers_.borrow_count(); }
     std::size_t caller_buffer_retained_count() const { return caller_device_buffers_.retained_count(); }
 
