@@ -29,6 +29,7 @@ import logging
 import os
 import platform as host_platform
 import sys
+import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -987,23 +988,38 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list, worker
     return chip_args, output_names
 
 
+_env_guard = threading.Lock()
+_active_env_scopes = 0
+_env_override_active = False
+
+
 @contextmanager
 def _temporary_env(env_updates):
-    """Temporarily set environment variables."""
-    if not env_updates:
-        yield
-        return
-    old = {k: os.environ.get(k) for k in env_updates}
-    for k, v in env_updates.items():
-        os.environ[k] = v
+    """Allow concurrent unmodified scopes, and require exclusive access for overrides."""
+    global _active_env_scopes, _env_override_active
+    with _env_guard:
+        if _env_override_active or (env_updates and _active_env_scopes):
+            raise RuntimeError("scene RUNTIME_ENV overrides require exclusive in-process execution")
+        _active_env_scopes += 1
+        _env_override_active = bool(env_updates)
+    old = {}
     try:
+        for key, value in env_updates.items():
+            previous = os.environ.get(key)
+            os.environ[key] = value
+            old[key] = previous
         yield
     finally:
-        for k, v in old.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        try:
+            for key, previous in old.items():
+                if previous is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous
+        finally:
+            with _env_guard:
+                _active_env_scopes -= 1
+                _env_override_active = False
 
 
 def _resolve_callable_paths(cls, cls_dir):
@@ -2022,6 +2038,7 @@ class SceneTestCase:
     # resolved). Prefer a `compare_outputs` override when the output is
     # self-describing enough to still be checked.
     SKIP_GOLDEN: bool = False
+    # Overrides require exclusive in-process scene execution. Conflicting runs raise RuntimeError.
     RUNTIME_ENV: dict = {}
 
     def generate_args(self, params) -> TaskArgsBuilder:
