@@ -4097,13 +4097,19 @@ bool ChipSwimlaneCollector::close_recorded_window(uint64_t run_epoch, int timeou
     }
 }
 
-bool ChipSwimlaneCollector::abandon_run(uint64_t run_epoch) {
-    // The bank goes back whatever the retained bookkeeping then says. This run
-    // submitted nothing, so no producer can hold its bank, and the credit it
-    // took at arm would otherwise never come back: three such rollbacks and no
-    // later diagnostic run could ever be armed.
-    release_run_terminal_bank(run_epoch);
-    if (!retained_ready_.load(std::memory_order_acquire)) return true;
+bool ChipSwimlaneCollector::abandon_run(uint64_t run_epoch) { return withdraw_admitted_run(run_epoch, false); }
+
+bool ChipSwimlaneCollector::withdraw_never_started_run(uint64_t run_epoch, const ProducerNeverStartedProof &proof) {
+    if (run_epoch == 0 || proof.identity().run_epoch != run_epoch) return false;
+    return withdraw_admitted_run(run_epoch, true);
+}
+
+bool ChipSwimlaneCollector::withdraw_admitted_run(uint64_t run_epoch, bool require_admission) {
+    // Ordinary NotStarted rollback keeps its existing bank-return contract.
+    // Submitted-but-CANCELLED wrappers require a matching live admission and
+    // retain the bank until the reader acknowledgement below also succeeds.
+    if (!require_admission) release_run_terminal_bank(run_epoch);
+    if (!retained_ready_.load(std::memory_order_acquire)) return !require_admission;
     size_t slot = 0;
     {
         std::lock_guard<std::mutex> lk(retained_mu_);
@@ -4111,10 +4117,11 @@ bool ChipSwimlaneCollector::abandon_run(uint64_t run_epoch) {
         // No slot under this identity: the admission never happened, so there
         // is nothing of this run's to withdraw and nothing of anyone else's
         // that this may touch.
-        if (found < 0) return true;
+        if (found < 0) return !require_admission;
         slot = static_cast<size_t>(found);
         const EpochBucket &bucket = retained_runs_[slot];
-        if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Admitting)) return true;
+        if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Admitting))
+            return !require_admission;
         // A target makes the run the writer's; only an unclosed one is still
         // this thread's to withdraw.
         if (bucket.target_installed) return false;
@@ -4128,8 +4135,8 @@ bool ChipSwimlaneCollector::abandon_run(uint64_t run_epoch) {
     }
     EpochBucket &bucket = retained_runs_[slot];
     // Withdraw admission, then wait for every shard to drop its reference —
-    // the sequence a seal uses, minus the publication: this run submitted
-    // nothing, so it produced no records to seal and promised no file.
+    // the sequence a seal uses, minus publication: no device producer entered,
+    // so this run produced no records to seal and promised no file.
     record_run_tombstone(run_epoch);
     bucket.state.store(static_cast<int>(EpochState::Closing), std::memory_order_release);
     bool released = false;
@@ -4179,10 +4186,11 @@ bool ChipSwimlaneCollector::abandon_run(uint64_t run_epoch) {
     // No verdict is recorded: a run that submitted nothing owes no file, so
     // reporting one would make a rolled-back launch read as a lost artifact and
     // fail every later flush.
+    if (require_admission) release_run_terminal_bank(run_epoch);
     release_run_slot(slot);
     try {
         LOG_WARN(
-            "ChipSwimlane: run %lu was admitted and never launched; its slot is released without an artifact",
+            "ChipSwimlane: run %lu was admitted without a producer; its slot is released without an artifact",
             static_cast<unsigned long>(run_epoch)
         );
     } catch (...) {}

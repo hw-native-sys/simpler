@@ -239,6 +239,14 @@ public:
     bool launch_native_run_joined(
         const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor, void *caller_stream = nullptr
     );
+    // Submit behind private notification waits. A predecessor supplies only
+    // execution-claim admission; no predecessor event is queued. False means
+    // no device submission. Every other failure requires backend finalization.
+    bool enqueue_native_run_held(
+        const ChipWorkerNativeRun &run, const ChipWorkerNativeRun *predecessor = nullptr, bool *credit_full = nullptr
+    );
+    // GO is irreversible and may only be called for the authorized lane front.
+    void release_native_run_held(const ChipWorkerNativeRun &run);
     bool poll_native_run(const ChipWorkerNativeRun &run);
     void bind_peer_cancel(const ChipWorkerNativeRun &run, const int32_t *request);
     void wait_native_run(const ChipWorkerNativeRun &run);
@@ -563,6 +571,7 @@ public:
      * moment-to-moment fact about the device streams.
      */
     bool supports_joined_native_launch() const;
+    bool supports_execution_gate() const;
     /**
      * Whether `run` may be ordered behind `predecessor` while both collect
      * swimlane diagnostics.
@@ -682,6 +691,7 @@ private:
     using SimplerFinalizeRunFn = decltype(&simpler_finalize_run_with_delivery);
     using ObserveFrameworkSubmissionsFn = decltype(&simpler_observe_framework_submissions);
     using SimplerJoinedLaunchFn = decltype(&simpler_launch_run_joined);
+    using ReleaseExecutionGateFn = decltype(&simpler_release_execution_gate);
     using ValidateExecutionContextFn = decltype(&simpler_validate_execution_context);
     using ValidateCallerStreamFn = decltype(&simpler_validate_caller_stream);
     // Optional ACL symbols use SDK pointer arguments. The status pointer
@@ -807,6 +817,8 @@ private:
     using CallerStreamSubmitFn = decltype(&simpler_submit_run_on_stream);
     CallerStreamSubmitFn submit_run_on_stream_fn_ = nullptr;
     SimplerJoinedLaunchFn launch_run_joined_fn_ = nullptr;
+    SimplerJoinedLaunchFn enqueue_run_held_fn_ = nullptr;
+    ReleaseExecutionGateFn release_execution_gate_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
     SimplerNativeRunFn query_run_completion_fn_ = nullptr;
     decltype(&simpler_bind_peer_cancel) peer_cancel_fn_ = nullptr;
@@ -862,6 +874,7 @@ private:
     SimplerFlushDiagnosticsFn flush_diagnostics_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_joined_native_launch_fn_ = nullptr;
+    SupportsConcurrentNativePrepareFn supports_execution_gate_fn_ = nullptr;
     SupportsJoinedDiagnosticLaunchFn supports_joined_diagnostic_launch_fn_ = nullptr;
     // The credit bridge. A runtime that exports none of these leaves the
     // slots null, which degrades to "no credit wait": the caller re-asks on
@@ -937,10 +950,20 @@ private:
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint64_t> ccu_preparation_keys_;
     std::unordered_map<int32_t, CcuCallableArtifacts> callable_artifacts_;
 
+    void negotiate_retained_epoch_capacity(uint32_t resource_grant);
     uint32_t resource_bank_for_slot(uint32_t kind, uint32_t slot_id) const;
     RegionBanks region_banks_for_slot(uint32_t slot_id) const;
 
-    enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, CALLER_SUBMITTED, FINALIZING };
+    enum class NativeRunPhase : uint8_t {
+        EMPTY,
+        PREPARING,
+        PREPARED,
+        ENQUEUED_HELD,
+        LAUNCHED,
+        REAPED,
+        CALLER_SUBMITTED,
+        FINALIZING
+    };
     class PreparedRunIncompatible : public std::runtime_error {
     public:
         using std::runtime_error::runtime_error;
@@ -1022,12 +1045,16 @@ private:
         bool pending_rc_set{false};
         bool result_observed{false};
         bool permits_prepared_successor{false};
+        NativeRunDescriptor gate_descriptor{};
     };
     /** What the storage tag says after a finalize that reached the C entry. */
     enum class RunStorageTag : uint8_t { Destroyed, Canonical, Noncanonical };
     /** Which operation a lease is being taken for; decides blocking and the admitted phases. */
     enum class NativeRunOp : uint8_t {
         Launch,
+        HeldEnqueue,
+        HeldClaimPredecessor,
+        ReleaseGate,
         BindPeerCancel,
         Poll,
         QueryCompletion,

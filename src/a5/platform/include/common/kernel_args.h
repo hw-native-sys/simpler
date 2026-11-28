@@ -176,6 +176,10 @@ struct KernelArgs {
     uint32_t force_simt_anchor{0};
     uint32_t runtime_descriptor_bytes{0};
     RuntimeDescriptorSection runtime_section{};
+    // This platform accepts only the all-zero ungated launch tuple.
+    uint64_t execution_gate_address{0};
+    uint64_t execution_gate_identity{0};
+    uint64_t execution_gate_generation{0};
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
@@ -200,7 +204,10 @@ static_assert(offsetof(KernelArgs, graph_section_offset) == 156, "KernelArgs::gr
 static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 168, "entry cache policy offset drift");
 static_assert(offsetof(KernelArgs, force_simt_anchor) == 172, "SIMT anchor offset drift");
 static_assert(offsetof(KernelArgs, runtime_section) == 184, "runtime descriptor section offset drift");
-static_assert(sizeof(KernelArgs) == 192, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, execution_gate_address) == 192, "execution gate address offset drift");
+static_assert(offsetof(KernelArgs, execution_gate_identity) == 200, "execution gate identity offset drift");
+static_assert(offsetof(KernelArgs, execution_gate_generation) == 208, "execution gate generation offset drift");
+static_assert(sizeof(KernelArgs) == 216, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
@@ -243,9 +250,15 @@ struct AicoreLaunchArgs {
     // this run's report. Zero on a kernel/persistent launch, which keeps the
     // `aicore_done != 0` predicate.
     uint64_t report_epoch;
+    uint64_t execution_gate_address;
+    uint64_t execution_gate_identity;
+    uint64_t execution_gate_generation;
 };
 
-static_assert(sizeof(AicoreLaunchArgs) == 48, "AicoreLaunchArgs size drift");
+static_assert(offsetof(AicoreLaunchArgs, execution_gate_address) == 48);
+static_assert(offsetof(AicoreLaunchArgs, execution_gate_identity) == 56);
+static_assert(offsetof(AicoreLaunchArgs, execution_gate_generation) == 64);
+static_assert(sizeof(AicoreLaunchArgs) == 72, "AicoreLaunchArgs size drift");
 
 /**
  * Fill the `AicoreLaunchArgs` fields every architecture shares, from the
@@ -261,6 +274,9 @@ inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_
     args.runtime_args = k_args.runtime_descriptor_bytes == 0 ? reinterpret_cast<uint64_t>(k_args.runtime_args) : 0;
     args.enable_profiling_flag = k_args.enable_profiling_flag;
     args.report_epoch = k_args.run_result_epoch;
+    args.execution_gate_address = k_args.execution_gate_address;
+    args.execution_gate_identity = k_args.execution_gate_identity;
+    args.execution_gate_generation = k_args.execution_gate_generation;
 }
 
 /**

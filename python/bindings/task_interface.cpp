@@ -3786,6 +3786,7 @@ NB_MODULE(_task_interface, m) {
         .def("done", &ChipRun::done)
         .def("activate", &ChipRun::activate)
         .def("_authorize_prepare", &ChipRun::authorize_prepare)
+        .def("_enqueue_held", &ChipRun::enqueue_held, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "bind_peer_cancel",
             [](ChipRun &self, uint64_t address) {

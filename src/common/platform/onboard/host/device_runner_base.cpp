@@ -86,6 +86,20 @@ extern "C" int dep_gen_host_graph_take(simpler::dfx::host_graph::HostGraphExport
 
 namespace {
 
+void trace_execution_gate(const char *name, const NativeRunIdentity &identity, uint64_t begin, int rc) noexcept {
+    try {
+        if (!SIMPLER_HOST_STRACE || !unified_log_host_span_enabled()) return;
+        char attrs[SIMPLER_HOST_SPAN_ATTRIBUTES_CAPACITY];
+        const int size = std::snprintf(
+            attrs, sizeof(attrs), "ep=%llu gen=%llu disp=%llu slot=%u rc=%d",
+            static_cast<unsigned long long>(identity.run_epoch), static_cast<unsigned long long>(identity.generation),
+            static_cast<unsigned long long>(identity.dispatch_id), identity.pipeline_slot, rc
+        );
+        if (size < 0 || static_cast<size_t>(size) >= sizeof(attrs)) return;
+        STRACE_HOST_SPAN_AT_A(name, begin, STRACE_NOW_NS() - begin, 1, attrs);
+    } catch (...) {}
+}
+
 void trace_event_return(const char *name, void *event, int rc, bool status_valid, int status, int timeout_ms) {
     try {
         if (!SIMPLER_HOST_STRACE || !unified_log_host_span_enabled()) return;
@@ -366,8 +380,14 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
     outcome.progress = transaction.progress;
     outcome.receipt = std::move(transaction.receipt);
     if (transaction.progress == LaunchProgress::NotStarted) {
-        if (!outcome.prepared->diagnostic_window_open)
-            withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
+        if (!outcome.prepared->diagnostic_window_open) {
+            const bool withdrawn =
+                withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
+            if (outcome.prepared->execution_gate) {
+                if (withdrawn) outcome.prepared->gate_swimlane_admitted = false;
+                else outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+            }
+        }
         bool caller_retired = false;
         try {
             caller_retired = submission_storage_[outcome.prepared->pipeline_slot]->caller_order->retire(
@@ -394,6 +414,150 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
         } catch (...) {}
     }
     return outcome;
+}
+
+int DeviceRunnerBase::prepare_execution_gate(PreparedExecution &prepared) {
+    if (!supports_execution_gate() || prepared.caller_stream != nullptr || prepared.caller_owns_submission ||
+        !execution_gate_diagnostics_eligible(prepared) || dma_workspace_handle_ != nullptr ||
+        timeout_config_.stream_sync_timeout_ms <= 0)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (prepared.execution_gate) return PTO_RUNTIME_ERR_INVALID_STATE;
+    int rc = enter_run_thread();
+    if (rc != 0) return rc;
+    const uint64_t gate_begin = STRACE_NOW_NS();
+    auto gate_trace = RAIIScopeGuard([&] {
+        trace_execution_gate("chip.run.gate.prepare", prepared.identity, gate_begin, rc);
+    });
+    auto gate = std::make_shared<NativeExecutionGate>(prepared.identity, timeout_config_.stream_sync_timeout_ms);
+    // The first gate is prepared before any held enqueue can consume this
+    // control stream. Creation performs no operation on a run stream.
+    {
+        std::lock_guard<std::mutex> control_lock(gate_control_mu_);
+        if (gate_control_stream_.load(std::memory_order_acquire) == nullptr) {
+            rtStream_t control_stream = nullptr;
+            rc = rtStreamCreate(&control_stream, 0);
+            if (rc != 0) return rc;
+            gate_control_stream_.store(control_stream, std::memory_order_release);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(execution_gates_mu_);
+        if (execution_gates_.count(prepared.identity.run_epoch) != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+        // Registration precedes fallible allocation so partial ownership stays
+        // reachable even if SDK cleanup cannot establish reclamation.
+        execution_gates_.emplace(prepared.identity.run_epoch, gate);
+    }
+    prepared.execution_gate = gate;
+    rc = gate->initialize();
+    if (rc != 0) {
+        if (gate->retire(false) == 0) {
+            std::lock_guard<std::mutex> lock(execution_gates_mu_);
+            execution_gates_.erase(prepared.identity.run_epoch);
+            prepared.execution_gate.reset();
+        }
+        return rc;
+    }
+    prepared.gate_original_streams = prepared.streams;
+    prepared.gate_original_stream_lifetime = prepared.stream_lifetime;
+    prepared.gate_streams_replaced = true;
+    prepared.streams = {gate->aicpu_stream(), gate->aicore_stream()};
+    rc = bind_execution_gate(prepared);
+    return rc;
+}
+
+bool DeviceRunnerBase::execution_gate_diagnostics_eligible(const PreparedExecution &prepared) const {
+    const auto &dfx = prepared.dfx;
+    if (!dfx.diagnostics_any()) return true;
+    return dfx.chip_swimlane_enabled() && !dfx.dump_args_enabled() && !dfx.pmu_enabled && !dfx.dep_gen_enabled &&
+           !dfx.scope_stats_enabled && chip_swimlane_collector_.retains_runs();
+}
+
+int DeviceRunnerBase::rollback_unsubmitted_execution_gate(PreparedExecution &prepared) {
+    if (!prepared.execution_gate) return 0;
+    if (!prepared.execution_gate->never_submitted() || prepared.gate_swimlane_admitted)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = retire_execution_gate(prepared, false);
+    if (rc != 0) return rc;
+    prepared.execution_gate.reset();
+    if (prepared.gate_streams_replaced) {
+        prepared.streams = prepared.gate_original_streams;
+        prepared.stream_lifetime = std::move(prepared.gate_original_stream_lifetime);
+        prepared.gate_streams_replaced = false;
+    }
+    prepared.kernel_args.args.execution_gate_address = 0;
+    prepared.kernel_args.args.execution_gate_identity = 0;
+    prepared.kernel_args.args.execution_gate_generation = 0;
+    prepared.gate_swimlane_admitted = false;
+    return 0;
+}
+
+int DeviceRunnerBase::withdraw_gate_cancelled_swimlane(PreparedExecution &prepared) {
+    if (!prepared.execution_gate || !prepared.execution_gate->cancelled()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!prepared.dfx.diagnostics_any() || prepared.gate_swimlane_withdrawn) return 0;
+    if (!execution_gate_diagnostics_eligible(prepared) || !prepared.gate_swimlane_admitted ||
+        !prepared.physical_complete || prepared.runtime == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    bool aic = false;
+    bool aiv = false;
+    for (int index = 0; index < prepared.num_aicore; ++index) {
+        aic = aic || prepared.runtime->core_type_rule(index) == CoreType::AIC;
+        aiv = aiv || prepared.runtime->core_type_rule(index) == CoreType::AIV;
+    }
+    const uint64_t withdrawal_begin = STRACE_NOW_NS();
+    int withdrawal_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    auto withdrawal_trace = RAIIScopeGuard([&] {
+        trace_execution_gate(
+            "chip.run.gate.never_started.withdraw", prepared.identity, withdrawal_begin, withdrawal_rc
+        );
+    });
+    const auto proof = prepared.execution_gate->prove_producer_never_started(prepared.identity, aic, aiv);
+    if (!proof || !chip_swimlane_collector_.withdraw_never_started_run(prepared.identity.run_epoch, *proof))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    prepared.gate_swimlane_withdrawn = true;
+    withdrawal_rc = 0;
+    return 0;
+}
+
+int DeviceRunnerBase::release_execution_gate(const NativeRunIdentity &identity, ExecutionGateDecision decision) {
+    std::shared_ptr<NativeExecutionGate> gate;
+    {
+        std::lock_guard<std::mutex> lock(execution_gates_mu_);
+        const auto it = execution_gates_.find(identity.run_epoch);
+        if (it == execution_gates_.end() || it->second->identity() != identity) return PTO_RUNTIME_ERR_INVALID_STATE;
+        gate = it->second;
+    }
+    const uint64_t release_begin = STRACE_NOW_NS();
+    int rc = enter_run_thread();
+    if (rc == 0) rc = gate->release(decision);
+    trace_execution_gate(
+        decision == ExecutionGateDecision::Go ? "chip.run.gate.go" : "chip.run.gate.cancel", identity, release_begin, rc
+    );
+    return rc;
+}
+
+int DeviceRunnerBase::validate_execution_gate(PreparedExecution &prepared) {
+    if (!prepared.execution_gate) return 0;
+    bool aic = false;
+    bool aiv = false;
+    for (int index = 0; index < prepared.num_aicore; ++index) {
+        aic = aic || prepared.runtime->core_type_rule(index) == CoreType::AIC;
+        aiv = aiv || prepared.runtime->core_type_rule(index) == CoreType::AIV;
+    }
+    const uint64_t validation_begin = STRACE_NOW_NS();
+    const int rc = prepared.execution_gate->validate_completed(aic, aiv);
+    trace_execution_gate("chip.run.gate.release_complete", prepared.identity, validation_begin, rc);
+    return rc;
+}
+
+int DeviceRunnerBase::retire_execution_gate(PreparedExecution &prepared, bool complete) {
+    if (!prepared.execution_gate) return 0;
+    if (prepared.execution_gate->cancelled() && prepared.gate_swimlane_admitted && !prepared.gate_swimlane_withdrawn)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = prepared.execution_gate->retire(complete);
+    if (rc != 0) return rc;
+    std::lock_guard<std::mutex> lock(execution_gates_mu_);
+    execution_gates_.erase(prepared.identity.run_epoch);
+    return 0;
 }
 
 DeviceRunnerBase::DeviceRunnerBase() {
@@ -2732,7 +2896,10 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
         return rc;
     }
     rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
-    if (control_stream == nullptr) control_stream = stream_aicpu_;
+    if (control_stream == nullptr)
+        control_stream = gate_control_stream_.load(std::memory_order_acquire) != nullptr ?
+                             gate_control_stream_.load(std::memory_order_acquire) :
+                             stream_aicpu_;
     return register_callable_on_device(callable_id, control_stream);
 }
 
@@ -3314,6 +3481,10 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
+    if (!abandon_device_resources) {
+        std::lock_guard<std::mutex> lock(execution_gates_mu_);
+        if (!execution_gates_.empty()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
     if (abandon_device_resources) {
         if (!prepared_resources_can_abandon()) return PTO_RUNTIME_ERR_INVALID_STATE;
         std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
@@ -3434,7 +3605,10 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (!abandon_device_resources) {
         if (rc != 0) return rc;
         rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
-        if (control_stream == nullptr) control_stream = stream_aicpu_;
+        if (control_stream == nullptr)
+            control_stream = gate_control_stream_.load(std::memory_order_acquire) != nullptr ?
+                                 gate_control_stream_.load(std::memory_order_acquire) :
+                                 stream_aicpu_;
         const int loader_rc = load_aicpu_op_.Finalize(control_stream);
         if (loader_rc != 0) return loader_rc;
         // HBG's orchestration images are host-owned. Preserve any failed
@@ -3445,6 +3619,13 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
             if (dlclose(handle) != 0) return PTO_RUNTIME_ERR_INTERNAL;
             handle = nullptr;
         }
+    }
+    if (gate_control_stream_ != nullptr) {
+        if (!abandon_device_resources) {
+            const int control_rc = rtStreamDestroy(gate_control_stream_);
+            if (control_rc != 0) return control_rc;
+        }
+        gate_control_stream_ = nullptr;
     }
     if (stream_aicpu_ != nullptr) {
         if (!abandon_device_resources) {

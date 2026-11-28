@@ -102,7 +102,7 @@ bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxS
 static constexpr size_t MAILBOX_FRAME_SIZE = 65536;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 7;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 8;
 
 // Error message region. 256 B of headroom is enough for
 // `<ExceptionType>: <short message>` produced by the child-side Python loops;
@@ -185,6 +185,9 @@ struct MailboxRunEntry {
     /* Parent, identity-checked: no earlier dispatch can still arrive. This
        permits native preparation only; activation has its own protocol. */
     int32_t prepare_ordered;
+    /* Parent, identity-checked after complete resource sealing. Only an
+       external full-success fence may authorize this held device enqueue. */
+    int32_t enqueue_before_success;
 };
 static_assert(
     std::is_trivially_copyable_v<MailboxRunEntry> && std::is_standard_layout_v<MailboxRunEntry>,
@@ -580,6 +583,7 @@ public:
     virtual void cancel_staged_progress(RunId run_id);
     virtual bool activate_progress(RunId run_id);
     virtual bool authorize_preparation(RunId run_id);
+    virtual bool authorize_held_enqueue(RunId run_id);
     virtual void request_progress_stop() noexcept;
     virtual void request_observation(RunId) {}
     virtual void request_peer_cancel(RunId) {}
@@ -682,6 +686,7 @@ public:
     void cancel_staged_progress(RunId run_id) override;
     bool activate_progress(RunId run_id) override;
     bool authorize_preparation(RunId run_id) override;
+    bool authorize_held_enqueue(RunId run_id) override;
     void request_progress_stop() noexcept override;
     void request_observation(RunId run_id) override;
     void request_peer_cancel(RunId run_id) override;
@@ -910,6 +915,7 @@ public:
     bool has_staged_run(RunId run_id) const;
     void cancel_staged_run(RunId run_id);
     bool authorize_preparation(RunId run_id);
+    bool authorize_held_enqueue(RunId run_id);
     bool activate_prepared(RunId run_id);
 
     /**
@@ -1201,6 +1207,7 @@ public:
     bool has_staged_run(RunId run_id) const;
     void cancel_staged_run(RunId run_id);
     bool authorize_preparation(RunId run_id);
+    bool authorize_held_enqueue(RunId run_id);
     bool activate_prepared_run(RunId run_id);
     /** @see WorkerThread::authorize_staged_launch. */
     bool authorize_staged_launch(RunId run_id);

@@ -30,6 +30,7 @@
 #include "context_preparation.h"
 #include "callable.h"
 #include "fixture.h"
+#include "executor_elf.h"
 #include "native_run_context.h"
 #include "host/raii_scope_guard.h"
 #include "host/kernel_pipeline_contract.h"
@@ -39,6 +40,13 @@
 #include "chip_worker.h"
 #undef private
 #include "chip_run_lane.h"
+
+namespace {
+const auto aicpu_executor = native_admission_test::executor_elf(SHT_DYNSYM, {simpler::executor_abi::AICPU_ENTRY});
+const auto aicore_executor = native_admission_test::executor_elf(
+    SHT_SYMTAB, {simpler::executor_abi::AIC_ENTRY, simpler::executor_abi::AIV_ENTRY}
+);
+}  // namespace
 
 extern "C" int args_dump_capture_supported_impl();
 
@@ -202,6 +210,56 @@ public:
 private:
     int cpu_stream_{0};
     int core_stream_{0};
+};
+
+class GateAdmissionRunner : public Runner {
+public:
+    bool fail_rollback_fence{false};
+    bool supports_execution_gate() const override { return true; }
+    int bind_execution_gate(PreparedExecution &prepared) override {
+        prepared.kernel_args.args.execution_gate_address = prepared.execution_gate->device_address();
+        prepared.kernel_args.args.execution_gate_identity = prepared.identity.run_epoch;
+        prepared.kernel_args.args.execution_gate_generation = prepared.identity.generation;
+        return 0;
+    }
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+        if (prepared.execution_gate && (launch_refusal_rc == 0 || partial_launch)) {
+            LaunchProgressSink sink;
+            const int rc =
+                prepared.execution_gate->enqueue_waits(prepared.streams.aicpu, prepared.streams.aicore, sink);
+            if (rc != 0) return {rc, LaunchProgress::Partial, {}};
+        }
+        auto result = Runner::launch_execution_impl(prepared, std::move(permit));
+        if (fail_rollback_fence && result.progress == LaunchProgress::NotStarted) control().stream_sync_rc = -991;
+        return result;
+    }
+    ChipSwimlaneCollector &swimlane() { return chip_swimlane_collector_; }
+    void start_swimlane() {
+        set_retain_runs(true);
+        EXPECT_EQ(
+            chip_swimlane_collector_.initialize(
+                1, 1, 0, ChipSwimlaneLevel::TASK_TIMING,
+                [this](size_t bytes) {
+                    return mem_alloc_.alloc(bytes);
+                },
+                nullptr,
+                [this](void *ptr) {
+                    return mem_alloc_.free(ptr);
+                }
+            ),
+            0
+        );
+        chip_swimlane_collector_.start([](std::function<void()> fn) {
+            return std::thread(std::move(fn));
+        });
+    }
+    ~GateAdmissionRunner() override {
+        chip_swimlane_collector_.finish_retained_runs();
+        chip_swimlane_collector_.stop();
+        chip_swimlane_collector_.finalize(nullptr, [this](void *ptr) {
+            return mem_alloc_.free(ptr);
+        });
+    }
 };
 
 class TimeoutRunner : public Runner {
@@ -396,6 +454,226 @@ void bind_program_lane(ChipWorker &worker, FencedCompletionRunner &runner) {
     program_lane_finalize_results.clear();
 }
 }  // namespace
+
+TEST_F(NativeAdmissionTest, ExecutionGatePartialStreamInitializationReleasesKnownOwners) {
+    control().fail_stream_create = 3;
+    NativeExecutionGate gate(NativeRunIdentity{10001, 1, 1, 0}, 1000);
+    EXPECT_NE(gate.initialize(), 0);
+    EXPECT_EQ(gate.retire(false), 0);
+    EXPECT_EQ(control().stream_destroy_calls, 2u);
+    EXPECT_EQ(control().bytes, 0u);
+    EXPECT_EQ(control().live_host_allocations, 0u);
+}
+
+TEST_F(NativeAdmissionTest, ExecutionGatePartialNotifyInitializationReleasesKnownOwners) {
+    control().fail_notify_create = 2;
+    NativeExecutionGate gate(NativeRunIdentity{10002, 1, 2, 0}, 1000);
+    EXPECT_NE(gate.initialize(), 0);
+    EXPECT_EQ(gate.retire(false), 0);
+    EXPECT_EQ(control().stream_destroy_calls, 3u);
+    EXPECT_EQ(control().bytes, 0u);
+    EXPECT_EQ(control().live_host_allocations, 0u);
+    EXPECT_EQ(control().live_notifies, 0u);
+}
+
+TEST_F(NativeAdmissionTest, ExecutionGateCancellationRequiresEntryProofAndDecisionCannotChange) {
+    NativeExecutionGate gate(NativeRunIdentity{10003, 2, 3, 0}, 1000);
+    ASSERT_EQ(gate.initialize(), 0);
+    EXPECT_NE(gate.aicpu_stream(), gate.aicore_stream());
+    LaunchProgressSink sink;
+    ASSERT_EQ(gate.enqueue_waits(gate.aicpu_stream(), gate.aicore_stream(), sink), 0);
+    EXPECT_TRUE(sink.submitted());
+    ASSERT_EQ(gate.release(ExecutionGateDecision::Cancel), 0);
+    EXPECT_EQ(gate.release(ExecutionGateDecision::Cancel), 0);
+    EXPECT_EQ(control().notify_record_calls, 2u);
+    EXPECT_EQ(gate.release(ExecutionGateDecision::Go), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_NE(gate.retire(true), 0);
+    // CPU transport does not execute kernels. Supply their explicit reports;
+    // this test covers owner retirement, not hardware wait or kernel behavior.
+    auto *record = reinterpret_cast<ExecutionGateRecord *>(gate.device_address());
+    record->aicpu.outcome = static_cast<uint32_t>(ExecutionGateOutcome::Cancel);
+    record->aic.outcome = static_cast<uint32_t>(ExecutionGateOutcome::Cancel);
+    record->aiv.outcome = static_cast<uint32_t>(ExecutionGateOutcome::Cancel);
+    ASSERT_EQ(gate.validate_completed(true, true), 0);
+    EXPECT_NE(gate.retire(false), 0);
+    EXPECT_EQ(gate.retire(true), 0);
+    EXPECT_EQ(control().live_notifies, 0u);
+    EXPECT_EQ(control().live_host_allocations, 0u);
+    EXPECT_EQ(control().stream_destroy_calls, 3u);
+}
+
+TEST_F(NativeAdmissionTest, HeldCapacityRefusalRestoresOrdinaryPreparationAndCanRetry) {
+    GateAdmissionRunner runner;
+    Attempt attempt(runner, 0, 10010);
+    ASSERT_EQ(attempt.prepare(), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    int cpu = 0, core = 0;
+    auto lifetime = std::make_shared<int>(7);
+    state->prepared_execution->streams = {&cpu, &core};
+    state->prepared_execution->stream_lifetime = lifetime;
+    runner.launch_refusal_rc = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+    for (int retry = 0; retry < 2; ++retry) {
+        EXPECT_EQ(
+            simpler_enqueue_run_held(&runner, attempt.storage, nullptr), SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL
+        );
+        ASSERT_NE(state->prepared_execution, nullptr);
+        EXPECT_EQ(state->prepared_execution->execution_gate, nullptr);
+        EXPECT_EQ(state->prepared_execution->streams.aicpu, &cpu);
+        EXPECT_EQ(state->prepared_execution->streams.aicore, &core);
+        EXPECT_EQ(state->prepared_execution->stream_lifetime, lifetime);
+        EXPECT_EQ(state->prepared_execution->kernel_args.args.execution_gate_address, 0u);
+        EXPECT_EQ(state->prepared_execution->kernel_args.args.execution_gate_identity, 0u);
+        EXPECT_EQ(state->prepared_execution->kernel_args.args.execution_gate_generation, 0u);
+        EXPECT_EQ(control().live_notifies, 0u);
+    }
+    runner.launch_refusal_rc = 0;
+    EXPECT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, HeldRollbackCannotReclaimSubmittedWaits) {
+    GateAdmissionRunner runner;
+    Attempt attempt(runner, 0, 10011);
+    ASSERT_EQ(attempt.prepare(), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    ASSERT_EQ(simpler_enqueue_run_held(&runner, attempt.storage, nullptr), 0);
+    auto &prepared = *state->active_execution->prepared;
+    auto gate = prepared.execution_gate;
+    EXPECT_EQ(runner.rollback_unsubmitted_execution_gate(prepared), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(prepared.execution_gate, gate);
+    ASSERT_EQ(runner.release_execution_gate(prepared.identity, ExecutionGateDecision::Cancel), 0);
+    auto *record = reinterpret_cast<ExecutionGateRecord *>(gate->device_address());
+    record->aicpu.outcome = record->aic.outcome = record->aiv.outcome =
+        static_cast<uint32_t>(ExecutionGateOutcome::Cancel);
+    ASSERT_EQ(gate->validate_completed(true, true), 0);
+    // The fake SDK's stream completions were successful; no user entry ran.
+    EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, attempt.storage, 0), SIMPLER_NATIVE_RUN_CANCELLED);
+}
+
+TEST_F(NativeAdmissionTest, CancelledSwimlaneWithdrawsOnlyItsAdmissionAfterNativeProof) {
+    GateAdmissionRunner runner;
+    runner.start_swimlane();
+    diagnostic_path = "native-gated-swimlane-withdraw";
+    std::filesystem::create_directory(diagnostic_path);
+    constexpr uint64_t kept_epoch = 10020;
+    constexpr uint64_t cancelled_epoch = 10021;
+    auto &collector = runner.swimlane();
+    ASSERT_TRUE(collector.run_begin(kept_epoch, diagnostic_path, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    ASSERT_TRUE(
+        collector.run_begin(cancelled_epoch, diagnostic_path, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false)
+    );
+    ASSERT_GE(collector.acquire_run_terminal_bank(cancelled_epoch), 0);
+    const auto slots = collector.retained_run_stats_for_test().open_slots;
+    Attempt attempt(runner, 0, cancelled_epoch);
+    attempt.config.enable_chip_swimlane = 1;
+    std::strcpy(attempt.config.output_prefix, diagnostic_path.c_str());
+    ASSERT_EQ(attempt.prepare(), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    ASSERT_EQ(simpler_enqueue_run_held(&runner, attempt.storage, nullptr), 0);
+    auto &prepared = *state->active_execution->prepared;
+    prepared.gate_swimlane_admitted = true;
+    auto gate = prepared.execution_gate;
+    ASSERT_EQ(runner.release_execution_gate(prepared.identity, ExecutionGateDecision::Cancel), 0);
+    auto *record = reinterpret_cast<ExecutionGateRecord *>(gate->device_address());
+    record->aicpu.outcome = record->aic.outcome = record->aiv.outcome =
+        static_cast<uint32_t>(ExecutionGateOutcome::Cancel);
+    EXPECT_EQ(runner.withdraw_gate_cancelled_swimlane(prepared), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(collector.retained_run_stats_for_test().open_slots, slots);
+    prepared.physical_complete = true;
+    ++prepared.identity.generation;
+    EXPECT_EQ(runner.withdraw_gate_cancelled_swimlane(prepared), PTO_RUNTIME_ERR_INVALID_STATE);
+    --prepared.identity.generation;
+    EXPECT_EQ(runner.withdraw_gate_cancelled_swimlane(prepared), 0);
+    EXPECT_EQ(collector.retained_run_stats_for_test().open_slots, slots - 1);
+    EXPECT_EQ(collector.run_terminal_bank_of(cancelled_epoch), -1);
+    EXPECT_EQ(runner.withdraw_gate_cancelled_swimlane(prepared), 0);
+    EXPECT_EQ(collector.retained_run_stats_for_test().open_slots, slots - 1);
+    EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, attempt.storage, 0), SIMPLER_NATIVE_RUN_CANCELLED);
+    EXPECT_TRUE(collector.abandon_run(kept_epoch));
+    ASSERT_TRUE(collector.run_begin(10022, diagnostic_path, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    EXPECT_TRUE(collector.abandon_run(10022));
+}
+
+#if defined(__linux__)
+TEST_F(NativeAdmissionTest, HeldRefusalWithUnknownRollbackOrPartialSubmissionCannotRetry) {
+    for (bool partial : {false, true}) {
+        SCOPED_TRACE(partial);
+        ASSERT_EXIT(
+            {
+                GateAdmissionRunner runner;
+                Attempt attempt(runner, 0, 10030);
+                if (attempt.prepare() != 0) std::_Exit(1);
+                runner.launch_refusal_rc = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+                runner.partial_launch = partial;
+                runner.fail_rollback_fence = !partial;
+                const int rc = simpler_enqueue_run_held(&runner, attempt.storage, nullptr);
+                if (rc == 0 || rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL || rc == PTO_RUNTIME_ERR_UNSUPPORTED)
+                    std::_Exit(2);
+                auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+                auto *prepared =
+                    state->active_execution ? state->active_execution->prepared.get() : state->prepared_execution.get();
+                if (prepared == nullptr || !prepared->execution_gate) std::_Exit(3);
+                if (partial != static_cast<bool>(state->active_execution)) std::_Exit(4);
+                if (control().live_notifies != 2) std::_Exit(5);
+                // Unknown last use is intentionally retained until process exit.
+                std::_Exit(0);
+            },
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+
+TEST_F(NativeAdmissionTest, NeverStartedProofRefusesInvalidIncompleteAndUnacknowledgedRetirement) {
+    diagnostic_path = "native-gated-swimlane-negative";
+    std::filesystem::create_directory(diagnostic_path);
+    for (int failure : {0, 1, 2, 3, 4}) {
+        SCOPED_TRACE(failure);
+        // Unprovable owners deliberately survive. A child process is the
+        // terminal cleanup boundary; no test-only bypass manufactures proof.
+        ASSERT_EXIT(
+            {
+                GateAdmissionRunner runner;
+                runner.start_swimlane();
+                const uint64_t epoch = 10100 + failure;
+                auto &collector = runner.swimlane();
+                if (!collector.run_begin(epoch, diagnostic_path, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false))
+                    std::_Exit(1);
+                const int bank = collector.acquire_run_terminal_bank(epoch);
+                if (bank < 0) std::_Exit(2);
+                Attempt attempt(runner, 0, epoch);
+                attempt.config.enable_chip_swimlane = 1;
+                std::strcpy(attempt.config.output_prefix, diagnostic_path.c_str());
+                if (attempt.prepare() != 0 || simpler_enqueue_run_held(&runner, attempt.storage, nullptr) != 0)
+                    std::_Exit(3);
+                auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+                auto &prepared = *state->active_execution->prepared;
+                prepared.gate_swimlane_admitted = true;
+                prepared.physical_complete = true;
+                const auto decision = failure == 0 ? ExecutionGateDecision::Go : ExecutionGateDecision::Cancel;
+                if (runner.release_execution_gate(prepared.identity, decision) != 0) std::_Exit(4);
+                auto *record = reinterpret_cast<ExecutionGateRecord *>(prepared.execution_gate->device_address());
+                record->aicpu.outcome = record->aic.outcome = record->aiv.outcome = static_cast<uint32_t>(decision);
+                if (failure == 1) record->aicpu.outcome = 0;
+                if (failure == 2) record->header.version = EXECUTION_GATE_VERSION + 1;
+                if (failure == 3) control().stream_sync_rc = -991;
+                if (failure == 4) collector.stop();
+                if (runner.withdraw_gate_cancelled_swimlane(prepared) == 0) std::_Exit(5);
+                if (prepared.gate_swimlane_withdrawn) std::_Exit(6);
+                if (collector.retained_run_stats_for_test().open_slots != 1 ||
+                    collector.run_terminal_bank_of(epoch) != bank)
+                    std::_Exit(7);
+                if (failure == 4) {
+                    const auto stats = collector.retained_run_stats_for_test();
+                    if (!stats.fatal || !stats.release_deferred || stats.quarantined != 1) std::_Exit(8);
+                }
+                if (runner.retire_execution_gate(prepared, true) == 0) std::_Exit(9);
+                std::_Exit(0);
+            },
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+#endif
 
 TEST_F(NativeAdmissionTest, ManualWorkspaceRefusalKeepsRetainedSourceAndSameRequestRecovers) {
     class ManualRunner : public FencedCompletionRunner {
@@ -1805,7 +2083,10 @@ TEST_F(NativeAdmissionTest, RoundedTimeoutContinuesAndPreservesStreamCreationFai
     control().fail_stream_create = 1;
     const uint8_t binary[] = {1};
     EXPECT_EQ(
-        simpler_init(&runner, 0, binary, sizeof(binary), binary, sizeof(binary), nullptr, 0, nullptr, 0, nullptr, 0),
+        simpler_init(
+            &runner, 0, aicpu_executor.data(), aicpu_executor.size(), aicore_executor.data(), aicore_executor.size(),
+            nullptr, 0, nullptr, 0, nullptr, 0
+        ),
         -4242
     );
     EXPECT_EQ(control().stream_create_calls, 1u);
@@ -1824,7 +2105,10 @@ TEST_F(NativeAdmissionTest, RoundedTimeoutContinuesAndPreservesStreamCreationFai
     EXPECT_EQ(control().stream_create_calls, 1u);
     EXPECT_EQ(control().op_timeout_calls, 1u);
     EXPECT_EQ(
-        simpler_init(&runner, 0, binary, sizeof(binary), binary, sizeof(binary), nullptr, 0, nullptr, 0, nullptr, 0),
+        simpler_init(
+            &runner, 0, aicpu_executor.data(), aicpu_executor.size(), aicore_executor.data(), aicore_executor.size(),
+            nullptr, 0, nullptr, 0, nullptr, 0
+        ),
         PTO_RUNTIME_ERR_INVALID_STATE
     );
     EXPECT_EQ(control().op_timeout_calls, 1u);
@@ -1837,7 +2121,10 @@ TEST_F(NativeAdmissionTest, OperatorTimeoutSetterFailureIsPreservedBeforeStreams
     control().fail_stream_create = 1;
     const uint8_t binary[] = {1};
     EXPECT_EQ(
-        simpler_init(&runner, 0, binary, sizeof(binary), binary, sizeof(binary), nullptr, 0, nullptr, 0, nullptr, 0),
+        simpler_init(
+            &runner, 0, aicpu_executor.data(), aicpu_executor.size(), aicore_executor.data(), aicore_executor.size(),
+            nullptr, 0, nullptr, 0, nullptr, 0
+        ),
         -4243
     );
     EXPECT_EQ(control().stream_create_calls, 0u);
@@ -1964,7 +2251,10 @@ TEST_F(NativeAdmissionTest, AutomaticRegistrationDoesNotRetryFailedProgramInitia
     const uint8_t binary[] = {0x01};
     control().fail_stream_create = 1;
     ASSERT_EQ(
-        simpler_init(&runner, 0, binary, sizeof(binary), binary, sizeof(binary), nullptr, 0, nullptr, 0, nullptr, 0),
+        simpler_init(
+            &runner, 0, aicpu_executor.data(), aicpu_executor.size(), aicore_executor.data(), aicore_executor.size(),
+            nullptr, 0, nullptr, 0, nullptr, 0
+        ),
         -4242
     );
     ASSERT_EQ(control().stream_create_calls, 1u);
@@ -4230,7 +4520,10 @@ int initialize_cold_kernel_runner(ColdKernelRunner &runner, uint32_t grant) {
         config.runtime_env.ring_heap[i] = test_heap_capacity();
         config.runtime_env.ring_dep_pool[i] = 4;
     }
-    return simpler_kernel_mode_init(&runner, 0, &binary, 1, &binary, 1, &binary, 1, &config, 1);
+    return simpler_kernel_mode_init(
+        &runner, 0, aicpu_executor.data(), aicpu_executor.size(), aicore_executor.data(), aicore_executor.size(),
+        &binary, 1, &config, 1
+    );
 }
 size_t uploads_to(const void *target) {
     return static_cast<size_t>(std::count_if(control().uploads.begin(), control().uploads.end(), [target](auto &copy) {
@@ -4320,7 +4613,13 @@ TEST_F(NativeAdmissionTest, ProgramRuntimeReservationRemainsLazyUntilPrepare) {
     ColdKernelRunner runner;
     control().loader_start_rc = 0;
     const uint8_t binary = 1;
-    ASSERT_EQ(simpler_init(&runner, 0, &binary, 1, &binary, 1, &binary, 1, nullptr, 0, nullptr, 0), 0);
+    ASSERT_EQ(
+        simpler_init(
+            &runner, 0, aicpu_executor.data(), aicpu_executor.size(), aicore_executor.data(), aicore_executor.size(),
+            &binary, 1, nullptr, 0, nullptr, 0
+        ),
+        0
+    );
     EXPECT_EQ(runner.result_storage().args.runtime_args, nullptr);
     EXPECT_EQ(runner.result_storage().args.runtime_upload_source, nullptr);
     EXPECT_EQ(control().host_allocations, 0u);
@@ -4956,7 +5255,13 @@ TEST_F(NativeAdmissionTest, KernelInitializationPrecreatesFixedResourcesForTheAc
         config.runtime_env.ring_heap[i] = test_heap_capacity();
         config.runtime_env.ring_dep_pool[i] = 4;
     }
-    ASSERT_EQ(simpler_kernel_mode_init(&runner, 0, &binary, 1, &binary, 1, &binary, 1, &config, 1), 0);
+    ASSERT_EQ(
+        simpler_kernel_mode_init(
+            &runner, 0, aicpu_executor.data(), aicpu_executor.size(), aicore_executor.data(), aicore_executor.size(),
+            &binary, 1, &config, 1
+        ),
+        0
+    );
     EXPECT_EQ(control().binary_register_calls, 1u);
     EXPECT_EQ(control().event_create_calls, static_cast<size_t>(KernelEventKind::Count) + 5u * 3u);
     EXPECT_TRUE(runner.set_run_resource_grant(3));
@@ -4991,7 +5296,13 @@ TEST_F(NativeAdmissionTest, FailedFixedResourceCreationKeepsHandlesThroughChecke
         config.runtime_env.ring_heap[i] = test_heap_capacity();
         config.runtime_env.ring_dep_pool[i] = 4;
     }
-    EXPECT_EQ(simpler_kernel_mode_init(&runner, 0, &binary, 1, &binary, 1, &binary, 1, &config, 1), -4210);
+    EXPECT_EQ(
+        simpler_kernel_mode_init(
+            &runner, 0, aicpu_executor.data(), aicpu_executor.size(), aicore_executor.data(), aicore_executor.size(),
+            &binary, 1, &config, 1
+        ),
+        -4210
+    );
     const size_t held = control().live_events;
     EXPECT_EQ(held, static_cast<size_t>(KernelEventKind::Count) + 2u);
     EXPECT_EQ(runner.kernel_execution_state().phase(), KernelContextPhase::Poisoned);
@@ -5198,7 +5509,13 @@ TEST_F(NativeAdmissionTest, ProgramInitializationKeepsContextControlDiscoveryLaz
     install_topology_reply();
     const uint8_t binary = 1;
     control().loader_start_rc = 0;
-    ASSERT_EQ(simpler_init(&runner, 0, &binary, 1, &binary, 1, &binary, 1, nullptr, 0, nullptr, 0), 0);
+    ASSERT_EQ(
+        simpler_init(
+            &runner, 0, aicpu_executor.data(), aicpu_executor.size(), aicore_executor.data(), aicore_executor.size(),
+            &binary, 1, nullptr, 0, nullptr, 0
+        ),
+        0
+    );
     EXPECT_EQ(runner.prepare_arch_calls, 0u);
     EXPECT_EQ(control().ctrl_query_calls, 0u);
     EXPECT_EQ(control().topology_query_calls, 0u);

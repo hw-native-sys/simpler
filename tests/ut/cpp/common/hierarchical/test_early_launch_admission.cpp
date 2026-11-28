@@ -775,3 +775,51 @@ TEST(EarlyLaunchAdmission, PreparationAuthorizationWaitsForEveryEarlierDispatchT
     EXPECT_EQ(h.orch.preparation_ordered_run_id(), second);
     EXPECT_FALSE(h.orch.run_activation_authorized(second));
 }
+
+TEST(EarlyLaunchAdmission, HeldEnqueueRequiresExplicitSuccessFenceAndCompleteSealing) {
+    for (bool requested : {false, true}) {
+        for (bool complete : {false, true}) {
+            EarlyLaunchHarness h(2, 2);
+            EXPECT_THROW(h.orch.begin_run(false, true), std::invalid_argument);
+            const RunId run = h.orch.begin_run(true, requested);
+            h.submit_one(980);
+            EXPECT_TRUE(h.orch.held_enqueue_run_ids().empty());
+            h.orch.seal_run_resources(run, {71}, complete);
+            EXPECT_TRUE(h.orch.held_enqueue_run_ids().empty());
+            h.orch.close_run_submission(run);
+            const std::vector<RunId> expected = requested && complete ? std::vector<RunId>{run} : std::vector<RunId>{};
+            EXPECT_EQ(h.orch.held_enqueue_run_ids(), expected);
+            EXPECT_FALSE(h.orch.run_activation_authorized(run));
+            h.orch.resolve_held_run(run, false);
+            EXPECT_TRUE(h.orch.held_enqueue_run_ids().empty());
+        }
+    }
+}
+
+TEST(EarlyLaunchAdmission, HeldPreparationRequiresNativeAcceptanceOfEveryEarlierParent) {
+    EarlyLaunchHarness h(4, 4);
+    const auto first = h.build_closed_run(981);
+    const RunId second_id = h.orch.begin_run(true, true);
+    const auto second_task = h.submit_one(982);
+    h.orch.seal_run_resources(second_id, {72}, true);
+    h.orch.close_run_submission(second_id);
+    const RunId third_id = h.orch.begin_run(true, true);
+    h.submit_one(983);
+    h.orch.seal_run_resources(third_id, {73}, true);
+    h.orch.close_run_submission(third_id);
+
+    // A dispatched frame may still be waiting for the child to scan its slot.
+    h.allocator.slot_state(first.task.task_slot)->state.store(TaskState::RUNNING, std::memory_order_release);
+    EXPECT_TRUE(h.orch.can_stage_run_on_worker(second_id, 0));
+    EXPECT_TRUE(h.orch.held_enqueue_run_ids().empty());
+    h.accept(first);
+    EXPECT_EQ(h.orch.held_enqueue_run_ids(), std::vector<RunId>({second_id}));
+    EXPECT_EQ(h.orch.preparation_ordered_run_id(), INVALID_RUN_ID);
+    EXPECT_FALSE(h.orch.run_activation_authorized(second_id));
+
+    h.orch.mark_task_accepted(second_task.task_slot);
+    EXPECT_EQ(h.orch.held_enqueue_run_ids(), std::vector<RunId>({second_id, third_id}));
+    EXPECT_FALSE(h.orch.run_activation_authorized(third_id));
+    h.orch.report_task_error(second_task.task_slot, "failed before held enqueue");
+    EXPECT_TRUE(h.orch.held_enqueue_run_ids().empty());
+}

@@ -10,6 +10,7 @@
  */
 
 #include "chip_worker.h"
+#include "common/execution_gate.h"
 #include "call_argument_snapshot.h"
 #include "queued_submission.h"
 #include "native_submission_state.h"
@@ -29,6 +30,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cassert>
@@ -363,6 +365,10 @@ void ChipWorker::init(
         launch_run_on_stream_fn_ = module->optional<CallerStreamLaunchFn>("simpler_launch_run_on_stream");
         submit_run_on_stream_fn_ = module->optional<CallerStreamSubmitFn>("simpler_submit_run_on_stream");
         launch_run_joined_fn_ = module->required<SimplerJoinedLaunchFn>("simpler_launch_run_joined");
+        enqueue_run_held_fn_ = module->required<SimplerJoinedLaunchFn>("simpler_enqueue_run_held");
+        release_execution_gate_fn_ = module->required<ReleaseExecutionGateFn>("simpler_release_execution_gate");
+        supports_execution_gate_fn_ =
+            module->required<SupportsConcurrentNativePrepareFn>("supports_execution_gate_ctx");
         poll_run_fn_ = module->required<SimplerNativeRunFn>("simpler_poll_run");
         query_run_completion_fn_ = module->optional<SimplerNativeRunFn>("simpler_query_run_completion");
         peer_cancel_fn_ = module->optional<decltype(&simpler_bind_peer_cancel)>("simpler_bind_peer_cancel");
@@ -670,22 +676,10 @@ void ChipWorker::init(
             if (set_retain_runs_fn_(device_ctx_, 1) != 0) {
                 throw std::runtime_error("ChipWorker::init: retaining runs across boundaries could not be enabled");
             }
-            // How many runs this Worker could ever have open at once: its own
-            // launch budget and the resource sets this context was actually
-            // granted, never the request and never a host-build constant --
-            // the runtime is loaded, so only it knows its device bound.
-            //
-            // A depth below two asks for nothing: that is L2's shape, whose
-            // launch budget is one, and it keeps the shipped capacity without
-            // being asked about separately. Only a success return records the
-            // grant; absence or refusal leaves this Worker exactly as a module
-            // without the entry leaves it.
-            const uint32_t depth =
-                launch_depth_ < resolved_contract.pipeline_depth ? launch_depth_ : resolved_contract.pipeline_depth;
-            if (depth > simpler::dfx::runs::kMaxOpenEpochs && set_retained_epoch_limit_fn_ != nullptr &&
-                set_retained_epoch_limit_fn_(device_ctx_, static_cast<int32_t>(depth)) == 0) {
-                retained_epoch_limit_granted_ = depth;
-            }
+            // Held submissions use independently granted resources, so their
+            // retention budget is negotiated independently of ordinary joined
+            // launch depth. The collector's own ceiling remains authoritative.
+            negotiate_retained_epoch_capacity(resolved_contract.pipeline_depth);
         }
         // Onboard init installs workspace ownership for both owned and borrowed
         // contexts. A finite limit is staged before either init entry runs.
@@ -1017,6 +1011,9 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     launch_run_on_stream_fn_ = nullptr;
     submit_run_on_stream_fn_ = nullptr;
     launch_run_joined_fn_ = nullptr;
+    enqueue_run_held_fn_ = nullptr;
+    release_execution_gate_fn_ = nullptr;
+    supports_execution_gate_fn_ = nullptr;
     poll_run_fn_ = nullptr;
     query_run_completion_fn_ = nullptr;
     peer_cancel_fn_ = nullptr;
@@ -1277,6 +1274,10 @@ bool ChipWorker::supports_concurrent_native_prepare() const {
            supports_concurrent_native_prepare_fn_(device_ctx_) > 0;
 }
 
+bool ChipWorker::supports_execution_gate() const {
+    return initialized_ && supports_execution_gate_fn_ != nullptr && supports_execution_gate_fn_(device_ctx_) > 0;
+}
+
 bool ChipWorker::supports_joined_native_launch() const {
     return initialized_ && launch_depth_ > 1 && pipeline_contract_.pipeline_depth > 1 &&
            supports_joined_native_launch_fn_(device_ctx_) > 0;
@@ -1367,6 +1368,27 @@ uint64_t ChipWorker::append_joined_comm_spans(std::vector<CallerDeviceSpan> &spa
     for (const auto &item : joined_domain_spans_)
         spans.insert(spans.end(), item.second.begin(), item.second.end());
     return generation;
+}
+
+void ChipWorker::negotiate_retained_epoch_capacity(uint32_t resource_grant) {
+    if (set_retained_epoch_limit_fn_ == nullptr) return;
+    const bool gated = supports_execution_gate_fn_ != nullptr && supports_execution_gate_fn_(device_ctx_) > 0;
+    uint32_t requested = gated ? resource_grant : std::min(launch_depth_, resource_grant);
+    if (requested > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+        throw std::runtime_error("retained epoch resource grant is outside the runtime API range");
+    while (requested > simpler::dfx::runs::kMaxOpenEpochs) {
+        const int rc = set_retained_epoch_limit_fn_(device_ctx_, static_cast<int32_t>(requested));
+        if (rc == 0) {
+            retained_epoch_limit_granted_ = requested;
+            return;
+        }
+        if (rc != PTO_RUNTIME_ERR_UNSUPPORTED)
+            throw std::runtime_error("retained epoch capacity negotiation failed with code " + std::to_string(rc));
+        if (!gated) return;
+        // UNSUPPORTED explicitly guarantees no mutation. Other errors cannot
+        // be treated as an invitation to retry with a different capacity.
+        --requested;
+    }
 }
 
 void ChipWorker::configure_launch_depth(unsigned depth) {
@@ -1473,7 +1495,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                 ++occupied;
                 const bool eager_peer =
                     allow_prepared_successor && entry.permits_prepared_successor &&
-                    (entry.phase == NativeRunPhase::LAUNCHED || entry.phase == NativeRunPhase::REAPED);
+                    (entry.phase == NativeRunPhase::LAUNCHED || entry.phase == NativeRunPhase::ENQUEUED_HELD ||
+                     entry.phase == NativeRunPhase::REAPED);
                 if (!eager_peer) {
                     throw RunPreparationRefused(
                         "prepare_native_run requires an active predecessor before staging a successor " +
@@ -1510,6 +1533,10 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                                              launch_depth_ > 1 ? 1u : 0u,
                                              provenance,
                                              ccu_workspace};
+        {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            native_runs_.at(run_epoch)->gate_descriptor = descriptor;
+        }
         rc = prepare(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
     } catch (...) {
         drop_preparing_native_run(run_epoch);
@@ -1735,15 +1762,21 @@ bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase
     switch (op) {
     case NativeRunOp::BindPeerCancel:
     case NativeRunOp::Launch:
+    case NativeRunOp::HeldEnqueue:
         return phase == NativeRunPhase::PREPARED;
+    case NativeRunOp::HeldClaimPredecessor:
+        return phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::ENQUEUED_HELD;
+    case NativeRunOp::ReleaseGate:
+        return phase == NativeRunPhase::ENQUEUED_HELD;
     case NativeRunOp::Poll:
     case NativeRunOp::WaitCompletion:
     case NativeRunOp::Wait:
         return phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED;
     case NativeRunOp::Finalize:
     case NativeRunOp::QueryCompletion:
-        return phase == NativeRunPhase::PREPARED || phase == NativeRunPhase::LAUNCHED ||
-               phase == NativeRunPhase::REAPED || phase == NativeRunPhase::CALLER_SUBMITTED;
+        return phase == NativeRunPhase::PREPARED || phase == NativeRunPhase::ENQUEUED_HELD ||
+               phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED ||
+               phase == NativeRunPhase::CALLER_SUBMITTED;
     case NativeRunOp::Probe:
         return phase == NativeRunPhase::LAUNCHED;
     case NativeRunOp::Predecessor:
@@ -1760,7 +1793,8 @@ bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase
 ChipWorker::NativeRunLease
 ChipWorker::inspect_native_run_locked(const ChipWorkerNativeRun &run, NativeRunOp op, NativeRunEntry **entry_out) {
     if (((native_runs_closing_ || terminal_reclamation_fenced_) && op != NativeRunOp::QueryCompletion) ||
-        (ccu_admission_closed_ && (op == NativeRunOp::Launch || op == NativeRunOp::ProbeSuccessor)))
+        (ccu_admission_closed_ && (op == NativeRunOp::Launch || op == NativeRunOp::HeldEnqueue ||
+                                   op == NativeRunOp::ReleaseGate || op == NativeRunOp::ProbeSuccessor)))
         return NativeRunLease::Reserved;
     const auto it = native_runs_.find(run.run_epoch);
     if (it == native_runs_.end()) return NativeRunLease::Absent;
@@ -1815,9 +1849,11 @@ ChipWorker::NativeRunLease ChipWorker::acquire_native_run_pair(
         // Both are decided under one hold of the mutex, so neither can change between them, and
         // both leases are taken together or not at all.
         const NativeRunLease own = inspect_native_run_locked(run, op, &entry);
-        const NativeRunLease other = inspect_native_run_locked(
-            predecessor, op == NativeRunOp::ProbeSuccessor ? NativeRunOp::Probe : NativeRunOp::Predecessor, &ahead
-        );
+        const NativeRunOp predecessor_op =
+            op == NativeRunOp::HeldEnqueue ?
+                NativeRunOp::HeldClaimPredecessor :
+                (op == NativeRunOp::ProbeSuccessor ? NativeRunOp::Probe : NativeRunOp::Predecessor);
+        const NativeRunLease other = inspect_native_run_locked(predecessor, predecessor_op, &ahead);
         if (own == NativeRunLease::Busy || other == NativeRunLease::Busy) {
             if (wait == LeaseWait::Immediate) return NativeRunLease::Busy;
             native_run_ops_done_.wait(lk);
@@ -2047,6 +2083,72 @@ bool ChipWorker::launch_native_run_joined(
     return !declined;
 }
 
+bool ChipWorker::enqueue_native_run_held(
+    const ChipWorkerNativeRun &run, const ChipWorkerNativeRun *predecessor, bool *credit_full
+) {
+    if (credit_full != nullptr) *credit_full = false;
+    validate_execution_process();
+    require_ccu_run_admission();
+    if (!supports_execution_gate()) return false;
+    void *storage = nullptr;
+    void *predecessor_storage = nullptr;
+    NativeRunOpLease held;
+    NativeRunOpLease predecessor_held;
+    const auto lease = predecessor != nullptr ?
+                           acquire_native_run_pair(
+                               run, *predecessor, NativeRunOp::HeldEnqueue, &storage, &predecessor_storage, &held,
+                               &predecessor_held, LeaseWait::Block
+                           ) :
+                           acquire_native_run_op(run, NativeRunOp::HeldEnqueue, &storage, nullptr, &held);
+    if (lease == NativeRunLease::Absent || lease == NativeRunLease::Stale) return false;
+    if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "enqueue_native_run_held");
+    validate_execution_context();
+    bool prior_launch_attempted;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        auto &entry = *native_runs_.at(run.run_epoch);
+        prior_launch_attempted = entry.launch_attempted;
+        entry.launch_attempted = true;
+    }
+    // From this point even an exception is a possible submission. Finalization
+    // must ask the backend to cancel and drain, never release a prepared plan.
+    const int rc = enqueue_run_held_fn_(device_ctx_, storage, predecessor_storage);
+    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED || rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL) {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        native_runs_.at(run.run_epoch)->launch_attempted = prior_launch_attempted;
+        if (credit_full != nullptr) *credit_full = rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        return false;
+    }
+    if (rc != 0) {
+        note_native_run_result(run.run_epoch, rc);
+        throw std::runtime_error(
+            "enqueue_native_run_held failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+        );
+    }
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    native_runs_.at(run.run_epoch)->phase = NativeRunPhase::ENQUEUED_HELD;
+    return true;
+}
+
+void ChipWorker::release_native_run_held(const ChipWorkerNativeRun &run) {
+    validate_execution_process();
+    require_ccu_run_admission();
+    NativeRunOpLease held;
+    void *storage = nullptr;
+    const auto lease = acquire_native_run_op(run, NativeRunOp::ReleaseGate, &storage, nullptr, &held);
+    if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "release_native_run_held");
+    validate_execution_context();
+    NativeRunDescriptor descriptor;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        descriptor = native_runs_.at(run.run_epoch)->gate_descriptor;
+    }
+    const int rc =
+        release_execution_gate_fn_(device_ctx_, &descriptor, static_cast<uint32_t>(ExecutionGateDecision::Go));
+    if (rc != 0) throw std::runtime_error("release_native_run_held failed with code " + std::to_string(rc));
+    note_native_run_launched(run.run_epoch);
+}
+
 void ChipWorker::bind_peer_cancel(const ChipWorkerNativeRun &run, const int32_t *request) {
     validate_execution_process();
     void *storage = nullptr;
@@ -2272,6 +2374,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     int persisted_rc = 0;
     bool persisted = false;
     bool result_observed = false;
+    NativeRunDescriptor gate_descriptor{};
     try {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         const auto it = native_runs_.find(run_epoch);
@@ -2280,6 +2383,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         persisted_rc = it->second->pending_rc;
         persisted = it->second->pending_rc_set;
         result_observed = it->second->result_observed;
+        gate_descriptor = it->second->gate_descriptor;
     } catch (...) {
         outcome.captured = std::current_exception();
         clear_finalize_reservation_noexcept(run_epoch);
@@ -2289,6 +2393,22 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
                             (phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED) &&
                             wait_run_fn_ != nullptr;
 
+    bool gate_cancel_requested = false;
+    if (phase == NativeRunPhase::ENQUEUED_HELD) {
+        // HELD is already submitted, but has never received logical execution
+        // authority. Cancel before any blocking drain; the private streams do
+        // not depend on an earlier lane member being released.
+        try {
+            gate_cancel_requested =
+                release_execution_gate_fn_(
+                    device_ctx_, &gate_descriptor, static_cast<uint32_t>(ExecutionGateDecision::Cancel)
+                ) == 0;
+        } catch (...) {
+            // Backend finalization still attempts cancellation and retains the
+            // context if it cannot prove both producer streams have drained.
+        }
+        deliver_outputs = false;
+    }
     bool entered_finalize = false;
     int finalize_rc = 0;
 
@@ -2377,6 +2497,8 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     }
 
     if (threw || outcome.fault != FinalizeFault::None) return outcome;
+    const bool cancelled_and_destroyed = gate_cancel_requested && outcome.context_destroyed;
+    if (cancelled_and_destroyed && finalize_rc == SIMPLER_NATIVE_RUN_CANCELLED) finalize_rc = 0;
     const int rc = finalize_rc != 0 ? finalize_rc : (persisted ? persisted_rc : 0);
     if (rc != 0) {
         outcome.fault = FinalizeFault::Failed;

@@ -495,7 +495,7 @@ inline void bind_worker(nb::module_ &m) {
         .def("_scope_end", &Orchestrator::scope_end)
         .def(
             "_begin_run", &Orchestrator::begin_run, nb::arg("hold_activation") = false,
-            nb::call_guard<nb::gil_scoped_release>()
+            nb::arg("enqueue_before_success") = false, nb::call_guard<nb::gil_scoped_release>()
         )
         .def("_resolve_held_run", &Orchestrator::resolve_held_run, nb::call_guard<nb::gil_scoped_release>())
         .def("_wait_any_run", &Orchestrator::wait_any_run, nb::call_guard<nb::gil_scoped_release>())
@@ -1086,6 +1086,7 @@ inline void bind_worker(nb::module_ &m) {
     entry_offsets["observation_requested"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, observation_requested));
     entry_offsets["peer_cancel_requested"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, peer_cancel_requested));
     entry_offsets["prepare_ordered"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, prepare_ordered));
+    entry_offsets["enqueue_before_success"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, enqueue_before_success));
     m.attr("MAILBOX_RUN_ENTRY_OFFSETS") = entry_offsets;
     nb::dict frame_offsets;
     frame_offsets["entry_index"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_ENTRY_INDEX);

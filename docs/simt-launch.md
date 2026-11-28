@@ -10,7 +10,7 @@ three-program model this builds on, see
 ## The setup
 
 On a5 the registered AICore kernel is a thin **SU dispatcher**:
-`KERNEL_ENTRY(aicore_kernel)` in
+`KERNEL_ENTRY(aicore_kernel_abi2)` in
 [onboard/aicore/kernel.cpp](../src/a5/platform/onboard/aicore/kernel.cpp) is a poll
 loop that calls `aicore_execute`, which jumps into the real per-task kernel
 code. Those per-task kernels — the ones that actually issue `mscatter` and

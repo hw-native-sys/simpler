@@ -2410,6 +2410,83 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle
     return static_cast<DeviceRunnerBase *>(ctx)->can_join_diagnostic_run(*succ, *pred) ? 1 : 0;
 }
 
+int supports_execution_gate_ctx(DeviceContextHandle ctx) {
+    return ctx != nullptr && static_cast<DeviceRunnerBase *>(ctx)->supports_execution_gate() ? 1 : 0;
+}
+
+int simpler_release_execution_gate(DeviceContextHandle ctx, const NativeRunDescriptor *descriptor, uint32_t decision) {
+    if (ctx == nullptr || descriptor == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        const NativeRunIdentity identity{
+            descriptor->run_epoch, descriptor->generation, descriptor->dispatch_id, descriptor->pipeline_slot
+        };
+        return static_cast<DeviceRunnerBase *>(ctx)->release_execution_gate(
+            identity, static_cast<ExecutionGateDecision>(decision)
+        );
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_enqueue_run_held(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor) {
+    auto *state = native_run_context(ctx, runtime, "simpler_enqueue_run_held");
+    if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared ||
+        state->prepared_execution == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!state->runner->supports_execution_gate() || state->caller_prepared ||
+        state->descriptor.ccu_workspace_addr != 0)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    NativeRunJoin claim_join{};
+    if (predecessor != nullptr) {
+        auto *ahead = native_run_context(ctx, predecessor, "simpler_enqueue_run_held");
+        if (ahead == nullptr || ahead == state) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        if (ahead->phase.load(std::memory_order_acquire) != NativeRunPhase::Running || !ahead->runner_claimed)
+            return PTO_RUNTIME_ERR_UNSUPPORTED;
+        auto *ahead_prepared = ahead->active_execution ? ahead->active_execution->prepared.get() : nullptr;
+        if (state->prepared_execution->dfx.diagnostics_any() ||
+            (ahead_prepared != nullptr && ahead_prepared->dfx.diagnostics_any())) {
+            if (ahead_prepared == nullptr ||
+                !state->runner->can_join_diagnostic_run(*state->prepared_execution, *ahead_prepared))
+                return PTO_RUNTIME_ERR_UNSUPPORTED;
+        }
+        claim_join = NativeRunJoin{ahead, ahead->identity()};
+    }
+    const int rc = state->runner->prepare_execution_gate(*state->prepared_execution);
+    if (rc != 0) return rc;
+    // The claim admits independent storage while another owner is live. No
+    // predecessor stream wait is queued: GO carries the complete-parent fence,
+    // and CANCEL must drain even when an earlier held run has not been released.
+    const uint64_t enqueue_begin = STRACE_NOW_NS();
+    const int launch_rc = launch_prepared_run(state, predecessor != nullptr ? &claim_join : nullptr);
+    if (SIMPLER_HOST_STRACE && unified_log_host_span_enabled()) {
+        const char *name = launch_rc == 0 ? "chip.run.gate.held_enqueued" : "chip.run.gate.enqueue_refused";
+        STRACE_HOST_SPAN_AT_A(name, enqueue_begin, STRACE_NOW_NS() - enqueue_begin, 1, state->trace_attrs);
+    }
+    bool rolled_back = false;
+    if (launch_rc != 0 && state->launch_not_started_proven && state->prepared_execution != nullptr &&
+        state->active_execution == nullptr) {
+        const int rollback_rc = state->runner->rollback_unsubmitted_execution_gate(*state->prepared_execution);
+        if (rollback_rc != 0) {
+            state->completion_rc = rollback_rc;
+            state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+            return rollback_rc;
+        }
+        rolled_back = true;
+    }
+    // Only preflight may decline as unsupported. Once the launch transaction
+    // ran, every partial outcome is an error even if a backend used a retry code.
+    if (launch_rc == PTO_RUNTIME_ERR_UNSUPPORTED ||
+        (launch_rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL && !rolled_back))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    return launch_rc;
+}
+
+static bool execution_gate_cancelled(const OnboardNativeRunContext *state) {
+    const auto *prepared =
+        state->active_execution ? state->active_execution->prepared.get() : state->prepared_execution.get();
+    return prepared != nullptr && prepared->execution_gate && prepared->execution_gate->cancelled();
+}
+
 int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run_joined");
     if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
@@ -2500,7 +2577,8 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
 
     if (!state->runner->accepts_new_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
     if (state->prepared_execution == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    state->prepared_execution->join = join != nullptr ? *join : NativeRunJoin{};
+    const bool gated = state->prepared_execution->execution_gate != nullptr;
+    state->prepared_execution->join = !gated && join != nullptr ? *join : NativeRunJoin{};
     if (!state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit, join)) {
         LOG_ERROR("launch_prepared_run: execution claim is occupied (%s)", state->trace_attrs);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -2555,7 +2633,7 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
             // is whether the *completed* enqueue preceded the predecessor's
             // completion; a read taken earlier leaves the window between it and
             // the submission returning, which is exactly the window in doubt.
-            if (rc == 0 && join != nullptr && launch.progress == LaunchProgress::Complete) {
+            if (rc == 0 && !gated && join != nullptr && launch.progress == LaunchProgress::Complete) {
                 emit_joined_launch_span(state->runner->note_joined_launch(*join, state->identity()));
             }
         }
@@ -2621,6 +2699,8 @@ static int retire_completed_native_run(OnboardNativeRunContext *state) {
     const int rc = state->runner->retire_completed_execution(*state->active_execution);
     if (rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return rc;
     note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
+    if (execution_gate_cancelled(state) && state->completion_rc == 0)
+        state->completion_rc = SIMPLER_NATIVE_RUN_CANCELLED;
     if (state->completion_rc == 0) collect_completion_feedback(state);
     const bool pending_outputs =
         state->runtime != nullptr && std::any_of(
@@ -2771,6 +2851,8 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
     if (!drain.physical_complete) quarantine_undrained_run(*state->runner, drain.device_rc);
     if (state->completion_rc == 0) state->completion_rc = drain.combined();
+    if (execution_gate_cancelled(state) && state->completion_rc == 0)
+        state->completion_rc = SIMPLER_NATIVE_RUN_CANCELLED;
     state->result_observed = true;
     state->physical_complete = state->physical_complete || drain.physical_complete;
     if (state->physical_complete) {
@@ -2951,6 +3033,10 @@ static int finalize_native_run(
     }
     auto *prepared =
         state->active_execution ? state->active_execution->prepared.get() : state->prepared_execution.get();
+    if (prepared != nullptr && prepared->execution_gate && prepared->execution_gate->pending()) {
+        const int cancel_rc = state->runner->release_execution_gate(prepared->identity, ExecutionGateDecision::Cancel);
+        if (cancel_rc != 0) return cancel_rc;
+    }
     const bool caller_submitted = state->caller_owns_submission && state->active_execution != nullptr;
     if (caller_submitted && !state->physical_complete) {
         const int rc = state->runner->finish_caller_submission(*state->active_execution);
@@ -2971,6 +3057,11 @@ static int finalize_native_run(
         if (execution_rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE && !state->physical_complete) return execution_rc;
     }
     state->completion_rc = execution_rc;
+    if (execution_rc == SIMPLER_NATIVE_RUN_CANCELLED && execution_gate_cancelled(state) && state->physical_complete) {
+        state->copyback_returned = true;
+        state->failure_reported = true;
+        note_workspace_fact(state, WorkspaceManager::RunFact::CopybackReturned);
+    }
     if (launched && !state->physical_complete) {
         // A cached error is not permission to release a live or unknown reader.
         // Keep the carrier, IO, actual streams and all unresolved cleanup debt.
@@ -2990,7 +3081,7 @@ static int finalize_native_run(
         } else if (attach_rc == 0) {
             if (launched && execution_rc == 0) collect_completion_feedback(state);
             // Error detail comes from the original call-owned record.
-            if (launched && execution_rc != 0) {
+            if (launched && execution_rc != 0 && !execution_gate_cancelled(state)) {
                 (void)state->runner->read_device_run_result(
                     state->descriptor.pipeline_slot, state->descriptor.run_epoch
                 );
@@ -3101,6 +3192,12 @@ static int finalize_native_run(
             resources_rc = PTO_RUNTIME_ERR_INTERNAL;
         }
         if (resources_rc == 0) state->runner_resources_owned = false;
+    }
+    if (resources_rc == 0) {
+        auto *prepared =
+            state->active_execution ? state->active_execution->prepared.get() : state->prepared_execution.get();
+        if (prepared != nullptr)
+            resources_rc = state->runner->retire_execution_gate(*prepared, state->physical_complete);
     }
     if (resources_rc != 0) return validation_rc != 0 ? validation_rc : resources_rc;
 

@@ -38,6 +38,8 @@
 
 #pragma once
 #include "host/aligned_image_storage.h"
+#include "host/executor_binary_abi.h"
+#include "native_execution_gate.h"
 
 #include <runtime/rt.h>
 
@@ -351,6 +353,7 @@ public:
      * per-thread device bind off a borrowed device.
      */
     ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
+    const ExecutionModeLatch &execution_mode_latch() const { return execution_mode_latch_; }
 
     /** True only after simpler_init succeeds and before teardown begins. */
     bool program_initialized() const { return program_initialized_; }
@@ -1093,6 +1096,7 @@ public:
      * `aicore_kernel_binary_`.
      */
     void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
+        simpler::executor_abi::validate(aicpu_so_binary, aicore_kernel_binary);
         aicpu_so_binary_ = std::move(aicpu_so_binary);
         aicore_kernel_binary_ = std::move(aicore_kernel_binary);
     }
@@ -1668,6 +1672,12 @@ public:
             num_aicore(other.num_aicore),
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
+            execution_gate(std::move(other.execution_gate)),
+            gate_original_streams(other.gate_original_streams),
+            gate_original_stream_lifetime(std::move(other.gate_original_stream_lifetime)),
+            gate_streams_replaced(other.gate_streams_replaced),
+            gate_swimlane_admitted(other.gate_swimlane_admitted),
+            gate_swimlane_withdrawn(other.gate_swimlane_withdrawn),
             prepared_resources(std::move(other.prepared_resources)),
             streams(std::exchange(other.streams, RunStreams{})),
             stream_lifetime(std::move(other.stream_lifetime)),
@@ -1706,6 +1716,12 @@ public:
         int num_aicore{0};
         int launch_aicpu_num{0};
         KernelArgsHelper kernel_args{};
+        std::shared_ptr<NativeExecutionGate> execution_gate;
+        RunStreams gate_original_streams{};
+        std::shared_ptr<void> gate_original_stream_lifetime;
+        bool gate_streams_replaced{false};
+        bool gate_swimlane_admitted{false};
+        bool gate_swimlane_withdrawn{false};
         std::shared_ptr<const PreparedRunResources> prepared_resources;
         // Bound before publication under the execution claim, unchanged through
         // retirement. The runner retains its Core stream and the caller owns
@@ -1752,6 +1768,16 @@ public:
         int retirement_diagnostics_rc{0};
         uint32_t scheduler_runtime_mode{0};
     };
+
+    virtual bool supports_execution_gate() const { return false; }
+    virtual int bind_execution_gate(PreparedExecution &) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+    int prepare_execution_gate(PreparedExecution &prepared);
+    int rollback_unsubmitted_execution_gate(PreparedExecution &prepared);
+    bool execution_gate_diagnostics_eligible(const PreparedExecution &prepared) const;
+    int withdraw_gate_cancelled_swimlane(PreparedExecution &prepared);
+    int release_execution_gate(const NativeRunIdentity &identity, ExecutionGateDecision decision);
+    int retire_execution_gate(PreparedExecution &prepared, bool complete);
+    int validate_execution_gate(PreparedExecution &prepared);
 
     virtual int prepare_collector_storage(const Runtime &, PreparedExecution &) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
@@ -3397,6 +3423,10 @@ protected:
     // `finalize()`. A2A3 reserves these for bootstrap/control operations and
     // submits runs on its own per-slot stream sets; A5 submits runs on these.
     // `nullptr` before init.
+    std::mutex execution_gates_mu_;
+    std::unordered_map<uint64_t, std::shared_ptr<NativeExecutionGate>> execution_gates_;
+    std::mutex gate_control_mu_;
+    std::atomic<rtStream_t> gate_control_stream_{nullptr};
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
     // Device-constant AICore MMIO register-address tables: one 8-byte entry per

@@ -53,6 +53,7 @@ struct ChipRunState {
     bool pipeline_leased{true};
     bool activated{false};
     bool prepare_ordered{false};
+    bool held_enqueued{false};
     bool crossed_launch_fence{false};
     bool depth_one_fallback{false};
     // Its prepare asked to wait: the device resources it needs are held by a
@@ -365,7 +366,9 @@ struct ChipRunLaneState {
      */
     bool permits_native_successor(const ChipRunState &predecessor) const {
         if (!worker->supports_concurrent_native_prepare()) return false;
-        if (predecessor.phase != ChipRunState::Phase::LAUNCHED) return false;
+        if (predecessor.phase != ChipRunState::Phase::LAUNCHED &&
+            !(predecessor.phase == ChipRunState::Phase::PREPARED && predecessor.held_enqueued))
+            return false;
         return joinable_shape(predecessor);
     }
 
@@ -690,8 +693,10 @@ struct ChipRunLaneState {
         const uint64_t generation_before = credit_generation();
         try {
             if (cancel_before_launch(run)) return;
-            if (worker->launch_native_run(run->native_run, run->caller_stream) ==
-                ChipWorker::NativeLaunch::DiagnosticCreditFull) {
+            if (run->held_enqueued) {
+                worker->release_native_run_held(run->native_run);
+            } else if (worker->launch_native_run(run->native_run, run->caller_stream) ==
+                       ChipWorker::NativeLaunch::DiagnosticCreditFull) {
                 note_credit_blocked(run, generation_before, /*at_front=*/true);
                 return;
             }
@@ -845,7 +850,7 @@ struct ChipRunLaneState {
         if (predecessor.phase != ChipRunState::Phase::LAUNCHED) return false;
         if (successor.phase != ChipRunState::Phase::PREPARED) return false;
         if (!successor.activated || successor.depth_one_fallback || successor.error != nullptr) return false;
-        if (successor.joined_launch_declined) return false;
+        if (successor.joined_launch_declined || successor.held_enqueued) return false;
         if (!joinable_shape(predecessor) || !joinable_shape(successor)) return false;
         const auto comm_generation = worker->joined_comm_generation();
         if (comm_generation == 0 || predecessor.comm_generation != comm_generation ||
@@ -874,7 +879,9 @@ struct ChipRunLaneState {
      * join the next — which is exactly what `joined_launch_declined` must not
      * be set for: that flag means the backend refused an attempt.
      */
-    bool permits_joined_diagnostic_launch(const ChipRunState &predecessor, const ChipRunState &successor) const {
+    bool permits_joined_diagnostic_launch(
+        const ChipRunState &predecessor, const ChipRunState &successor, bool held_enqueue = false
+    ) const {
         const CallConfig &pred = predecessor.config;
         const CallConfig &succ = successor.config;
         if (pred.enable_chip_swimlane != succ.enable_chip_swimlane) return false;
@@ -882,7 +889,10 @@ struct ChipRunLaneState {
         if (pred.enable_pmu != succ.enable_pmu) return false;
         if (pred.enable_dep_gen != succ.enable_dep_gen) return false;
         if (pred.enable_scope_stats != succ.enable_scope_stats) return false;
-        return worker->supports_joined_diagnostic_launch(successor.native_run, predecessor.native_run);
+        // The held API rechecks actual native configuration, shape, retention
+        // and capacity before arming. Its claim predecessor may itself be HELD;
+        // the ordinary joined diagnostic probe intentionally accepts LAUNCHED only.
+        return held_enqueue || worker->supports_joined_diagnostic_launch(successor.native_run, predecessor.native_run);
     }
 
     /**
@@ -1466,6 +1476,49 @@ void ChipRun::authorize_prepare() {
     // arrives. Normal lane progress retries a resource-blocked preparation.
     lane_->launch_front();
     lane_->prepare_queued_successors();
+}
+
+bool ChipRun::enqueue_held() {
+    if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    lane_->require_usable();
+    lane_->require_reclamation_allowed();
+    if (run_->held_enqueued) return true;
+    if (run_->owner != ChipRunOwner::Lane || run_->activated || !run_->prepare_ordered ||
+        run_->phase != ChipRunState::Phase::PREPARED || run_->caller_stream != nullptr ||
+        run_->config.enable_dump_args != 0 || run_->config.enable_pmu != 0 || run_->config.enable_scope_stats != 0 ||
+        run_->config.enable_dep_gen != 0 || run_->error != nullptr || run_->depth_one_fallback ||
+        !lane_->joinable_shape(*run_) || !lane_->worker->supports_execution_gate())
+        return false;
+    const auto generation = lane_->worker->joined_comm_generation();
+    if (generation == 0 || generation != run_->comm_generation) return false;
+    const auto predecessor = lane_->execution_predecessor(run_);
+    // A queued intermediate run owns the next execution position. Giving this
+    // run the claim tail before that intermediate launches would deadlock it.
+    if (predecessor != nullptr &&
+        ((predecessor->phase != ChipRunState::Phase::LAUNCHED &&
+          !(predecessor->phase == ChipRunState::Phase::PREPARED && predecessor->held_enqueued)) ||
+         !lane_->joinable_shape(*predecessor) || predecessor->comm_generation == 0))
+        return false;
+    if (predecessor != nullptr && (predecessor->config.diagnostics_any() || run_->config.diagnostics_any()) &&
+        !lane_->permits_joined_diagnostic_launch(*predecessor, *run_, true))
+        return false;
+    const uint64_t credit_before = lane_->credit_generation();
+    if (run_->credit_blocked && run_->credit_blocked_generation == credit_before) return false;
+    try {
+        bool credit_full = false;
+        run_->held_enqueued = lane_->worker->enqueue_native_run_held(
+            run_->native_run, predecessor != nullptr ? &predecessor->native_run : nullptr, &credit_full
+        );
+        if (credit_full) lane_->note_credit_blocked(run_, credit_before, /*at_front=*/false);
+        else run_->credit_blocked = false;
+    } catch (...) {
+        lane_->fail_launch(run_);
+        lane_->rethrow_run_error(run_);
+    }
+    if (run_->held_enqueued) lane_->prepare_queued_successors();
+    return run_->held_enqueued;
 }
 
 void ChipRun::activate() {

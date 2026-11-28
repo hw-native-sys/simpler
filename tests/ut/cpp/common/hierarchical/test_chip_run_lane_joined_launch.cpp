@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <new>
 #include <string>
@@ -53,13 +54,13 @@
 namespace {
 
 std::unordered_map<void *, uint32_t> g_slots;
-std::array<bool, 2> g_complete{};
+std::array<bool, 4> g_complete{};
 int g_wait_rc{0};
 int g_completion_rc{0};
-std::array<int, 2> g_launch_rc{};
-std::array<int, 2> g_prepare_rc{};
-std::array<uint64_t, 2> g_prepare_epochs{};
-std::array<bool, 2> g_joinable_boundary_requested{};
+std::array<int, 4> g_launch_rc{};
+std::array<int, 4> g_prepare_rc{};
+std::array<uint64_t, 4> g_prepare_epochs{};
+std::array<bool, 4> g_joinable_boundary_requested{};
 int g_joined_rc{0};
 bool g_joined_throws{false};
 bool g_supports_joined{true};
@@ -1823,4 +1824,370 @@ TEST_F(ChipWorkerDomainOwnersTest, ThrowingBackendReleaseQuarantinesDomain) {
     EXPECT_THROW(worker.comm_release_domain_windows(session, 11, 1, 0), std::runtime_error);
     EXPECT_EQ(g_domain_release_calls, 1);
 }
+
+// The fake gate deliberately refuses to finalize Pending. This catches a
+// cleanup path that tries to drain before publishing CANCEL without a hang.
+std::map<uint32_t, uint32_t> g_gate_decisions;
+std::vector<std::pair<uint32_t, uint32_t>> g_gate_claims;
+int g_gate_enqueue_rc{0};
+int g_gate_cancel_result{SIMPLER_NATIVE_RUN_CANCELLED};
+int enqueue_held(void *, void *runtime, void *predecessor) {
+    const auto slot = slot_of(runtime);
+    g_events.push_back("held" + std::to_string(slot));
+    if (g_gate_enqueue_rc != 0) return g_gate_enqueue_rc;
+    if (predecessor != nullptr) EXPECT_NE(slot, slot_of(predecessor));
+    g_gate_claims.emplace_back(slot, predecessor != nullptr ? slot_of(predecessor) : UINT32_MAX);
+    g_gate_decisions[slot] = 0;
+    return 0;
+}
+int release_gate(void *, const NativeRunDescriptor *descriptor, uint32_t decision) {
+    EXPECT_EQ(descriptor->run_epoch, g_prepare_epochs[descriptor->pipeline_slot]);
+    auto &current = g_gate_decisions.at(descriptor->pipeline_slot);
+    if (current != 0 && current != decision) return PTO_RUNTIME_ERR_INVALID_STATE;
+    current = decision;
+    g_events.push_back((decision == 1 ? "go" : "cancel") + std::to_string(descriptor->pipeline_slot));
+    return 0;
+}
+int finalize_gate(void *ctx, void *runtime, int deliver) {
+    const auto slot = slot_of(runtime);
+    const auto gate = g_gate_decisions.find(slot);
+    if (gate == g_gate_decisions.end()) return finalize_run(ctx, runtime, deliver);
+    g_events.push_back("drain" + std::to_string(slot));
+    if (gate->second == 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (gate->second == 2) {
+        EXPECT_EQ(deliver, 0);
+        return g_gate_cancel_result;
+    }
+    return 0;
+}
+void prime_gate(ChipWorker &worker) {
+    prime_worker(worker);
+    g_gate_decisions.clear();
+    g_gate_claims.clear();
+    g_gate_enqueue_rc = 0;
+    g_gate_cancel_result = SIMPLER_NATIVE_RUN_CANCELLED;
+    worker.supports_execution_gate_fn_ = supports_successor;
+    worker.enqueue_run_held_fn_ = enqueue_held;
+    worker.release_execution_gate_fn_ = release_gate;
+    worker.finalize_run_fn_ = finalize_gate;
+}
+
+TEST(ChipRunLaneGate, ActivationCannotReleaseGoBeforeExecutionFront) {
+    ChipWorker worker;
+    prime_gate(worker);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    second.authorize_prepare();
+    ASSERT_TRUE(second.enqueue_held());
+    EXPECT_FALSE(second.launched());
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    EXPECT_EQ(g_gate_decisions.at(1), 0u);
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    (void)second.done();
+    EXPECT_TRUE(second.launched());
+    EXPECT_EQ(g_gate_decisions.at(1), 1u);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "launch1"), 0);
+    lane.close();
+}
+
+TEST(ChipRunLaneGate, AbandonCancelsAndDrainsWithoutWaitingForPredecessor) {
+    ChipWorker worker;
+    prime_gate(worker);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    second.authorize_prepare();
+    ASSERT_TRUE(second.enqueue_held());
+    EXPECT_NO_THROW(second.abandon());
+    EXPECT_FALSE(g_complete[0]);
+    EXPECT_FALSE(second.launched());
+    EXPECT_FALSE(second.lane_poisoned());
+    EXPECT_LT(
+        std::find(g_events.begin(), g_events.end(), "cancel1"), std::find(g_events.begin(), g_events.end(), "drain1")
+    );
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "go1"), 0);
+    lane.close();
+}
+
+TEST(ChipRunLaneGate, InvalidEntryOutcomeIsNotSwallowedAsCancellation) {
+    ChipWorker worker;
+    prime_gate(worker);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    second.authorize_prepare();
+    ASSERT_TRUE(second.enqueue_held());
+    g_gate_cancel_result = PTO_RUNTIME_ERR_INVALID_STATE;
+    EXPECT_THROW(second.abandon(), std::runtime_error);
+    EXPECT_TRUE(second.lane_poisoned());
+    EXPECT_THROW(lane.close(), std::runtime_error);
+}
+
+TEST(ChipRunLaneGate, UnsupportedEnqueuePreservesOrdinaryPreparedRun) {
+    ChipWorker worker;
+    prime_gate(worker);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    second.authorize_prepare();
+    g_gate_enqueue_rc = PTO_RUNTIME_ERR_UNSUPPORTED;
+    EXPECT_FALSE(second.enqueue_held());
+    second.activate();
+    EXPECT_TRUE(second.launched());
+    EXPECT_TRUE(g_gate_decisions.empty());
+    lane.close();
+}
+
+TEST(ChipRunLaneGate, LaneCloseCancelsUnactivatedHeldRun) {
+    ChipWorker worker;
+    prime_gate(worker);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    second.authorize_prepare();
+    ASSERT_TRUE(second.enqueue_held());
+    EXPECT_NO_THROW(lane.close());
+    EXPECT_EQ(g_gate_decisions.at(1), 2u);
+    EXPECT_FALSE(second.launched());
+}
+
+TEST(ChipRunLaneGate, NewRunResourceSnapshotDoesNotRequirePredecessorToBorrowIt) {
+    ChipWorker worker;
+    prime_gate(worker);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    worker.advance_comm_join_generation();
+    auto second = submit(lane, 102, 1, false, host_args());
+    second.authorize_prepare();
+    ASSERT_TRUE(second.enqueue_held());
+    second.abandon();
+    lane.close();
+}
+
+TEST(ChipRunLaneGate, PendingIntermediateCannotBeSkippedToAcquireExecutionClaim) {
+    ChipWorker worker;
+    prime_gate(worker);
+    worker.pipeline_contract_.pipeline_depth = 3;
+    worker.pipeline_generations_.resize(3);
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto intermediate = submit(lane, 102, 1, false, host_args());
+    auto successor = submit(lane, 103, 2, false, host_args());
+    successor.authorize_prepare();
+    EXPECT_FALSE(successor.enqueue_held());
+    EXPECT_TRUE(g_gate_decisions.empty());
+    successor.activate();
+    EXPECT_FALSE(successor.launched());
+    successor.abandon();
+    intermediate.abandon();
+    lane.close();
+}
+
+TEST(ChipRunLaneGate, SwimlaneOnlyMayBeHeldButOtherDeviceDiagnosticsStayConservative) {
+    for (bool other_diagnostic : {false, true}) {
+        ChipWorker worker;
+        prime_gate(worker);
+        ChipRunLane lane(worker);
+        CallConfig config;
+        config.enable_chip_swimlane = 1;
+        config.enable_pmu = other_diagnostic ? 1 : 0;
+        std::strcpy(config.output_prefix, "gate-lane-swimlane");
+        auto first = submit(lane, 101, 0, true, host_args(), config);
+        auto second = submit(lane, 102, 1, false, host_args(), config);
+        second.authorize_prepare();
+        EXPECT_EQ(second.enqueue_held(), !other_diagnostic);
+        EXPECT_FALSE(second.launched());
+        second.abandon();
+        lane.close();
+    }
+}
+
+TEST(ChipRunLaneGate, HeldCapacityRefusalDoesNotResubmitWithoutNewCredit) {
+    ChipWorker worker;
+    prime_gate(worker);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    second.authorize_prepare();
+    g_gate_enqueue_rc = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+    EXPECT_FALSE(second.enqueue_held());
+    const auto attempts = std::count(g_events.begin(), g_events.end(), "held1");
+    EXPECT_FALSE(second.enqueue_held());
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "held1"), attempts);
+    second.abandon();
+    lane.close();
+}
+
+void grant_gate_slots(ChipWorker &worker, uint32_t slots) {
+    worker.pipeline_contract_.pipeline_depth = slots;
+    worker.pipeline_generations_.resize(slots);
+    while (worker.runtime_bufs_.size() < slots)
+        worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
+}
+
+TEST(ChipRunLaneGate, ThreeHeldSuccessorsUseGrantedSlotsAndGoOnlyAtExecutionFront) {
+    ChipWorker worker;
+    prime_gate(worker);
+    grant_gate_slots(worker, 4);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    auto third = submit(lane, 103, 2, false, host_args());
+    auto fourth = submit(lane, 104, 3, false, host_args());
+    second.authorize_prepare();
+    ASSERT_TRUE(second.enqueue_held());
+    EXPECT_EQ(third.preparation_disposition(), ChipRunPreparationDisposition::NATIVE_PREPARED);
+    third.authorize_prepare();
+    ASSERT_TRUE(third.enqueue_held());
+    EXPECT_EQ(fourth.preparation_disposition(), ChipRunPreparationDisposition::NATIVE_PREPARED);
+    fourth.authorize_prepare();
+    ASSERT_TRUE(fourth.enqueue_held());
+    EXPECT_EQ(g_gate_claims, (std::vector<std::pair<uint32_t, uint32_t>>{{1, 0}, {2, 1}, {3, 2}}));
+    third.activate();
+    fourth.activate();
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    EXPECT_FALSE(third.launched());
+    EXPECT_FALSE(fourth.launched());
+    g_complete[0] = true;
+    ASSERT_TRUE(first.done());
+    EXPECT_TRUE(second.launched());
+    EXPECT_FALSE(third.launched());
+    g_complete[1] = true;
+    ASSERT_TRUE(second.done());
+    EXPECT_TRUE(third.launched());
+    EXPECT_FALSE(fourth.launched());
+    g_complete[2] = true;
+    ASSERT_TRUE(third.done());
+    EXPECT_TRUE(fourth.launched());
+    lane.close();
+}
+
+TEST(ChipRunLaneGate, ReverseCancellationDrainsIndependentHeldRunsAndRestoresClaimTail) {
+    ChipWorker worker;
+    prime_gate(worker);
+    grant_gate_slots(worker, 3);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    auto third = submit(lane, 103, 2, false, host_args());
+    second.authorize_prepare();
+    ASSERT_TRUE(second.enqueue_held());
+    third.authorize_prepare();
+    ASSERT_TRUE(third.enqueue_held());
+    EXPECT_THROW(submit(lane, 104, 1, false, host_args()), RunPreparationRefused);
+    EXPECT_EQ(g_gate_claims.size(), 2u);
+    third.abandon();
+    EXPECT_FALSE(g_complete[0]);
+    EXPECT_EQ(g_gate_decisions.at(1), 0u);
+    second.abandon();
+    auto later = submit(lane, 105, 1, false, host_args());
+    later.authorize_prepare();
+    ASSERT_TRUE(later.enqueue_held());
+    EXPECT_EQ(g_gate_claims.back(), (std::pair<uint32_t, uint32_t>{1, 0}));
+    later.abandon();
+    lane.close();
+}
+
+TEST(ChipRunLaneGate, HeldClaimPermissionDoesNotBroadenOrdinaryJoinedOrProbeOperations) {
+    using Op = ChipWorker::NativeRunOp;
+    using Phase = ChipWorker::NativeRunPhase;
+    EXPECT_TRUE(ChipWorker::native_run_op_admits_phase(Op::HeldClaimPredecessor, Phase::ENQUEUED_HELD));
+    EXPECT_TRUE(ChipWorker::native_run_op_admits_phase(Op::HeldClaimPredecessor, Phase::LAUNCHED));
+    EXPECT_FALSE(ChipWorker::native_run_op_admits_phase(Op::HeldClaimPredecessor, Phase::PREPARED));
+    EXPECT_FALSE(ChipWorker::native_run_op_admits_phase(Op::Predecessor, Phase::ENQUEUED_HELD));
+    EXPECT_FALSE(ChipWorker::native_run_op_admits_phase(Op::Probe, Phase::ENQUEUED_HELD));
+}
+
+TEST(ChipRunLaneGate, CapacityRefusalOfThirdRunLeavesHeldPredecessorAndRetriesOnCredit) {
+    uint64_t credit = 1;
+    ChipWorker worker;
+    prime_gate(worker);
+    grant_gate_slots(worker, 3);
+    struct ResetContext {
+        ChipWorker &worker;
+        ~ResetContext() { worker.device_ctx_ = nullptr; }
+    } reset_context{worker};
+    worker.device_ctx_ = &credit;
+    worker.credit_generation_fn_ = [](void *ctx) {
+        return *static_cast<uint64_t *>(ctx);
+    };
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    auto third = submit(lane, 103, 2, false, host_args());
+    second.authorize_prepare();
+    ASSERT_TRUE(second.enqueue_held());
+    third.authorize_prepare();
+    g_gate_enqueue_rc = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+    EXPECT_FALSE(third.enqueue_held());
+    EXPECT_EQ(g_gate_decisions.at(1), 0u);
+    EXPECT_EQ(g_gate_claims.size(), 1u);
+    g_gate_enqueue_rc = 0;
+    EXPECT_FALSE(third.enqueue_held());
+    ++credit;
+    ASSERT_TRUE(third.enqueue_held());
+    EXPECT_EQ(g_gate_claims.back(), (std::pair<uint32_t, uint32_t>{2, 1}));
+    third.abandon();
+    second.abandon();
+    lane.close();
+    worker.device_ctx_ = nullptr;
+}
+
+TEST(ChipRunLaneGate, LateFailureOfActiveFrontCancelsWholeHeldChain) {
+    ChipWorker worker;
+    prime_gate(worker);
+    grant_gate_slots(worker, 3);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0, true, host_args());
+    auto second = submit(lane, 102, 1, false, host_args());
+    auto third = submit(lane, 103, 2, false, host_args());
+    second.authorize_prepare();
+    ASSERT_TRUE(second.enqueue_held());
+    third.authorize_prepare();
+    ASSERT_TRUE(third.enqueue_held());
+    g_wait_rc = -992;
+    EXPECT_THROW(first.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    EXPECT_EQ(g_gate_decisions.at(1), 2u);
+    EXPECT_EQ(g_gate_decisions.at(2), 2u);
+    EXPECT_FALSE(second.launched());
+    EXPECT_FALSE(third.launched());
+}
+
+std::vector<int32_t> g_retained_requests;
+int g_retained_error{0};
+int grant_retained_capacity(void *, int32_t request) {
+    g_retained_requests.push_back(request);
+    if (g_retained_error != 0) return g_retained_error;
+    return request <= 3 ? 0 : PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+TEST(ChipRunLaneGate, RetainedCapacityFollowsActualGrantAndBackendCeiling) {
+    ChipWorker worker;
+    prime_gate(worker);
+    worker.set_retained_epoch_limit_fn_ = grant_retained_capacity;
+    g_retained_requests.clear();
+    g_retained_error = 0;
+    worker.negotiate_retained_epoch_capacity(6);
+    EXPECT_EQ(g_retained_requests, (std::vector<int32_t>{6, 5, 4, 3}));
+    EXPECT_EQ(worker.retained_epoch_limit_granted_, 3u);
+    EXPECT_EQ(worker.launch_depth_, 2u);
+}
+TEST(ChipRunLaneGate, RetainedCapacityErrorIsNotMisreportedAsAResourceLimit) {
+    ChipWorker worker;
+    prime_gate(worker);
+    worker.set_retained_epoch_limit_fn_ = grant_retained_capacity;
+    g_retained_requests.clear();
+    g_retained_error = PTO_RUNTIME_ERR_INTERNAL;
+    const auto before = worker.retained_epoch_limit_granted_;
+    EXPECT_THROW(worker.negotiate_retained_epoch_capacity(6), std::runtime_error);
+    EXPECT_EQ(g_retained_requests, (std::vector<int32_t>{6}));
+    EXPECT_EQ(worker.retained_epoch_limit_granted_, before);
+    g_retained_error = 0;
+}
+
 }  // namespace

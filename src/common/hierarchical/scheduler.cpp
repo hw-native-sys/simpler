@@ -568,6 +568,10 @@ void Scheduler::dispatch_preparable_next_level_singles() {
         const RunId ordered = cfg_.preparation_ordered_run_cb();
         if (ordered != INVALID_RUN_ID) cfg_.manager->authorize_preparation(ordered);
     }
+    if (cfg_.held_enqueue_runs_cb) {
+        for (RunId id : cfg_.held_enqueue_runs_cb())
+            cfg_.manager->authorize_held_enqueue(id);
+    }
 }
 
 void Scheduler::stage_preparable_run(RunId run_id) {

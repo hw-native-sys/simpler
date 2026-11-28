@@ -1708,6 +1708,12 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle) { return 0; }
 // ABI stays uniform across platforms rather than resolving per backend.
 int supports_joined_native_launch_ctx(DeviceContextHandle) { return 0; }
 
+int supports_execution_gate_ctx(DeviceContextHandle) { return 0; }
+int simpler_enqueue_run_held(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+int simpler_release_execution_gate(DeviceContextHandle, const NativeRunDescriptor *, uint32_t) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 // Simulation orders nothing behind anything, so the diagnostic variant
 // answers the same refusal its non-diagnostic sibling does.
 int supports_joined_diagnostic_launch_ctx(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return 0; }

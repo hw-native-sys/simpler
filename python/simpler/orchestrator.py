@@ -1031,8 +1031,8 @@ class Orchestrator:
     def _scope_end(self) -> None:
         self._o._scope_end()
 
-    def _begin_run(self, hold_activation: bool = False) -> int:
-        return int(self._o._begin_run(hold_activation))
+    def _begin_run(self, hold_activation: bool = False, enqueue_before_success: bool = False) -> int:
+        return int(self._o._begin_run(hold_activation, enqueue_before_success))
 
     def _resolve_held_run(self, run_id: int, success: bool) -> None:
         self._o._resolve_held_run(run_id, success)

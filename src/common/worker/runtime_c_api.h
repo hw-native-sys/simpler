@@ -137,6 +137,9 @@ enum {
     SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE = PTO_RUNTIME_ERR_BASE - 8,
     /* Host register/unregister succeeded, but restoring the caller context failed. */
     SIMPLER_HOST_DDR_CONTEXT_RESTORE_FAILED = PTO_RUNTIME_ERR_BASE - 9,
+    /* A held execution was cancelled and its submitted streams completed
+       without user execution. This is not a successful model result. */
+    SIMPLER_NATIVE_RUN_CANCELLED = PTO_RUNTIME_ERR_BASE - 10,
 };
 
 /**
@@ -1283,6 +1286,27 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle
  * same meaning it has for simpler_launch_run().
  */
 int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor);
+
+/** Nonzero only when this backend provides held device enqueue and release. */
+int supports_execution_gate_ctx(DeviceContextHandle ctx);
+
+/**
+ * Enqueue a prepared run behind an optional local predecessor and an unreleased
+ * execution gate. Success acknowledges device submission, not authorization to
+ * execute. Unsupported leaves the run prepared with no device work submitted.
+ * Other failures retain the ordinary partial-launch reclamation obligations.
+ */
+int simpler_enqueue_run_held(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor);
+
+/**
+ * Publish an immutable terminal gate decision: 1 permits execution, 2 cancels.
+ * The descriptor's slot, generation, dispatch id and run epoch must identify
+ * the registered gate exactly. The entry uses a separate release stream and
+ * does not wait for native execution or take the run-lane mutex. Success only
+ * acknowledges release submission; resource retirement still requires physical
+ * completion of every possibly submitted stream and release operation.
+ */
+int simpler_release_execution_gate(DeviceContextHandle ctx, const NativeRunDescriptor *descriptor, uint32_t decision);
 
 /**
  * Nonblocking own-execution completion query after launch. Returns POLL_*.

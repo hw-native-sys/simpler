@@ -617,7 +617,7 @@ device_worker_main(device_id)
               dispatcher writes <hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
             LoadAicpuOp::Init()
               rtsBinaryLoadFromFile()
-              rtsFuncGetByName(simpler_aicpu_exec, ...)
+              rtsFuncGetByName(simpler_aicpu_exec_abi2, ...)
             init CANN runtime-launch compatibility payload
 
     for each callable:

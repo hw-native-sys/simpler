@@ -74,7 +74,7 @@ enum class GraphSectionSource : uint32_t {
  * that alignment, but keeping the source's offset aligned too means the two
  * agree whenever the launch base does.
  */
-inline constexpr size_t LAUNCH_ENVELOPE_HEADER_BYTES = 192;
+inline constexpr size_t LAUNCH_ENVELOPE_HEADER_BYTES = 256;
 
 // Byte ranges in the RTS-owned launch packet. Offsets are relative to KernelArgs.
 struct LaunchImageSection {

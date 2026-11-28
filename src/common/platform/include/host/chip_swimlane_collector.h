@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include "host/producer_never_started.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1924,6 +1925,9 @@ public:
      * writer's service nor replace the failure that brought the caller here.
      */
     bool abandon_run(uint64_t run_epoch);
+    // Submitted platform wrappers may withdraw only with native proof that
+    // immutable CANCEL prevented every producer from entering.
+    bool withdraw_never_started_run(uint64_t run_epoch, const ProducerNeverStartedProof &proof);
 
     /**
      * Stop admitting runs and publish every retained run up to that point.
@@ -1991,6 +1995,7 @@ public:
     RetainedRunStats retained_run_stats_for_test() const;
 
 private:
+    bool withdraw_admitted_run(uint64_t run_epoch, bool require_admission);
     /**
      * Take one unused `swimlane-<k>` under `output_root`, by exclusive creation.
      *

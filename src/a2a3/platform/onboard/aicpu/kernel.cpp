@@ -17,6 +17,7 @@
 
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
+#include "common/execution_gate.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_entry_args.h"
 #include "aicpu/runtime_launch_view.h"
@@ -145,9 +146,29 @@ static int execute_platform_task(void *arg, Runtime *runtime) {
     return rc;
 }
 
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+static ExecutionGateOutcome enter_execution_gate(const KernelArgs &args) {
+    if (args.execution_gate_address == 0) {
+        return args.execution_gate_identity == 0 && args.execution_gate_generation == 0 ? ExecutionGateOutcome::Go :
+                                                                                          ExecutionGateOutcome::Invalid;
+    }
+    if (args.execution_gate_address % alignof(ExecutionGateRecord) != 0) return ExecutionGateOutcome::Invalid;
+    auto *gate = reinterpret_cast<ExecutionGateRecord *>(args.execution_gate_address);
+    cache_invalidate_range(&gate->header, sizeof(gate->header));
+    const auto outcome = execution_gate_outcome(
+        gate->header.version, gate->header.decision, gate->header.identity, gate->header.generation,
+        args.execution_gate_identity, args.execution_gate_generation
+    );
+    __atomic_store_n(&gate->aicpu.outcome, static_cast<uint32_t>(outcome), __ATOMIC_RELEASE);
+    cache_flush_range(&gate->aicpu, sizeof(gate->aicpu));
+    return outcome;
+}
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec_abi2(void *arg) {
     if (arg == nullptr) return -1;
     auto *args = static_cast<KernelArgs *>(arg);
+    const auto gate = enter_execution_gate(*args);
+    if (gate == ExecutionGateOutcome::Cancel) return 0;
+    if (gate != ExecutionGateOutcome::Go) return -1;
     RuntimeLaunchView runtime_view;
     auto *runtime = runtime_view.bind(*args);
     if (runtime == nullptr) return -1;

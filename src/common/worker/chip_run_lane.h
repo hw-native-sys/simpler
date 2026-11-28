@@ -47,6 +47,8 @@ public:
     void activate();
     // Parent proof that no earlier dispatch can arrive; never grants execution.
     void authorize_prepare();
+    // Explicit parent request after resource sealing; never grants execution.
+    bool enqueue_held();
     void abandon();
     // Release a caller-owned submission after its last possible execution.
     // Keep the handle for a checked retry if finalization fails.

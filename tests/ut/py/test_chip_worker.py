@@ -681,6 +681,20 @@ def kernel_symbol_runtime(tmp_path_factory):
                 """)
                 )
 
+        gate_stubs = {
+            "supports_execution_gate_ctx": "int supports_execution_gate_ctx(DeviceContextHandle) { return 0; }",
+            "simpler_enqueue_run_held": (
+                "int simpler_enqueue_run_held(DeviceContextHandle, RuntimeHandle, RuntimeHandle) "
+                "{ return PTO_RUNTIME_ERR_UNSUPPORTED; }"
+            ),
+            "simpler_release_execution_gate": (
+                "int simpler_release_execution_gate(DeviceContextHandle, const NativeRunDescriptor *, uint32_t) "
+                "{ return PTO_RUNTIME_ERR_UNSUPPORTED; }"
+            ),
+        }
+        with source.open("a", encoding="utf-8") as output:
+            output.write("\n".join(code for name, code in gate_stubs.items() if name not in missing) + "\n")
+
         # These symbols are only resolved during init; any invocation is a test failure.
         # A separate TU keeps the sentinels independent of the C ABI parameter lists.
         sentinels.write_text(
@@ -975,6 +989,9 @@ class TestChipWorkerKernelSymbols:
         "missing",
         (
             *_KERNEL_LIFECYCLE_SYMBOLS,
+            "supports_execution_gate_ctx",
+            "simpler_enqueue_run_held",
+            "simpler_release_execution_gate",
             "simpler_kernel_mode_supported",
             "simpler_execution_environment_releasable_ctx",
             "simpler_get_init_error_ctx",
@@ -1171,6 +1188,11 @@ class TestWorkerNativeChip:
             for node in frame_loop.body
             if isinstance(node, ast.FunctionDef) and node.name == "activate_pending_runs"
         )
+        held_enqueue = next(
+            node
+            for node in frame_loop.body
+            if isinstance(node, ast.FunctionDef) and node.name == "enqueue_held_if_authorized"
+        )
         discard = next(
             node
             for node in ast.walk(tree)
@@ -1205,6 +1227,7 @@ class TestWorkerNativeChip:
             entry_buf=b"b",
             activated=False,
             native_activated=False,
+            enqueued_held=False,
             prepare_ordered=False,
             ccu_binding=None,
             chip_run=b_run,
@@ -1241,7 +1264,7 @@ class TestWorkerNativeChip:
         wrapper = ast.FunctionDef(
             name="exercise",
             args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
-            body=[ast.parse('shutdown_message = ""').body[0], discard, activation, observation],
+            body=[ast.parse('shutdown_message = ""').body[0], discard, held_enqueue, activation, observation],
             decorator_list=[],
         )
 
@@ -1270,6 +1293,7 @@ class TestWorkerNativeChip:
                 for name in (
                     "_ACTIVATE",
                     "_CANCEL_STAGED",
+                    "_FRAME_STAGED",
                     "_OFF_ENTRY_STATE",
                     "_OFF_ENTRY_PREPARE_ORDERED",
                     "_OFF_ENTRY_OBSERVATION_REQUESTED",

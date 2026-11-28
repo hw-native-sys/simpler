@@ -143,7 +143,9 @@ void Orchestrator::set_comm_execution_fence(uint64_t allocation_id, bool enabled
     if (wake && ready_notify_cb_) ready_notify_cb_();
 }
 
-RunId Orchestrator::begin_run(bool hold_activation) {
+RunId Orchestrator::begin_run(bool hold_activation, bool enqueue_before_success) {
+    if (enqueue_before_success && !hold_activation)
+        throw std::invalid_argument("held enqueue requires an external complete-success activation fence");
     RunId run_id = INVALID_RUN_ID;
     {
         std::unique_lock<std::mutex> lk(runs_mu_);
@@ -178,6 +180,7 @@ RunId Orchestrator::begin_run(bool hold_activation) {
             // Generation zero is the reserved "no slot held" lease encoding.
             auto run = std::make_shared<RunState>(run_id, PipelineSlotLease{});
             run->activation_held = hold_activation;
+            run->enqueue_before_success = enqueue_before_success;
             bool inserted = runs_.emplace(run_id, run).second;
             if (!inserted) throw std::logic_error("Orchestrator::begin_run: duplicate run id");
             map_published = true;
@@ -790,6 +793,28 @@ bool Orchestrator::refresh_early_launch_locked() {
     // every transition would otherwise wake the scheduler for nothing, and a
     // prefix that only shrank as its head retired authorizes nobody new.
     return newly_authorized;
+}
+
+std::vector<RunId> Orchestrator::held_enqueue_run_ids() const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    std::vector<RunId> result;
+    for (RunId id : run_fifo_) {
+        const auto found = runs_.find(id);
+        if (found == runs_.end()) break;
+        const auto &run = *found->second;
+        {
+            std::lock_guard<std::mutex> run_lk(run.completion_mu);
+            if (run.first_error || run.submission_failed) break;
+        }
+        if (run.activation_held && run.enqueue_before_success && run.resource_sealed && run.resources_complete &&
+            run.phase.load(std::memory_order_acquire) == RunPhase::PREPARED && run_resources_.owns(run.lease))
+            result.push_back(id);
+        // Publication and frame consumption precede insertion into the child
+        // native FIFO. Only native acceptance closes that arrival race for
+        // the next held run's preparation and enqueue authorization.
+        if (!all_dispatches_accepted(found->second)) break;
+    }
+    return result;
 }
 
 RunId Orchestrator::early_launch_run_id() const {

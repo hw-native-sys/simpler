@@ -76,6 +76,12 @@ struct Control {
     std::function<int(void *, void *, size_t, const std::string &)> aicpu_payload;
     std::vector<std::vector<unsigned char>> aicpu_argument_copies;
     size_t binary_register_calls{0};
+    size_t notify_create_calls{0};
+    size_t fail_notify_create{0};
+    size_t live_notifies{0};
+    size_t notify_record_calls{0};
+    size_t notify_wait_calls{0};
+    int notify_record_rc{0};
     size_t event_create_calls{0};
     size_t event_destroy_calls{0};
     size_t live_events{0};
@@ -84,6 +90,7 @@ struct Control {
     int capture_info_rc{0};
     bool recording_invalidated{false};
     size_t stream_create_calls{0};
+    size_t stream_destroy_calls{0};
     size_t fail_stream_create{0};
     size_t d2h_calls{0};
     size_t d2h_bytes{0};

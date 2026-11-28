@@ -155,7 +155,7 @@ public:
     SubmitResult submit_sub_group(const CallableIdentity &callable, const std::vector<TaskArgs> &args_list);
 
     // Only the calling orchestration thread builds a run at a time.
-    RunId begin_run(bool hold_activation = false);
+    RunId begin_run(bool hold_activation = false, bool enqueue_before_success = false);
     // Resolve an explicitly requested predecessor-success dependency. Failure
     // cancels staged descriptors before their native launch or output delivery.
     void resolve_held_run(RunId run_id, bool success);
@@ -281,6 +281,7 @@ public:
     std::vector<RunId> preparable_run_ids() const;
     // Only the FIFO head has proof that no earlier dispatch can still arrive.
     RunId preparation_ordered_run_id() const;
+    std::vector<RunId> held_enqueue_run_ids() const;
 
     // Scheduler-only: staging must follow every earlier run's publication on
     // this endpoint, including its dependency-blocked singles and groups.

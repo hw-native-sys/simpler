@@ -14,8 +14,13 @@
 using aclError = int;
 using aclrtStream = void *;
 using aclrtEvent = void *;
+using aclrtNotify = void *;
 using aclmdlRI = void *;
 constexpr int ACL_SUCCESS = 0;
+constexpr uint64_t ACL_NOTIFY_DEFAULT = 0;
+constexpr int ACL_MEM_MALLOC_NORMAL_ONLY = 0;
+constexpr int ACL_MEMCPY_HOST_TO_DEVICE = 1;
+constexpr int ACL_MEMCPY_DEVICE_TO_HOST = 2;
 constexpr int ACL_HBM_MEM = 0;
 constexpr int ACL_ERROR_NONE = 0;
 constexpr int ACL_ERROR_RT_MEMORY_ALLOCATION = 207001;
@@ -39,6 +44,17 @@ enum aclmdlRICaptureMode {
 extern "C" {
 const char *aclGetRecentErrMsg();
 int aclFinalize();
+int aclrtCreateStream(aclrtStream *);
+int aclrtDestroyStream(aclrtStream);
+int aclrtCreateNotify(aclrtNotify *, uint64_t);
+int aclrtDestroyNotify(aclrtNotify);
+int aclrtRecordNotify(aclrtNotify, aclrtStream);
+int aclrtWaitAndResetNotify(aclrtNotify, aclrtStream, uint32_t);
+int aclrtMalloc(void **, size_t, int);
+int aclrtFree(void *);
+int aclrtMallocHost(void **, size_t);
+int aclrtFreeHost(void *);
+int aclrtMemcpyAsync(void *, size_t, const void *, size_t, int, aclrtStream);
 int aclrtGetMemInfo(int, size_t *, size_t *);
 int aclrtCreateEventExWithFlag(aclrtEvent *, uint32_t);
 int aclrtDestroyEvent(aclrtEvent);

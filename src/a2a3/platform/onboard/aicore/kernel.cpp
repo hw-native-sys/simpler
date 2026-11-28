@@ -15,6 +15,7 @@
 #include "aicore/aicore_profiling_state.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
+#include "common/execution_gate.h"
 #include "common/aicore_runtime_packet.h"
 #include "common/chip_swimlane_profiling.h"
 
@@ -72,6 +73,34 @@ __attribute__((weak)) __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlan
 
 extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 
+__aicore__ static inline ExecutionGateOutcome
+enter_execution_gate(uint64_t address, uint64_t identity, uint64_t generation) {
+    if (address == 0) {
+        return identity == 0 && generation == 0 ? ExecutionGateOutcome::Go : ExecutionGateOutcome::Invalid;
+    }
+    if (address % alignof(ExecutionGateRecord) != 0) return ExecutionGateOutcome::Invalid;
+    auto *gate = reinterpret_cast<__gm__ ExecutionGateRecord *>(address);
+    dcci(&gate->header, SINGLE_CACHE_LINE);
+    dsb(DSB_DDR);
+    const auto outcome = execution_gate_outcome(
+        gate->header.version, gate->header.decision, gate->header.identity, gate->header.generation, identity,
+        generation
+    );
+#ifdef __DAV_VEC__
+    const bool reporter = get_block_idx() == 0 && get_subblockid() == 0;
+    auto *status = &gate->aiv;
+#else
+    const bool reporter = get_block_idx() == 0;
+    auto *status = &gate->aic;
+#endif
+    if (reporter) {
+        status->outcome = static_cast<uint32_t>(outcome);
+        dcci(status, SINGLE_CACHE_LINE, CACHELINE_OUT);
+        dsb(DSB_DDR);
+    }
+    return outcome;
+}
+
 /**
  * Kernel entry point with control loop
  *
@@ -85,8 +114,9 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  *
  * Each core (AIC or AIV) gets its own handshake buffer indexed by block_idx.
  * Every value this entry needs arrives in the launch parameter block, so the
- * per-core state below is published before the executor runs and without any
- * GM read. The host builds that block after collector arming, which is what
+ * per-core state below is published before the executor runs. An enabled
+ * execution gate is checked before any per-core state changes.
+ * The host builds that block after collector arming, which is what
  * makes these addresses this run's final ones.
  *
  * @param runtime_args Device Runtime address, or zero for the inline descriptor
@@ -96,11 +126,19 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  *        uint64_t[num_aicore] table of per-core active-head slots, or 0
  * @param report_epoch This run's handshake report identity; 0 selects the
  *        pre-existing kernel/persistent report protocol
+ * @param execution_gate_address Per-run execution record, or zero for an ordinary launch
+ * @param execution_gate_identity Expected native invocation identity
+ * @param execution_gate_generation Expected lease generation
  */
-extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
+extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel_abi2)(
     uint64_t runtime_args, uint32_t enable_profiling_flag, uint64_t ffts_base_addr,
-    uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch
+    uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch, uint64_t execution_gate_address,
+    uint64_t execution_gate_identity, uint64_t execution_gate_generation
 ) {
+    if (enter_execution_gate(execution_gate_address, execution_gate_identity, execution_gate_generation) !=
+        ExecutionGateOutcome::Go) {
+        return;
+    }
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();

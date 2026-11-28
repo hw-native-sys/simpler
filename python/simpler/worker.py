@@ -421,7 +421,7 @@ _DISPOSITION_NONE = 0
 _VALIDATED_ONLY = 1
 _NATIVE_PREPARED = 2
 _TASK_ACCEPTED = 1
-_TASK_PROTOCOL_VERSION = 7
+_TASK_PROTOCOL_VERSION = 8
 
 # A request frame's own header: which run-state entry this payload belongs to,
 # that entry's generation, and this frame's generation — which the child echoes
@@ -457,7 +457,8 @@ _OFF_ENTRY_ADMISSIBLE_SETS = _OFF_ENTRY_ERROR_TEXT + MAILBOX_ERROR_MSG_SIZE
 _OFF_ENTRY_OBSERVATION_REQUESTED = _OFF_ENTRY_ADMISSIBLE_SETS + 4
 _OFF_ENTRY_PEER_CANCEL_REQUESTED = _OFF_ENTRY_OBSERVATION_REQUESTED + 4
 _OFF_ENTRY_PREPARE_ORDERED = _OFF_ENTRY_PEER_CANCEL_REQUESTED + 4
-_ENTRY_BYTES = _OFF_ENTRY_PREPARE_ORDERED + 4
+_OFF_ENTRY_ENQUEUE_BEFORE_SUCCESS = _OFF_ENTRY_PREPARE_ORDERED + 4
+_ENTRY_BYTES = _OFF_ENTRY_ENQUEUE_BEFORE_SUCCESS + 4
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
@@ -610,6 +611,10 @@ def _assert_mailbox_wire_constants() -> None:
             MAILBOX_RUN_ENTRY_OFFSETS["peer_cancel_requested"],
         ),
         "entry.prepare_ordered": (_OFF_ENTRY_PREPARE_ORDERED, MAILBOX_RUN_ENTRY_OFFSETS["prepare_ordered"]),
+        "entry.enqueue_before_success": (
+            _OFF_ENTRY_ENQUEUE_BEFORE_SUCCESS,
+            MAILBOX_RUN_ENTRY_OFFSETS["enqueue_before_success"],
+        ),
         # And the request frame's header, which binds a payload to its entry.
         "frame.entry_index": (_OFF_FRAME_ENTRY_INDEX, MAILBOX_REQUEST_FRAME_OFFSETS["entry_index"]),
         "frame.entry_generation": (
@@ -4096,6 +4101,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             ccu_started: bool = False
             native_activated: bool = False
             prepare_ordered: bool = False
+            enqueued_held: bool = False
             cancelled_before_launch: bool = False
 
         staged_runs: dict[int, _StagedRun] = {}
@@ -4388,6 +4394,35 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
         shutdown_addr = _buffer_field_addr(buf, _OFF_SHUTDOWN)
         ccu_control_requires_idle: bool | None = None
 
+        def enqueue_held_if_authorized(staged: _StagedRun, entry_state: int) -> bool:
+            nonlocal shutdown_message
+            if (
+                staged.native_activated
+                or staged.enqueued_held
+                or entry_state != _FRAME_STAGED
+                or not _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_ENQUEUE_BEFORE_SUCCESS)
+                or _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_PEER_CANCEL_REQUESTED)
+            ):
+                return True
+            if (
+                _mailbox_load_u64(staged.entry_addr + _OFF_ENTRY_GENERATION) != staged.entry_generation
+                or _read_run_entry_identity(staged.entry_buf) != staged.identity
+            ):
+                shutdown_message = f"chip_process dev={device_id}: stale held enqueue authorization"
+                return False
+            try:
+                if not staged.prepare_ordered:
+                    # The held grant follows native acceptance of every
+                    # earlier parent; frame consumption alone is insufficient.
+                    staged.chip_run._authorize_prepare()
+                    staged.prepare_ordered = True
+                    republish_native_preparation(staged)
+                staged.enqueued_held = staged.chip_run._enqueue_held()
+            except Exception as error:
+                shutdown_message = _format_exc("chip run held enqueue", error)
+                return False
+            return True
+
         def activate_pending_runs() -> bool:
             nonlocal shutdown_message
 
@@ -4432,6 +4467,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     except Exception as error:
                         shutdown_message = _format_exc("chip run preparation authorization", error)
                         return False
+                if not enqueue_held_if_authorized(staged, entry_state):
+                    return False
                 if staged.native_activated or (entry_state != _ACTIVATE and not staged.activated):
                     continue
                 if _read_run_entry_identity(staged.entry_buf) != staged.identity:
@@ -16100,7 +16137,7 @@ class Worker:
         assert self._worker is not None
         if getattr(cfg, "output_prefix", ""):
             _bind_host_log_session_directory()
-        run_id = self._orch._begin_run(True) if success_predecessor is not None else self._orch._begin_run()
+        run_id = self._orch._begin_run(True, True) if success_predecessor is not None else self._orch._begin_run()
         resources = _RunResources()
         handle = RunHandle(self, run_id, (callable, args, cfg), resources)
         handle._completion_callback = completion_callback

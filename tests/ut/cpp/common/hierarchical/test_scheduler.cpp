@@ -6035,3 +6035,37 @@ TEST_F(MailboxPipelineSchedulerFixture, AlreadyStagedHeldRunReceivesPreparationO
     EXPECT_EQ(__atomic_load_n(&entry->accepted, __ATOMIC_ACQUIRE), 0);
     EXPECT_FALSE(orchestrator.run_activation_authorized(second));
 }
+
+TEST(LocalMailboxEndpointHeldEnqueue, CancellationPrecedesHeldEnqueueAuthorization) {
+    Ring allocator;
+    allocator.init(0);
+    const TaskSlot slot = make_progress_slot(allocator, 22, 0, 1);
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+    endpoint.submit_progress(&allocator, WorkerDispatch{slot, 0, 42, true});
+    endpoint.cancel_staged_progress(22);
+    EXPECT_FALSE(endpoint.authorize_held_enqueue(22));
+    EXPECT_EQ(__atomic_load_n(&test_entry(mailbox, 0)->enqueue_before_success, __ATOMIC_ACQUIRE), 0);
+    allocator.shutdown();
+}
+
+TEST(LocalMailboxEndpointHeldEnqueue, AuthorizationIsIdentityCheckedAndDoesNotActivate) {
+    Ring allocator;
+    allocator.init(0);
+    const TaskSlot slot = make_progress_slot(allocator, 22, 0, 1);
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+    endpoint.submit_progress(&allocator, WorkerDispatch{slot, 0, 42, true});
+    auto *entry = test_entry(mailbox, 0);
+    EXPECT_FALSE(endpoint.authorize_held_enqueue(23));
+    EXPECT_EQ(__atomic_load_n(&entry->enqueue_before_success, __ATOMIC_ACQUIRE), 0);
+    ASSERT_TRUE(endpoint.authorize_held_enqueue(22));
+    EXPECT_EQ(__atomic_load_n(&entry->enqueue_before_success, __ATOMIC_ACQUIRE), 1);
+    EXPECT_EQ(__atomic_load_n(&entry->accepted, __ATOMIC_ACQUIRE), 0);
+    // A new publication generation must never inherit an older grant.
+    __atomic_add_fetch(&entry->entry_generation, 2, __ATOMIC_RELEASE);
+    __atomic_store_n(&entry->enqueue_before_success, 0, __ATOMIC_RELEASE);
+    EXPECT_FALSE(endpoint.authorize_held_enqueue(22));
+    EXPECT_EQ(__atomic_load_n(&entry->enqueue_before_success, __ATOMIC_ACQUIRE), 0);
+    allocator.shutdown();
+}

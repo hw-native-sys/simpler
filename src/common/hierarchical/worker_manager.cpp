@@ -279,6 +279,7 @@ void WorkerEndpoint::cancel_staged_progress(RunId) {}
 
 bool WorkerEndpoint::activate_progress(RunId) { return false; }
 bool WorkerEndpoint::authorize_preparation(RunId) { return false; }
+bool WorkerEndpoint::authorize_held_enqueue(RunId) { return false; }
 void WorkerEndpoint::request_progress_stop() noexcept {}
 void WorkerEndpoint::report_progress_error(const std::string &) { request_progress_stop(); }
 bool WorkerEndpoint::report_submission_error(const WorkerDispatch &, const std::string &reason) {
@@ -741,6 +742,7 @@ bool WorkerThread::authorize_staged_launch(RunId run_id) {
 }
 
 bool WorkerThread::authorize_preparation(RunId run_id) { return endpoint_->authorize_preparation(run_id); }
+bool WorkerThread::authorize_held_enqueue(RunId run_id) { return endpoint_->authorize_held_enqueue(run_id); }
 
 void WorkerThread::cancel_staged_run(RunId run_id) { endpoint_->cancel_staged_progress(run_id); }
 
@@ -1186,6 +1188,7 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     entry->observation_requested = 0;
     entry->peer_cancel_requested = 0;
     entry->prepare_ordered = 0;
+    entry->enqueue_before_success = 0;
     entry->preparation_disposition = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
     std::memset(entry->error_text, 0, MAILBOX_ERROR_MSG_SIZE);
     entry->run_epoch = 0;
@@ -1640,6 +1643,33 @@ bool LocalMailboxEndpoint::authorize_preparation(RunId run_id) {
         // shared cache line on every scheduler pass after publication.
         if (load_entry_i32(&entry->prepare_ordered) != 0) continue;
         store_entry_i32(&entry->prepare_ordered, 1);
+        published = true;
+    }
+    return published;
+}
+
+bool LocalMailboxEndpoint::authorize_held_enqueue(RunId run_id) {
+    std::lock_guard<std::mutex> lk(progress_mu_);
+    if (endpoint_poisoned_) return false;
+    bool published = false;
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        const auto &record = entries_[index];
+        if (!record.occupied || !record.dispatch.prepare_only || record.run_id != run_id ||
+            record.cancellation_requested)
+            continue;
+        auto *entry = run_entry(index);
+        if (!entry_identity_matches(record, entry)) {
+            poison_progress("stale run-state entry identity before held enqueue authorization");
+            return false;
+        }
+        const auto state = static_cast<MailboxState>(load_entry_i32(&entry->state));
+        if (state == MailboxState::TASK_DONE || state == MailboxState::TASK_FAILED ||
+            state == MailboxState::CANCEL_STAGED || load_entry_i32(&entry->peer_cancel_requested) != 0)
+            continue;
+        // The grant is sticky for this entry generation. Do not bounce the
+        // shared cache line on every scheduler pass after publication.
+        if (load_entry_i32(&entry->enqueue_before_success) != 0) continue;
+        store_entry_i32(&entry->enqueue_before_success, 1);
         published = true;
     }
     return published;
@@ -2467,6 +2497,14 @@ bool WorkerManager::authorize_preparation(RunId run_id) {
     bool published = false;
     for (const auto &worker : next_level_threads_) {
         published = worker->authorize_preparation(run_id) || published;
+    }
+    return published;
+}
+
+bool WorkerManager::authorize_held_enqueue(RunId run_id) {
+    bool published = false;
+    for (const auto &worker : next_level_threads_) {
+        published = worker->authorize_held_enqueue(run_id) || published;
     }
     return published;
 }

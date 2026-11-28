@@ -155,9 +155,13 @@ static int execute_platform_task(void *arg, Runtime *runtime) {
     return rc;
 }
 
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec_abi2(void *arg) {
     if (arg == nullptr) return -1;
     auto *args = static_cast<KernelArgs *>(arg);
+    if (args->execution_gate_address != 0 || args->execution_gate_identity != 0 ||
+        args->execution_gate_generation != 0) {
+        return -1;
+    }
     RuntimeLaunchView runtime_view;
     auto *runtime = runtime_view.bind(*args);
     if (runtime == nullptr) return -1;

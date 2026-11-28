@@ -100,6 +100,7 @@ public:
         // ever have one.
         std::function<std::vector<RunId>()> preparable_runs_cb;
         std::function<RunId()> preparation_ordered_run_cb;
+        std::function<std::vector<RunId>()> held_enqueue_runs_cb;
         // An earlier run's undispatched work on this endpoint must precede a
         // staged successor in the endpoint's dispatch-id FIFO.
         std::function<bool(RunId, int32_t)> can_stage_run_on_worker_cb;

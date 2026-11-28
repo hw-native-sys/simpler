@@ -157,6 +157,7 @@ struct RunState {
     std::unordered_map<CanonicalIdentity, TensorResource, CanonicalIdentityHash> tensor_resources;
     std::vector<uint64_t> domain_resources;
     bool activation_held{false};
+    bool enqueue_before_success{false};
     bool resource_sealed{false};
     bool resources_complete{false};
     bool native_resources_complete{true};

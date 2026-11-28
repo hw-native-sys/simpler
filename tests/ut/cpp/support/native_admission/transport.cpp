@@ -141,6 +141,7 @@ int rtStreamCreate(rtStream_t *out, int32_t) {
     return *out ? 0 : -12;
 }
 int rtStreamDestroy(rtStream_t p) {
+    ++native_admission_transport::control().stream_destroy_calls;
     if (native_admission_transport::control().retired) {
         ++native_admission_transport::control().calls_after_retire;
         return -4244;
@@ -170,6 +171,46 @@ int rtKernelLaunchWithHandleV2(void *, uint64_t, uint32_t, rtArgsEx_t *, void *,
 }
 const char *aclGetRecentErrMsg() { return "native admission CPU transport"; }
 int aclFinalize() { return 0; }
+int aclrtCreateStream(aclrtStream *out) { return rtStreamCreate(out, 0); }
+int aclrtDestroyStream(aclrtStream stream) { return rtStreamDestroy(stream); }
+int aclrtMalloc(void **out, size_t bytes, int) { return rtMalloc(out, bytes, 0, 0); }
+int aclrtFree(void *pointer) { return rtFree(pointer); }
+int aclrtMallocHost(void **out, size_t bytes) {
+    auto &c = native_admission_transport::control();
+    ++c.host_allocations;
+    *out = nullptr;
+    if (c.host_alloc_rc != 0) return c.host_alloc_rc;
+    if (posix_memalign(out, 64, bytes) != 0) return -12;
+    ++c.live_host_allocations;
+    return 0;
+}
+int aclrtFreeHost(void *pointer) { return rtFreeHost(pointer); }
+int aclrtMemcpyAsync(void *dst, size_t capacity, const void *src, size_t bytes, int kind, aclrtStream stream) {
+    return rtMemcpyAsync(dst, capacity, src, bytes, static_cast<rtMemcpyKind_t>(kind), stream);
+}
+int aclrtCreateNotify(aclrtNotify *out, uint64_t) {
+    auto &c = native_admission_transport::control();
+    *out = nullptr;
+    if (++c.notify_create_calls == c.fail_notify_create) return -4230;
+    *out = std::malloc(1);
+    if (*out != nullptr) ++c.live_notifies;
+    return *out != nullptr ? 0 : -12;
+}
+int aclrtDestroyNotify(aclrtNotify notify) {
+    --native_admission_transport::control().live_notifies;
+    std::free(notify);
+    return 0;
+}
+int aclrtRecordNotify(aclrtNotify, aclrtStream) {
+    auto &c = native_admission_transport::control();
+    ++c.notify_record_calls;
+    return c.notify_record_rc;
+}
+int aclrtWaitAndResetNotify(aclrtNotify, aclrtStream, uint32_t) {
+    ++native_admission_transport::control().notify_wait_calls;
+    return 0;
+}
+
 int aclrtGetMemInfo(int, size_t *free, size_t *total) {
     *free = *total = 1ULL << 30;
     return 0;
