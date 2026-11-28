@@ -11,10 +11,12 @@
 
 from __future__ import annotations
 
+import datetime
 import importlib
 import importlib.util
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -556,3 +558,20 @@ def test_standalone_runtime_and_level_filter_without_marking_a_child(monkeypatch
 
     assert result.value.code == 0
     assert dispatched == ([] if child else [True])
+
+
+def test_overlapping_diagnostics_reserve_distinct_directories(monkeypatch, tmp_path):
+    scene = importlib.import_module("simpler_setup.scene_test")
+
+    class FixedTime(datetime.datetime):
+        @classmethod
+        def now(cls):
+            return cls(2026, 1, 1)
+
+    monkeypatch.setattr(datetime, "datetime", FixedTime)
+    monkeypatch.setattr(scene, "_outputs_dir", lambda: tmp_path)
+    with ThreadPoolExecutor(4) as pool:
+        prefixes = list(pool.map(scene.build_output_prefix, ["tile"] * 4))
+    assert tmp_path / "tile_20260101_000000" in prefixes
+    assert len(set(prefixes)) == 4
+    assert all(prefix.is_dir() for prefix in prefixes)

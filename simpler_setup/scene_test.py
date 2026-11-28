@@ -1246,9 +1246,8 @@ def build_output_prefix(case_label: str) -> Path:
 
     Each case gets its own ``outputs/<case_label>_<timestamp>/`` directory; the
     runtime writes ``chip_swimlane_records.json``, ``args_dump/``, and ``pmu.csv``
-    under that root with fixed filenames. Two cases of the same name run in
-    the same second is not a contemplated scenario (parallel xdist runs differ
-    by class+method).
+    under that root with fixed filenames. An exclusive mkdir reserves the prefix,
+    adding a suffix when a concurrent or previous run owns the same name.
 
     The directory is created here: the dep_gen host replay (and any other
     writer) ``fopen``s ``<prefix>/<file>`` directly without an mkdir of its
@@ -1258,9 +1257,18 @@ def build_output_prefix(case_label: str) -> Path:
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_label = _sanitize_for_filename(case_label)
-    prefix = _outputs_dir() / f"{safe_label}_{timestamp}"
-    prefix.mkdir(parents=True, exist_ok=True)
-    return prefix
+    root = _outputs_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    base = root / f"{safe_label}_{timestamp}"
+    prefix = base
+    suffix = 0
+    while True:
+        try:
+            prefix.mkdir()
+            return prefix
+        except FileExistsError:
+            suffix += 1
+            prefix = base.with_name(f"{base.name}_{suffix}")
 
 
 def _run_swimlane_converter(
