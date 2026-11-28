@@ -44,6 +44,23 @@ if(NOT PTO_ISA_ROOT)
         "(needs pto-isa headers + CANN 9.0+)")
 endif()
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${PTO_ISA_ROOT}/include")
+option(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE "Enable PTO RDMA domain workspaces" OFF)
+if(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
+    find_path(PTO_HCCP_INCLUDE_DIR hccp.h
+        HINTS ENV PTO_HCCP_INCLUDE_DIR
+        PATHS ${ASCEND_HOME_PATH}/include ${ASCEND_HOME_PATH}/pkg_inc/hccp)
+    find_path(IBVERBS_INCLUDE_DIR infiniband/verbs.h)
+    find_path(HCCL_INCLUDE_DIR hccl/hccl.h PATHS ${ASCEND_HOME_PATH}/include)
+    if(NOT PTO_HCCP_INCLUDE_DIR OR NOT IBVERBS_INCLUDE_DIR OR NOT HCCL_INCLUDE_DIR)
+        message(FATAL_ERROR "A3 RDMA requires matching HCCP headers (PTO_HCCP_INCLUDE_DIR) and libibverbs development headers")
+    endif()
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS
+        "${PTO_ISA_ROOT}/pkg_inc" "${PTO_ISA_ROOT}/kernels/include"
+        "${PTO_HCCP_INCLUDE_DIR}" "${IBVERBS_INCLUDE_DIR}" "${HCCL_INCLUDE_DIR}"
+        "${ASCEND_HOME_PATH}/pkg_inc/aicpu" "${ASCEND_HOME_PATH}/pkg_inc/driver"
+        "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/aicpu"
+        "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/driver")
+endif()
 
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
@@ -101,6 +118,9 @@ endif()
 list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
 message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
 message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
+if(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
+    list(REMOVE_ITEM HOST_RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp")
+endif()
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(host_runtime)
@@ -129,10 +149,18 @@ endif()
 target_compile_definitions(host_runtime PRIVATE
     SIMPLER_PLATFORM_NAME="a2a3"
     SIMPLER_RUNTIME_NAME="${SIMPLER_RUNTIME_NAME}"
+    # Host-only CCEC builds omit __NPU_ARCH__; PTO needs the A2/A3 host contract.
+    PTO_NPU_ARCH_A2A3
     PTO_COMM_WORKSPACE_SDMA_SUPPORTED=1
     PTO_COMM_WORKSPACE_URMA_SUPPORTED=0
-    PTO_COMM_WORKSPACE_RDMA_SUPPORTED=0
 )
+if(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
+    target_compile_definitions(host_runtime PRIVATE
+        SIMPLER_ENABLE_PTO_RDMA_WORKSPACE PTO_COMM_WORKSPACE_RDMA_SUPPORTED=1
+        PTO_RDMA_SUPPORTED PTO_RDMA_BACKEND_IN_DIE_SUPPORTED)
+else()
+    target_compile_definitions(host_runtime PRIVATE PTO_COMM_WORKSPACE_RDMA_SUPPORTED=0)
+endif()
 
 set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
     "PTO-ISA commit used for host_runtime cache key")
@@ -218,6 +246,29 @@ target_link_directories(host_runtime
 )
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")
+
+if(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
+    find_program(SIMPLER_CCEC_COMPILER ccec HINTS
+        "${ASCEND_HOME_PATH}/bin" "${ASCEND_HOME_PATH}/tools/bisheng_compiler/bin"
+        "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/bin")
+    if(NOT SIMPLER_CCEC_COMPILER)
+        message(FATAL_ERROR "A3 PTO domain headers require CANN ccec --cce-host-only")
+    endif()
+    # PTO's domain header carries device-qualified tensor declarations; this object is host-only.
+    set(_rdma_comm_object "${CMAKE_CURRENT_BINARY_DIR}/comm_hccl_rdma.o")
+    add_custom_command(OUTPUT "${_rdma_comm_object}"
+        COMMAND "${SIMPLER_CCEC_COMPILER}" -xcce --cce-host-only -std=c++17 -fPIC
+            "$<TARGET_PROPERTY:host_runtime,COMPILE_OPTIONS>"
+            "-I$<JOIN:$<TARGET_PROPERTY:host_runtime,INCLUDE_DIRECTORIES>,;-I>"
+            "-D$<JOIN:$<TARGET_PROPERTY:host_runtime,COMPILE_DEFINITIONS>,;-D>"
+            -MMD -MF "${_rdma_comm_object}.d"
+            -c "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp" -o "${_rdma_comm_object}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
+        DEPFILE "${_rdma_comm_object}.d"
+        COMMAND_EXPAND_LISTS VERBATIM)
+    set_source_files_properties("${_rdma_comm_object}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    target_sources(host_runtime PRIVATE "${_rdma_comm_object}")
+endif()
 
 # Apply compiler sanitizers to this host-compiled target. No-op unless
 # SIMPLER_SANITIZERS is set at configure time, which runtime_compiler only

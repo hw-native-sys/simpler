@@ -215,6 +215,32 @@ def test_sim_incore_cache_tracks_isa_pin(monkeypatch):
     assert first != second
 
 
+@pytest.mark.parametrize(("platform", "backend"), [("a2a3", "IN_DIE"), ("a5", "HNS_1825")])
+def test_rdma_incore_cache_separates_enabled_backend(monkeypatch, platform, backend):
+    from simpler_setup import kernel_compiler  # noqa: PLC0415
+
+    compiler = kernel_compiler.KernelCompiler.__new__(kernel_compiler.KernelCompiler)
+    compiler.platform = platform
+    compiler.ccec = SimpleNamespace(
+        cxx_path="ccec", linker_path="ld.lld", get_compile_flags=lambda **_kwargs: ["-device"]
+    )
+    monkeypatch.setattr(kernel_compiler, "_executable_cache_identity", lambda path: {"name": path})
+    monkeypatch.setattr(kernel_compiler, "read_pto_isa_pin", lambda: "a" * 40)
+    monkeypatch.setenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", "OFF")
+    disabled = compiler.incore_compile_cache_token("aiv")
+    monkeypatch.setenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", "ON")
+    enabled = compiler.incore_compile_cache_token("aiv")
+
+    assert enabled != disabled
+    assert "-DPTO_RDMA_SUPPORTED" not in disabled["flags"]
+    assert "-DPTO_RDMA_SUPPORTED" in enabled["flags"]
+    assert f"-DPTO_RDMA_BACKEND_{backend}_SUPPORTED" in enabled["flags"]
+    other_backend = "HNS_1825" if backend == "IN_DIE" else "IN_DIE"
+    assert f"-DPTO_RDMA_BACKEND_{other_backend}_SUPPORTED" not in enabled["flags"]
+    monkeypatch.setattr(kernel_compiler, "read_pto_isa_pin", lambda: "b" * 40)
+    assert compiler.incore_compile_cache_token("aiv") != enabled
+
+
 def test_compiler_subprocess_runs_from_checkout_root(monkeypatch):
     from simpler_setup import kernel_compiler  # noqa: PLC0415
     from simpler_setup.environment import PROJECT_ROOT  # noqa: PLC0415

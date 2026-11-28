@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1080" viewBox="0 0 1280 1080" role="img" aria-labelledby="title desc">
+  <title id="title">A3 通用 RDMA 后端：从 SDK 到真实完成</title>
+  <desc id="desc">Host 注册普通 callable 并创建域。PTO HCCP 建链后，AICPU 调度 AIV 直接提交 RDMA；AICPU 将 FIN 与真实 CQE 合并。</desc>
+  <defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#45617b"/></marker></defs>
+  <style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#17304b} .title{font-size:29px;font-weight:700}.sub{font-size:17px;fill:#53677c}.h{font-size:20px;font-weight:700}.t{font-size:16px}.tiny{font-size:15px;fill:#53677c}.flow{fill:none;stroke:#45617b;stroke-width:2.5;marker-end:url(#arrow)}.box{stroke:#bbccdc;stroke-width:1.5;rx:12}.host{fill:#edf5ff}.dev{fill:#edf9f4}.net{fill:#fff4e7}.new{fill:#f4efff}</style>
+  <rect width="1280" height="1080" fill="#fff"/>
+  <text x="40" y="48" class="title">A3 通用 RDMA 后端调用流程</text><text x="40" y="78" class="sub">设计范围：simpler SDK / Host 资源 / TMR / AIV / AICPU；基于 PTO-ISA PR 2155 IN_DIE</text>
+  <rect x="25" y="104" width="1230" height="260" rx="18" fill="#f7f9fc"/>
+  <text x="45" y="135" class="h">① 构建注册与首次域准备</text>
+  <rect x="45" y="158" width="355" height="82" class="box host"/><text x="62" y="187" class="h">复用通用编译与装配</text><text x="62" y="215" class="t">KernelCompiler → ChipCallable.build()</text>
+  <path d="M400 199H443" class="flow"/>
+  <rect x="445" y="158" width="350" height="82" class="box host"/><text x="462" y="187" class="h">Worker.register() → init()</text><text x="462" y="215" class="t">注册产物，建立已有执行环境</text>
+  <path d="M795 199H838" class="flow"/>
+  <text x="840" y="147" class="tiny">由应用调用 Worker.run(...) 执行</text>
+  <rect x="840" y="158" width="390" height="82" class="box host"/><text x="857" y="187" class="h">rdma_host_orchestration()</text><text x="857" y="215" class="t">get_or_allocate_domain() 创建/复用域</text>
+  <path d="M1035 240V267H796" class="flow"/>
+  <rect x="445" y="270" width="785" height="69" class="box dev"/><text x="462" y="297" class="h">comm_alloc_domain_windows → domain_alloc_via_rdma</text><text x="462" y="324" class="t">复用 DomainAllocation / PTO BuildComm → MR、AI QP、workspace → 上传 context</text>
+  <text x="45" y="290" class="tiny">Host 负责准备资源。</text><text x="45" y="315" class="tiny">每次数据传输由 AIV 直接发起。</text>
+  <rect x="25" y="386" width="1230" height="555" rx="18" fill="#f7f9fc"/>
+  <text x="45" y="418" class="h">② 每次调用（窗口 / MR / QP 不重建）</text>
+  <text x="45" y="452" class="sub">Host / simpler SDK</text><text x="445" y="452" class="sub">AICPU / TMR</text><text x="840" y="452" class="sub">AIV / PTO / NIC</text>
+  <rect x="45" y="474" width="355" height="100" class="box host"/><text x="62" y="503" class="h">rdma_host_orchestration()</text><text x="62" y="530" class="t">domain.device_context() 获取本轮 lease</text><text x="62" y="555" class="t">TaskArgs → submit_next_level()</text>
+  <path d="M400 524H443" class="flow"/>
+  <rect x="445" y="474" width="350" height="100" class="box dev"/><text x="462" y="503" class="h">既有/薄层 Chip orchestration</text><text x="462" y="530" class="t">aicpu_orchestration_entry()</text><text x="462" y="555" class="t">rt_submit_aiv_task() → 普通派发</text>
+  <path d="M795 524H838" class="flow"/>
+  <rect x="840" y="474" width="390" height="100" class="box new"/><text x="857" y="503" class="h">AIV kernel_entry()</text><text x="857" y="530" class="t">校验参数 → 检查 completion 容量</text><text x="857" y="555" class="t">BuildAsyncSession&lt;RDMA&gt;()</text>
+  <path d="M1035 574V600" class="flow"/>
+  <rect x="840" y="603" width="390" height="100" class="box dev"/><text x="857" y="632" class="h">TPUT_ASYNC / TGET_ASYNC</text><text x="857" y="659" class="t">IN_DIE Post → WQE → SQ doorbell</text><text x="857" y="684" class="tiny">event → register_completion_condition()</text>
+  <path d="M1035 703V730" class="flow"/>
+  <rect x="840" y="733" width="390" height="85" class="box net"/><text x="857" y="762" class="h">A3 板载 RoCE 执行搬移</text><text x="857" y="791" class="t">本地 / 对端 HBM；产生真实 CQE</text>
+  <path d="M840 653H797" class="flow"/><text x="701" y="638" class="tiny">AIV FIN</text>
+  <path d="M840 776H797" class="flow"/><text x="682" y="806" class="tiny">只读 CQE</text>
+  <rect x="445" y="611" width="350" height="90" class="box dev"/><text x="462" y="641" class="h">正常结束条件</text><text x="462" y="670" class="t">FIN / NORMAL_DONE</text>
+  <rect x="445" y="733" width="350" height="85" class="box new"/><text x="462" y="762" class="h">IN_DIE completion observer</text><text x="462" y="791" class="t">按序验证成功前缀；不写 CQ tail</text>
+  <path d="M445 656H227V844" class="flow"/><path d="M445 776H350V844" class="flow"/>
+  <rect x="45" y="847" width="1185" height="67" class="box dev"/><text x="62" y="874" class="h">FIN AND 所有 RDMA 条件成功 → TaskId 完成 → 释放本地后继依赖</text><text x="62" y="899" class="t">PUT 完成不表示远端业务已消费；GET 期间远端源必须稳定。</text>
+  <rect x="25" y="963" width="1230" height="91" rx="18" fill="#edf5ff"/><text x="45" y="995" class="h">③ 结束与释放</text><text x="45" y="1025" class="t">本地完整完成 + 远端访问静默 → release agreement → TryDestroyComm → free GM → 释放端口；未知完成保留 owner。</text>
+</svg>

@@ -143,7 +143,7 @@ struct DomainAllocation {
     bool host_registered = false;
     bool initialized = false;
     bool cleanup_failed = false;
-    CommWorkspaceConfig workspace_config{1, 0, COMM_CCU_MODE_SCHED};
+    CommWorkspaceConfig workspace_config{1, 0, COMM_CCU_MODE_SCHED, 1, 0, {}};
     uint32_t urma_aiv_count = pto::comm::urma::kUrmaAutoAivCount;
     CcuCallableRegistration *ccu = nullptr;
     std::shared_ptr<simpler::ccu::HcommDomainChannels> ccu_channels;
@@ -2328,7 +2328,10 @@ static int allocate_domain_windows(
         return COMM_DOMAIN_URMA_CONFIG_INVALID;
     }
     const CommWorkspaceConfig config =
-        workspace_config ? *workspace_config : CommWorkspaceConfig{1, 0, COMM_CCU_MODE_SCHED};
+        workspace_config ? *workspace_config : CommWorkspaceConfig{1, 0, COMM_CCU_MODE_SCHED, 1, 0, {}};
+    if (config.rdma_qp_num != 1 || config.rdma_base_port != 0 || config.rdma_local_ip[0] != '\0') {
+        return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    }
     if (config.ccu_mode > COMM_CCU_MODE_SCHED) {
         LOG_ERROR("[comm rank %d] alloc_domain: invalid CCU mode %u", h->rank, config.ccu_mode);
         return -1;

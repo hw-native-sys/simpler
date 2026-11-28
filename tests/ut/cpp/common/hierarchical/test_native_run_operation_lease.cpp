@@ -1670,7 +1670,7 @@ TEST(NativeRunOperationLeaseTest, DomainAllocationOwnershipPrecedesOutputValidat
         return 0;
     };
     ownership = 0;
-    const CommWorkspaceConfig config{2, 512, COMM_CCU_MODE_SCHED};
+    const CommWorkspaceConfig config{2, 512, COMM_CCU_MODE_SCHED, 1, 0, {}};
     const auto result = worker.comm_alloc_domain_windows(comm, 2, {0, 1}, 0, 4096, 2, &ownership, {}, &config);
     EXPECT_EQ(std::get<0>(result), 0x100u);
     EXPECT_EQ(std::get<1>(result), 0x200u);

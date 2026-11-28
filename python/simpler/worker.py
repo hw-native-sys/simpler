@@ -358,6 +358,7 @@ from .worker_chip_orch_comm import (
 )
 from .worker_level import WorkerLevel
 from .worker_level import span_prefix as _span_prefix
+from .workspace_config import RdmaConfig
 
 # Upper bound on how long the parent waits for every chip's bootstrap mailbox
 # to leave IDLE.  Well above a realistic HCCL init (seconds) but short enough
@@ -999,16 +1000,16 @@ def _remove_empty_comm_directory(path: str) -> None:
             raise
 
 
-# Domain-allocation request shm layout: 48-byte header + buffer_nbytes (u64) +
+# Domain-allocation request shm layout: 120-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
 # of rank_count parity; rank_ids come last (u32 has no alignment concern).
-_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI20x")
+_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI92x")
 # fields: allocation_id (u64), rank_count (u32), domain_rank (u32),
 #         window_size (u64), buffer_count (u32), workspace_mask (u32),
-#         urma_jetties_per_aiv (u32), urma_sq_depth (u32), ccu_mode (u32), padding (4 bytes)
-assert _DOMAIN_REQ_HEADER.size == 48
+#         84-byte CommWorkspaceConfig at offset 32, padding (4 bytes)
+assert _DOMAIN_REQ_HEADER.size == 120
 _DOMAIN_WORKSPACE_CONFIG_OFFSET = 32
-_DOMAIN_WORKSPACE_CONFIG = struct.Struct("<III")
+_DOMAIN_WORKSPACE_CONFIG = struct.Struct("<IIIII64s")
 _DOMAIN_WORKSPACE_MASK_OFFSET = struct.calcsize("<QIIQI")
 
 # Domain-allocation reply shm layout: 40-byte header + buffer_ptrs (u64).
@@ -2976,8 +2977,8 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
     try:
         (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
         workspace_mask = struct.unpack_from("<I", req_buf, _DOMAIN_WORKSPACE_MASK_OFFSET)[0]
-        urma_jetties, urma_sq_depth, ccu_mode = _DOMAIN_WORKSPACE_CONFIG.unpack_from(
-            req_buf, _DOMAIN_WORKSPACE_CONFIG_OFFSET
+        urma_jetties, urma_sq_depth, ccu_mode, rdma_qp_num, rdma_base_port, rdma_ip = (
+            _DOMAIN_WORKSPACE_CONFIG.unpack_from(req_buf, _DOMAIN_WORKSPACE_CONFIG_OFFSET)
         )
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
         nbytes_offset = _DOMAIN_REQ_HEADER.size
@@ -3015,6 +3016,9 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
             urma_jetties_per_aiv=urma_jetties,
             urma_sq_depth=urma_sq_depth,
             ccu_mode=ccu_mode,
+            rdma_qp_num=rdma_qp_num,
+            rdma_base_port=rdma_base_port,
+            rdma_local_ip=rdma_ip.split(b"\0", 1)[0].decode("ascii"),
         )
 
         # Carve buffer pointers sequentially inside the local window.
@@ -11312,6 +11316,7 @@ class Worker:
         config = DomainConfig.capture(
             members, window_size, buffers, retain_after_run, topology, workspace_engines, memory_source
         )
+        runtime = self._config.get("runtime")
         if config.memory_source == AddressSpace.HOST:
             if self.level != 3 or self._config.get("platform") not in ("a2a3", "a5"):
                 raise ValueError("Host-source domains require onboard L3 A2/A3 or A5")
@@ -11333,8 +11338,20 @@ class Worker:
         if config.workspace_engines:
             if self.level != 3:
                 raise ValueError("workspace_engines selection is supported only on L3 domains")
-            if self._config.get("platform") != "a5":
-                raise ValueError("domain workspace selection requires A5; A2/A3 SDMA uses enable_sdma")
+            platform = self._config.get("platform")
+            if "urma" in config.workspace_engines and platform != "a5":
+                raise ValueError("URMA workspace requires A5 onboard")
+            if platform != "a5":
+                if platform != "a2a3" or config.workspace_engines != ("rdma",):
+                    raise ValueError("A2/A3 DEVICE domains support only the RDMA workspace; SDMA uses enable_sdma")
+                if runtime != "tensormap_and_ringbuffer":
+                    raise ValueError("A3 RDMA domains require tensormap_and_ringbuffer")
+            if "rdma" in config.workspace_engines:
+                rdma = config.rdma_config()
+                if rdma.roce_ips and len(rdma.roce_ips) != len(config.members):
+                    raise ValueError("roce_ips must have one device address per domain member")
+                if platform == "a5" and (rdma.qp_num != 1 or rdma.base_port is not None or rdma.roce_ips):
+                    raise ValueError("non-default RdmaConfig is supported only by A3 IN_DIE domains")
             if "urma" in config.workspace_engines:
                 if self._config.get("runtime") != "tensormap_and_ringbuffer":
                     raise ValueError("URMA domain workspaces require the A5 tensormap_and_ringbuffer runtime")
@@ -11431,6 +11448,7 @@ class Worker:
                         urma_jetties_per_aiv=config.urma_config().jetties_per_aiv,
                         urma_sq_depth=config.urma_config().sq_depth,
                         ccu_mode=("ms", "sched").index(config.ccu_config().mode),
+                        rdma_config=config.rdma_config(),
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
@@ -11801,6 +11819,7 @@ class Worker:
         urma_jetties_per_aiv: int = 1,
         urma_sq_depth: int = 0,
         ccu_mode: int = 1,
+        rdma_config: RdmaConfig = RdmaConfig(),
     ) -> CommDomainHandle:
         # Admission is the run() lease that the driving orchestrator holds;
         # validation checks resource presence rather than the public lifecycle,
@@ -11874,7 +11893,14 @@ class Worker:
                         workspace_mask,
                     )
                     _DOMAIN_WORKSPACE_CONFIG.pack_into(
-                        req_buf, _DOMAIN_WORKSPACE_CONFIG_OFFSET, urma_jetties_per_aiv, urma_sq_depth, ccu_mode
+                        req_buf,
+                        _DOMAIN_WORKSPACE_CONFIG_OFFSET,
+                        urma_jetties_per_aiv,
+                        urma_sq_depth,
+                        ccu_mode,
+                        rdma_config.qp_num,
+                        rdma_config.base_port or 0,
+                        rdma_config.roce_ips[worker_to_rank[chip_idx]].encode("ascii") if rdma_config.roce_ips else b"",
                     )
                     nbytes_off = _DOMAIN_REQ_HEADER.size
                     if buffer_count:

@@ -30,6 +30,7 @@
 #include "host/comm_generation_lease.h"
 
 #include <cerrno>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,7 @@
 #include <utility>
 #include <vector>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,6 +57,11 @@
 #include "hccl/hccl_types.h"
 #include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
 #include "pto/comm/workspace.hpp"
+
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+#include "pto/pto-inst.hpp"
+#include "communication/host/comm_context.hpp"
+#endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
 // layer in case we need to swap (e.g., InitConfig variant) later.
@@ -104,6 +111,21 @@ struct DomainAllocation {
     std::string host_shm_name;
     bool host_shm_owned = false;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    bool rdma_domain = false;
+    std::unique_ptr<pto::comm::domain::CommContext> rdma_context;
+    void *rdma_window = nullptr;
+    void *rdma_workspace = nullptr;
+    void *rdma_device_context = nullptr;
+    uint64_t rdma_workspace_size = 0;
+    std::string rdma_rootinfo;
+    uint64_t rdma_run_token = 0;
+    uint64_t rdma_allocation_id = 0;
+    uint32_t rdma_round = 0;
+    uint32_t rdma_port = 0;
+    int rdma_port_fd = -1;
+    std::chrono::steady_clock::time_point rdma_deadline;
+#endif
 };
 
 static_assert(sizeof(CommGlobalDomainDescriptor) == 288, "global domain descriptor ABI changed");
@@ -397,6 +419,24 @@ static aclError import_ipc_window(
 }
 
 static aclError release_domain_windows(DomainAllocation *alloc) {
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    if (alloc->rdma_context) {
+        if (alloc->release_failed) return ACL_ERROR_FAILURE;
+        if (!pto::comm::domain::TryDestroyComm(*alloc->rdma_context)) return ACL_ERROR_FAILURE;
+        for (void **storage : {&alloc->rdma_device_context, &alloc->rdma_workspace, &alloc->rdma_window}) {
+            if (*storage != nullptr) {
+                const auto status = aclrtFree(*storage);
+                if (status != ACL_SUCCESS) {
+                    // An SDK free error does not prove that storage is still allocated.
+                    alloc->release_failed = true;
+                    return status;
+                }
+                *storage = nullptr;
+            }
+        }
+        alloc->rdma_context.reset();
+    }
+#endif
     aclError first_error = release_vmm_windows(&alloc->peer_windows);
     record_first_error(release_vmm_window(&alloc->local_window), &first_error);
     return first_error;
@@ -431,6 +471,14 @@ VmmWindow &VmmWindow::operator=(VmmWindow &&other) noexcept {
 }
 
 DomainAllocation::~DomainAllocation() {
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    // A failed reclamation remains owned by the communicator, including its external GM.
+    if (rdma_domain) {
+        if (rdma_context) (void)rdma_context.release();
+        device_ctx = nullptr;
+        return;
+    }
+#endif
     if (device_ctx != nullptr) {
         aclrtFree(device_ctx);
         device_ctx = nullptr;
@@ -1523,6 +1571,166 @@ extern "C" int comm_barrier(CommHandle h) {
     return 0;
 }
 
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+static bool domain_host_all_gather(void *opaque, const void *source, size_t bytes, void *destination) try {
+    auto &owner = *static_cast<DomainAllocation *>(opaque);
+    if (!source || !destination || bytes == 0 || bytes > 4096 || owner.nranks <= 0 || owner.nranks > 64) return false;
+    const auto round = owner.rdma_round++;
+    const auto phase = "rdma_" + std::to_string(round);
+    const auto tag = domain_barrier_tag(owner.rdma_allocation_id, phase.c_str());
+    std::ostringstream record;
+    record << "1 " << owner.rank << ' ' << owner.nranks << ' ' << bytes << ' ';
+    constexpr char digits[] = "0123456789abcdef";
+    const auto *data = static_cast<const uint8_t *>(source);
+    for (size_t i = 0; i < bytes; ++i)
+        record << digits[data[i] >> 4] << digits[data[i] & 15];
+    const auto local_path = barrier_marker_path(owner.rdma_rootinfo, owner.rdma_run_token, tag, owner.rank);
+    if (!file_marker_handshake::publish_marker(local_path, record.str().c_str())) return false;
+    const file_marker_handshake::WaitOptions options;
+    for (int peer = 0; peer < owner.nranks; ++peer) {
+        const auto path = barrier_marker_path(owner.rdma_rootinfo, owner.rdma_run_token, tag, peer);
+        if (!file_marker_handshake::wait_for_path(
+                 path, file_marker_handshake::Stage::ARRIVAL_WAIT, peer, owner.rdma_deadline, options.poll_interval
+            )
+                 .ok())
+            return false;
+        std::ifstream input(path);
+        uint32_t version = 0;
+        int rank = -1;
+        int ranks = 0;
+        size_t length = 0;
+        std::string encoded;
+        std::string extra;
+        if (!(input >> version >> rank >> ranks >> length >> encoded) || (input >> extra) || version != 1 ||
+            rank != peer || ranks != owner.nranks || length != bytes || encoded.size() != bytes * 2)
+            return false;
+        auto *output = static_cast<uint8_t *>(destination) + size_t(peer) * bytes;
+        for (size_t i = 0; i < bytes; ++i) {
+            const auto high = std::strchr(digits, encoded[i * 2]);
+            const auto low = std::strchr(digits, encoded[i * 2 + 1]);
+            if (!high || !low || encoded[i * 2] == '\0' || encoded[i * 2 + 1] == '\0') return false;
+            output[i] = static_cast<uint8_t>(((high - digits) << 4) | (low - digits));
+        }
+    }
+    return true;
+} catch (...) {
+    return false;
+}
+
+static int domain_alloc_via_rdma(
+    CommHandle h, uint64_t allocation_id, uint32_t domain_rank, size_t rank_count, size_t window_size,
+    const CommWorkspaceConfig &options, DomainAllocation *owner
+) {
+    namespace domain = pto::comm::domain;
+    if (options.rdma_qp_num < 1 || options.rdma_qp_num > 8 || options.rdma_base_port > 65535 ||
+        strnlen(options.rdma_local_ip, sizeof(options.rdma_local_ip)) == sizeof(options.rdma_local_ip) ||
+        window_size == 0 || window_size % 64 != 0)
+        return -1;
+    int32_t device = -1;
+    int32_t physical = -1;
+    if (aclrtGetDevice(&device) != ACL_SUCCESS || aclrtGetPhyDevIdByLogicDevId(device, &physical) != ACL_SUCCESS ||
+        physical < 0)
+        return -1;
+    owner->rdma_domain = true;
+    owner->rdma_context = std::make_unique<domain::CommContext>();
+    owner->rdma_rootinfo = h->rootinfo_path;
+    owner->rdma_run_token = h->run_token;
+    owner->rdma_allocation_id = allocation_id;
+    owner->rdma_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    uint32_t port = options.rdma_base_port != 0 ?
+                        options.rdma_base_port :
+                        49152U + static_cast<uint32_t>((h->run_token ^ allocation_id) % 16384);
+    bool reserved = false;
+    const uint32_t attempts = options.rdma_base_port != 0 ? 1U : 256U;
+    for (uint32_t attempt = 0; attempt < attempts && !reserved; ++attempt) {
+        const auto path = "/tmp/simpler-rdma-port-" + std::to_string(getuid()) + '-' + std::to_string(physical) + '-' +
+                          std::to_string(port) + ".lock";
+        int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        struct stat held{}, named{};
+        const bool acquired = fd >= 0 && fstat(fd, &held) == 0 && lstat(path.c_str(), &named) == 0 &&
+                              S_ISREG(held.st_mode) && held.st_uid == getuid() && held.st_nlink == 1 &&
+                              held.st_dev == named.st_dev && held.st_ino == named.st_ino &&
+                              flock(fd, LOCK_EX | LOCK_NB) == 0;
+        const uint32_t local[2]{port, acquired ? 1U : 0U};
+        std::vector<std::array<uint32_t, 2>> votes(rank_count);
+        const bool exchanged = domain_host_all_gather(owner, local, sizeof(local), votes.data());
+        reserved = exchanged;
+        for (const auto &vote : votes)
+            reserved = reserved && vote[0] == port && vote[1] == 1;
+        if (reserved) {
+            owner->rdma_port_fd = fd;
+            owner->rdma_port = port;
+        } else {
+            if (fd >= 0) close(fd);
+            if (!exchanged) return -1;
+            port = port == 65535 ? 49152 : port + 1;
+        }
+    }
+    if (!reserved) return -1;
+
+    domain::CommConfig config;
+    config.rankId = static_cast<int>(domain_rank);
+    config.rankNum = static_cast<int>(rank_count);
+    config.deviceId = device;
+    config.backends = domain::CommBackend::RDMA;
+    config.symBytes = window_size;
+    config.bootstrap = domain::Bootstrap::External;
+    config.rdmaOptional = false;
+    config.rdma.localIp = options.rdma_local_ip;
+    config.rdma.qpNum = options.rdma_qp_num;
+    config.rdma.basePort = static_cast<uint16_t>(owner->rdma_port);
+    config.exchange = {domain_host_all_gather, owner};
+    domain::CommWorkspaceSizes sizes;
+    if (domain::GetCommWorkspaceSize(config, &sizes) != ACL_SUCCESS || sizes.rdma == 0 ||
+        sizes.rdmaSymmetric != window_size || sizes.rdmaDeviceContext == 0)
+        return -1;
+    owner->rdma_workspace_size = sizes.rdma;
+    if (aclrtMalloc(&owner->rdma_window, sizes.rdmaSymmetric, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+        aclrtMalloc(&owner->rdma_workspace, sizes.rdma, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+        aclrtMalloc(&owner->rdma_device_context, sizes.rdmaDeviceContext, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+        aclrtMemset(owner->rdma_window, window_size, 0, window_size) != ACL_SUCCESS)
+        return -1;
+    domain::CommWorkspaceAddresses addresses;
+    addresses.rdmaSymmetric = owner->rdma_window;
+    addresses.rdma = owner->rdma_workspace;
+    addresses.rdmaDeviceContext = owner->rdma_device_context;
+    if (!domain::BuildComm(config, addresses, sizes, *owner->rdma_context)) {
+        LOG_ERROR(
+            "RDMA domain initialization failed: stage=%u rank=%d",
+            static_cast<uint32_t>(owner->rdma_context->rdmaReport.status), owner->rdma_context->rdmaReport.rank
+        );
+        return -1;
+    }
+    pto::comm::rdma::RdmaInfo header{};
+    if (aclrtMemcpy(&header, sizeof(header), owner->rdma_workspace, sizeof(header), ACL_MEMCPY_DEVICE_TO_HOST) !=
+            ACL_SUCCESS ||
+        header.magic != pto::comm::rdma::kRdmaWorkspaceMagic ||
+        header.version != pto::comm::rdma::kRdmaWorkspaceVersion || header.backend != pto::comm::RdmaBackend::IN_DIE ||
+        header.rankCount != rank_count || header.qpNum != options.rdma_qp_num ||
+        owner->rdma_context->rdmaReport.status != domain::RdmaInitStatus::Ready)
+        return -1;
+    const auto &converted = owner->rdma_context->rdmaHostCtx;
+    if (converted.rankId != domain_rank || converted.rankNum != rank_count || converted.winSize != window_size)
+        return -1;
+    CommContext context{};
+    context.rankId = domain_rank;
+    context.rankNum = static_cast<uint32_t>(rank_count);
+    context.winSize = window_size;
+    for (size_t peer = 0; peer < rank_count; ++peer) {
+        if (converted.windowsIn[peer] == 0 || converted.windowsIn[peer] > UINT64_MAX - window_size) return -1;
+        context.windowsIn[peer] = converted.windowsIn[peer];
+        context.windowsOut[peer] = converted.windowsOut[peer];
+    }
+    if (!set_comm_workspace(
+            context, CommWorkspaceKind::RDMA, reinterpret_cast<uint64_t>(owner->rdma_workspace), sizes.rdma
+        ))
+        return -1;
+    return comm_domain_onboard::upload_context(context, owner->device_ctx, owner->rank, "RDMA domain") == ACL_SUCCESS ?
+               0 :
+               -1;
+}
+#endif
+
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
@@ -1530,7 +1738,15 @@ extern "C" int comm_alloc_domain_windows(
 ) try {
     if (workspace_config && (workspace_config->urma_jetties_per_aiv != 1 || workspace_config->urma_sq_depth != 0))
         return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
-    if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    const bool rdma_requested = workspace_mask == comm_workspace_bit(CommWorkspaceKind::RDMA);
+    if (!rdma_requested && workspace_config &&
+        (workspace_config->rdma_qp_num != 1 || workspace_config->rdma_base_port != 0 ||
+         workspace_config->rdma_local_ip[0] != '\0'))
+        return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    if (workspace_mask != 0 && !rdma_requested) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+#ifndef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    if (rdma_requested) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+#endif
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
     if (host_cleanup_failed(h)) return COMM_RECLAMATION_UNCONFIRMED;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
@@ -1577,6 +1793,20 @@ extern "C" int comm_alloc_domain_windows(
     if (!inserted) return -1;
     DomainAllocation *owner = it->second.get();
     try {
+        if (rdma_requested) {
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+            const CommWorkspaceConfig options =
+                workspace_config ? *workspace_config : CommWorkspaceConfig{1, 0, COMM_CCU_MODE_SCHED, 1, 0, {}};
+            if (domain_alloc_via_rdma(h, allocation_id, domain_rank, rank_count, window_size, options, owner) != 0)
+                return COMM_INITIALIZATION_ABORT_REQUIRED;
+            owner->initialized = true;
+            h->domain_admission_stopped = false;
+            *device_ctx_out = reinterpret_cast<uint64_t>(owner->device_ctx);
+            *local_window_base_out = reinterpret_cast<uint64_t>(owner->rdma_window);
+            *actual_window_size_out = window_size;
+            return 0;
+#endif
+        }
         const FabricAttempt fabric_result =
             domain_alloc_via_fabric(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, owner);
         if (fabric_result == FabricAttempt::kError) return COMM_INITIALIZATION_ABORT_REQUIRED;
@@ -1804,6 +2034,43 @@ static int release_domain_allocation(
         if (rc == 0) h->domain_allocations.erase(it);
         return rc;
     }
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    if (alloc->rdma_domain) {
+        if (alloc->release_failed) return COMM_RECLAMATION_UNCONFIRMED;
+        if (collective && host_cleanup_failed(h)) return COMM_RECLAMATION_UNCONFIRMED;
+        const bool prior_admission_stopped = h->domain_admission_stopped;
+        h->domain_admission_stopped = true;
+        if (collective && !file_barrier(
+                              h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count),
+                              domain_barrier_tag(allocation_id, "release"), h->run_token
+                          ))
+            return COMM_RECLAMATION_UNCONFIRMED;
+        if (release_domain_windows(alloc.get()) != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
+        if (alloc->device_ctx != nullptr) {
+            if (aclrtFree(alloc->device_ctx) != ACL_SUCCESS) {
+                alloc->release_failed = true;
+                return COMM_RECLAMATION_UNCONFIRMED;
+            }
+            alloc->device_ctx = nullptr;
+        }
+        if (alloc->rdma_port_fd >= 0) {
+            const int fd = std::exchange(alloc->rdma_port_fd, -1);
+            if (close(fd) != 0) return COMM_RECLAMATION_UNCONFIRMED;
+        }
+        if (collective) {
+            const auto retired = file_marker_handshake::retire_allocation(
+                h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count), h->run_token,
+                allocation_id
+            );
+            if (!retired.ok()) return COMM_RECLAMATION_UNCONFIRMED;
+        }
+        h->domain_allocations.erase(it);
+        h->domain_admission_stopped =
+            h->domain_release_failed ||
+            (prior_admission_stopped && (collective || h->last_allocation_id != allocation_id));
+        return 0;
+    }
+#endif
     if (collective && host_cleanup_failed(h)) return COMM_RECLAMATION_UNCONFIRMED;
     int rc = 0;
     const bool prior_admission_stopped = h->domain_admission_stopped;
@@ -2054,6 +2321,11 @@ extern "C" int comm_global_domain_release(uint64_t domain_id) try {
 
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+    for (const auto &item : h->domain_allocations) {
+        if (item.second->rdma_domain) return COMM_RECLAMATION_UNCONFIRMED;
+    }
+#endif
 
     // Keep registration owners and the runtime alive if retirement is unconfirmed.
     for (auto it = h->domain_allocations.begin(); it != h->domain_allocations.end();) {

@@ -67,6 +67,8 @@ bool fabric_supported = true;
 int unsupported_attempts = 0;
 std::weak_ptr<PhysicalAllocation> unsupported_resource;
 bool fail_context_upload = false;
+int device_free_calls = 0;
+int fail_device_free_call = -1;
 bool reject_explicit_access = false;
 int explicit_access_calls = 0;
 enum class PeerFailure { NONE, IMPORT, RESERVE, MAP };
@@ -122,7 +124,11 @@ extern "C" aclError aclrtHostMemMapCapabilities(uint32_t, aclrtHacType engine, a
     return ACL_SUCCESS;
 }
 extern "C" aclError aclrtMalloc(void **out, size_t bytes, aclrtMemMallocPolicy) { return map_buffer(out, bytes); }
-extern "C" aclError aclrtFree(void *p) { return unmap_buffer(p); }
+extern "C" aclError aclrtFree(void *p) {
+    ++device_free_calls;
+    const auto status = unmap_buffer(p);
+    return device_free_calls == fail_device_free_call ? ACL_ERROR_FAILURE : status;
+}
 extern "C" aclError aclrtMemcpy(void *out, size_t, const void *in, size_t bytes, aclrtMemcpyKind) {
     if (fail_context_upload && bytes == sizeof(CommContext)) return 1;
     std::memcpy(out, in, bytes);
@@ -280,7 +286,7 @@ static void test_host_registration_lifecycle(const std::string &scenario) {
     fail_host_reserve = scenario == "host_reserve_failure";
     const uint32_t mask = sdma ? comm_workspace_bit(CommWorkspaceKind::SDMA) : 0;
     // A2/A3 has no URMA engine, so any non-default engine configuration is rejected.
-    const CommWorkspaceConfig urma_config{2, 0};
+    const CommWorkspaceConfig urma_config{2, 0, COMM_CCU_MODE_SCHED, 1, 0, {}};
     assert(
         comm_alloc_host_domain_windows(
             h.get(), 2, ranks, h->nranks, 0, size, 0, name.c_str(), &ctx, &base, &mapped, &urma_config

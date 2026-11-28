@@ -18,6 +18,7 @@
 
 #include "aicpu/platform_regs.h"
 #include "backend/sdma/sdma_completion_scheduler.h"
+#include "backend/rdma/rdma_completion_scheduler.h"
 #include "intrinsic.h"
 #include "aicore_completion_mailbox.h"
 #include "completion_token.h"
@@ -56,6 +57,8 @@ struct CompletionCondition {
     uint64_t addr{0};
     uint64_t backend_cookie{0};
     uint32_t expected_value{0};
+    uint64_t owner_epoch{0};
+    mutable simpler::rdma::InDieCompletionCursor rdma_cursor{};
 
     CompletionPollResult test() const;
     void retire();
@@ -84,10 +87,24 @@ inline void sdma_event_record_retire_op(CompletionCondition &cond) {
     retire_sdma_post_done_record(cond.addr, cond.backend_cookie);
 }
 
+inline CompletionPollResult rdma_in_die_poll_op(const CompletionCondition &cond) {
+    if (cond.engine != ASYNC_ENGINE_ROCE || cond.expected_value != 0) {
+        return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+    }
+    return simpler::rdma::poll_rdma_in_die_event(cond.addr, cond.backend_cookie, cond.owner_epoch, cond.rdma_cursor);
+}
+
+inline void rdma_in_die_retire_op(CompletionCondition &cond) {
+    simpler::rdma::retire_rdma_in_die_event(cond.rdma_cursor);
+}
+
 inline const CompletionBackendOps *completion_backend_ops_for(int completion_type) {
     static const CompletionBackendOps kOps[] = {
         {counter_poll_op, counter_retire_op},                      // COMPLETION_TYPE_COUNTER = 0
         {sdma_event_record_poll_op, sdma_event_record_retire_op},  // COMPLETION_TYPE_SDMA_EVENT_RECORD = 1
+        {nullptr, nullptr},
+        {nullptr, nullptr},
+        {rdma_in_die_poll_op, rdma_in_die_retire_op},  // COMPLETION_TYPE_RDMA_IN_DIE_EVENT_HANDLE = 4
     };
     constexpr int kOpsCount = static_cast<int>(sizeof(kOps) / sizeof(kOps[0]));
     if (completion_type < 0 || completion_type >= kOpsCount) return nullptr;
@@ -301,6 +318,8 @@ struct AsyncWaitList {
                                 reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(addr)) :
                                 nullptr;
         cond.expected_value = expected_value;
+        cond.owner_epoch = TaskId::to_uint64(entry.task_token) + 1;
+        cond.rdma_cursor = {};
         entry.waiting_completion_count++;
         return true;
     }

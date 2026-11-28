@@ -35,6 +35,7 @@ inline constexpr int32_t MAX_COMPLETIONS_PER_TASK = 64;
 
 #define COMPLETION_TYPE_COUNTER 0
 #define COMPLETION_TYPE_SDMA_EVENT_RECORD 1
+#define COMPLETION_TYPE_RDMA_IN_DIE_EVENT_HANDLE 4
 
 // DeferredCompletionEntry / DeferredCompletionSlab back the per-task scratch
 // area that AICore writes into to record "this completion has to be observed

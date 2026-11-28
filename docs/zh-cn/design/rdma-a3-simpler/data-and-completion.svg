@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800" role="img" aria-labelledby="title desc">
+  <title id="title">A3 数据路径与完成边界</title><desc id="desc">PUT 和 GET 都通过 NPU 板载 RoCE 在 HBM 间搬移，不经过 Host payload。任务完成需要 FIN 和传输成功，窗口覆盖还需远端消费结束。</desc>
+  <defs><marker id="arr" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#326c9b"/></marker></defs>
+  <style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#17304b}.h{font-size:23px;font-weight:700}.t{font-size:18px}.s{font-size:16px;fill:#52677e}.a{fill:none;stroke:#326c9b;stroke-width:3;marker-end:url(#arr)}.b{stroke:#c0d1e0;stroke-width:1.5;rx:12}</style>
+  <rect width="1280" height="800" fill="white"/><text x="35" y="45" class="h">数据走 NPU 侧 RoCE；控制和数据分开</text>
+  <rect x="35" y="75" width="1210" height="62" class="b" fill="#edf4ff"/><text x="55" y="113" class="t">Host：Worker / 窗口与端口 / Bootstrap / HCCP 建链；不接收或转发每笔 RDMA payload</text>
+  <rect x="35" y="174" width="345" height="171" class="b" fill="#edf9f4"/><text x="58" y="210" class="h">rank r / NPU HBM</text><text x="58" y="245" class="t">PUT：本地 source</text><text x="58" y="276" class="t">GET：本地 destination</text><text x="58" y="316" class="s">AIV 发 WQE；MR 保护窗口</text>
+  <rect x="470" y="174" width="340" height="171" class="b" fill="#fff5e8"/><text x="500" y="212" class="h">A3 板载 RoCE</text><text x="500" y="247" class="t">NIC 传输 / 真实 CQE</text><text x="500" y="278" class="s">PUT → 远端写</text><text x="500" y="310" class="s">GET ← 远端读返回</text>
+  <rect x="900" y="174" width="345" height="171" class="b" fill="#edf9f4"/><text x="923" y="210" class="h">peer p / NPU HBM</text><text x="923" y="245" class="t">PUT：远端 destination</text><text x="923" y="276" class="t">GET：远端 source</text><text x="923" y="316" class="s">VA 是 MR 寻址，不是本地映射</text>
+  <path d="M380 226H467M810 226H897" class="a"/><path d="M900 294H813M470 294H383" class="a"/>
+  <text x="35" y="397" class="h">三种结束条件，不能混为一谈</text>
+  <rect x="35" y="430" width="350" height="82" class="b" fill="#edf4ff"/><text x="55" y="462" class="t">AIV FIN / NORMAL_DONE</text><text x="55" y="490" class="s">内核已结束发起操作</text>
+  <rect x="35" y="548" width="350" height="82" class="b" fill="#fff5e8"/><text x="55" y="580" class="t">CQE 成功前缀 / PTO tail</text><text x="55" y="608" class="s">传输已完成；AICPU 只读查询</text>
+  <path d="M385 471H437V527H467M385 589H437V527" class="a"/>
+  <rect x="470" y="483" width="340" height="91" class="b" fill="#edf9f4"/><text x="491" y="518" class="h">TaskId 完整完成</text><text x="491" y="549" class="s">两个条件均到达，释放本地依赖</text>
+  <path d="M810 528H897" class="a"/>
+  <rect x="900" y="461" width="345" height="135" class="b" fill="#f4efff"/><text x="921" y="496" class="h">窗口可覆盖 / 可释放</text><text x="921" y="532" class="t">还需应用确认远端使用结束</text><text x="921" y="567" class="s">本地完成 ≠ 远端消费者完成</text>
+  <rect x="35" y="678" width="1210" height="86" class="b" fill="#fff6f1"/><text x="55" y="713" class="t">超时、部分提交或清理失败：保留 owner / MR / QP / 窗口 / 端口，停止新请求。</text><text x="55" y="744" class="s">不以 FIN、submit 返回值、owner bit 的一次匹配或“等待足够久”伪造成功。</text>
+</svg>

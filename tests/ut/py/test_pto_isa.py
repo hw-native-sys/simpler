@@ -91,7 +91,7 @@ def test_clone_falls_back_to_gitcode_after_three_github_pin_failures(tmp_path, m
         "https://github.com/hw-native-sys/pto-isa.git",
         "https://github.com/hw-native-sys/pto-isa.git",
         "https://github.com/hw-native-sys/pto-isa.git",
-        "https://gitcode.com/luohuan40/pto-isa.git",
+        "https://gitcode.com/cann/pto-isa.git",
     ]
     assert sleeps == [2, 4]
 
@@ -118,7 +118,7 @@ def test_clone_falls_back_to_gitcode_after_three_github_clone_failures(tmp_path,
         "https://github.com/hw-native-sys/pto-isa.git",
         "https://github.com/hw-native-sys/pto-isa.git",
         "https://github.com/hw-native-sys/pto-isa.git",
-        "https://gitcode.com/luohuan40/pto-isa.git",
+        "https://gitcode.com/cann/pto-isa.git",
     ]
 
 

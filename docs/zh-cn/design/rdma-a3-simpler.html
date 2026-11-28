@@ -1,0 +1,1503 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>A3 通用 RDMA 后端接入 simpler 设计说明书</title><style>
+:root{color-scheme:light;--ink:#203248;--accent:#1c6397;--border:#dbe3ec}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:26px}body{margin:0;background:#f4f7fb;color:var(--ink);font:16px/1.85 'Microsoft YaHei','Noto Sans CJK SC',sans-serif}nav{position:fixed;inset:0 auto 0 0;width:264px;background:#102b43;padding:22px 18px;overflow:auto}nav strong{color:#fff;display:block;font-size:20px;margin-bottom:12px}nav .caption{color:#9dbbd3;font-size:13px;margin-bottom:18px}nav a{display:block;color:#cce1f3;text-decoration:none;line-height:1.6;padding:6px 9px;border-radius:5px}nav a:hover{background:#26465f;color:white}.nav-main{font-weight:bold;margin-top:12px}.nav-sub{font-size:13px;padding-left:18px}main{margin-left:264px;padding:30px 38px 80px;max-width:1600px}section{background:#fff;border:1px solid var(--border);border-radius:15px;margin-bottom:28px;padding:28px 32px;box-shadow:0 4px 18px #112d4508}h1{font-size:28px;line-height:1.45;border-bottom:3px solid #d3e6f5;padding-bottom:17px;margin-top:4px}h2{font-size:23px;margin:34px 0 14px}h3{font-size:19px;color:#2e536d;margin-top:25px}p{margin:13px 0}a{color:var(--accent);text-underline-offset:3px}table{border-collapse:collapse;width:100%;font-size:14px;margin:18px 0;table-layout:auto}th,td{border:1px solid var(--border);padding:10px 12px;text-align:left;vertical-align:top;overflow-wrap:anywhere}th{background:#ecf3fa}tr:nth-child(even){background:#f8fafc}code{font-family:Consolas,'Noto Sans Mono',monospace;background:#f0f4f8;color:#a33846;padding:1px 4px;border-radius:4px;font-size:.9em;overflow-wrap:anywhere}pre{background:#122b40;color:#e2edf6;padding:18px 20px;overflow:auto;border-radius:9px;line-height:1.65}pre code{color:inherit;background:none;padding:0;overflow-wrap:normal}figure{margin:22px 0;padding:10px;background:white;border:1px solid #dde6ee;border-radius:10px;overflow:auto}figure svg{width:100%;height:auto;display:block;min-width:660px}figcaption{text-align:center;font-size:13px;color:#657b90;margin-top:8px}li{margin:8px 0}details{margin:15px 0}summary{cursor:pointer;color:#1c6397}.meta{font-size:13px;color:#708297;margin-bottom:18px}@media(max-width:1000px){nav{position:static;width:auto;max-height:310px}nav .nav-sub{display:none}main{margin:0;padding:16px}section{padding:20px}}@media print{body{background:white}nav{display:none}main{margin:0;padding:0}section{box-shadow:none;border:0;break-before:page}h2,h3{break-after:avoid}table{font-size:10px}a{color:inherit}figure svg{min-width:0}pre{white-space:pre-wrap}}
+</style></head><body><nav><strong>A3 RDMA / simpler</strong><div class="caption">设计与实现 · 2026-11-27<br>PTO PR 2155 / IN_DIE<br>范围：simpler 层</div><a class="nav-main" href="#overview">设计总览</a><a class="nav-sub" href="#overview-1-阅读入口">1. 阅读入口</a><a class="nav-sub" href="#overview-2-设计基线">2. 设计基线</a><a class="nav-sub" href="#overview-3-总体流程">3. 总体流程</a><a class="nav-sub" href="#overview-4-数据路径与首版范围">4. 数据路径与首版范围</a><a class="nav-sub" href="#overview-5-必须落实的设计约束">5. 必须落实的设计约束</a><a class="nav-main" href="#architecture">架构与源码</a><a class="nav-sub" href="#architecture-1-复用-a5-机制替换设备提供方">1. 复用 A5 机制，替换设备提供方</a><a class="nav-sub" href="#architecture-2-已有-simpler-函数与作用">2. 已有 simpler 函数与作用</a><a class="nav-sub" href="#architecture-3-pto-pr-2155-的关键调用">3. PTO PR 2155 的关键调用</a><a class="nav-sub" href="#architecture-4-simpler-到-pto-的完整调用关系">4. simpler 到 PTO 的完整调用关系</a><a class="nav-sub" href="#architecture-5-资源边界">5. 资源边界</a><a class="nav-main" href="#interfaces">接口增改清单</a><a class="nav-sub" href="#interfaces-pto-isa-pr-2155-的依赖合同">PTO-ISA PR 2155 的依赖合同</a><a class="nav-sub" href="#interfaces-1-sdk-及参数接口">1. SDK 及参数接口</a><a class="nav-sub" href="#interfaces-2-现有-host-c-abi-与内部资源函数">2. 现有 Host C ABI 与内部资源函数</a><a class="nav-sub" href="#interfaces-aiv-request-interfaces">3. AIV 请求、callable 与完成接口</a><a class="nav-sub" href="#interfaces-4-构建配置与测试接口">4. 构建、配置与测试接口</a><a class="nav-main" href="#completion">请求与完成</a><a class="nav-sub" href="#completion-1-每次触发如何传参数">1. 每次触发如何传参数</a><a class="nav-sub" href="#completion-aiv-submission">2. AIV 提交与完成登记</a><a class="nav-sub" href="#completion-3-完成-tokencqe-与游标所有权">3. 完成 token、CQE 与游标所有权</a><a class="nav-sub" href="#completion-4-fin-汇合错误与数据可见性">4. FIN 汇合、错误与数据可见性</a><a class="nav-sub" href="#completion-5-多次触发与并发边界">5. 多次触发与并发边界</a><a class="nav-main" href="#lifecycle">窗口与生命周期</a><a class="nav-sub" href="#lifecycle-1-alloc_domain-在哪里调用是否需要修改">1. alloc_domain 在哪里调用，是否需要修改</a><a class="nav-sub" href="#lifecycle-2-初始化及全-rank-发布">2. 初始化及全 rank 发布</a><a class="nav-sub" href="#lifecycle-3-workspace-和窗口分别保存什么">3. workspace 和窗口分别保存什么</a><a class="nav-sub" href="#lifecycle-4-多次使用与直接-simpler-sdk">4. 多次使用与直接 simpler SDK</a><a class="nav-sub" href="#lifecycle-5-结束失败与保留">5. 结束、失败与保留</a><a class="nav-main" href="#implementation">实施与验收</a><a class="nav-sub" href="#implementation-1-源文件与工作拆分">1. 源文件与工作拆分</a><a class="nav-sub" href="#implementation-2-工具链与构建接入">2. 工具链与构建接入</a><a class="nav-sub" href="#implementation-3-不需要设备的验证">3. 不需要设备的验证</a><a class="nav-sub" href="#implementation-4-a3-双-rank-实机验收">4. A3 双 rank 实机验收</a><a class="nav-sub" href="#implementation-5-设计评审关口">5. 设计评审关口</a></nav><main><div class="meta">离线阅读版；图表已内嵌，无需网络或 Markdown 插件。接口合同与实现对应；无设备构建和实机验收分别记录。</div><section id="overview"><h1 id="overview-a3-通用-rdma-后端接入-simpler-设计说明书">A3 通用 RDMA 后端接入 simpler 设计说明书</h1>
+<p>设计日期：2026-11-25。范围：simpler 的 SDK、通信资源、AIV callable、AICPU 完成调度及构建验证。本文不设计 lib/PyPTO 的接口、IR、Pass 或 codegen，也不修改已有 A5 设计。</p>
+<p><strong>采用 PTO-ISA PR 2155 的 <code>IN_DIE</code> 直接提交路径：Host 建链，AIV 发起 PUT/GET，A3 板载 RoCE 搬移 NPU 显存，AICPU 查询真实完成。</strong> 不需要 Host 轮询请求、代理提交每笔传输。</p>
+<h2 id="overview-1-阅读入口">1. 阅读入口</h2>
+<table>
+<thead>
+<tr>
+<th>文档</th>
+<th>主要内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="#architecture">架构与源码依据</a></td>
+<td>两个 PR 的职责、已核对的函数位置、资源和调用流程</td>
+</tr>
+<tr>
+<td><a href="#interfaces">新增、修改与复用接口</a></td>
+<td>SDK、Host 内部、设备、调度、构建接口的签名和功能</td>
+</tr>
+<tr>
+<td><a href="#completion">请求与完成协议</a></td>
+<td>48 B 参数、事件编码、CQE、只读完成查询和 FIN 汇合</td>
+</tr>
+<tr>
+<td><a href="#lifecycle">窗口、建链与生命周期</a></td>
+<td>alloc_domain、Bootstrap、窗口复用、端口租约、异常和释放</td>
+</tr>
+<tr>
+<td><a href="#implementation">实施与验收</a></td>
+<td>文件清单、依赖、构建接入、确定性测试和实施顺序</td>
+</tr>
+<tr>
+<td><a href="#overview">完整离线阅读版</a></td>
+<td>合并全文和内嵌流程图，可直接用浏览器打开</td>
+</tr>
+</tbody>
+</table>
+<p>各表中的“已有”指下表固定的 simpler main 或 PTO PR 源码；“新增/修改”标出本后端相对基线的改动。实现与构建证据见<a href="#implementation">实施与验收</a>；真实 A3 NIC 验收另行进行。</p>
+<h2 id="overview-2-设计基线">2. 设计基线</h2>
+<table>
+<thead>
+<tr>
+<th>依据</th>
+<th>固定版本</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>simpler <a href="https://github.com/hw-native-sys/simpler/pull/2157/changes">PR 2157</a></td>
+<td>head <code>5cdfdb9f6f341369b5feadb3765f7188048851cb</code></td>
+<td>A5 AIV 提交、deferred completion、AICPU CQ 查询的历史参考</td>
+</tr>
+<tr>
+<td>simpler <a href="https://github.com/hw-native-sys/simpler/commit/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9">设计初稿 main 快照</a></td>
+<td><code>ec5dd4fc0fa29e977b6b71a533c191439fb96ff9</code></td>
+<td>初稿的函数与生命周期参考</td>
+</tr>
+<tr>
+<td>本次实现的 <a href="https://github.com/makangkang2026/simpler/commit/70415c727abd3e5a6dbb25fdec485379bb308c79">fork main</a></td>
+<td><code>70415c727abd3e5a6dbb25fdec485379bb308c79</code></td>
+<td>2026-11-27 核对的提交基线；包含本地 peer cancellation，RDMA 已接入该取消后的请求排空路径</td>
+</tr>
+<tr>
+<td>upstream 提交基线 <a href="https://github.com/hw-native-sys/simpler/commit/9f9beac34c7b62efa0abafab7eb9ad0dea3d6dcf">main</a></td>
+<td><code>9f9beac34c7b62efa0abafab7eb9ad0dea3d6dcf</code></td>
+<td>2026-11-28 重新对齐并验证；保留上游 A3 epoch retirement，按新的 CPU/SDK/device 测试分层放置资源协议测试</td>
+</tr>
+<tr>
+<td>上述 main 的 PTO-ISA pin</td>
+<td><code>45435c0624c1d0d056bf38aa60d4f56dc0ef3b6b</code></td>
+<td>尚无本设计依赖的 A3 <code>IN_DIE</code> 后端，必须升级</td>
+</tr>
+<tr>
+<td>PTO-ISA <a href="https://gitcode.com/cann/pto-isa/pull/2155/diffs">PR 2155</a></td>
+<td>head <code>596dc095892da42f1990622830c5209309d025cf</code>；base <code>d77753cfc652db5b994f1e9253692ec24fd34c39</code></td>
+<td>A2/A3 HCCP、AI QP、AIV WQE、IN_DIE CQE 和自动建链</td>
+</tr>
+</tbody>
+</table>
+<p>PR 2155 在核对时仍为 opened。实施时固定包含该实现的不可变 commit；若其合入版本改变布局或签名，生产者、AICPU 查询器和测试必须同时更新。本文已读取该 head 的完整源代码，不能用旧 pin 下“A5 only”的文档否定该 PR 的新能力。</p>
+<h2 id="overview-3-总体流程">3. 总体流程</h2>
+<p><figure><svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1080" viewBox="0 0 1280 1080" role="img" aria-labelledby="title-fig1 desc-fig1">
+  <title id="title-fig1">A3 通用 RDMA 后端：从 SDK 到真实完成</title>
+  <desc id="desc-fig1">Host 注册普通 callable 并创建域。PTO HCCP 建链后，AICPU 调度 AIV 直接提交 RDMA；AICPU 将 FIN 与真实 CQE 合并。</desc>
+  <defs><marker id="arrow-fig1" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#45617b"/></marker></defs>
+  <style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#17304b} .title{font-size:29px;font-weight:700}.sub{font-size:17px;fill:#53677c}.h{font-size:20px;font-weight:700}.t{font-size:16px}.tiny{font-size:15px;fill:#53677c}.flow{fill:none;stroke:#45617b;stroke-width:2.5;marker-end:url(#arrow-fig1)}.box{stroke:#bbccdc;stroke-width:1.5;rx:12}.host{fill:#edf5ff}.dev{fill:#edf9f4}.net{fill:#fff4e7}.new{fill:#f4efff}</style>
+  <rect width="1280" height="1080" fill="#fff"/>
+  <text x="40" y="48" class="title">A3 通用 RDMA 后端调用流程</text><text x="40" y="78" class="sub">设计范围：simpler SDK / Host 资源 / TMR / AIV / AICPU；基于 PTO-ISA PR 2155 IN_DIE</text>
+  <rect x="25" y="104" width="1230" height="260" rx="18" fill="#f7f9fc"/>
+  <text x="45" y="135" class="h">① 构建注册与首次域准备</text>
+  <rect x="45" y="158" width="355" height="82" class="box host"/><text x="62" y="187" class="h">复用通用编译与装配</text><text x="62" y="215" class="t">KernelCompiler → ChipCallable.build()</text>
+  <path d="M400 199H443" class="flow"/>
+  <rect x="445" y="158" width="350" height="82" class="box host"/><text x="462" y="187" class="h">Worker.register() → init()</text><text x="462" y="215" class="t">注册产物，建立已有执行环境</text>
+  <path d="M795 199H838" class="flow"/>
+  <text x="840" y="147" class="tiny">由应用调用 Worker.run(...) 执行</text>
+  <rect x="840" y="158" width="390" height="82" class="box host"/><text x="857" y="187" class="h">rdma_host_orchestration()</text><text x="857" y="215" class="t">get_or_allocate_domain() 创建/复用域</text>
+  <path d="M1035 240V267H796" class="flow"/>
+  <rect x="445" y="270" width="785" height="69" class="box dev"/><text x="462" y="297" class="h">comm_alloc_domain_windows → domain_alloc_via_rdma</text><text x="462" y="324" class="t">复用 DomainAllocation / PTO BuildComm → MR、AI QP、workspace → 上传 context</text>
+  <text x="45" y="290" class="tiny">Host 负责准备资源。</text><text x="45" y="315" class="tiny">每次数据传输由 AIV 直接发起。</text>
+  <rect x="25" y="386" width="1230" height="555" rx="18" fill="#f7f9fc"/>
+  <text x="45" y="418" class="h">② 每次调用（窗口 / MR / QP 不重建）</text>
+  <text x="45" y="452" class="sub">Host / simpler SDK</text><text x="445" y="452" class="sub">AICPU / TMR</text><text x="840" y="452" class="sub">AIV / PTO / NIC</text>
+  <rect x="45" y="474" width="355" height="100" class="box host"/><text x="62" y="503" class="h">rdma_host_orchestration()</text><text x="62" y="530" class="t">domain.device_context() 获取本轮 lease</text><text x="62" y="555" class="t">TaskArgs → submit_next_level()</text>
+  <path d="M400 524H443" class="flow"/>
+  <rect x="445" y="474" width="350" height="100" class="box dev"/><text x="462" y="503" class="h">既有/薄层 Chip orchestration</text><text x="462" y="530" class="t">aicpu_orchestration_entry()</text><text x="462" y="555" class="t">rt_submit_aiv_task() → 普通派发</text>
+  <path d="M795 524H838" class="flow"/>
+  <rect x="840" y="474" width="390" height="100" class="box new"/><text x="857" y="503" class="h">AIV kernel_entry()</text><text x="857" y="530" class="t">校验参数 → 检查 completion 容量</text><text x="857" y="555" class="t">BuildAsyncSession&lt;RDMA&gt;()</text>
+  <path d="M1035 574V600" class="flow"/>
+  <rect x="840" y="603" width="390" height="100" class="box dev"/><text x="857" y="632" class="h">TPUT_ASYNC / TGET_ASYNC</text><text x="857" y="659" class="t">IN_DIE Post → WQE → SQ doorbell</text><text x="857" y="684" class="tiny">event → register_completion_condition()</text>
+  <path d="M1035 703V730" class="flow"/>
+  <rect x="840" y="733" width="390" height="85" class="box net"/><text x="857" y="762" class="h">A3 板载 RoCE 执行搬移</text><text x="857" y="791" class="t">本地 / 对端 HBM；产生真实 CQE</text>
+  <path d="M840 653H797" class="flow"/><text x="701" y="638" class="tiny">AIV FIN</text>
+  <path d="M840 776H797" class="flow"/><text x="682" y="806" class="tiny">只读 CQE</text>
+  <rect x="445" y="611" width="350" height="90" class="box dev"/><text x="462" y="641" class="h">正常结束条件</text><text x="462" y="670" class="t">FIN / NORMAL_DONE</text>
+  <rect x="445" y="733" width="350" height="85" class="box new"/><text x="462" y="762" class="h">IN_DIE completion observer</text><text x="462" y="791" class="t">按序验证成功前缀；不写 CQ tail</text>
+  <path d="M445 656H227V844" class="flow"/><path d="M445 776H350V844" class="flow"/>
+  <rect x="45" y="847" width="1185" height="67" class="box dev"/><text x="62" y="874" class="h">FIN AND 所有 RDMA 条件成功 → TaskId 完成 → 释放本地后继依赖</text><text x="62" y="899" class="t">PUT 完成不表示远端业务已消费；GET 期间远端源必须稳定。</text>
+  <rect x="25" y="963" width="1230" height="91" rx="18" fill="#edf5ff"/><text x="45" y="995" class="h">③ 结束与释放</text><text x="45" y="1025" class="t">本地完整完成 + 远端访问静默 → release agreement → TryDestroyComm → free GM → 释放端口；未知完成保留 owner。</text>
+</svg>
+<figcaption>A3 RDMA 调用流程</figcaption></figure></p>
+<ol>
+<li>应用通过既有通用编译/装配流程构建并注册普通 <code>ChipCallable</code>，与 SDMA 接入方式一致。<code>Worker.init()</code> 启动执行环境并准备 Host Orchestrator，不自动创建本次通信域。</li>
+<li>应用调用 <code>Worker.run(rdma_host_orchestration,...)</code>；运行时执行该 Python Host 编排函数，由其显式调用已有 <code>allocate_domain()</code> 或 <code>get_or_allocate_domain()</code>，请求 <code>workspace_engines=(&quot;rdma&quot;,)</code>。首次创建域时延迟建立基础 communicator。</li>
+<li>simpler A3 平台层分配本地设备窗口，调用 PTO 的 <code>GetCommWorkspaceSize()</code>、<code>BuildComm()</code>，得到 MR、AI QP、RDMA workspace 和各 rank 的显存地址。</li>
+<li>每次调用通过 <code>TaskArgs</code> 传递 context、peer、本地/远端偏移、长度和 QP 号。<code>orch.submit_next_level()</code> 提交同一个 callable，不重新注册 MR/QP。</li>
+<li>Chip orchestration 使用已有 <code>rt_submit_aiv_task()</code> 派发 AIV <code>kernel_entry()</code>；AIV 在提交前确认完成记录容量，再调用 <code>BuildAsyncSession&lt;RDMA&gt;()</code> 和 <code>TPUT_ASYNC/TGET_ASYNC&lt;RDMA&gt;()</code>，随后复用 <code>register_completion_condition()</code> 登记事件。</li>
+<li>NIC 执行传输。AIV 返回并发布普通 FIN；AICPU 只读查询 IN_DIE CQ 的成功前缀。<strong>FIN 与真实传输完成都满足后</strong>，运行时才完成 TaskId 并释放后继依赖。</li>
+</ol>
+<h2 id="overview-4-数据路径与首版范围">4. 数据路径与首版范围</h2>
+<p><figure><svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800" role="img" aria-labelledby="title-fig2 desc-fig2">
+  <title id="title-fig2">A3 数据路径与完成边界</title><desc id="desc-fig2">PUT 和 GET 都通过 NPU 板载 RoCE 在 HBM 间搬移，不经过 Host payload。任务完成需要 FIN 和传输成功，窗口覆盖还需远端消费结束。</desc>
+  <defs><marker id="arr-fig2" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#326c9b"/></marker></defs>
+  <style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#17304b}.h{font-size:23px;font-weight:700}.t{font-size:18px}.s{font-size:16px;fill:#52677e}.a{fill:none;stroke:#326c9b;stroke-width:3;marker-end:url(#arr-fig2)}.b{stroke:#c0d1e0;stroke-width:1.5;rx:12}</style>
+  <rect width="1280" height="800" fill="white"/><text x="35" y="45" class="h">数据走 NPU 侧 RoCE；控制和数据分开</text>
+  <rect x="35" y="75" width="1210" height="62" class="b" fill="#edf4ff"/><text x="55" y="113" class="t">Host：Worker / 窗口与端口 / Bootstrap / HCCP 建链；不接收或转发每笔 RDMA payload</text>
+  <rect x="35" y="174" width="345" height="171" class="b" fill="#edf9f4"/><text x="58" y="210" class="h">rank r / NPU HBM</text><text x="58" y="245" class="t">PUT：本地 source</text><text x="58" y="276" class="t">GET：本地 destination</text><text x="58" y="316" class="s">AIV 发 WQE；MR 保护窗口</text>
+  <rect x="470" y="174" width="340" height="171" class="b" fill="#fff5e8"/><text x="500" y="212" class="h">A3 板载 RoCE</text><text x="500" y="247" class="t">NIC 传输 / 真实 CQE</text><text x="500" y="278" class="s">PUT → 远端写</text><text x="500" y="310" class="s">GET ← 远端读返回</text>
+  <rect x="900" y="174" width="345" height="171" class="b" fill="#edf9f4"/><text x="923" y="210" class="h">peer p / NPU HBM</text><text x="923" y="245" class="t">PUT：远端 destination</text><text x="923" y="276" class="t">GET：远端 source</text><text x="923" y="316" class="s">VA 是 MR 寻址，不是本地映射</text>
+  <path d="M380 226H467M810 226H897" class="a"/><path d="M900 294H813M470 294H383" class="a"/>
+  <text x="35" y="397" class="h">三种结束条件，不能混为一谈</text>
+  <rect x="35" y="430" width="350" height="82" class="b" fill="#edf4ff"/><text x="55" y="462" class="t">AIV FIN / NORMAL_DONE</text><text x="55" y="490" class="s">内核已结束发起操作</text>
+  <rect x="35" y="548" width="350" height="82" class="b" fill="#fff5e8"/><text x="55" y="580" class="t">CQE 成功前缀 / PTO tail</text><text x="55" y="608" class="s">传输已完成；AICPU 只读查询</text>
+  <path d="M385 471H437V527H467M385 589H437V527" class="a"/>
+  <rect x="470" y="483" width="340" height="91" class="b" fill="#edf9f4"/><text x="491" y="518" class="h">TaskId 完整完成</text><text x="491" y="549" class="s">两个条件均到达，释放本地依赖</text>
+  <path d="M810 528H897" class="a"/>
+  <rect x="900" y="461" width="345" height="135" class="b" fill="#f4efff"/><text x="921" y="496" class="h">窗口可覆盖 / 可释放</text><text x="921" y="532" class="t">还需应用确认远端使用结束</text><text x="921" y="567" class="s">本地完成 ≠ 远端消费者完成</text>
+  <rect x="35" y="678" width="1210" height="86" class="b" fill="#fff6f1"/><text x="55" y="713" class="t">超时、部分提交或清理失败：保留 owner / MR / QP / 窗口 / 端口，停止新请求。</text><text x="55" y="744" class="s">不以 FIN、submit 返回值、owner bit 的一次匹配或“等待足够久”伪造成功。</text>
+</svg>
+<figcaption>数据路径与完成边界</figcaption></figure></p>
+<p>业务数据路径是 <code>本 rank NPU HBM → A3 板载 RoCE → 对端 NPU HBM</code>，GET 的方向相反。Host 负责资源、Bootstrap 和调度；Host 的文件/控制消息仅交换连接信息，不中转业务 payload。远端 VA 是 MR 寻址信息，不能当作本地可解引用的 peer mapping。</p>
+<p>首版支持 A3、<code>platform=&quot;a2a3&quot;</code>、TMR、同一 Host 的双 rank L3、设备内存窗口、连续字节 PUT/GET、持久窗口和多次调用。PTO 支持 A2 不等于 simpler 的 A2 已经验证；更多 rank、HBG、跨 Host L4、Host-backed RDMA、通知操作、任意 Tensor 自动注册及 InCore 融合不在本次范围。</p>
+<p><code>CommWorkspaceKind.RDMA</code> 已存在，无须新增枚举值；<code>RdmaConfig</code> 已存在，但要补齐 A3 的 QP/地址/端口配置。现有 <code>allocate_domain()</code> 的公开签名保持不变，<strong>其 A3 实现必须修改</strong>：当前非零 <code>workspace_mask</code> 被拒绝，原有 Fabric/IPC peer 映射路径也不能直接承担 RDMA-only 资源准备。</p>
+<p>PUT 完成表示本次 RDMA 写的传输完成，不表示远端业务已消费；GET 要求远端源在读取期间保持稳定。跨 rank 的数据就绪、消费和下一轮覆盖许可仍由应用阶段协议保证。</p>
+<h2 id="overview-5-必须落实的设计约束">5. 必须落实的设计约束</h2>
+<table>
+<thead>
+<tr>
+<th>约束</th>
+<th>设计要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A3/A5 队列布局不同</td>
+<td>A3 使用 <code>RdmaBackend::IN_DIE</code>、workspace v3、<code>RDMA_IN_DIE_CQE=4</code>；禁止复用 HNS1825 CQE 解析和 doorbell 格式</td>
+</tr>
+<tr>
+<td>完成注册失败不能丢请求</td>
+<td>发 WQE 前检查容量，在本任务独占 slab 的合同下复用原登记函数；不使用失败后 <code>event.Wait()</code> 的阻塞兜底</td>
+</tr>
+<tr>
+<td>CQ 只有一个回收主体</td>
+<td>PTO 的 AIV <code>Progress()</code> 修改 CQ/SQ tail 和 CQ doorbell；AICPU 只读观察成功前缀</td>
+</tr>
+<tr>
+<td>队列绕圈不能误判</td>
+<td>查询同时使用完整事件目标、workspace generation、已回收 tail 和 CQE 状态；不能只比较一个 owner bit</td>
+</tr>
+<tr>
+<td>生命周期必须覆盖 DMA</td>
+<td>run lease、已提交任务、远端阶段访问和 provider 清理都结束后，才能释放 MR/窗口</td>
+</tr>
+<tr>
+<td>失败保留所有权</td>
+<td>初始化残留或提交结果未知时保留 owner；不重试同一写、不自动清空队列、不 reset 设备</td>
+</tr>
+<tr>
+<td>真机结果不能由编译替代</td>
+<td>代码、构建、模拟和 A3 实机验收分别记录；无设备的编译验证不等于实机可运行</td>
+</tr>
+</tbody>
+</table>
+</section><section id="architecture"><h1 id="architecture-a3-rdma-架构与源码依据">A3 RDMA 架构与源码依据</h1>
+<p><a href="#overview">返回设计入口</a></p>
+<h2 id="architecture-1-复用-a5-机制替换设备提供方">1. 复用 A5 机制，替换设备提供方</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>simpler PR 2157 / A5</th>
+<th>本设计 / PTO PR 2155</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>设备后端</td>
+<td>HNS1825，经 UB 连接的 NIC</td>
+<td>A3 板载 RoCE，<code>IN_DIE</code></td>
+</tr>
+<tr>
+<td>Host 资源</td>
+<td>HCOMM 通道及 HNS1825 workspace</td>
+<td>HCCP <code>RaRegisterMr</code>、<code>RaAiQpCreate</code> 和 <code>BuildComm</code></td>
+</tr>
+<tr>
+<td>架构</td>
+<td><code>__NPU_ARCH__=3510</code></td>
+<td><code>__NPU_ARCH__=2201</code>；Host 同时检查实际 SoC</td>
+</tr>
+<tr>
+<td>AIV 发起</td>
+<td>PTO 生成 HNS1825 WQE</td>
+<td>PTO <code>in_die::Post()</code> 生成 64 B WQE 并提交 doorbell</td>
+</tr>
+<tr>
+<td>CQE</td>
+<td>HNS1825 owner/opcode/syndrome</td>
+<td>32 B CQE，word0 owner 位 7、status 位 8～15</td>
+</tr>
+<tr>
+<td>事件</td>
+<td>RDMA event handle</td>
+<td>同一高低字编码，但高字是 <code>peer * qpNum + qpIdx</code></td>
+</tr>
+<tr>
+<td>真实完成</td>
+<td>AICPU HNS1825 adapter</td>
+<td>新增 AICPU IN_DIE 只读 observer</td>
+</tr>
+<tr>
+<td>可复用部分</td>
+<td>deferred slab、FIN 汇合、普通 AIV 调度</td>
+<td>复用这些机制，补齐 A3 dispatcher 和资源生命周期</td>
+</tr>
+<tr>
+<td>不直接移植的部分</td>
+<td>A5 低地址阈值、dbCos patch、旧 workspace 镜像</td>
+<td>不在 A3 应用这些假设</td>
+</tr>
+</tbody>
+</table>
+<p>PR 2155 已包含 AIV 多核共享 QP 的 tournament lock 和 SQ/CQ 容量回收。本设计不再添加另一套 WQE、锁、socket/MR 交换实现。simpler 负责将自身资源和完成语义接到它上面。</p>
+<h2 id="architecture-2-已有-simpler-函数与作用">2. 已有 simpler 函数与作用</h2>
+<p>下列位置均相对于 simpler main <code>ec5dd4fc0fa29e977b6b71a533c191439fb96ff9</code>；链接固定 commit，行号不随 main 漂移。</p>
+<table>
+<thead>
+<tr>
+<th>函数 / 位置</th>
+<th>当前作用</th>
+<th>本设计处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/python/simpler/orchestrator.py#L572"><code>Orchestrator.allocate_domain()</code>，orchestrator.py:572</a></td>
+<td>同步创建通信域、窗口和指定 workspace</td>
+<td>复用签名，更新 A3 支持说明</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/python/simpler/orchestrator.py#L627"><code>get_or_allocate_domain()</code>，同文件:627</a></td>
+<td>精确配置命中则复用现有域</td>
+<td>配置比较加入 RDMA 参数；命中不重置窗口</td>
+</tr>
+<tr>
+<td><code>Worker._submit_l3_locked()</code>，<code>python/simpler/worker.py</code></td>
+<td>在当前 run scope 内执行 <code>callable(self._orch,args,cfg)</code>，即调用用户 Host 回调</td>
+<td>复用；回调自行调用 get_or_allocate_domain，不由 register/init 隐式触发</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/python/simpler/worker.py#L11290"><code>Worker._comm_domain()</code>，worker.py:11290</a></td>
+<td>创建/查找 owner，组织域使用与释放</td>
+<td>接入 A3 RDMA capability、端口租约和失败保留</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/python/simpler/worker.py#L11708"><code>Worker._allocate_domain()</code>，同文件:11708</a></td>
+<td>校验并向各 chip 发起域分配控制请求</td>
+<td>在分发前协调 RDMA 配置和端口</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/python/simpler/worker.py#L2925"><code>_handle_ctrl_alloc_domain()</code>，同文件:2925</a></td>
+<td>chip 子进程解码控制请求，调用 native</td>
+<td>增加 RDMA 配置解码，不新增控制操作种类</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/src/common/worker/chip_worker.cpp#L2861"><code>ChipWorker::comm_alloc_domain_windows()</code>，chip_worker.cpp:2861</a></td>
+<td>Python/native/platform 转发</td>
+<td>携带扩展配置，保留原输出契约</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/src/a2a3/platform/onboard/host/comm_hccl.cpp#L1502"><code>comm_alloc_domain_windows()</code>，A3 comm_hccl.cpp:1502</a></td>
+<td>当前拒绝非零 workspace mask</td>
+<td>新增 RDMA-only 分支，调用 PTO 建链</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/src/a2a3/platform/onboard/host/comm_hccl.cpp#L1744"><code>release_domain_allocation()</code>，同文件:1744</a></td>
+<td>collective/local abort 释放入口</td>
+<td>RDMA 分支必须确认静默，清理失败保留 map 中 owner</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/src/a2a3/platform/onboard/host/comm_hccl.cpp#L1810"><code>comm_release_domain_windows()</code> / <code>comm_abort_domain_windows()</code>，同文件:1810/1815</a></td>
+<td>正常释放 / 初始化失败后的本地清理</td>
+<td>复用 C ABI，分别落实正常和残留清理条件</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/python/simpler/task_interface.py#L1265"><code>CommDomainHandle.device_context()</code>，task_interface.py:1265</a></td>
+<td>返回选中 worker 的 GM context，并登记 domain 使用</td>
+<td>每个 run 内调用，保证纯 scalar 参数也持有窗口 owner</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/python/simpler/worker.py#L11395"><code>Worker._use_domain()</code>，worker.py:11395</a></td>
+<td>将域 owner 绑定到本轮 cleanup fence</td>
+<td>复用，错误运行不能提前解除 DMA 保护</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/python/simpler/orchestrator.py#L328"><code>orch.submit_next_level()</code>，orchestrator.py:328</a></td>
+<td>向目标 chip 提交 callable、参数和依赖</td>
+<td>复用，不新增 RDMA 专用 Host submit API</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/async_kernel_api.h#L45"><code>register_completion_condition()</code>，A3 async_kernel_api.h:45</a></td>
+<td>向当前 AIV 任务的 deferred slab 写完成条件</td>
+<td>直接复用；RDMA helper 在发 WQE 前检查容量</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/async_wait.h#L87"><code>completion_backend_ops_for()</code>，A3 async_wait.h:87</a></td>
+<td>当前只分发 counter 和 SDMA record</td>
+<td>新增 IN_DIE 完成条件处理</td>
+</tr>
+</tbody>
+</table>
+<p><code>Worker.register()</code> 位于同一基线 <code>worker.py:8672</code>，<code>Worker.init()</code> 位于 <code>:9689</code>，公开 <code>Worker.run()</code> 位于 <code>:14870</code>。三者分别注册产物、初始化执行环境、驱动一次运行；不能把 callable 注册误认为 MR 注册或网络传输。</p>
+<h2 id="architecture-3-pto-pr-2155-的关键调用">3. PTO PR 2155 的关键调用</h2>
+<p>以下为 head <code>596dc095892da42f1990622830c5209309d025cf</code> 的真实函数。路径链接到该 PR 的 source repository；这是依赖源码，不是 simpler 需要重写的接口。</p>
+<table>
+<thead>
+<tr>
+<th>函数</th>
+<th>代码位置</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GetCommWorkspaceSize()</code></td>
+<td><code>kernels/include/communication/host/comm_context.hpp:63</code></td>
+<td>查询 RDMA workspace、PTO 设备 context 和业务窗口需求</td>
+</tr>
+<tr>
+<td><code>BuildComm()</code></td>
+<td>同文件 <code>:182</code></td>
+<td>组织 Bootstrap、寻址、transport 和 RDMA 资源；返回可保留失败 owner</td>
+</tr>
+<tr>
+<td><code>BootstrapComm()</code></td>
+<td><code>kernels/include/communication/host/detail/bootstrap.hpp</code></td>
+<td>RDMA-only 加 HostExchange 时可不创建额外 HCCL 域</td>
+</tr>
+<tr>
+<td><code>SetupRdmaTransport()</code></td>
+<td><code>kernels/include/communication/host/detail/rdma_transport.hpp</code></td>
+<td>调用初始化、回填远端 MR 地址并全 rank 确认</td>
+</tr>
+<tr>
+<td><code>InitRdmaWorkspace()</code></td>
+<td><code>kernels/include/communication/host/detail/rdma_workspace.hpp</code></td>
+<td>分阶段汇总能力、端点、建链结果及清理状态</td>
+</tr>
+<tr>
+<td><code>RdmaWorkspaceManager::{Preflight,Init,Finalize}</code></td>
+<td><code>include/pto/comm/async/rdma/rdma_workspace_manager.hpp</code></td>
+<td>选择 <code>IN_DIE</code>，检查 SoC，分派后端并管理所有权</td>
+</tr>
+<tr>
+<td><code>in_die::WorkspaceManager::Init()</code></td>
+<td><code>pkg_inc/pto/comm/async/rdma/backends/in_die/in_die_workspace_manager.hpp:39</code></td>
+<td>注册业务 MR/operand MR，创建连接，拷贝队列和 MR 表到 GM</td>
+</tr>
+<tr>
+<td><code>Connection::{CreateQp,LinkQp}</code></td>
+<td><code>.../in_die/in_die_connection.hpp</code></td>
+<td><code>RaAiQpCreate</code> 创建 AI QP，注册 QP 关联 MR，连接并等待 ready</td>
+</tr>
+<tr>
+<td><code>BuildAsyncSession&lt;RDMA&gt;()</code></td>
+<td><code>include/pto/comm/async_common/async_event_impl.hpp:86</code></td>
+<td>AIV 将 workspace、rank、scratch、sync、QP 装成会话</td>
+</tr>
+<tr>
+<td><code>in_die::Post()</code></td>
+<td><code>.../in_die/in_die_backend.hpp</code></td>
+<td>校验 MR 范围、Reserve/Lock、StageWqe、doorbell、返回事件</td>
+</tr>
+<tr>
+<td><code>in_die::Progress()</code></td>
+<td>同文件</td>
+<td>在队列锁内按顺序消费成功 CQE，更新 CQ/SQ tail 和 CQ doorbell</td>
+</tr>
+<tr>
+<td><code>AsyncEvent::CompletionRecordCount/At()</code></td>
+<td><code>include/pto/comm/async_common/async_event_impl.hpp</code></td>
+<td>返回 IN_DIE CQE 地址、owner 预期和完成种类</td>
+</tr>
+<tr>
+<td><code>in_die::GetRdmaCompletionRecord()</code></td>
+<td><code>.../in_die/in_die_backend.hpp:339</code></td>
+<td>设置 <code>CompletionKind::RDMA_IN_DIE_CQE</code>，owner 位与 A5 不同</td>
+</tr>
+<tr>
+<td><code>TryDestroyComm()</code></td>
+<td><code>kernels/include/communication/host/comm_context.hpp</code></td>
+<td>释放 PTO owner；失败保留仍被 provider 引用的资源</td>
+</tr>
+</tbody>
+</table>
+<p>固定版本入口：<a href="https://gitcode.com/mengxun233/pto-isa/tree/596dc095892da42f1990622830c5209309d025cf">PTO PR source tree</a>。上表中的缩写 <code>.../in_die/</code> 指 <code>pkg_inc/pto/comm/async/rdma/backends/in_die/</code>。</p>
+<h2 id="architecture-4-simpler-到-pto-的完整调用关系">4. simpler 到 PTO 的完整调用关系</h2>
+<figure><svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1080" viewBox="0 0 1280 1080" role="img" aria-labelledby="title-fig3 desc-fig3">
+  <title id="title-fig3">A3 通用 RDMA 后端：从 SDK 到真实完成</title>
+  <desc id="desc-fig3">Host 注册普通 callable 并创建域。PTO HCCP 建链后，AICPU 调度 AIV 直接提交 RDMA；AICPU 将 FIN 与真实 CQE 合并。</desc>
+  <defs><marker id="arrow-fig3" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#45617b"/></marker></defs>
+  <style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#17304b} .title{font-size:29px;font-weight:700}.sub{font-size:17px;fill:#53677c}.h{font-size:20px;font-weight:700}.t{font-size:16px}.tiny{font-size:15px;fill:#53677c}.flow{fill:none;stroke:#45617b;stroke-width:2.5;marker-end:url(#arrow-fig3)}.box{stroke:#bbccdc;stroke-width:1.5;rx:12}.host{fill:#edf5ff}.dev{fill:#edf9f4}.net{fill:#fff4e7}.new{fill:#f4efff}</style>
+  <rect width="1280" height="1080" fill="#fff"/>
+  <text x="40" y="48" class="title">A3 通用 RDMA 后端调用流程</text><text x="40" y="78" class="sub">设计范围：simpler SDK / Host 资源 / TMR / AIV / AICPU；基于 PTO-ISA PR 2155 IN_DIE</text>
+  <rect x="25" y="104" width="1230" height="260" rx="18" fill="#f7f9fc"/>
+  <text x="45" y="135" class="h">① 构建注册与首次域准备</text>
+  <rect x="45" y="158" width="355" height="82" class="box host"/><text x="62" y="187" class="h">复用通用编译与装配</text><text x="62" y="215" class="t">KernelCompiler → ChipCallable.build()</text>
+  <path d="M400 199H443" class="flow"/>
+  <rect x="445" y="158" width="350" height="82" class="box host"/><text x="462" y="187" class="h">Worker.register() → init()</text><text x="462" y="215" class="t">注册产物，建立已有执行环境</text>
+  <path d="M795 199H838" class="flow"/>
+  <text x="840" y="147" class="tiny">由应用调用 Worker.run(...) 执行</text>
+  <rect x="840" y="158" width="390" height="82" class="box host"/><text x="857" y="187" class="h">rdma_host_orchestration()</text><text x="857" y="215" class="t">get_or_allocate_domain() 创建/复用域</text>
+  <path d="M1035 240V267H796" class="flow"/>
+  <rect x="445" y="270" width="785" height="69" class="box dev"/><text x="462" y="297" class="h">comm_alloc_domain_windows → domain_alloc_via_rdma</text><text x="462" y="324" class="t">复用 DomainAllocation / PTO BuildComm → MR、AI QP、workspace → 上传 context</text>
+  <text x="45" y="290" class="tiny">Host 负责准备资源。</text><text x="45" y="315" class="tiny">每次数据传输由 AIV 直接发起。</text>
+  <rect x="25" y="386" width="1230" height="555" rx="18" fill="#f7f9fc"/>
+  <text x="45" y="418" class="h">② 每次调用（窗口 / MR / QP 不重建）</text>
+  <text x="45" y="452" class="sub">Host / simpler SDK</text><text x="445" y="452" class="sub">AICPU / TMR</text><text x="840" y="452" class="sub">AIV / PTO / NIC</text>
+  <rect x="45" y="474" width="355" height="100" class="box host"/><text x="62" y="503" class="h">rdma_host_orchestration()</text><text x="62" y="530" class="t">domain.device_context() 获取本轮 lease</text><text x="62" y="555" class="t">TaskArgs → submit_next_level()</text>
+  <path d="M400 524H443" class="flow"/>
+  <rect x="445" y="474" width="350" height="100" class="box dev"/><text x="462" y="503" class="h">既有/薄层 Chip orchestration</text><text x="462" y="530" class="t">aicpu_orchestration_entry()</text><text x="462" y="555" class="t">rt_submit_aiv_task() → 普通派发</text>
+  <path d="M795 524H838" class="flow"/>
+  <rect x="840" y="474" width="390" height="100" class="box new"/><text x="857" y="503" class="h">AIV kernel_entry()</text><text x="857" y="530" class="t">校验参数 → 检查 completion 容量</text><text x="857" y="555" class="t">BuildAsyncSession&lt;RDMA&gt;()</text>
+  <path d="M1035 574V600" class="flow"/>
+  <rect x="840" y="603" width="390" height="100" class="box dev"/><text x="857" y="632" class="h">TPUT_ASYNC / TGET_ASYNC</text><text x="857" y="659" class="t">IN_DIE Post → WQE → SQ doorbell</text><text x="857" y="684" class="tiny">event → register_completion_condition()</text>
+  <path d="M1035 703V730" class="flow"/>
+  <rect x="840" y="733" width="390" height="85" class="box net"/><text x="857" y="762" class="h">A3 板载 RoCE 执行搬移</text><text x="857" y="791" class="t">本地 / 对端 HBM；产生真实 CQE</text>
+  <path d="M840 653H797" class="flow"/><text x="701" y="638" class="tiny">AIV FIN</text>
+  <path d="M840 776H797" class="flow"/><text x="682" y="806" class="tiny">只读 CQE</text>
+  <rect x="445" y="611" width="350" height="90" class="box dev"/><text x="462" y="641" class="h">正常结束条件</text><text x="462" y="670" class="t">FIN / NORMAL_DONE</text>
+  <rect x="445" y="733" width="350" height="85" class="box new"/><text x="462" y="762" class="h">IN_DIE completion observer</text><text x="462" y="791" class="t">按序验证成功前缀；不写 CQ tail</text>
+  <path d="M445 656H227V844" class="flow"/><path d="M445 776H350V844" class="flow"/>
+  <rect x="45" y="847" width="1185" height="67" class="box dev"/><text x="62" y="874" class="h">FIN AND 所有 RDMA 条件成功 → TaskId 完成 → 释放本地后继依赖</text><text x="62" y="899" class="t">PUT 完成不表示远端业务已消费；GET 期间远端源必须稳定。</text>
+  <rect x="25" y="963" width="1230" height="91" rx="18" fill="#edf5ff"/><text x="45" y="995" class="h">③ 结束与释放</text><text x="45" y="1025" class="t">本地完整完成 + 远端访问静默 → release agreement → TryDestroyComm → free GM → 释放端口；未知完成保留 owner。</text>
+</svg>
+<figcaption>主调用流程。精确函数序列见下方 Mermaid 源码。</figcaption></figure><details><summary>查看 Mermaid 时序图源码</summary><pre><code>sequenceDiagram
+    participant App as simpler SDK 应用
+    participant W as Worker / Host orchestration
+    participant P as A3 platform
+    participant PTO as PTO Host / HCCP
+    participant CPU as AICPU scheduler
+    participant AIV as AIV kernel_entry
+    participant NIC as A3 RoCE
+    App-&gt;&gt;W: 通用编译/装配 ChipCallable → register → init
+    App-&gt;&gt;W: Worker.run(rdma_host_orchestration)
+    W-&gt;&gt;W: _submit_l3_locked → rdma_host_orchestration(orch,args,cfg)
+    W-&gt;&gt;P: allocate_domain → comm_alloc_domain_windows
+    P-&gt;&gt;P: 既有 DomainAllocation + domain_alloc_via_rdma
+    P-&gt;&gt;PTO: GetCommWorkspaceSize → BuildComm
+    PTO-&gt;&gt;PTO: RaRegisterMr → RaAiQpCreate → LinkQp
+    PTO--&gt;&gt;P: workspace / peer MR VA / ready
+    P--&gt;&gt;W: simpler CommContext + local window
+    loop 每次请求
+      W-&gt;&gt;CPU: submit_next_level(callable, TaskArgs)
+      CPU-&gt;&gt;CPU: 既有/薄层 AICPU 编排 → rt_submit_aiv_task
+      CPU-&gt;&gt;AIV: 普通 AIV 任务派发
+      AIV-&gt;&gt;AIV: 校验 → 检查 completion 容量 → BuildAsyncSession
+      AIV-&gt;&gt;NIC: TPUT/TGET → IN_DIE Post → doorbell
+      AIV--&gt;&gt;CPU: register_completion_condition → flush → FIN
+      NIC--&gt;&gt;CPU: 只读观察 CQE / 已回收成功 tail
+      CPU--&gt;&gt;W: FIN AND transfer ready → TaskId 完成
+    end
+    W-&gt;&gt;P: 所有本地任务与远端访问静默后 release
+    P-&gt;&gt;PTO: 既有 release/abort 路径 → TryDestroyComm
+    P-&gt;&gt;P: 成功后释放 GM/端口；失败保留 owner
+</code></pre></details><p>图中的 AICPU 编排复用现有契约：业务可直接在已有入口提交 RDMA AIV；独立 RDMA ChipCallable 的共享模板实现默认 <code>aicpu_orchestration_entry()</code> 和 <code>aicpu_orchestration_config()</code>，仅检查入参形状并转发六个 scalar，不新增 RDMA 专用编排 API。默认符号并不自带可执行函数体，独立 callable 的薄层源码位于 builtins/rdma；PUT/GET 内核也由该目录提供。</p>
+<p>编译和装配复用现有 KernelCompiler/CoreCallable/ChipCallable；示例可用私有 <code>_build_rdma_callable()</code> 包装这些步骤，不新增 RDMA 专用公共 builder。AICPU 派发和 AIV <code>kernel_entry</code> 走现有 TMR dispatch，不增加第二个常驻 runtime、Host progress 线程或 CCU mission。入口/config 的必要性与 SDMA 对照见<a href="#interfaces-aicpu-orchestration">接口清单</a>。</p>
+<h2 id="architecture-5-资源边界">5. 资源边界</h2>
+<p>每个 rank 有独立的 Host owner 和 GM <code>CommContext</code>。simpler 的 <code>CommContext</code> 与 PTO 的 <code>pto::comm::domain::CommContext</code> 是不同类型：前者是现有 simpler 设备 ABI，后者是 Host 侧 provider owner。禁止互相强转。</p>
+<p>Host owner 持有业务窗口、PTO workspace、PTO 临时设备 context、PTO domain owner、端口租约和状态。最终仅向 AIV 发布 simpler context：<code>rankId/rankNum/winSize</code>、各 peer 的 MR VA，以及 <code>workspaces[RDMA]={addr,size}</code>。RDMA-only 域无需导入 peer Fabric/IPC mapping。</p>
+<p>该 Host owner 是现有 <code>DomainAllocation</code> 的扩展字段，不新增 A3RdmaDomain 类及 Prepare/Close/Abort 生命周期。初始化保留文件内 <code>domain_alloc_via_rdma()</code> 和必要的 HostExchange 回调；校验、端口协调、释放与失败保留接入现有路径。SDMA/PTO 复用边界见<a href="#interfaces-host-resource-ownership">接口清单</a>。</p>
+<p>业务窗口属于应用数据；workspace 属于传输元数据。PTO 自动路径可能按自身公共约定初始化 signal prefix，simpler 不把该 prefix 作为新增用户通知能力；新域初始化完成后才公开，复用命中不再调用 <code>BuildComm</code>、不重置数据。业务 <code>CommBufferSpec</code> 的 carve 仍由 simpler 管理，不把 UB scratch 或 provider operand 页算进用户窗口。</p>
+</section><section id="interfaces"><h1 id="interfaces-simpler-接口增改清单">simpler 接口增改清单</h1>
+<p><a href="#overview">返回设计入口</a></p>
+<p>本页只定义 simpler 接入。函数前的“新增/修改/复用”区分提案与已有实现；<code>pld.rdma.*</code>、lib 包装、PyPTO 编译装配均不在这里定义。现有公共资源 C ABI 不增加函数，所需变化进入已有配置和分配/释放实现。</p>
+<h2 id="interfaces-pto-isa-pr-2155-的依赖合同">PTO-ISA PR 2155 的依赖合同</h2>
+<p>依赖固定到 <a href="https://gitcode.com/cann/pto-isa/pull/2155/diffs">PR 2155</a> 的 <code>596dc095892da42f1990622830c5209309d025cf</code>；2026-11-27 再次核对该 PR 当前 head 与此一致。以下接口使用该版本的真实声明，不能以 simpler 自定义同名类型替代。</p>
+<p>该 SHA 同时由官方仓 <code>https://gitcode.com/cann/pto-isa.git</code> 的 <code>refs/merge-requests/2155/head</code> 提供；已用空 Git 仓验证按完整 SHA fetch 成功。现有依赖管理器在主镜像无法取得该提交时使用 GitCode 回退，并校验最终 HEAD，不能回退成另一个版本。</p>
+<table>
+<thead>
+<tr>
+<th>PTO 接口 / 类型</th>
+<th>接入必须遵守的约束</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>domain::GetCommWorkspaceSize(config,&amp;sizes)</code></td>
+<td>检查 <code>ACL_SUCCESS</code>，据返回容量创建独立业务窗口、workspace 和临时 device context；不猜测 workspace 大小</td>
+</tr>
+<tr>
+<td><code>domain::BuildComm(config,addresses,sizes,context)</code></td>
+<td>返回 bool；配置 RDMA-only、External Bootstrap 和 HostExchange，外部 GM 由 simpler 持有；失败不发布 Python domain</td>
+</tr>
+<tr>
+<td><code>domain::TryDestroyComm(context)</code></td>
+<td>返回 bool；确认 provider 销毁成功后才释放外部 GM 和端口，失败保留原 owner</td>
+</tr>
+<tr>
+<td><code>BuildAsyncSession&lt;DmaEngine::RDMA&gt;(scratch,workspace,my_rank,session,sync_id,qp_index)</code></td>
+<td>检查 bool；独立 UB scratch 采用 <code>kRdmaScratchBytes</code>；IN_DIE 的 sync_id 为 0～7，QP 下标先校验再转换</td>
+</tr>
+<tr>
+<td><code>TPUT_ASYNC&lt;RDMA&gt;(remote_dst,local_src,session,peer)</code> / <code>TGET_ASYNC&lt;RDMA&gt;(local_dst,remote_src,session,peer)</code></td>
+<td>peer 必须按该版本专用重载传入 <code>uint32_t</code>；先验证 64 位参数再窄化；远端地址来自已注册 MR</td>
+</tr>
+<tr>
+<td><code>AsyncEvent</code> / <code>CompletionRecordCount/At</code></td>
+<td>检查 postFailed、error handle、记录数及 kind/address/expected；不得把 handle 当作 GM 指针或只保存 CQE 地址</td>
+</tr>
+<tr>
+<td><code>RdmaInfo</code>、<code>RdmaMemInfo</code>、<code>in_die::Queue/Ring</code></td>
+<td>直接包含固定版本的 Host-safe 定义；校验 magic/version/IN_DIE 和布局，不复制 HNS1825 结构</td>
+</tr>
+<tr>
+<td>AIV <code>Progress()</code></td>
+<td>保持 CQ/SQ tail、Queue.error 和 CQ doorbell 的唯一回收职责；simpler AICPU observer 只读，不接管该职责</td>
+</tr>
+</tbody>
+</table>
+<p><code>register_completion_condition()</code> 属于 simpler 现有运行时，不宣称为 PR 2155 新增的 PTO API。AICPU 的只读 observer 也是 simpler 的适配实现；其设备可见性假设仍需要 A3 实机验收。</p>
+<h2 id="interfaces-1-sdk-及参数接口">1. SDK 及参数接口</h2>
+<h3 id="interfaces-复用通用编译与-callable-装配">复用：通用编译与 callable 装配</h3>
+<p>RDMA 沿用 SDMA 的普通原生 kernel 接入方式：准备 AICPU orchestration 和 AIV 源码，复用 <code>KernelCompiler</code>、<code>CoreCallable.build()</code>、<code>ChipCallable.build()</code> 生成可注册产物。共享源码模板放 <code>src/a2a3/runtime/tensormap_and_ringbuffer/builtins/rdma/</code>，不新增 <code>python/simpler/rdma.py</code> 或 RDMA 专用公共 builder。</p>
+<pre><code class="language-text">AICPU orchestration + AIV PUT/GET 源码
+  → KernelCompiler.compile_orchestration / compile_incore
+  → CoreCallable.build
+  → ChipCallable.build
+  → Worker.register / init
+</code></pre><p>SDMA 已有两种对应做法：示例在 <code>SceneTestCase.CALLABLE</code> 中声明 orchestration/incores，由通用 <code>compile_chip_callable_spec()</code> 装配；测试文件中另有私有 <code>_build_sdma_callable()</code>，也只是封装同一通用编译函数。这说明 SDMA 同样需要编译装配，但后端不要求专用公开工厂函数。</p>
+<p>对照依据为 2026-11-27 核对的 upstream main <code>a723ae8f7201ed6db25b089fd68af6d0a4e6babc</code>：<a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/test_sdma_async_completion_demo.py#L58">SDMA 示例声明</a>、<a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/tests/st/worker/comm_domain/test_a3_host_source_domain.py#L97">私有 SDMA 装配 helper</a>、<a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/simpler_setup/scene_test.py#L1777">通用编译装配</a>。整体 A3 接入基线仍见设计入口的固定版本。</p>
+<p>RDMA 示例可按同一惯例提供私有 <code>_build_rdma_callable(op,platform,runtime)</code>，集中选择 PUT/GET 共享源码、声明规格并调用通用编译装配；也可以直接使用 <code>SceneTestCase.CALLABLE</code>。它属于示例便利代码，不是后端能力或 SDK 契约。直接 SDK 用户可以直接调用既有 KernelCompiler/CoreCallable/ChipCallable，无须依赖测试框架。</p>
+<p>PUT 和 GET 仍为两个普通入口产物，运行参数不固化在二进制中。复用既有构建缓存，并使键覆盖源码、PTO commit、平台/runtime、工具链及请求 ABI 版本。缺少 A3 provider 构建能力时在构建或加载阶段报错。编译装配只生成产物，后续仍由既有 Worker/domain API 创建执行和通信资源。</p>
+<h3 id="interfaces-应用示例-host-编排rdma_host_orchestration">应用/示例 Host 编排：<code>rdma_host_orchestration()</code></h3>
+<p>本次 A3 RDMA 使用示例的 Host 编排函数统一命名为：</p>
+<pre><code class="language-python">from functools import partial
+
+
+def rdma_host_orchestration(orch, _args, config, *, request) -&gt; None:
+    ...
+
+worker.run(partial(rdma_host_orchestration, request=request), config=call_config)
+</code></pre><p>它由应用/示例实现，定义于 <code>examples/a2a3/tensormap_and_ringbuffer/rdma_async_completion_demo/test_rdma_async_completion_demo.py</code>。函数负责创建或复用 domain、准备本次 TaskArgs，并用 <code>submit_next_level()</code> 提交通用 RDMA ChipCallable。PUT/GET 可以共用这段 Host 编排，通过传入的请求和 callable handle 选择操作。</p>
+<p>这个名称是本设计的示例约定，不新增 simpler 公共 Host API；应用已有编排函数时可以直接接入这些步骤。独立 RDMA ChipCallable 包含薄层 AICPU <code>aicpu_orchestration_entry()</code> 和 AIV 内核，不包含此 Python Host 编排函数。Host 入口由 <code>Worker.run()</code> 执行，AICPU 入口由 ChipCallable 的执行路径调用。业务已有 AICPU 编排时，也可以直接在其中提交 RDMA AIV，不必再经过一个 RDMA 专用编排入口。</p>
+<h3 id="interfaces-修改已有-rdmaconfig">修改：已有 <code>RdmaConfig</code></h3>
+<p>位置：<code>python/simpler/workspace_config.py</code>。main 中它已经存在，当前是无字段的 immutable dataclass。扩展为：</p>
+<pre><code class="language-python">@dataclass(frozen=True)
+class RdmaConfig:
+    qp_num: int = 1
+    base_port: int | None = None
+    roce_ips: tuple[str, ...] = ()
+</code></pre><table>
+<thead>
+<tr>
+<th>字段</th>
+<th>功能与校验</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>qp_num</code></td>
+<td>每 peer 的 QP 数；首版 simpler 接受 1～8，所有 rank 一致。资源数随 <code>(rankNum-1)*qp_num</code> 增长；实际能力以 HCCP 返回为准</td>
+</tr>
+<tr>
+<td><code>base_port</code></td>
+<td><code>None</code> 由 L3 coordinator 租用；显式值须在 1～65535 且可租用，所有 rank 一致。不能把默认 60032 无条件用于所有域</td>
+</tr>
+<tr>
+<td><code>roce_ips</code></td>
+<td>空元组使用 PTO 自动发现；非空时与 domain members 顺序一一对应，保存每个设备的 RoCE IP。每项少于 64 个 ASCII 字节且不含 NUL，在集体分配前完成校验。不能使用普通 Host 网卡 IP 代替</td>
+</tr>
+</tbody>
+</table>
+<p>规范化要拒绝 bool 冒充整数、非法 IP、重复或不完整地址及超范围参数。<code>roce_ips</code> 属于域的 immutable 配置；子进程只收到自己选中的 local IP。自动发现遇到多个候选地址时保留 PTO 的报错行为，不任选一个。未请求 RDMA 的域不探测 <code>libra</code> 或 RoCE。</p>
+<p><code>workspace_engines=(&quot;rdma&quot;,)</code> 继续等价于默认 <code>RdmaConfig()</code>。新增非默认字段首版仅向 A3 <code>IN_DIE</code> 接入；A5 若未完成同字段适配，显式拒绝相应配置，不能静默忽略。默认 A5 行为保持现有契约。</p>
+<h3 id="interfaces-复用已有业务入口">复用：已有业务入口</h3>
+<table>
+<thead>
+<tr>
+<th>接口</th>
+<th>功能</th>
+<th>本次需要注意的行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Worker(...)</code> / <code>register()</code> / <code>init()</code> / <code>run()</code></td>
+<td>创建执行层级、注册产物、启动环境、执行一次 Host orchestration</td>
+<td>同一个 callable 可在多个 run 重复提交</td>
+</tr>
+<tr>
+<td><code>KernelCompiler</code> / <code>CoreCallable.build()</code> / <code>ChipCallable.build()</code></td>
+<td>编译并装配普通 AICPU/AIV 执行产物</td>
+<td>直接 SDK 和示例复用；不新增 RDMA 专用公共装配 API</td>
+</tr>
+<tr>
+<td><code>Orchestrator.allocate_domain(...)</code></td>
+<td>创建域、窗口和 workspace</td>
+<td>保持签名；A3 允许 RDMA-only DEVICE 域</td>
+</tr>
+<tr>
+<td><code>get_or_allocate_domain(...)</code></td>
+<td>精确配置复用</td>
+<td>配置比较包含 qp_num、IP、端口请求；自动分配的实际端口是 owner 状态，不改变“请求 None”的复用键</td>
+</tr>
+<tr>
+<td><code>CommBufferSpec</code> / <code>CommDomainHandle.buffer*</code></td>
+<td>窗口内逻辑 buffer carve 和获取</td>
+<td>复用已有对齐和长度校验</td>
+</tr>
+<tr>
+<td><code>CommDomainHandle.device_context(worker, workspace_engines=(&quot;rdma&quot;,))</code></td>
+<td>取本 rank GM context，登记本轮资源引用</td>
+<td>必须在每次 Host callback 内获取，不能只在初始化时缓存裸指针</td>
+</tr>
+<tr>
+<td><code>TaskArgs</code> / <code>CallConfig</code></td>
+<td>传入参数、读写方向及依赖</td>
+<td>本设计的六个 uint64 逐轮传入，64 位值不得经 float 中转</td>
+</tr>
+<tr>
+<td><code>orch.submit_next_level(handle,args,config,worker=rank)</code></td>
+<td>提交 chip callable</td>
+<td>本地依赖由普通 TaskId/显式 deps 表达</td>
+</tr>
+<tr>
+<td><code>CommDomainHandle.release()</code> / <code>Worker.close()</code></td>
+<td>显式释放或最终关闭</td>
+<td>受本地 in-flight 与远端静默约束；未知完成不能提前清理</td>
+</tr>
+</tbody>
+</table>
+<p>不新增 Host 的 <code>rdma_open/alloc/register/submit/poll/wait/close</code> 系列接口。直接 SDK 使用的能力由上述已有资源/提交接口和通用编译装配能力提供；示例 helper 仅减少装配代码。</p>
+<h2 id="interfaces-2-现有-host-c-abi-与内部资源函数">2. 现有 Host C ABI 与内部资源函数</h2>
+<h3 id="interfaces-修改配置结构保留函数签名">修改配置结构，保留函数签名</h3>
+<p><code>src/common/platform_comm/comm.h::CommWorkspaceConfig</code> 现有三个字段保持用途，拟追加固定布局字段：</p>
+<pre><code class="language-cpp">uint32_t rdma_qp_num;       // 默认 1
+uint32_t rdma_base_port;    // 0 表示自动；native 预留候选并全 rank 确认后才建链
+char rdma_local_ip[64];     // NUL 结尾；空字符串由 PTO 发现
+</code></pre><p>结构总长度从 12 B 变为 84 B。Python binding、control payload 编解码、native 转发、A3/A5/sim 生产者和消费者必须同步重建；不支持新旧布局混用。所有路径必须初始化默认字段，禁止把未初始化内存传到未使用该配置的后端。</p>
+<table>
+<thead>
+<tr>
+<th>已有接口 / 位置</th>
+<th>修改内容与功能</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Worker._allocate_domain/_dispatch_control_domain</code>，<code>python/simpler/worker.py</code></td>
+<td>编码规范化配置和端口请求，发起各 rank 分配；native 以相同 allocation 身份选择候选并投票，复用已有 join/abort 事务，全部成功后才发布</td>
+</tr>
+<tr>
+<td><code>_handle_ctrl_alloc_domain</code>，同文件</td>
+<td>解码、校验长度/配置，转发到当前 chip 的 native allocator</td>
+</tr>
+<tr>
+<td><code>ChipWorker::comm_alloc_domain_windows</code>，<code>src/common/worker/chip_worker.cpp</code> 及 binding</td>
+<td>携带扩展结构；不能在 native 成功前发布 context</td>
+</tr>
+<tr>
+<td><code>comm_alloc_domain_windows(...)</code>，<code>src/a2a3/platform/onboard/host/comm_hccl.cpp</code></td>
+<td>从原先拒绝全部非零 mask，扩展为支持 RDMA-only；分配本地 HBM、PTO 外部内存，建链并上传 simpler context</td>
+</tr>
+<tr>
+<td><code>DomainAllocation</code>，同文件</td>
+<td>扩展现有 owner，保存 PTO Host context、外部 GM 分配、端口占用记录和清理状态；不增加另一套 domain owner 类</td>
+</tr>
+<tr>
+<td><code>release_domain_allocation()</code> / <code>release_domain_windows()</code>，同文件</td>
+<td>在现有公共 release/abort 后接入 RDMA 分支；复用 PTO TryDestroyComm，成功后再 free 外部 GM、释放端口，失败不 erase owner</td>
+</tr>
+<tr>
+<td><code>comm_release_domain_windows(...)</code>，同文件</td>
+<td>确认所有 rank 已停止访问后销毁 PTO provider，再释放外部 GM；失败保留 owner</td>
+</tr>
+<tr>
+<td><code>comm_abort_domain_windows(...)</code>，同文件</td>
+<td>初始化失败且所有参与请求已终止后，清理未发布 owner；不是已运行 DMA 的通用取消函数</td>
+</tr>
+<tr>
+<td><code>comm_destroy</code> / <code>DomainAllocation</code> 清理路径，同文件</td>
+<td>不能绕过 RDMA retain 状态、无条件清空 owner map 或让析构提前 free GM</td>
+</tr>
+<tr>
+<td><code>comm_alloc_host_domain_windows</code>，同文件</td>
+<td>保留 Host-backed RDMA 不支持的明确错误，不误走 SDMA Host mapping</td>
+</tr>
+<tr>
+<td><code>CommContext</code> / <code>comm_workspace&lt;RDMA&gt;()</code>，<code>src/common/platform_comm/comm_context.h</code></td>
+<td>保持 1104 B 布局和现有 RDMA 枚举值 2；填入 MR VA 和独立 workspace，不新增通用裸指针字段</td>
+</tr>
+</tbody>
+</table>
+<h3 id="interfaces-host-resource-ownership">复用现有 owner 与清理入口</h3>
+<p>资源接入直接修改现有 <code>src/a2a3/platform/onboard/host/comm_hccl.cpp</code>，不新建 <code>rdma_domain.{h,cpp}</code>。不增加 <code>A3RdmaDomain</code> 及其 Prepare/Close/AbortInitialization 方法，也不增加 <code>DomainRequest</code>、<code>DomainStatus</code>、<code>QuiescenceProof</code> 类型。配置使用扩展后的 <code>CommWorkspaceConfig</code>，owner 使用扩展后的 <code>DomainAllocation</code>，外部状态继续使用现有 C ABI 错误码。</p>
+<table>
+<thead>
+<tr>
+<th>职责</th>
+<th>复用或修改位置</th>
+<th>新接口判断</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>组织 RDMA 准备</td>
+<td><code>comm_alloc_domain_windows()</code> 的 RDMA 分支；按已有 <code>domain_alloc_via_ipc/fabric</code> 惯例拆出文件内 <code>domain_alloc_via_rdma()</code></td>
+<td>仅保留一个私有分配 helper，不建立独立生命周期 API</td>
+</tr>
+<tr>
+<td>注册 MR、建 QP、初始化 workspace</td>
+<td>PTO <code>GetCommWorkspaceSize()</code>、<code>BuildComm()</code> 及其内部 <code>InitRdmaWorkspace()</code> / manager Init</td>
+<td>直接复用，不复制 NIC 初始化实现</td>
+</tr>
+<tr>
+<td>配置与布局检查</td>
+<td>Python 已有配置规范化、PTO 初始化检查、RDMA 分配分支和既有 AIV checked helper</td>
+<td>删除独立 <code>validate_rdma_context()</code>；在各自边界校验，保留 simpler extent、PTO pin、workspace backend/version 等接入检查</td>
+</tr>
+<tr>
+<td>生成 simpler GM context</td>
+<td>逐字段转换 PTO 的 <code>rdmaHostCtx</code>，复用 <code>comm_domain_onboard::upload_context()</code></td>
+<td>不新增 context 上传接口，不把两种 CommContext 强转</td>
+</tr>
+<tr>
+<td>正常关闭与初始化失败清理</td>
+<td>已有 <code>comm_release_domain_windows()</code> / <code>comm_abort_domain_windows()</code> → <code>release_domain_allocation()</code> / <code>release_domain_windows()</code> → PTO <code>TryDestroyComm()</code></td>
+<td>修改既有 RDMA 清理分支；复用入口并保留正常 release 与本地 initialization abort 的不同前置条件</td>
+</tr>
+<tr>
+<td>端口占用</td>
+<td>既有 <code>_allocate_domain()</code> / native 分配分支协调候选；占用记录、独占锁句柄和实际端口归 <code>DomainAllocation</code></td>
+<td>不新增 <code>RdmaPortLease::Acquire/Release</code> 类接口；仍需新增私有端口预留/确认逻辑及释放代码</td>
+</tr>
+</tbody>
+</table>
+<p>SDMA 对照依据为 upstream main <code>a723ae8f7201ed6db25b089fd68af6d0a4e6babc</code>：<a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/src/a2a3/platform/onboard/host/comm_hccl.cpp#L93"><code>DomainAllocation</code></a>、<a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/src/a2a3/platform/onboard/host/comm_hccl.cpp#L1103"><code>SdmaWorkspaceOwner</code> / <code>dma_workspace_provision()</code></a>、<a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/src/a2a3/platform/onboard/host/comm_hccl.cpp#L1776">既有 release/abort 共用路径</a>。复用 SDMA 的外部分配和 owner 模式；其 Worker 级 <code>dma_workspace_provision()</code> 只接受 SDMA mask，且不接收 domain members/业务 MR 参数，不能原样用于 RDMA。RDMA owner 必须绑定域。PTO <code>DestroyWorkspace()</code> 不返回清理成功状态，RDMA 保留所选 <code>BuildComm()</code> / <code>TryDestroyComm()</code> 路径，不机械照搬 SDMA 的销毁调用。</p>
+<h3 id="interfaces-仅保留分配-helper-和必要的交换回调">仅保留分配 helper 和必要的交换回调</h3>
+<table>
+<thead>
+<tr>
+<th>私有函数</th>
+<th>最小职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>domain_alloc_via_rdma(...)</code></td>
+<td>使用现有 allocation 参数、配置和 <code>DomainAllocation*</code>，分配外部 GM、配置 PTO、调用 BuildComm、完成接入检查并上传 simpler context。端口预留状态随 owner 保存</td>
+</tr>
+<tr>
+<td><code>domain_host_all_gather(void*,const void*,size_t,void*) -&gt; bool</code></td>
+<td>适配 PTO <code>HostExchange::allGather</code>。复用既有 allocation/run 命名空间、原子文件发布和有截止时间的等待，补上固定长度记录的按 rank 汇集；不交换另一套 MR/QP 私有协议</td>
+</tr>
+</tbody>
+</table>
+<p>这两个函数只在 <code>comm_hccl.cpp</code> 内使用，不对 SDK 导出。端口协调中需要的局部实现不构成另一组 backend 接口；缩减接口不意味着该逻辑已由现有代码自动提供。</p>
+<p>PTO 已有 <code>GetRdmaExchange()</code> / <code>HcclHostAllGather()</code>，但需要匹配当前 domain 的 communicator。simpler 的 base HCCL communicator 可能包含额外 rank 或不同顺序，不能直接用于任意 members 子集，否则会发生 collective 参与者不一致。本设计继续使用薄的 HostExchange callback，不新建每域 HCCL communicator，不引入 MPI。既有 <code>file_barrier()</code> 只证明到达，不传输记录；不能直接冒充 all-gather。<code>publish_marker()</code> 的 payload 是文本，PTO 的不透明二进制记录须无损编码后发布，解码时校验精确长度，不能直接传含 NUL 的原始指针。<a href="https://gitcode.com/cann/pto-isa/blob/596dc095892da42f1990622830c5209309d025cf/kernels/include/communication/host/detail/rdma_transport.hpp#L80">PTO 交换选择源码</a></p>
+<p>当前未找到可直接复用的跨域 RDMA 端口分配器。保留原端口隔离合同，使用系统独占锁实现占用并接入现有分配/释放路径；已有 <code>GenerationLease</code> 是固定 generation 目录的共享锁，不能直接充当 device/port 独占锁。其 inode/owner 校验可参照，不能把共享锁改成独占锁而影响现有 generation 生命周期。<a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/src/common/platform/include/host/comm_generation_lease.h#L32">GenerationLease 源码</a></p>
+<p>状态复用 <code>COMM_DOMAIN_WORKSPACE_UNSUPPORTED</code>、<code>COMM_INITIALIZATION_ABORT_REQUIRED</code> 和 <code>COMM_RECLAMATION_UNCONFIRMED</code>；错误记录保留 PTO <code>rdmaReport</code>、ACL/HCCP 原错误和阶段/rank。静默条件仍须由已有 run/domain owner 与 release 协议证明：停止新请求、本地任务完整结束、远端业务访问结束、控制操作全部 join。清理失败保留 map owner、GM 和端口，不能仅凭调用返回或析构尝试而判定成功。</p>
+<h2 id="interfaces-aiv-request-interfaces">3. AIV 请求、callable 与完成接口</h2>
+<h3 id="interfaces-新增公共字节-abi">新增公共字节 ABI</h3>
+<p>拟新增 <code>src/common/rdma/rdma_request.h</code>，供构建器、chip orchestration 和 AIV wrapper 共享：</p>
+<pre><code class="language-cpp">struct RdmaTransferArgsV1 {
+    uint64_t comm_context;   // simpler CommContext 的 GM 地址
+    uint64_t peer_rank;      // domain 内 dense rank，不是物理 device id
+    uint64_t local_offset;   // 相对本 rank 窗口起点，字节
+    uint64_t remote_offset;  // 相对 peer 窗口起点，字节
+    uint64_t nbytes;
+    uint64_t qp_index;
+};
+// sizeof == 48；offsetof 依次为 0,8,16,24,32,40；alignof == 8。
+</code></pre><p>PUT/GET 由 callable 种类区分，无 opcode 扩展位。请求没有 Host 指针、QP 句柄或 rkey；这些归 domain owner 管理。此结构是新增协议，不能被描述成 main 已有接口。TaskArgs 传六个 uint64 scalar，chip 层转成同一语义的 CoreTaskArgs；不得 memcpy 含 padding 的临时类型作为网络协议。</p>
+<h3 id="interfaces-aicpu-orchestration">复用 AICPU 编排契约，独立 callable 只提供薄层入口</h3>
+<p>不新增 <code>rdma_orchestration_config()</code>、<code>rdma_orchestration_entry()</code> 作为 RDMA 后端必备接口。复用现有 <code>OrchestrationConfig</code>、<code>ChipTaskArgs</code>、<code>CoreTaskArgs</code>、<code>rt_submit_aiv_task()</code> 和编排 SO 的加载/调用机制；无需修改 AICPU executor 或 SDMA 编排实现。</p>
+<table>
+<thead>
+<tr>
+<th>使用方式</th>
+<th>入口实现</th>
+<th>config 处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>已有业务 AICPU 编排中调用 RDMA</td>
+<td>在业务入口中组装六个 scalar 并调用 <code>rt_submit_aiv_task(rdma_kernel_id,core_args)</code>；RDMA AIV 加入该 ChipCallable 的子内核列表</td>
+<td>复用业务 config；若业务入参合同变化，同步修改其声明和校验，不强制业务入口只接收六个 scalar</td>
+</tr>
+<tr>
+<td>独立 PUT/GET ChipCallable，供 SDK 直接注册调用</td>
+<td><code>builtins/rdma/rdma_orchestration.cpp</code> 提供普通 <code>aicpu_orchestration_entry(const ChipTaskArgs&amp;)</code> 薄层实现</td>
+<td>同一 SO 导出普通 <code>aicpu_orchestration_config()</code>，返回 <code>expected_arg_count=6</code></td>
+</tr>
+</tbody>
+</table>
+<p>这两个 <code>aicpu_*</code> 名称是已有默认符号约定，不代表框架已经提供了可直接执行的函数体。当前没有找到可直接复用的“任意六个 scalar 转发到单个 AIV”的通用入口实现；独立 callable 仍需上述薄层源码。PUT/GET 可共用同一编排 SO，由各自 ChipCallable 将对应 AIV 子内核绑定为 <code>func_id=0</code>。业务自定义入口名称也可继续通过 <code>ChipCallable.build(func_name=...,config_name=...)</code> 指定。</p>
+<p>对照 upstream main <code>a723ae8f7201ed6db25b089fd68af6d0a4e6babc</code>：</p>
+<ul>
+<li><a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp#L559"><code>AicpuExecutor::load_orch_so()</code></a> 先选择指定符号或默认符号，再执行 <code>dlsym</code>。entry 缺失会注册失败；config 缺失仅记录 ERROR 并置空，当前 run 路径跳过它。因此 config 不是当前加载器的硬要求，但独立模板仍导出它，保留参数预检并避免错误日志。</li>
+<li><a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/src/a2a3/runtime/tensormap_and_ringbuffer/orchestration/orchestration_api.h#L441"><code>OrchestrationConfig</code></a> 只有 <code>expected_arg_count</code>；<a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp#L731"><code>run_orchestration()</code> 的检查</a> 是 <code>tensor_count + scalar_count &gt;= expected_arg_count</code>。它不声明参数类型，也不校验 op/产物 ABI。独立入口必须另查 <code>tensor_count()==0 &amp;&amp; scalar_count()==6</code>，失败用已有 <code>rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS,...)</code> 报错，不能只打印日志后返回。</li>
+<li><a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/kernels/orchestration/sdma_async_completion_orch.cpp#L20">SDMA 示例编排</a> 自己定义 config/入口，固定读取三个 tensor 和一个 scalar，再提交 producer、consumer 两个 AIV；<a href="https://github.com/hw-native-sys/simpler/blob/a723ae8f7201ed6db25b089fd68af6d0a4e6babc/examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/test_sdma_async_completion_demo.py#L58">示例声明</a> 指定其入口名称。这是模块的具体编排，不是 SDMA 后端公共 API，函数体不能原样处理 RDMA 的六个 scalar。</li>
+</ul>
+<p>独立模板的入口逻辑如下，实现在 <code>builtins/rdma/rdma_orchestration.cpp</code>：</p>
+<pre><code class="language-cpp">extern &quot;C&quot; __attribute__((visibility(&quot;default&quot;)))
+OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &amp;) {
+    return OrchestrationConfig{.expected_arg_count = 6};
+}
+
+extern &quot;C&quot; __attribute__((visibility(&quot;default&quot;)))
+void aicpu_orchestration_entry(const ChipTaskArgs &amp;args) {
+    if (args.tensor_count() != 0 || args.scalar_count() != 6) {
+        rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, &quot;RDMA expects six uint64 scalars&quot;);
+        return;
+    }
+    CoreTaskArgs core_args;
+    for (uint32_t i = 0; i &lt; 6; ++i) {
+        core_args.add_scalar(args.scalar&lt;uint64_t&gt;(i));
+    }
+    rt_submit_aiv_task(0, core_args);
+}
+</code></pre><p>模板只做入参形状检查和任务转发；MR/QP 资源由 Host domain owner 准备，请求字段合法性与完成容量由 AIV checked helper 校验，完成事件由 AICPU completion backend 汇合。op/子内核绑定及产物 ABI 在构建装配合同中校验，不塞进 <code>OrchestrationConfig</code> 的计数字段。</p>
+<h3 id="interfaces-设备与调度接口">设备与调度接口</h3>
+<table>
+<thead>
+<tr>
+<th>函数</th>
+<th>位置</th>
+<th>功能</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>aicpu_orchestration_config()</code></td>
+<td><code>builtins/rdma/rdma_orchestration.cpp</code></td>
+<td>复用默认符号约定，独立模板实现最少六个参数的预检声明；不检查类型或 op/ABI</td>
+</tr>
+<tr>
+<td><code>aicpu_orchestration_entry(const ChipTaskArgs&amp;)</code></td>
+<td>同上</td>
+<td>独立模板的薄层实现；严格检查零 tensor、六 scalar，转发到 <code>rt_submit_aiv_task(0,...)</code>；已有业务入口可直接包含同类提交逻辑</td>
+</tr>
+<tr>
+<td><code>AicpuExecutor::load_orch_so()</code> / <code>run_orchestration()</code></td>
+<td><code>aicpu/aicpu_executor.cpp:476/631</code></td>
+<td>原样复用指定/默认符号加载、config 调用及 entry 调用，不新增 RDMA 分支</td>
+</tr>
+<tr>
+<td><code>rt_submit_aiv_task(int32_t,const CoreTaskArgs&amp;)</code></td>
+<td><code>orchestration/orchestration_api.h:194</code></td>
+<td>原样复用普通 AIV 提交；内核编号必须匹配当前 ChipCallable 的子内核绑定</td>
+</tr>
+<tr>
+<td><code>kernel_entry(...)</code></td>
+<td><code>builtins/rdma/rdma_put.cpp</code>、<code>rdma_get.cpp</code></td>
+<td>共享模板生成两个普通 AIV 内核，调用 checked helper</td>
+</tr>
+<tr>
+<td><code>rdma_put_async_checked/rdma_get_async_checked</code></td>
+<td><code>runtime/backend/rdma/rdma_completion_kernel.h</code></td>
+<td>新增；完整校验请求及完成容量、构造 session、发 WQE，再复用现有函数登记真实 event</td>
+</tr>
+<tr>
+<td><code>register_completion_condition(AsyncCtx&amp;,const CompletionToken&amp;)</code></td>
+<td><code>runtime/async_kernel_api.h:45</code></td>
+<td>复用；向本任务 slab 追加 IN_DIE 完成 token 并更新 count，无须增加另一套登记 API</td>
+</tr>
+<tr>
+<td><code>pto2::detail::defer_flush(AsyncCtx&amp;)</code></td>
+<td><code>runtime/completion_context.h:51</code></td>
+<td>复用；将记录和计数按 A3 cache/屏障协议发布给 AICPU，必须先于 FIN</td>
+</tr>
+<tr>
+<td><code>poll_rdma_in_die_event(handle,workspace,owner_epoch,InDieCompletionCursor &amp;cursor)</code></td>
+<td><code>runtime/backend/rdma/rdma_completion_scheduler.h</code></td>
+<td>AICPU 有界只读查询成功前缀，返回 READY/PENDING/FAILED，不回收 CQ；每个完成条件独占 cursor</td>
+</tr>
+<tr>
+<td><code>retire_rdma_in_die_event(InDieCompletionCursor &amp;cursor)</code></td>
+<td>同上</td>
+<td>清空当前完成条件的观察状态；不修改 PTO tail、不 free workspace</td>
+</tr>
+<tr>
+<td><code>completion_backend_ops_for()</code></td>
+<td><code>runtime/async_wait.h</code></td>
+<td>注册 A3 RDMA 条件分发，校验 engine/type，接入 FIN 汇合</td>
+</tr>
+</tbody>
+</table>
+<p>上表中的 <code>runtime/</code> 均位于 <code>src/a2a3/runtime/tensormap_and_ringbuffer/</code>。内部 owner_epoch 在每个完成条件的 cursor 中保存，不改变 PTO 事件编码，也不把悬空 scalar 指针变成可跨 domain 使用的句柄。</p>
+<p>首版内置 AIV kernel 每次只发一个 PUT/GET，并独占当前任务的 completion slab，直到登记并返回 FIN。在检查与登记之间，PTO 调用不写 simpler AsyncCtx，因此只需在提交前检查还剩一条容量；不增加 reserve/commit/cancel 接口。现有 A3 SDMA <code>send_request_entry()</code> 已采用同一所有权和容量检查模式。不同 AIV 任务使用自己的 slab；共享 QP 不等于共享 slab。详见<a href="#completion-aiv-submission">完成协议</a>。</p>
+<p>新增条件类型拟命名 <code>COMPLETION_TYPE_RDMA_IN_DIE_EVENT_HANDLE=4</code>；现有 <code>COMPLETION_ENGINE_ROCE=1</code> 复用。这里是 <strong>simpler completion type</strong>；PTO 的 <code>CompletionKind::RDMA_IN_DIE_CQE=4</code> 属于另一枚举，数值相同不表示可以直接强转。原 A5 <code>RDMA_EVENT_HANDLE=3</code> 不重新解释为 A3。</p>
+<p>A3 的分发表显式处理未支持的 type2/3，不能直接在当前两项数组末尾 append 后误用下标。token 保持 <code>addr=完整 event.handle</code>、<code>backend_cookie=PTO workspace 地址</code>、<code>expected_value=0</code>；PTO record 仅用于交叉验证。<code>CompletionCondition</code> 保存内部 <code>owner_epoch=TaskId::to_uint64(task_token)+1</code>，由 mailbox consumer 填充，传给 observer；这不是 AIV 参数或 PTO generation 字段，也不是独立的跨 run 世代。受 run lease 保护的 workspace 在本轮内不释放，每次登记/退休都重置私有 cursor。</p>
+<h2 id="interfaces-4-构建配置与测试接口">4. 构建、配置与测试接口</h2>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>修改或复用</th>
+<th>功能</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>simpler_setup/pto_isa.py</code> 和 pin 管理</td>
+<td>修改依赖版本</td>
+<td>固定包含 PR 2155 的 commit，校验需要的 headers 可打包</td>
+</tr>
+<tr>
+<td><code>simpler_setup/kernel_compiler.py</code></td>
+<td>修改</td>
+<td>A3 RDMA artifact 使用 2201 及既有 <code>PTO_RDMA_SUPPORTED</code>、<code>PTO_RDMA_BACKEND_IN_DIE_SUPPORTED</code> 定义；不夹带 A5 define</td>
+</tr>
+<tr>
+<td><code>simpler_setup/runtime_builder.py/runtime_compiler.py</code></td>
+<td>修改</td>
+<td>扩展既有 <code>SIMPLER_ENABLE_PTO_RDMA_WORKSPACE</code> 对 A3 的接入；构建缓存区分平台/backend/PTO pin</td>
+</tr>
+<tr>
+<td>A3 <code>platform/onboard/host/CMakeLists.txt</code></td>
+<td>修改</td>
+<td>为现有 comm_hccl.cpp 的 RDMA 分支配置匹配 runtime 的 HCCP/verbs/driver/tsd 头文件；保留 PTO 的 <code>libra.so/libtsdclient.so</code> 动态加载</td>
+</tr>
+<tr>
+<td>A3 TMR Host/AICPU/AIV 构建与安装清单</td>
+<td>修改</td>
+<td>共享 ABI、只读 observer 和 builtins 源码进入 source/wheel 产物；AICPU 只包含 Host-safe 布局，不拉入 AIV intrinsic/HCCP Host 实现</td>
+</tr>
+<tr>
+<td>sim provider</td>
+<td>复用明确能力边界</td>
+<td>普通 sim 不伪装实际 RDMA ready；单测使用显式 fake 队列/provider 注入</td>
+</tr>
+<tr>
+<td><code>tests/ut/{py,cpp}</code> 与 A3 examples/ST</td>
+<td>新增</td>
+<td>ABI、资源回滚、CQ 绕圈/并发、FIN 汇合、真实双 rank PUT/GET；详见验收文档</td>
+</tr>
+</tbody>
+</table>
+<p>不新增环境变量或新 backend 开关；复用现有构建开关和 PTO 已定义的 backend 宏。硬件、runtime 和 provider 的不兼容要在 capability/构建检查中明确失败，不能以换成 SDMA、Host staging 或 event.Wait 来掩盖。</p>
+</section><section id="completion"><h1 id="completion-a3-请求参数与真实完成协议">A3 请求参数与真实完成协议</h1>
+<p><a href="#overview">返回设计入口</a></p>
+<h2 id="completion-1-每次触发如何传参数">1. 每次触发如何传参数</h2>
+<p>同一个已注册 callable 可多次提交，每次的六个 uint64 是独立 <code>TaskArgs</code>。固定 ABI 见<a href="#interfaces-aiv-request-interfaces">接口清单</a>。例如同一个域可以先 PUT <code>local+0 → peer+4096, 4096 B</code>，下一次 GET <code>peer+8192 → local+16384, 2048 B</code>；更换 offset/peer/长度不需要重新编译或重新注册 MR。</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>PUT</th>
+<th>GET</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>comm_context</code></td>
+<td>当前 rank 的 simpler GM context</td>
+<td>相同</td>
+</tr>
+<tr>
+<td><code>peer_rank</code></td>
+<td>远端目标 rank</td>
+<td>远端源 rank</td>
+</tr>
+<tr>
+<td><code>local_offset</code></td>
+<td>本地源窗口偏移</td>
+<td>本地目标窗口偏移</td>
+</tr>
+<tr>
+<td><code>remote_offset</code></td>
+<td>远端目标窗口偏移</td>
+<td>远端源窗口偏移</td>
+</tr>
+<tr>
+<td><code>nbytes</code></td>
+<td>搬移字节数</td>
+<td>搬移字节数</td>
+</tr>
+<tr>
+<td><code>qp_index</code></td>
+<td><code>[0, qp_num)</code> 中的 QP</td>
+<td>相同</td>
+</tr>
+</tbody>
+</table>
+<p>构建出的普通 chip orchestration 将它们交给 AIV；不是把这些值写死到 Host 注册 callback，也不通过 CCU task args 传递。TaskArgs 和 CoreTaskArgs 的内部表示不一定就是 48 B 连续内存，<strong>六个逻辑 uint64 的次序和取值</strong>才是两个边界必须共同遵守的合同。</p>
+<p>AIV 在发 WQE 前检查：有效 TMR AsyncCtx、非空 context、当前任务对应的有效域、RDMA workspace 范围、magic/version/IN_DIE、rank/peer/QP、peer 非自身、窗口与 MR 一致、地址加法不溢出。首版要求 <code>nbytes&gt;0</code>、<code>nbytes&lt;=0x7fffffff</code>，offset 和长度均为 64 B 倍数；这是 simpler 的保守合同，不声称是 PTO 的最小硬件对齐要求。</p>
+<p>所有范围使用 <code>offset &lt;= extent &amp;&amp; nbytes &lt;= extent-offset</code> 校验，不能先相加再比较。先在 64 位上判断 peer/QP 范围，再窄化。远端地址只用于 PTO tensor 的 MR 寻址，AIV 不以普通 load/store 访问它。</p>
+<h2 id="completion-aiv-submission">2. AIV 提交与完成登记</h2>
+<ol>
+<li><code>kernel_entry()</code> 解析参数并校验；获取本任务的 <code>AsyncCtx</code>。</li>
+<li>helper 检查 task token、count/entries/error 指针、已有错误和容量；要求当前 count 小于 capacity。容量不足时在发 WQE 前失败。首版每次 kernel 只发一个 PUT/GET event，所需容量上界为1。</li>
+<li>使用独立 UB scratch 建立 <code>BuildAsyncSession&lt;DmaEngine::RDMA&gt;()</code>。公共 scratch 大小沿用 PTO 的 <code>kRdmaScratchBytes=256</code>，不侵占业务 GM；IN_DIE 的具体最小值不能替代通用接口约定。</li>
+<li>独立 wrapper 独占 pipeline event 0 和 UB scratch；组合业务调用 checked helper 时由调用者分配合法 <code>syncId</code>，使用 <code>qp_index</code>，发起 <code>TPUT_ASYNC&lt;RDMA&gt;(...,peer)</code> 或 <code>TGET_ASYNC&lt;RDMA&gt;(...,peer)</code>。</li>
+<li>PTO <code>Post()</code> 在 MR 检查后进入 <code>Reserve/Lock</code>，生成 WQE，通过 MTE 写 NIC 可访问 SQ 并提交 SQ doorbell，返回事件。</li>
+<li>校验 <code>postFailed</code>、非零 handle、error-handle 和 <code>CompletionRecordCount/At()</code>。成功事件必须解析到 <code>RDMA_IN_DIE_CQE</code>，记录地址与当前队列匹配。</li>
+<li>构造 <code>CompletionToken</code>，调用已有 <code>register_completion_condition(ctx,token)</code> 写条目并更新 count，再执行 <code>defer_flush(ctx)</code>；AIV 之后返回普通 FIN。</li>
+</ol>
+<p>内置 wrapper 使用动态长度、连续一维的 <code>uint8_t</code> GlobalTensor 表示 payload，形状长度就是 <code>nbytes</code>，不把字节数乘成元素数。PUT 的 dst 是 peer MR VA 加 remote_offset，src 是本地 MR VA 加 local_offset；GET 的 dst/src 相反。这样相同内核可处理不同业务 dtype 的窗口字节，不为每种 dtype 重编译一个搬移实现。</p>
+<p>session 采用 peer-independent 重载 <code>BuildAsyncSession&lt;RDMA&gt;(scratch,workspace,my_rank,session,sync_id,qp_index)</code>，随后在 PUT/GET 调用中显式传 peer。<code>sync_id</code> 必须满足当前 IN_DIE 的 0～7 范围，并由 wrapper 的 UB/流水线资源分配保证与同一 AIV 内其他事件不冲突；不能把 TaskId 或 peer_rank 当 sync_id。</p>
+<p>直接复用登记函数成立的关键是 slab 所有权：本任务的 AIV kernel 在返回前独占该 slab；从容量检查到登记之间，不调用其他会消耗其槽位的 simpler API；PTO 的 RDMA 提交只操作自己的 session/队列，不写这个 AsyncCtx。共享 QP 的不同任务仍有独立的 slab，因此 QP 多核并发不会抢占本任务的完成槽。</p>
+<p>现有 A3 SDMA <a href="https://github.com/hw-native-sys/simpler/blob/ec5dd4fc0fa29e977b6b71a533c191439fb96ff9/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/backend/sdma/sdma_completion_kernel.h#L127">send_request_entry()</a> 已在发起传输前检查所需容量，然后调用最终使用 <code>register_completion_condition()</code> 的登记路径。源码中明确说明 kernel 返回前没有其他 writer 消耗这些槽位。本设计沿用这一模式，无需新增登记或取消 API。</p>
+<p>仍须检查 <code>register_completion_condition()</code> 的返回值。在上述不变量成立且内存有效时，提交后不会因容量耗尽而失败；若仍失败，应视为 runtime 不变量或上下文失效，记录错误并保留已提交请求的 owner，不调用 event.Wait 兜底，也不伪装为“未提交”。不得在发布 FIN 后补写记录。未来若改变为多 writer 或允许交错调用消耗同一 slab，必须先修订该所有权协议；已知 N 个事件的单 writer 批量提交也可先检查 N 条容量。</p>
+<p>PTO 的 <code>AsyncEvent.valid()</code> 只判断 handle 非零，不代表成功；error-handle 也可能非零。<code>TestEvent()</code> 返回非 pending 也可能包含失败。simpler 必须检查状态，不能把这些布尔结果当作成功完成。</p>
+<p>IN_DIE 的 <code>Reserve()</code> 本身可能等待锁或队列空间，并可能调用 AIV <code>Progress()</code>，当前源码有内部 cycle timeout。因此本设计的“异步”表示不在 AIV 等待本笔传输完成，<strong>不承诺提交路径严格 wait-free</strong>。无需把 PTO 的锁或回收逻辑再移植进 simpler。</p>
+<h2 id="completion-3-完成-tokencqe-与游标所有权">3. 完成 token、CQE 与游标所有权</h2>
+<h3 id="completion-事件编码和资源身份">事件编码和资源身份</h3>
+<p>PTO 事件高 32 位为 <code>queueIndex=peer*qpNum+qpIdx</code>，低 32 位为提交后的目标 SQ head。高字 <code>0xffffffff</code> 表示错误。IN_DIE 在 32 位 head 耗尽前返回错误，不能自行允许整数回绕或仅用有符号差值推断无限复用。</p>
+<p>simpler 条件保存完整 handle、workspace 地址和当前 TaskId 身份。domain generation 由既有 run lease 关联，只有旧 run 的设备访问已静默才允许释放和重用地址。每次登记清空条件的私有 cursor，TaskId 派生身份仅用于该条件内部校验，不被宣称为跨 run 的唯一 generation，也不增加 token ABI 字段。</p>
+<p>PTO record 提供目标 CQE 地址、预期 owner 和 kind。AICPU 可用它交叉验证，但首版以“完整事件目标 + 已成功回收前缀 + 有界 CQE 扫描”查询：一个 CQE 地址和一个 owner bit 不足以防止 AIV 回收后绕圈覆盖，也无法表达此前 SQ 项的错误。</p>
+<h3 id="completion-只读-observer">只读 observer</h3>
+<p>IN_DIE 的 <code>Queue</code> 包含 <code>sq/cq Ring</code>、错误字段和 AIV tournament gates。<code>Ring</code> 提供 GM buffer、doorbell、head/tail 地址、深度和 stride。所有布局从固定 PTO 的 Host-safe <code>rdma_workspace_types.hpp</code>、<code>in_die_types.hpp</code> 获取；不得复制旧版 HNS1825 结构。</p>
+<p><strong>唯一修改 CQ 消费位置的主体是 PTO AIV <code>Progress()</code>。</strong> AICPU 不写 <code>cq.tail</code>、<code>sq.tail</code>、<code>Queue.error</code>，不敲 CQ doorbell，也不参与 AIV 的 COREID tournament lock。实现采用每条件私有 cursor，访问受既有 AsyncWaitList 锁保护；多个条件没有共享缓存，也不把 cursor 写入 PTO Queue。</p>
+<p><code>poll_rdma_in_die_event()</code> 的算法：</p>
+<ol>
+<li>验证 owner/generation 和全部地址范围；读取并校验队列实际深度、stride=32、target 非零且不超过已发布 SQ head。</li>
+<li>invalidate 相应 cache line，acquire 读取 PTO <code>cq.tail</code>。这是 PTO 已逐项检查成功的前缀。如果 <code>tail&gt;=target</code>，可报告该事件完成；后面新出现的错误不追溯否定这个已成功前缀。</li>
+<li>从 <code>max(tail, observer.success_prefix)</code> 扫描到 target，每次 tick 最多扫描 32 项。每项地址是 <code>cq.buffer+(index &amp; (depth-1))*stride</code>。</li>
+<li>使用 <strong>同一个 word0 快照</strong>判断 owner 和 status。owner 是 <code>(word0&gt;&gt;7)&amp;1</code>，ready 预期为 <code>(index &amp; depth)==0 ? 1 : 0</code>；ready 后 status=<code>(word0&gt;&gt;8)&amp;0xff</code> 必须为 0。</li>
+<li>读取每个 CQE 后重新 acquire 读取 tail。若 tail 已越过该项，采用 PTO 已确认的成功前缀，丢弃可能属于新一圈的快照；若 tail 未越过该项，基于“SQ/CQ 最多 outstanding depth-1，未回收槽不可重用”的 PTO 不变量解释快照。</li>
+<li>owner 未就绪返回 PENDING；发现错误 CQE 返回 FAILED 并缓存该绝对错误位置。不能只检查最后一项，也不能因后续成功 CQE 覆盖而丢失错误。</li>
+<li>只有逐项扫描或已回收 tail 证明整个目标前缀成功，才返回 READY；扫描到更早已缓存的失败位置时返回 FAILED。最后执行适合 AICPU 的 acquire/设备可见性屏障，沿既有调度协议释放后继。</li>
+</ol>
+<p>这个 observer <strong>不推进硬件 CQ</strong>。队列逐渐满时，PTO 下一次 <code>Reserve()</code> 调用自己的 <code>Progress()</code> 回收；少量请求完成后即使 tail 尚未更新，AICPU 也可凭真实 CQE 完成任务。关闭时确认所有已提交 target 完成，再由 provider 销毁 QP，不为清空计数而伪造 tail。</p>
+<h3 id="completion-必须验证的硬件前提">必须验证的硬件前提</h3>
+<p>上述只读算法是 simpler 的设计，并非 PR 2155 已提供的 AICPU 查询 API。它依赖 HCCP 返回的 CQ buffer/tail 所在 GM 可被 AICPU 正确访问，以及 IN_DIE 的有序 CQ 语义。集成时需要在实际 A3 SDK/驱动验证；编译可见的结构体不能证明这些硬件性质。</p>
+<p>仓库当前 <a href="../../hardware/cache-coherency.md">cache-coherency.md</a> 已列出可选 A3 IN_DIE 后端的 CQE 保守失效策略，不能套用 A5 的“无需 invalidate”。本设计采用 A3 DMA 读取的 cache maintenance，并要求 observer 对 PTO 数据页始终只读，避免 clean+invalidate 将 AICPU 脏数据写回覆盖 provider 状态。具体内存属性、刷新范围、完成屏障，以及 CQE 发布与绕圈复用仍须通过 A3 硬件验收。</p>
+<p>若发现任何前提不成立，应先在 PTO/provider 增加正式 Host-safe 完成快照能力并同步设计，不能退回“FIN 就完成”、Host 代理 payload 或竞争写 CQ tail。AICore 无法访问 SPR 控制窗的限制也不能靠自定义 MMIO 规避；NIC doorbell 仅使用此 PR 的正式路径。</p>
+<h2 id="completion-4-fin-汇合错误与数据可见性">4. FIN 汇合、错误与数据可见性</h2>
+<p><figure><svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800" role="img" aria-labelledby="title-fig4 desc-fig4">
+  <title id="title-fig4">A3 数据路径与完成边界</title><desc id="desc-fig4">PUT 和 GET 都通过 NPU 板载 RoCE 在 HBM 间搬移，不经过 Host payload。任务完成需要 FIN 和传输成功，窗口覆盖还需远端消费结束。</desc>
+  <defs><marker id="arr-fig4" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#326c9b"/></marker></defs>
+  <style>text{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;fill:#17304b}.h{font-size:23px;font-weight:700}.t{font-size:18px}.s{font-size:16px;fill:#52677e}.a{fill:none;stroke:#326c9b;stroke-width:3;marker-end:url(#arr-fig4)}.b{stroke:#c0d1e0;stroke-width:1.5;rx:12}</style>
+  <rect width="1280" height="800" fill="white"/><text x="35" y="45" class="h">数据走 NPU 侧 RoCE；控制和数据分开</text>
+  <rect x="35" y="75" width="1210" height="62" class="b" fill="#edf4ff"/><text x="55" y="113" class="t">Host：Worker / 窗口与端口 / Bootstrap / HCCP 建链；不接收或转发每笔 RDMA payload</text>
+  <rect x="35" y="174" width="345" height="171" class="b" fill="#edf9f4"/><text x="58" y="210" class="h">rank r / NPU HBM</text><text x="58" y="245" class="t">PUT：本地 source</text><text x="58" y="276" class="t">GET：本地 destination</text><text x="58" y="316" class="s">AIV 发 WQE；MR 保护窗口</text>
+  <rect x="470" y="174" width="340" height="171" class="b" fill="#fff5e8"/><text x="500" y="212" class="h">A3 板载 RoCE</text><text x="500" y="247" class="t">NIC 传输 / 真实 CQE</text><text x="500" y="278" class="s">PUT → 远端写</text><text x="500" y="310" class="s">GET ← 远端读返回</text>
+  <rect x="900" y="174" width="345" height="171" class="b" fill="#edf9f4"/><text x="923" y="210" class="h">peer p / NPU HBM</text><text x="923" y="245" class="t">PUT：远端 destination</text><text x="923" y="276" class="t">GET：远端 source</text><text x="923" y="316" class="s">VA 是 MR 寻址，不是本地映射</text>
+  <path d="M380 226H467M810 226H897" class="a"/><path d="M900 294H813M470 294H383" class="a"/>
+  <text x="35" y="397" class="h">三种结束条件，不能混为一谈</text>
+  <rect x="35" y="430" width="350" height="82" class="b" fill="#edf4ff"/><text x="55" y="462" class="t">AIV FIN / NORMAL_DONE</text><text x="55" y="490" class="s">内核已结束发起操作</text>
+  <rect x="35" y="548" width="350" height="82" class="b" fill="#fff5e8"/><text x="55" y="580" class="t">CQE 成功前缀 / PTO tail</text><text x="55" y="608" class="s">传输已完成；AICPU 只读查询</text>
+  <path d="M385 471H437V527H467M385 589H437V527" class="a"/>
+  <rect x="470" y="483" width="340" height="91" class="b" fill="#edf9f4"/><text x="491" y="518" class="h">TaskId 完整完成</text><text x="491" y="549" class="s">两个条件均到达，释放本地依赖</text>
+  <path d="M810 528H897" class="a"/>
+  <rect x="900" y="461" width="345" height="135" class="b" fill="#f4efff"/><text x="921" y="496" class="h">窗口可覆盖 / 可释放</text><text x="921" y="532" class="t">还需应用确认远端使用结束</text><text x="921" y="567" class="s">本地完成 ≠ 远端消费者完成</text>
+  <rect x="35" y="678" width="1210" height="86" class="b" fill="#fff6f1"/><text x="55" y="713" class="t">超时、部分提交或清理失败：保留 owner / MR / QP / 窗口 / 端口，停止新请求。</text><text x="55" y="744" class="s">不以 FIN、submit 返回值、owner bit 的一次匹配或“等待足够久”伪造成功。</text>
+</svg>
+<figcaption>真实完成与窗口复用</figcaption></figure></p>
+<p>TMR 完成需要 <code>normal_done &amp;&amp; all_registered_conditions_ready &amp;&amp; no_error</code>。AIV 发出 WQE、AIV FIN、Host submit 返回、CQ owner 尚未更新都不是成功条件。AIV FIN 早于 CQE时等待网络；CQE早于 FIN 时仍等待正常执行结束。</p>
+<p>既有 <code>SchedulerContext::drain_cancelled_run()</code> 增加 ROCE/type4 分支：先按原协议确认 AIV 已停止，再用同一只读 observer 检查 wait-list、mailbox 和 slab 中的事件。只有真实 CQ 成功才确认该条件 drained；错误或超时保留 owner，不完成 TaskId，不释放失败图的依赖。raw slab 条件按当前 TaskId 初始化私有观察身份。</p>
+<p>GET 后续本地消费者必须通过完整完成的依赖再读取目标，沿用 TMR 的 AICPU→AIV 派发和 cache/流水线协议；AICPU 的普通 acquire 不能单独替代 AIV 的 GM 可见性处理。PUT 的本地源到传输结束前不可覆盖；远端目标消费仍需要应用阶段协调。</p>
+<table>
+<thead>
+<tr>
+<th>错误发生点</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>参数、能力或 completion 容量错误，确定未提交</td>
+<td>失败结束本任务，不发 WQE，不阻塞等待</td>
+</tr>
+<tr>
+<td>session/event 错误，无法证明未提交</td>
+<td>标记 run failed，停止新任务，保留相关 owner；不能因缺少登记记录而释放资源</td>
+</tr>
+<tr>
+<td>CQE status 错误</td>
+<td>缓存队列失败位置，传播原状态、peer、QP、target 和 stage；不要继续将失败目标报成 READY</td>
+</tr>
+<tr>
+<td>等待超时</td>
+<td>返回超时并保留 in-flight 所有权；超时不是 DMA 已停止的证据</td>
+</tr>
+<tr>
+<td>完成 ABI 或 workspace generation 不匹配</td>
+<td>fail closed，保留诊断，禁止猜测历史布局</td>
+</tr>
+</tbody>
+</table>
+<p><code>retire</code> 只清空当前条件的私有 cursor，不改变 PTO 的队列，也不会清除其他条件的观察状态。每次新登记重新初始化 cursor，避免跨任务/跨 run 缓存污染；工作区本身由 domain generation/run lease 保持存续。资源清理由<a href="#lifecycle">生命周期协议</a>统一控制。</p>
+<h2 id="completion-5-多次触发与并发边界">5. 多次触发与并发边界</h2>
+<p>多任务可以发往同一个 peer/QP，PTO 的 AIV lock 保证 WQE 发布；但不同任务访问重叠窗口范围仍须用 TaskId/deps 串行化。QP 排序不等于应用数据竞争已解决。多 QP 和多 rank 不提供隐式全局顺序。</p>
+<p>内置 callable 每个请求只派发一个 AIV block。重复或并发请求在不同物理 AIV 上运行时使用 PTO 的 COREID 锁；不在同一 AIV 上创建可重入发布流。实际 QP 数以域配置和 provider 结果为准，不能一直按 <code>peer*qpNum</code> 固定选择 QP0。</p>
+<p>任务只能访问同一有效域的窗口。首版没有跨 domain 请求，也不把普通 Tensor 地址直接变成临时 MR。若业务输入在普通 Tensor，应用通过既有 copy 机制放入通信窗口并建立依赖后，再调用该后端。</p>
+</section><section id="lifecycle"><h1 id="lifecycle-a3-窗口建链与生命周期">A3 窗口、建链与生命周期</h1>
+<p><a href="#overview">返回设计入口</a></p>
+<h2 id="lifecycle-1-alloc_domain-在哪里调用是否需要修改">1. alloc_domain 在哪里调用，是否需要修改</h2>
+<p>以本设计的 L3 SDK 路径为例，<code>Worker.init()</code> 准备执行环境和绑定到 Worker 的 Host Orchestrator。随后应用调用 <code>Worker.run(rdma_host_orchestration,args,config)</code>；<code>run()</code> 经 <code>submit()</code>、<code>_submit_locked()</code> 到 <code>_submit_l3_locked()</code>，后者在当前 run scope 内执行 <code>callable(self._orch,args,cfg)</code>。这个 callable 就是传入的 Python Host 编排函数 <code>rdma_host_orchestration()</code>。域创建/复用必须由该函数显式调用，不是 register/init 自动调用，也不在 AICPU 的薄层 <code>aicpu_orchestration_entry()</code> 或业务编排入口中执行。</p>
+<p>应用 Host 回调调用 <code>allocate_domain()</code> / <code>get_or_allocate_domain()</code> 后进入：</p>
+<pre><code class="language-text">Orchestrator._domain
+  → Worker._comm_domain
+  → Worker._allocate_domain
+  → Worker._ensure_comm_base（首次懒初始化，成功后缓存）
+  → Worker._dispatch_control_domain(op=&quot;alloc&quot;)
+  → chip 子进程 _handle_ctrl_alloc_domain
+  → ChipWorker::comm_alloc_domain_windows
+  → A3 platform::comm_alloc_domain_windows
+  → 文件内 domain_alloc_via_rdma（拟新增薄层 helper）
+  → PTO GetCommWorkspaceSize / BuildComm
+      → SetupRdmaTransport → InitRdmaWorkspace → manager Init（PTO 已有）
+</code></pre><p>上图是未命中缓存的创建分支。命中已有且配置一致的域时，<code>_comm_domain()</code> 登记本轮使用并直接返回 handle，不调用 <code>_allocate_domain()</code> 或重复建链。现有首次创建分支通过 <code>_ensure_comm_base()</code> 向各 chip 发送 <code>CTRL_COMM_INIT</code>，建立基础 HCCL communicator；这与随后 PTO BuildComm 的 RDMA MR/QP 准备是不同步骤。</p>
+<p>当前 A3 的 native 函数拒绝非零 <code>workspace_mask</code>。本设计保持上层函数签名，修改此处增加 <code>mask == comm_workspace_bit(RDMA)</code> 的专用分支；零 mask 仍走原来的窗口路径，混合 RDMA+SDMA/URMA/CCU 请求明确拒绝。</p>
+<p>RDMA 分支只分配本 rank 的 HBM 业务窗口，不导入 peer Fabric/IPC 映射。<code>CommContext.windowsIn/Out[peer]</code> 保存 peer 注册 MR 的 VA，PUT/GET helper 通过 PTO 使用这些地址。它们不是该 rank 的普通远端映射，不能用于同步 TLOAD/TSTORE/TNOTIFY。</p>
+<p>域内 <code>rankId</code> 按 members 顺序密集编号。physical device id、Worker chip id 和 domain rank 是三种身份，Bootstrap 必须明确转换，不能取 <code>rank % device_count</code> 替代 Worker 真实设备选择。</p>
+<h2 id="lifecycle-2-初始化及全-rank-发布">2. 初始化及全 rank 发布</h2>
+<h3 id="lifecycle-现有-domainallocation-的-rdma-初始化分支">现有 DomainAllocation 的 RDMA 初始化分支</h3>
+<ol>
+<li>L3 parent 校验 members、DEVICE backing、TMR、RDMA-only、窗口 carve 和一致配置。在派发任何业务任务前完成同步域准备。</li>
+<li>coordinator 按有序 members 分发相同 QP 数、端口请求和各自 local IP。自动请求以 0 编码；native 使用相同 run_token/allocation_id 提议候选并全 rank 投票。记录 owner 身份和绝对截止时间，保存端口独占锁，并在任何 BuildComm 开始前完成预留确认。</li>
+<li>native 复用已有 <code>DomainAllocation</code>，追加 PTO Host context、外部 GM 分配、端口占用记录和状态字段，尽早放入已有 pending owner map。初始化使用文件内 <code>domain_alloc_via_rdma()</code>；不增加另一套 owner 类和 Prepare/Close API。析构不得替代有返回状态的清理，异常不能让已注册资源失去 owner。</li>
+<li><code>aclrtMalloc</code> 创建本地窗口，记录实际 owner/extent。注册和 <code>CommContext.winSize</code> 对外统一采用已协商业务 extent，不能各 rank 按不同物理 padding 生成不一致 MR。</li>
+<li>配置 PTO <code>CommConfig</code>：RDMA-only、<code>rdmaOptional=false</code>、显式 deviceId/dense rank/rankNum、symBytes、qpNum、basePort、localIp；设置 <code>HostExchange</code>。使用 RDMA-only 的 callback Bootstrap，无需为每个域再创建 HCCL communicator。</li>
+<li><code>GetCommWorkspaceSize()</code> 查询并分配三块独立外部存储：业务窗口 <code>rdmaSymmetric</code>、RDMA workspace、PTO 临时设备 context。业务窗口已经存在时将其绑定，不能重复申请一份未被应用使用的窗口。</li>
+<li><code>BuildComm()</code> 负责能力/地址协商、HCCP 服务/rdev lease、业务 MR 和 operand MR、socket 连接、AI QP、MR/QP 绑定、QP ready、GM metadata 及 peer 地址回填。</li>
+<li>复用 PTO 的配置/建链检查，在分配分支校验 <code>rdmaReport=Ready</code>、IN_DIE/v3 和 simpler 窗口/工作区 extent 等接入条件；不增加独立 validate API。读取 PTO 的 Host context，逐字段转换为 simpler <code>CommContext</code>，复用 <code>comm_domain_onboard::upload_context()</code> 上传镜像。</li>
+<li>PTO 完成全 rank ready agreement 后，复用 Worker 既有分配请求 join/abort：所有 native context 准备成功后才发布 Python handle。任何 rank 失败都不发布半成品域，不增加另一套公开 prepare/commit 协议。</li>
+</ol>
+<p>PTO <code>BuildComm()</code> 既有的可选后端降级不在本设计使用：RDMA-only 要么完整 ready，要么失败。已有 base HCCL 环境和 PTO HCCP 服务共享必须尊重其 owned/borrowed 标记；域关闭不得关闭由 HCCL 持有的服务。</p>
+<h3 id="lifecycle-hostexchange-的协议">HostExchange 的协议</h3>
+<p>使用已有本机 allocation 控制会合机制实现 callback，首版不新增 MPI 依赖。会合键至少包含 <code>run_token/allocation_id/generation/stage/round</code>；文件采用写临时文件后原子发布，不允许把上次失败遗留文件当新回复。</p>
+<p>保留一个私有 <code>domain_host_all_gather()</code> 适配函数，复用 marker 路径、原子发布和有界等待，增加记录汇集。PTO 的 HCCL all-gather 只有在 communicator 与 domain 的成员和顺序完全匹配时可用；本设计支持任意 members 子集，不借用可能更大的 base communicator，也不新建每域 HCCL communicator。普通 file barrier 不能传递初始化记录。</p>
+<p>callback 接收 PTO 的固定长 Host 记录；外层保存版本、长度、rank 数、stage 和校验信息，按 dense rank 顺序返回。所有参与者必须调用相同序列，失败也要结束已派发的请求后再进入 abort。外层协议逐字段编码，不把 C++ padding 或 Host 指针当稳定网络格式。</p>
+<p>PTO callback 的 payload 按不透明字节承载，字段解释由固定版本的 PTO 负责；该路径只用于同一 Host、同一构建 ABI 的参与者，不承诺将这些原始记录作为跨架构的稳定 wire ABI。外层 header 使用文本字段，payload 使用定长十六进制编码，避免二进制 NUL 截断。</p>
+<p>PR 2155 的 <code>Connection::Exchange()</code> 另外负责通过 HCCP socket 交换业务 MR 的 base/size/rkey、rank 和 QP 数，并检查预先协商的 peer base。simpler 不重复发送 lkey，也不发明另一套 QP 私有数据格式。</p>
+<h3 id="lifecycle-端口租约">端口租约</h3>
+<p>同一物理设备的多个 RDMA 域不能无条件同时监听 60032。parent 派发的 native 分配事务在建链前为所有参与设备取得同一个空闲 base port，租约归 run/allocation owner 所有。</p>
+<p>自动模式先提议端口，再全 rank 预留/确认；任一失败则撤销本轮预留，并在<strong>尚未开始 QP 建链</strong>时选择新端口。显式端口冲突直接报错。当前实现使用每 UID/物理设备/端口的文件独占 flock，持有 fd 即代表进程内 owner；进程结束时内核释放锁。打开时检查 inode、文件所有者和链接数；不 unlink 活跃的锁文件。该约束覆盖同 UID 多 Worker/进程；不同用户及外部 HCCP 应用仍由 provider 检测实际冲突，不能只凭“Host TCP bind 成功”断言 HCCP 端口可用。</p>
+<p>外部 HCCP 应用未参与租约时仍可能冲突，provider 失败必须按初始化失败清理，不自动在部分建链后盲目重试。租约在所有相关 QP/socket 成功销毁后释放；失败 owner 保留租约防止误复用。</p>
+<p>PTO 的 <code>TryDestroyComm()</code> 保留可继续清理的 provider 状态；外部 GM 的 <code>aclrtFree()</code> 出错则不同：调用可能已产生释放副作用，simpler 将 owner 标记为 terminal cleanup failure，后续 close 只报告 retained，不自动再次 free 同一地址。诊断 owner 仍在原 map 中，析构不替代有返回状态的清理。</p>
+<p>端口协调逻辑接入现有 <code>_allocate_domain()</code> 和 native RDMA 分支，占用 fd/实际端口保存在已有 owner，释放在既有清理路径完成。不新增 RdmaPortLease 类接口；当前 SDMA/PTO 没有提供可直接套用的多域端口分配器，仍需补这部分私有实现。现有 GenerationLease 使用共享锁保护 generation 文件回收，不能用来排斥同设备同端口的另一个 owner。</p>
+<h2 id="lifecycle-3-workspace-和窗口分别保存什么">3. workspace 和窗口分别保存什么</h2>
+<table>
+<thead>
+<tr>
+<th>资源</th>
+<th>创建者 / 阶段</th>
+<th>内容 / 用途</th>
+<th>释放者</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>既有 Host <code>DomainAllocation</code> 的 RDMA 字段</td>
+<td>native allocator / RDMA 分支</td>
+<td>allocation 身份、配置、PTO owner、内存、端口、错误和保留状态</td>
+<td>既有 release/abort 路径，失败保留 map entry</td>
+</tr>
+<tr>
+<td>本地业务窗口</td>
+<td>simpler A3 platform / RDMA 分支</td>
+<td>应用的输入、输出及 CommBufferSpec 切片；被 HCCP 注册</td>
+<td>provider 脱离 MR 后 simpler 才 free</td>
+</tr>
+<tr>
+<td>PTO RDMA workspace</td>
+<td>simpler 分配，PTO 初始化</td>
+<td>64 B RdmaInfo、每 peer/QP 的 Queue、MR 表、operand 页</td>
+<td>provider 销毁后 simpler free</td>
+</tr>
+<tr>
+<td>NIC SQ/CQ 和 doorbell 信息</td>
+<td>HCCP / CreateQp</td>
+<td>真实 WQE/CQE ring、队列深度、地址和队列号</td>
+<td>HCCP/PTO 负责 QP 生命周期</td>
+</tr>
+<tr>
+<td>PTO 设备 context</td>
+<td>simpler 分配，BuildComm 回填</td>
+<td>PTO 的窗口寻址格式，作为转换依据</td>
+<td>PTO 不再使用后 simpler free</td>
+</tr>
+<tr>
+<td>simpler GM <code>CommContext</code></td>
+<td>simpler / 全 rank ready 前</td>
+<td>当前 rank、窗口 extent、peer MR VA、workspaces[RDMA]</td>
+<td>所有引用结束后 simpler free</td>
+</tr>
+<tr>
+<td>AIV UB scratch</td>
+<td>built-in AIV / 每次执行</td>
+<td>WQE、MTE 和 session 暂存，公共预算 256 B</td>
+<td>本内核退出后可复用</td>
+</tr>
+<tr>
+<td>DeferredCompletionSlab</td>
+<td>现有 TMR / AIV dispatch</td>
+<td>本次请求的完成条件和错误；不是业务窗口</td>
+<td>按现有 FIN/条件移交协议回收</td>
+</tr>
+<tr>
+<td>AICPU observer 状态</td>
+<td>runtime / 每个完成条件登记时</td>
+<td>该条件独占的 cursor、已证明成功前缀、失败位置、owner epoch</td>
+<td>当前条件 retire 时清空；workspace 的寿命仍由 run lease 保护</td>
+</tr>
+</tbody>
+</table>
+<p>每个 rank 有自己的一份 GM context/workspace，不是全体 rank 共用一份。远端 VA 可以不同；“symmetric”在这里要求逻辑布局一致，并不要求所有进程 VA 数值相同。</p>
+<p>PTO 的 workspace v3 仍使用 <code>RdmaInfo</code> 头；IN_DIE 下 <code>sqPtr/scqPtr</code> 指向同一 Queue 数组，每项同时包含 SQ/CQ，不是 HNS1825 的两组独立结构。通知 operand 页是该 provider 的内部资源，本设计即使只暴露 PUT/GET，也按其 sizing/初始化合同分配，不能擅自缩小。</p>
+<h2 id="lifecycle-4-多次使用与直接-simpler-sdk">4. 多次使用与直接 simpler SDK</h2>
+<p>以下是调用顺序示意，<code>TaskArgs</code> 的 scalar 增加方法按当前 SDK 实际类型构建；这不是可复制即运行的示例程序：</p>
+<pre><code class="language-text">创建 L3 Worker + A3 chip children
+通用编译/装配：KernelCompiler → CoreCallable.build → ChipCallable.build
+Worker.register(callable)；Worker.init()
+
+每次 Worker.run(rdma_host_orchestration, args, config):
+  domain = orch.get_or_allocate_domain(
+      相同 name/members/buffers/window_size,
+      retain_after_run=True,
+      workspace_engines={&quot;rdma&quot;: RdmaConfig(...)})
+  ctx = domain.device_context(rank, workspace_engines=(&quot;rdma&quot;,))
+  args = 六个本轮 uint64（ctx, peer, local_offset, remote_offset, nbytes, qp）
+  orch.submit_next_level(put_or_get_handle, args, deps配置, worker=rank)
+
+所有 rank 业务阶段结束 → domain.release() → Worker.close()
+</code></pre><p>窗口内容的保留还取决于现有 persistent/reset 策略；需要复用内容时明确关闭 persistent window reset，不能依赖 <code>None</code> 默认值。<code>get_or_allocate_domain</code> 命中不重新建链、清零或重新运行 initializer。不能对 retained handle 随意使用会在退出时 release 的 context manager。</p>
+<p>每次 run 内调用 <code>device_context()</code>，使已有 <code>_use_domain()</code> 持有本轮 owner。仅缓存上次 run 的裸 GM 指针会绕过此引用追踪，不属于安全使用方式。SDK 是受信任的低层接口，检查非空不能使任意 GM 地址自动变成有效 context。</p>
+<p>observer 的 <code>owner_epoch</code> 由当前 TaskId 派生，是私有 cursor 的任务归属标识，不是独立的跨 run 世代。每次登记和退休都重置 cursor；domain/workspace 的跨 run 存续由已有 run lease 保护。相同 owner 的队列计数跨 run 保留，但旧任务 token 不可跨 run 重放。域在 run lease 结束前不能释放，因此同一 run 内不得出现相同 VA 已被重分配为另一个域的 ABA。此机制不向 PTO header 的 reserved 字段塞 generation，也不扩展六字参数 ABI。</p>
+<h2 id="lifecycle-5-结束失败与保留">5. 结束、失败与保留</h2>
+<p>正常释放顺序：停止接收新请求 → 本地所有 AIV FIN 和 RDMA 条件完成 → 业务确认所有远端访问静默 → 全 rank release agreement → <code>TryDestroyComm()</code> → 释放 PTO/业务/context 外部 GM → 释放端口和 owner。已有 C ABI 的 collective release 可以承载会合，但不能用一次 barrier 证明调用方没有尚未提交的业务访问。</p>
+<p>实现入口复用 <code>comm_release_domain_windows()</code> / <code>comm_abort_domain_windows()</code> → <code>release_domain_allocation()</code>；RDMA provider 与内存的清理加入既有 <code>release_domain_windows()</code> 分支。正常 release 的静默协议和 initialization abort 的 parent join 前置条件保留区别，底层清理机制共用，不新增 Close/AbortInitialization 方法。</p>
+<p>当前 A3 清理路径存在“barrier 超时也释放本地状态”和 map erase 路径。新增 RDMA 分支必须改为 fail closed：不能在远端还可能访问已注册窗口时继续 free，也不能因清理函数返回错误就丢掉 owner。</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>可否提交</th>
+<th>允许的动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PREPARING</td>
+<td>否</td>
+<td>继续阶段协商，或所有准备请求终止后调用既有 comm_abort_domain_windows</td>
+</tr>
+<tr>
+<td>READY</td>
+<td>是</td>
+<td>受依赖和范围约束提交，或开始静默关闭</td>
+</tr>
+<tr>
+<td>QUIESCING</td>
+<td>否</td>
+<td>等待已知任务和应用远端阶段，不重置队列</td>
+</tr>
+<tr>
+<td>INIT_RETAINED</td>
+<td>否</td>
+<td>返回 INITIALIZATION_ABORT_REQUIRED；join 全部准备请求后按 owner 记录清理</td>
+</tr>
+<tr>
+<td>RUN_RETAINED / CLEANUP_UNCONFIRMED</td>
+<td>否</td>
+<td>返回原错误并保留环境、窗口、QP 和端口；需明确恢复证明，普通 close 不盲目重试</td>
+</tr>
+<tr>
+<td>CLOSED</td>
+<td>否</td>
+<td>资源已销毁；后续旧 handle 使用报错</td>
+</tr>
+</tbody>
+</table>
+<p>PTO <code>Finalize()</code> 可在 Init 失败后仍持有资源；调用方只能依据其明确成功结果释放 caller-owned GM。正常运行未知完成与纯初始化残留不能混用同一种 abort。普通接口不宣称具备设备错误后的自动恢复能力；无法证明静默时保留 owner 并报告未确认回收，不执行设备 reset 或隐式重发 PUT/GET。</p>
+</section><section id="implementation"><h1 id="implementation-a3-rdma-实施与验收">A3 RDMA 实施与验收</h1>
+<p><a href="#overview">返回设计入口</a></p>
+<h2 id="implementation-1-源文件与工作拆分">1. 源文件与工作拆分</h2>
+<table>
+<thead>
+<tr>
+<th>顺序</th>
+<th>增改位置</th>
+<th>完成判据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>PTO pin、下载/安装与 package headers 清单</td>
+<td>固定包含 PR 2155 的 commit；source 和 wheel 都能找到公开 Host API、Host-safe 队列布局及 AIV intrinsic</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>python/simpler/workspace_config.py</code>、worker control 编解码、<code>comm.h</code>、native binding</td>
+<td>RDMA 配置、84 B Host 配置结构、端口请求/实际值一致；旧接口调用仍得到正确默认配置</td>
+</tr>
+<tr>
+<td>3</td>
+<td>现有 <code>src/a2a3/platform/onboard/host/comm_hccl.cpp</code> 的 DomainAllocation、分配/释放/abort 分支</td>
+<td>仅增加私有 domain_alloc_via_rdma 和 HostExchange 适配；复用 PTO BuildComm/TryDestroyComm、context 上传、Worker join/abort；补端口协调和清理保留，不新建 owner 生命周期 API</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>src/common/rdma/rdma_request.h</code> 与 A3 completion adapters</td>
+<td>48 B ABI、提交前容量检查、复用现有完成登记、IN_DIE 事件检查、只读 observer、有界进度和错误传播</td>
+</tr>
+<tr>
+<td>5</td>
+<td>A3 TMR <code>async_wait.h</code>、mailbox type 与 completion owner</td>
+<td>type4/ROCE 分发、FIN 与 RDMA 合并，未改变 SDMA/counter 语义</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>builtins/rdma/</code>、kernel/runtime compiler、RDMA 示例声明/私有 helper</td>
+<td>复用通用编译、CoreCallable/ChipCallable 和既有 AICPU 入口契约；独立 callable 仅提供默认符号的薄层源码，业务可在已有入口直接提交；注册一次可多次运行，不新增公共 RDMA builder；source/wheel 行为一致</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>tests/ut/py</code>、<code>tests/ut/cpp/a2a3</code>、<code>examples/a2a3/.../rdma_async_completion_demo</code></td>
+<td>以下各层验收分开执行并留证</td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>docs/comm-domain.md</code>、<code>docs/developer-guide.md</code>、<code>docs/hardware/cache-coherency.md</code>、A3 API/场景文档</td>
+<td>更新 A3 原先“workspace_mask 必须为0”和 CQE unsupported 等支持表；只设计 PUT/GET，不引入本次范围外接口</td>
+</tr>
+</tbody>
+</table>
+<p>上述文件已加入本实现；后续章节分别记录构建、模拟、A3 实机冒烟结果和仍需完成的设备验收，不把这些结果混为一项。</p>
+<h2 id="implementation-2-工具链与构建接入">2. 工具链与构建接入</h2>
+<p>基线要求是可编译 <code>__NPU_ARCH__=2201</code> 的 CANN/Bisheng、匹配 A3 的 driver/firmware、匹配运行时的 HCCP 头文件和 <code>libra.so/libtsdclient.so</code>。PR 2155 明确要求 <code>hccp.h/hccp_common.h</code>，还使用 <code>infiniband/verbs.h</code>、driver 和 tsd 声明；不能自行镜像私有结构来消除编译错误。</p>
+<p>SDK 包缺 HCCP 头文件时，使用与实际 HCOMM/HCCP runtime 对应的源码 headers，通过 PTO 已有 <code>PTO_HCCP_INCLUDE_DIR</code> 指定。文档不把一个未核对的 CANN 最低小版本写成已验证兼容表；实施应记录精确 Toolkit/HCOMM/HCCP/driver/firmware 版本、SoC 和 PTO commit。</p>
+<p>复用既有 <code>SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON</code>；A3 产物使用 PTO 已定义的 <code>PTO_NPU_ARCH_A2A3</code>、<code>PTO_RDMA_SUPPORTED</code> 和 <code>PTO_RDMA_BACKEND_IN_DIE_SUPPORTED</code>，A5 继续选择 HNS1825。PTO 明确不允许同一编译单元同时选择两个 RDMA backend。shared <code>a2a3</code> 目录不等于所有 A2 变体都支持，Host <code>IsSupportedSoc()</code> 与真实 device 选择都需要生效。</p>
+<p>构建产物分三类：Host provider 代码、AICPU runtime、AIV builtins。固定 PTO 的高层 Host domain header 带设备 tensor 声明，普通 g++ 无法独立解析；开启 RDMA 时，CMake 用 CANN <code>ccec -xcce --cce-host-only -std=c++17 -fPIC</code> 编译 <code>comm_hccl.cpp</code> 为普通 Host object，再链接进 Host runtime。其他 Host 源文件仍用普通工具链。AICPU 只读取 Host-safe 数据结构和设备内存，不能把 <code>in_die_backend.hpp</code> 的 AIV intrinsic 编译进 AICPU，不复制依赖布局。</p>
+<p>构建缓存和 wheel 索引必须含 platform/runtime/backend/PTO commit/ABI 版本；从源码测试成功不能证明 wheel 内置模板和头文件齐全。非 RDMA 构建及原 A5 默认配置应有回归检查，新增字段不能让旧路径读到随机值。</p>
+<h2 id="implementation-3-不需要设备的验证">3. 不需要设备的验证</h2>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>必测点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ABI</td>
+<td>六个 uint64 的大小、offset、64 位 round-trip；Host 配置长度 84 B；CommContext 保持原布局；IN_DIE/PTO kind 与 simpler type 不混用</td>
+</tr>
+<tr>
+<td>参数</td>
+<td>溢出、越界、零长度、超长、未对齐、peer=self、非法 QP、高字截断、错误 workspace/backend/version</td>
+</tr>
+<tr>
+<td>调用装配</td>
+<td>PUT/GET 使用相同请求合同；普通 register/init/run/submit；产物缓存不固化本轮数据；默认/自定义 AICPU 入口均可装配；独立薄层拒绝非零 tensor、非六 scalar，并返回失败而不是空图成功</td>
+</tr>
+<tr>
+<td>域复用</td>
+<td>相同请求命中；members 顺序、QP、IP、端口请求不同拒绝复用；自动实际端口不导致复用 miss；命中不清零</td>
+</tr>
+<tr>
+<td>Bootstrap</td>
+<td>某 rank preflight/分配/建链失败、阶段号不一致、过期文件、callback 异常、超时、清理残留；所有分配请求 join 后才 abort；members 子集/重排不误调用更大的 base HCCL collective</td>
+</tr>
+<tr>
+<td>端口</td>
+<td>同设备并行域冲突、显式端口占用、租约清理失败保留、多进程 owner 存活身份</td>
+</tr>
+<tr>
+<td>完成登记</td>
+<td>slab 满时 provider post 次数必须为0；剩余一条时能提交并经原函数登记；单 writer 合同成立、QP 并发任务不共享 slab；无 event.Wait 兜底</td>
+</tr>
+<tr>
+<td>CQ 查询</td>
+<td>owner0/1、status 错误、target head 非零、多个 QP、非目标此前错误、有界32项扫描、不可达地址拒绝</td>
+</tr>
+<tr>
+<td>并发 CQ</td>
+<td>AIV 回收与 AICPU 读取交错；tail 重读；CQ 绕圈覆盖；observer cursor 缓存失败；旧 run token 重放；不向任何 PTO tail/doorbell 写值</td>
+</tr>
+<tr>
+<td>FIN 汇合</td>
+<td>人工 gate 分别控制 FIN 和 CQE；任一个未到时 TaskId 不完成，二者皆到才释放后继</td>
+</tr>
+<tr>
+<td>生命周期</td>
+<td>清理失败仍保留 MR/窗口/端口/owner；超时不等于静默；初始化 abort 不能取消已发 DMA</td>
+</tr>
+</tbody>
+</table>
+<p>采用 fake provider 和可控制的队列快照验证状态机；这些单测只证明算法与协议，不证明 HCCP 硬件可用。并发覆盖通过显式事件/gate/注入点建立顺序，不能用 sleep 或“足够长时间没出错”代替断言。</p>
+<p>编译检查应覆盖 Host+AICPU+AIV，链接检查使用真实 SDK 库，sim 明确标识未执行 RoCE。完成测试后只按实际执行结果报告，不能把源代码 grep 或 syntax-only 检查称作完整编译通过。</p>
+<h3 id="implementation-当前无设备验证记录">当前无设备验证记录</h3>
+<p>2026-11-27 的构建使用 Ubuntu 24.04、CANN <code>9.3.0-beta.1</code> 内的 CCEC 和 AArch64 工具链，Host 普通源使用 GCC 13.3。PTO 固定为 <code>596dc095892da42f1990622830c5209309d025cf</code>。SDK 分发包之外的声明来自官方 HCOMM 9.3.0 <code>50792bd5ed191699a544c7e71b4426bbb2be7c71</code>、HCCL 9.3.0 <code>7b8e1ac5565263efc43fa7d45ce36549b3db52dd</code>，以及 Ubuntu libibverbs <code>50.0-2ubuntu0.2</code>。这些是已使用的编译输入，不是未经实机核对的 SDK/driver/firmware 兼容承诺。</p>
+<table>
+<thead>
+<tr>
+<th>检查</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>实际 SDK 构建</td>
+<td>A3 TMR 的 Host、AICPU、AIV 编译链接成功；PUT/GET 内核及标准 AICPU 编排产物生成成功</td>
+</tr>
+<tr>
+<td>安装资产</td>
+<td>最终 non-editable wheel 在隔离目录安装；实际从 wheel 导入编译器模块，12 项关键 native 资产和编译器模块与最终源码逐字节一致；编译 PUT/GET 和编排并完成 CoreCallable/ChipCallable 装配，未启动设备</td>
+</tr>
+<tr>
+<td>相关 Python 回归</td>
+<td>336 项通过；最终配置/control 子集 51 项通过，不能将有重叠的数量累加为总用例数</td>
+</tr>
+<tr>
+<td>编译缓存</td>
+<td>最终编译器子集 27 项通过，覆盖 RDMA 开关、A3/A5 后端宏与 PTO pin 改变时的缓存隔离</td>
+</tr>
+<tr>
+<td>通信域和 Host Worker</td>
+<td>最终回归 482 项通过，2 项按已有条件跳过</td>
+</tr>
+<tr>
+<td>Host 资源协议</td>
+<td>7 种 RDMA 场景通过：成功、初始化残留、provider 清理失败、两类 GM free 产生副作用后失败、端口冲突、双 rank HostExchange；另有原 Host lifecycle 30 项通过。均为明确替换外部 provider 的无设备测试</td>
+</tr>
+<tr>
+<td>C++ 完成与生命周期</td>
+<td>8 个聚焦测试可执行文件通过，覆盖请求 ABI、CQ owner/wrap/status/tail 交错、有界扫描、FIN/CQ 两种到达顺序、取消排空、A5 完成回归及 native 配置 ABI</td>
+</tr>
+<tr>
+<td>完整模拟场景覆盖</td>
+<td>全部 94 个资源场景子进程退出成功；整场命令在后续 L2 阶段触发 1200 秒总时限，因此不能宣称该单次命令通过。按运行时拆分后，HBG 为 18 通过、8 原有条件跳过、1 个 BF16 失败；TMR 为 33 通过、2 原有条件跳过、2 个 BF16 失败。以下环境修正后，这 3 个失败用例分别重跑通过；这些分阶段数量不作为无重复总数累加</td>
+</tr>
+<tr>
+<td>提交检查</td>
+<td>原仓 pre-commit 的格式、clang-tidy、lint、文档和类型检查通过</td>
+</tr>
+<tr>
+<td>A3 NIC 实机</td>
+<td>已完成下节的同 Host 双 rank 冒烟；CQ 绕圈、并发和故障等完整验收仍未完成</td>
+</tr>
+</tbody>
+</table>
+<p>BF16 模拟需要原生类型，PTO 的 <code>include/pto/common/type.hpp</code> 在不支持的工具链上将 <code>bfloat16_t</code> 占位为 <code>_Float16</code>。本机最初按 CI 的后备做法将 GCC 13 用作 <code>g++-15</code> 别名，造成三个 BF16 注意力用例数值不符。安装 Ubuntu 官方 GCC <code>14.2.0-4ubuntu2~24.04.1</code> 后，验证 BF16 与 half 类型不同且 <code>1.0</code> 的位表示为 <code>0x3f80</code>；HBG paged attention 重跑 1 项通过，TMR paged attention 和 batch paged attention 重跑 2 项通过。测试入口仍是仓库现有 <code>g++-15</code> 名称，实际版本为 GCC 14，未安装或声称使用 GCC 15。CANN Host 源在安装后也重新编译通过。没有放宽 golden 容差或修改算法。</p>
+<p>模拟覆盖使用同一份最终源码、原有 markers 和 golden 检查。整场与拆分命令均采用 CI 的 <code>--pto-session-timeout 1200 --require-pto-isa --manual exclude</code>；拆分只选择 <code>--level 2</code> 和对应 runtime，保留完整 L2 范围。上述模拟结果没有执行 IN_DIE 网卡数据路径。</p>
+<h3 id="implementation-a3-目标设备冒烟记录">A3 目标设备冒烟记录</h3>
+<p>2026-11-27，在两张空闲的 Ascend910_9362 上，以 CANN <code>9.3.0-beta.1</code>、driver <code>25.5.1</code> 和同一 PTO pin 重新完成 ARM64 Host、AICPU、AIV 构建及 Python 绑定、PUT/GET callable 装配。服务器默认 CANN <code>8.5.2</code> 缺少当前基线需要的接口，测试使用独立的 9.3 SDK，未升级驱动或修改默认 CANN 链接。</p>
+<p>原始示例发现两处 SDK 使用错误：<code>Transfer</code> 不能作为 <code>Worker.run(args=...)</code> 的 <code>TaskArgs</code>，窗口拷贝也必须覆盖已声明的 buffer slices。示例使用回调捕获请求，并声明覆盖整个窗口的 <code>CommBufferSpec</code> 后，两个先失败的回归测试通过；连同 RDMA 配置和替换 provider 的资源协议测试，最终为 30 项通过。这些 Python 修复不改变 RDMA 后端本体。</p>
+<p>设备上完成原示例四轮 PUT/GET，确认同一 domain/context 复用、动态参数和双 rank 数据校验。另用独立验收驱动覆盖 <code>PUT/GET × 256 B/4 KiB/64 KiB × QP 0/1</code> 共 12 个组合；每轮检查完整窗口，源区、目标区和其余区域均符合预期。HCCL Bootstrap 在多网卡服务器上需要通过已有 <code>HCCL_SOCKET_IFNAME</code> 选择链路正常的 Host 网口；数据仍通过 NPU RoCE。</p>
+<p>测试前后两张设备的进程查询均为空、健康状态为 OK，成功测试日志中没有强制 reset 或错误。环境没有 <code>task-submit</code>，使用即时占用检查和本地 advisory lock，不能据此声称获得共享队列隔离。以上仅证明该设备/SDK/驱动组合的同 Host 双 rank 冒烟；没有覆盖下面验收中的 CQ 绕圈、并发 producer、FIN/CQ 人工顺序控制、故障注入或跨 Host 场景。</p>
+<p>2026-11-28，对齐 upstream main <code>9f9beac34c7b62efa0abafab7eb9ad0dea3d6dcf</code> 后，在同一设备/SDK/驱动组合上重新构建 ARM64 Host、AICPU、AIV 和 Python 绑定，并装配 PUT/GET callable。原示例四轮及上述 12 个 payload/QP 组合再次通过，确认新 epoch retirement 基线下的完成与域复用。相关 Python 回归为 487 通过、4 个条件跳过；SDK 资源协议测试按上游新分层单独运行，7 项通过。8 个聚焦 C++ 测试与全量改动文件的 pre-commit 检查通过。这些是重对齐后的验证，不与前面的历史计数累加；剩余实机验收范围保持上述界限。</p>
+<p>实际 SDK 构建入口如下，外部头文件目录须指向部署环境对应版本：</p>
+<pre><code class="language-bash">source /path/to/ascend-toolkit/set_env.sh
+export PTO_HCCP_INCLUDE_DIR=/path/to/hcomm/src/base_comm/resources/hccp/inc/network
+export CMAKE_PREFIX_PATH=/path/to/hccl-dev-prefix:/path/to/verbs-dev-prefix
+export SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON
+python simpler_setup/build_runtimes.py --platforms a2a3 --runtime tensormap_and_ringbuffer
+</code></pre><p>直接 SDK 的 PUT/GET 编译装配和运行入口见 <a href="../../../examples/a2a3/tensormap_and_ringbuffer/rdma_async_completion_demo/README.md">RDMA 示例</a>。模拟场景验证公共运行时行为；它没有模拟 IN_DIE 网卡，不能替代本节以下的实机验收。</p>
+<h2 id="implementation-4-a3-双-rank-实机验收">4. A3 双 rank 实机验收</h2>
+<ol>
+<li>在真实 A3 的同 Host 两个设备建立域。核对 SoC、logical→physical id、RoCE IP、业务 MR base/size、QP ready，确保未误选普通 Host NIC。</li>
+<li>PUT/GET 分别覆盖至少 256 B、4 KiB、64 KiB 和较大 payload。源/目标两侧放 canary，按 rank/序列填不同内容；验证目标字节及邻接区域。</li>
+<li>一个 callable、一个 domain 连续多轮复用；交替 peer/offset/长度并验证数据确实随参数改变。复用期间 MR/QP/端口不重新创建，业务内容按显式 reset 策略保留。</li>
+<li>多 AIV task 发往同 peer/QP、多 QP 分流，累计超过实际 CQ 深度数倍，以确认 PTO 回收和只读 observer 不因 owner 绕圈误判。记录实际 HCCP 深度，不能用源码请求8192当作设备一定返回的值。</li>
+<li>用可观察阶段 gate 确认 FIN-before-CQE、CQE-before-FIN、CQE cache 刷新和 GET 后继读取；只有传输与正常执行都完成，后继才能消费。</li>
+<li>在 SQ 未满前提交少量请求，确认 observer 在 PTO tail 尚未推进时可读真实 CQE；再提交足够请求确认 AIV Reserve/Progress 回收仍工作。</li>
+<li>确认 AICPU 能访问真实 CQ buffer 和 software tail；验证 CQ owner/status 与固定 PR 源码一致。若不成立，停止集成并修正 provider 完成接口，不编造成功路径。</li>
+<li>正常关闭再创建、显式端口冲突、链路/peer 失败和超时分别验收。故障注入发生在可观察提交阶段，校验 live owner 不被提前 free；这类用例需要受控设备，不在无设备环境假装执行。</li>
+</ol>
+<p>首版支持范围可以在双 rank验收后扩展到更多 rank，但 <code>(rankNum-1)*qp_num</code> 的设备资源预算、all-rank 失败协商和全互连建链必须一并验证。完成本地 PUT 不等于远端消费，跨 rank 测试要用显式业务握手证明覆盖许可。</p>
+<h2 id="implementation-5-设计评审关口">5. 设计评审关口</h2>
+<p>落地代码需同时满足：依赖版本固定、HCCP 真实建链、原 API 的 A3 alloc/release 接入、48 B ABI、提交前容量保障并复用登记函数、无阻塞完成兜底、只读 CQ observer、FIN 合并、错误保留、wheel 可用和直接 SDK 场景。只有 builtin kernel 或只有 Host 资源接口都不算完成通用后端。</p>
+<p>依赖源码已核对，但以下属于实施验证关口：HCCP 与具体 SDK/驱动匹配、AICPU 对 NIC CQ/tail 的可访问性与一致性、PTO 分配/回收在实际 A3 上的时序、GET 后继 cache 可见性、资源清理失败语义。构建和 fake 测试通过后可宣称“可编译、协议测试通过”；真实 A3 验收通过后才能宣称该设备组合上运行通过。</p>
+</section></main></body></html>

@@ -270,6 +270,7 @@ class KernelCompiler:
             # must see this on their include path so orchestration cpp can
             # resolve e.g. "common/core_type.h" the same way it did before.
             str(self.project_root / "src" / "common" / "platform" / "include"),
+            str(self.project_root / "src" / "common"),
         ]
 
     def get_orchestration_include_dirs(self, runtime_name: str) -> list[str]:
@@ -326,6 +327,7 @@ class KernelCompiler:
         include_dirs = platform_dirs + [
             str(Path(__file__).resolve().parent / "incore"),
             str(self.project_root / "src" / "common" / "platform" / "include"),
+            str(self.project_root / "src" / "common"),
         ]
         if self.platform in ("a5", "a5sim"):
             include_dirs.append(str(self.project_root / "src" / "a5" / "runtime"))
@@ -333,8 +335,11 @@ class KernelCompiler:
 
     def _incore_feature_defines(self) -> list[str]:
         """Feature macros forwarded to incore compiles for the RDMA overlay."""
-        if self.platform == "a5" and _cmake_bool_env_enabled("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", default=False):
-            return ["-DPTO_RDMA_SUPPORTED", "-DPTO_RDMA_BACKEND_HNS_1825_SUPPORTED"]
+        if self.platform in ("a2a3", "a5") and _cmake_bool_env_enabled(
+            "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", default=False
+        ):
+            backend = "IN_DIE" if self.platform == "a2a3" else "HNS_1825"
+            return ["-DPTO_RDMA_SUPPORTED", f"-DPTO_RDMA_BACKEND_{backend}_SUPPORTED"]
         return []
 
     @staticmethod
@@ -497,7 +502,7 @@ class KernelCompiler:
         else:
             assert self.ccec is not None, "ccec toolchain is only available for hardware platforms"
             incore = self.ccec
-            flags = incore.get_compile_flags(core_type=core_type)
+            flags = [*incore.get_compile_flags(core_type=core_type), *self._incore_feature_defines()]
             linker = {
                 "identity": _executable_cache_identity(self.ccec.linker_path),
                 "flags": ["-e", "kernel_entry"],
@@ -509,7 +514,7 @@ class KernelCompiler:
             "core_type": core_type,
             "flags": flags,
             "linker": linker,
-            "pto_isa_commit": read_pto_isa_pin() if self.platform.endswith("sim") else None,
+            "pto_isa_commit": read_pto_isa_pin(),
         }
 
     def _run_subprocess(

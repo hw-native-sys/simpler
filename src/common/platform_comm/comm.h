@@ -45,10 +45,16 @@ typedef struct CommWorkspaceConfig {
     uint32_t urma_jetties_per_aiv;
     uint32_t urma_sq_depth;
     uint32_t ccu_mode;
+    uint32_t rdma_qp_num;
+    uint32_t rdma_base_port;  // Zero requests automatic per-domain reservation.
+    char rdma_local_ip[64];
 } CommWorkspaceConfig;
 #ifdef __cplusplus
 static_assert(std::is_trivially_copyable_v<CommWorkspaceConfig> && std::is_standard_layout_v<CommWorkspaceConfig>);
-static_assert(sizeof(CommWorkspaceConfig) == 12);
+static_assert(sizeof(CommWorkspaceConfig) == 84);
+static_assert(offsetof(CommWorkspaceConfig, rdma_qp_num) == 12);
+static_assert(offsetof(CommWorkspaceConfig, rdma_base_port) == 16);
+static_assert(offsetof(CommWorkspaceConfig, rdma_local_ip) == 20);
 #endif
 // Abort (also for run sets): 0 confirms stop; 1 awaits completion after successful abort;
 // COMM_RECLAMATION_UNCONFIRMED retains owners after an SDK error.

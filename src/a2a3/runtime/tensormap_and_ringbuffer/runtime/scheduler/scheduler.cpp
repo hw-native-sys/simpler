@@ -79,6 +79,7 @@ void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *aicore_mailbox, con
         uint64_t backend_cookie;
         uint32_t expected_value;
         uint32_t observed_value;
+        uint32_t backend_error;
         int32_t entry_idx;
         int32_t condition_idx;
         int32_t waiting_completion_count;
@@ -175,6 +176,7 @@ void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *aicore_mailbox, con
         detail.backend_cookie = cond != nullptr ? cond->backend_cookie : 0;
         detail.expected_value = cond != nullptr ? cond->expected_value : 0;
         detail.observed_value = 0;
+        detail.backend_error = cond != nullptr ? cond->rdma_cursor.error : 0;
         detail.entry_idx = entry_idx;
         detail.condition_idx = condition_idx;
         detail.waiting_completion_count = entry.waiting_completion_count;
@@ -263,12 +265,12 @@ void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *aicore_mailbox, con
         }
         LOG_WARN(
             "[ASYNC_WAIT reason=%s entry=%d cond=%d] task_token=%llu normal_done=%u waiting=%d conditions=%d "
-            "engine=%s type=%d addr=0x%llx cookie=0x%llx expected=%u observed=%s retired=%u",
+            "engine=%s type=%d addr=0x%llx cookie=0x%llx expected=%u observed=%s retired=%u backend_error=%u",
             reason, detail.entry_idx, detail.condition_idx, static_cast<unsigned long long>(detail.task_id),
             static_cast<unsigned>(detail.normal_done), detail.waiting_completion_count, detail.condition_count,
             detail.condition_idx >= 0 ? async_engine_name(detail.engine) : "none", detail.completion_type,
             static_cast<unsigned long long>(detail.addr), static_cast<unsigned long long>(detail.backend_cookie),
-            detail.expected_value, observed, static_cast<unsigned>(detail.retired)
+            detail.expected_value, observed, static_cast<unsigned>(detail.retired), detail.backend_error
         );
     }
 }

@@ -557,7 +557,9 @@ extern "C" int comm_alloc_domain_windows(
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
     size_t *actual_window_size_out, const CommWorkspaceConfig *workspace_config
 ) try {
-    if (workspace_config && (workspace_config->urma_jetties_per_aiv != 1 || workspace_config->urma_sq_depth != 0))
+    if (workspace_config && (workspace_config->urma_jetties_per_aiv != 1 || workspace_config->urma_sq_depth != 0 ||
+                             workspace_config->rdma_qp_num != 1 || workspace_config->rdma_base_port != 0 ||
+                             workspace_config->rdma_local_ip[0] != '\0'))
         return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr || local_window_base_out == nullptr ||

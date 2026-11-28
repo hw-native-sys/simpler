@@ -707,7 +707,7 @@ static void test_host_domain(const std::string &scenario) {
         const auto marker = barrier_marker_path(h->rootinfo_path, h->run_token, tag, 1);
         assert(file_marker_handshake::publish_marker(marker));
     }
-    const CommWorkspaceConfig config{2, 512};
+    const CommWorkspaceConfig config{2, 512, COMM_CCU_MODE_SCHED, 1, 0, {}};
     std::unique_ptr<HostPeerBacking> peer_backing;
     if (peer_mte) peer_backing = std::make_unique<HostPeerBacking>(h.get(), 1, 1);
     const int rc = comm_alloc_host_domain_windows(
@@ -1192,13 +1192,17 @@ int main(int argc, char **argv) {
     assert(mappings.empty() && physical_handles == 0);
     fail_engine = -1;
 
-    for (const CommWorkspaceConfig config : {CommWorkspaceConfig{0, 0}, {9, 0}, {2, 3}, {2, 1u << 31}}) {
+    for (const CommWorkspaceConfig config :
+         {CommWorkspaceConfig{0, 0, COMM_CCU_MODE_SCHED, 1, 0, {}},
+          {9, 0, COMM_CCU_MODE_SCHED, 1, 0, {}},
+          {2, 3, COMM_CCU_MODE_SCHED, 1, 0, {}},
+          {2, 1u << 31, COMM_CCU_MODE_SCHED, 1, 0, {}}}) {
         const int starts = started[1];
         assert(allocate(2, first, first_ctx, &config) == COMM_DOMAIN_URMA_CONFIG_INVALID);
         assert(started[1] == starts && h->domain_allocations.empty());
         assert(mappings.empty() && physical_handles == 0);
     }
-    const CommWorkspaceConfig multi{2, 512};
+    const CommWorkspaceConfig multi{2, 512, COMM_CCU_MODE_SCHED, 1, 0, {}};
     assert(allocate(0, first, first_ctx, &multi) == COMM_DOMAIN_URMA_CONFIG_INVALID);
     device_aiv_count = 129;
     assert(allocate(2, first, first_ctx, &multi) == COMM_DOMAIN_URMA_CONFIG_INVALID);
