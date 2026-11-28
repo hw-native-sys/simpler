@@ -22,6 +22,12 @@ macro(a2a3_platform_case src)
         LABEL no_hardware ${ARGN})
 endmacro()
 
+# The host compiler ignores the device entry's [[block_local]] storage attribute.
+a2a3_platform_case(test_aiv_launch_mask.cpp
+    ARCH a2a3 RUNTIME tensormap_and_ringbuffer
+    COMPILE_OPTIONS -Wno-attributes
+    INCLUDES ${SIMPLER_SRC}/a2a3/platform ${SIMPLER_SRC}/a2a3/platform/sim/aicore)
+
 # aicpu_affinity_select.cpp holds the arithmetic half of the probe and reaches
 # for neither CANN nor libdl, so it compiles here as-is; its sibling
 # aicpu_topology_probe.cpp owns the driver queries and includes ascend_hal.h,
