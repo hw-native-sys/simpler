@@ -255,6 +255,26 @@ TEST(ChipRunLaneJoinedLaunchTest, PendingCancelRetiresSuccessorBeforeJoinedSubmi
     lane.close();
 }
 
+TEST(ChipRunLaneJoinedLaunchTest, PeerBindingReportsTheSuccessorsPrepareRefusal) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 30, 0, true, host_args());
+    worker.prepare_run_fn_ = [](void *, void *runtime, int32_t, const void *, const CallConfig *,
+                                const NativeRunDescriptor *descriptor) {
+        publish_released_preparation(runtime, descriptor->run_epoch);
+        return -5;
+    };
+    auto second = submit(lane, 31, 1, false, host_args());
+    int32_t cancel = 0;
+    EXPECT_THROW(second.bind_peer_cancel(&cancel), RunPreparationRefused);
+    EXPECT_FALSE(second.launched());
+    EXPECT_FALSE(second.owner_recovery_required());
+    EXPECT_TRUE(first.wait_until(ChipRun::Deadline::max()));
+    EXPECT_THROW(first.bind_peer_cancel(&cancel), std::runtime_error);
+    lane.close();
+}
+
 TEST(ChipRunLaneJoinedLaunchTest, DeferredBindFailureRetiresThePreparedCarrier) {
     ChipWorker worker;
     prime_worker(worker);

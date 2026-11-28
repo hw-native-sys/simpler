@@ -4247,12 +4247,12 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     False,
                     **staged.provenance._asdict(),
                 )
+                staged.pending_args = None  # type: ignore[attr-defined]
+                staged.chip_run.bind_peer_cancel(staged.entry_addr + _OFF_ENTRY_PEER_CANCEL_REQUESTED)
             except RunPreparationRefused:
                 if import_registry.host_mappings is not None:
                     import_registry.host_mappings.release(staged.identity)
                 raise
-            staged.pending_args = None  # type: ignore[attr-defined]
-            staged.chip_run.bind_peer_cancel(staged.entry_addr + _OFF_ENTRY_PEER_CANCEL_REQUESTED)
             raw_disposition = staged.chip_run.preparation_disposition
             disposition = int(getattr(raw_disposition, "value", raw_disposition))
             if disposition not in (_VALIDATED_ONLY, _NATIVE_PREPARED):
