@@ -71,10 +71,13 @@ def test_vector_fixed_sram(tmp_path, st_platform, request):
         config = CallConfig()
         config.output_prefix = str(tmp_path)
         config.enable_dep_gen = request.config.getoption("--enable-dep-gen")
+        config.enable_chip_swimlane = request.config.getoption("--enable-chip-swimlane")
         worker.run(handle, args, config)
         check_vector(worker, windows, values, expected)
         rows = [json.loads(line) for line in (tmp_path / "wse_events.jsonl").read_text().splitlines()]
         assert rows[0]["expected_tasks"] == 4
+        if config.enable_chip_swimlane:
+            assert (tmp_path / "wse_swimlane.pftrace").stat().st_size > 0
         if config.enable_dep_gen:
             assert (tmp_path / "deps.json").is_file()
         for window in windows:

@@ -805,7 +805,6 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 }
 
 void WseHostRunner::apply_call_config(const CallConfig &config) {
-    set_chip_swimlane_enabled(config.enable_chip_swimlane);
     set_pmu_enabled(config.enable_pmu > 0);
     set_output_prefix(config.output_prefix);
 }

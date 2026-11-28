@@ -42,10 +42,18 @@ def ffn_inputs(seed):
     return shared_ffn_inputs(seed, 40)
 
 
-def audit_ffn(path):
+def audit_ffn(path, *, timed=False):
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     header, events = rows[0], rows[1:]
     assert header["core_count"] == 40 and header["expected_tasks"] == 5
+    if timed:
+        assert header["clock"] == "CLOCK_MONOTONIC" and header["timestamp_unit"] == "ns"
+        assert all(e["monotonic_ns"] > 0 for e in events)
+        assert (path.parent / "wse_swimlane.pftrace").stat().st_size > 0
+    else:
+        assert "clock" not in header and "timestamp_unit" not in header
+        assert all("monotonic_ns" not in e for e in events)
+        assert not (path.parent / "wse_swimlane.pftrace").exists()
     done = [e for e in events if e["kind"] == 6]
     assert len(done) == 5 and sorted(e["value"] for e in done) == [1, 2, 3, 4, 5]
     for task in (1, 2, 3):
@@ -102,13 +110,14 @@ def test_ffn_independent_pe_graph_replay(tmp_path, st_platform):
             config = CallConfig()
             config.output_prefix = str(tmp_path / str(seed))
             config.enable_dep_gen = True
+            config.enable_chip_swimlane = seed == 0
             worker.run(handle, args, config)
             for index, expected in enumerate(golden, 3):
                 copy_from(worker, tensors[index], buffers[index])
                 torch.testing.assert_close(tensors[index], expected, rtol=0, atol=0)
             copy_from(worker, tensors[6], buffers[6])
             assert tensors[6].tolist() == [[b % 40, b // 40] for b in range(160)]
-            epochs.append(audit_ffn(tmp_path / str(seed) / "wse_events.jsonl"))
+            epochs.append(audit_ffn(tmp_path / str(seed) / "wse_events.jsonl", timed=seed == 0))
             assert (tmp_path / str(seed) / "deps.json").is_file()
             for buffer in buffers:
                 release_view(worker, buffer)

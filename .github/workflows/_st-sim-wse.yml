@@ -126,7 +126,7 @@ jobs:
         uses: ./.github/actions/setup-venv
         with:
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
-          packages: "--no-build-isolation --config-settings=build.targets=build_package_wsesim .[test]"
+          packages: "--no-build-isolation --config-settings=build.targets=build_package_wsesim .[test] perfetto==0.59.1"
           install-torch: ${{ inputs.setup_variant == 'github' && 'true' || 'false' }}
           system-site-packages: ${{ inputs.setup_variant == 'self-cpu' && 'true' || 'false' }}
 
@@ -136,10 +136,10 @@ jobs:
             --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
             --manual "$MANUAL_MODE"
 
-      - name: Run dependency capture smoke (wsesim)
+      - name: Run dependency and PE swimlane capture smoke (wsesim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/wse/host_build_graph/vector_example \
-            --platform wsesim --device 0-15 --max-parallel "$ST_MAX_PARALLEL" --enable-dep-gen \
+            --platform wsesim --device 0-15 --max-parallel "$ST_MAX_PARALLEL" --enable-dep-gen --enable-chip-swimlane \
             --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
             --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}"

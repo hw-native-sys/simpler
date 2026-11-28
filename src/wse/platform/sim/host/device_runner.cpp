@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "device_runner.h"
+#include "pe_swimlane.h"
 #include "common/dma_workspace.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
@@ -148,8 +149,10 @@ int DeviceRunner::prepare_launch_shape(Runtime &runtime, const CallConfig &confi
         LOG_ERROR("WSE requires aicpu_thread_num=0 (got %d)", config.aicpu_thread_num);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (config.enable_chip_swimlane || config.enable_dump_args || config.enable_pmu || config.enable_scope_stats) {
-        LOG_ERROR("WSE exposes PE events through output_prefix; legacy device diagnostic collectors are unsupported");
+    if (config.enable_chip_swimlane < 0 ||
+        config.enable_chip_swimlane > static_cast<int>(ChipSwimlaneLevel::ORCH_PHASES) || config.enable_dump_args ||
+        config.enable_pmu || config.enable_scope_stats) {
+        LOG_ERROR("WSE supports PE swimlane levels 1-4; the requested diagnostic collector is unsupported");
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
     block_dim_ = cores;
@@ -158,7 +161,8 @@ int DeviceRunner::prepare_launch_shape(Runtime &runtime, const CallConfig &confi
     runtime.set_aicpu_thread_num(0);
     // The common host callable interface retains a type vector; it does not route WSE execution.
     runtime.set_core_type_rule(worker_count_, worker_count_);
-    runtime.dev.chip_swimlane_level = config.enable_chip_swimlane;
+    // The shared device field enables AICPU profiling. WSE timestamps its own PE events.
+    runtime.dev.chip_swimlane_level = 0;
     runtime.dev.dump_args_level = config.enable_dump_args;
     return 0;
 }
@@ -176,15 +180,15 @@ int DeviceRunner::ensure_binaries_loaded() {
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run_v6"));
+    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run_v7"));
     if (!create_run_) {
-        LOG_ERROR("WSE PE runtime ABI mismatch: expected wse_create_run_v6");
+        LOG_ERROR("WSE PE runtime ABI mismatch: expected wse_create_run_v7");
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     destroy_run_ = reinterpret_cast<decltype(destroy_run_)>(dlsym(aicore_so_handle_, "wse_destroy_run"));
     execute_pe_ = reinterpret_cast<decltype(execute_pe_)>(dlsym(aicore_so_handle_, "wse_execute_pe"));
-    run_events_ = reinterpret_cast<decltype(run_events_)>(dlsym(aicore_so_handle_, "wse_run_events"));
+    run_events_ = reinterpret_cast<decltype(run_events_)>(dlsym(aicore_so_handle_, "wse_run_events_v7"));
     completed_tasks_ = reinterpret_cast<decltype(completed_tasks_)>(dlsym(aicore_so_handle_, "wse_completed_tasks"));
     runtime_used_ = reinterpret_cast<decltype(runtime_used_)>(dlsym(aicore_so_handle_, "wse_runtime_used"));
     memory_sections_ = reinterpret_cast<decltype(memory_sections_)>(dlsym(aicore_so_handle_, "wse_memory_sections"));
@@ -219,7 +223,7 @@ int DeviceRunner::prepare_execution(
     char error[512]{};
     run->state = create_run_(
         descriptor, prepared->num_aicore / WSE_PE_PER_CORE, identity.run_epoch, regions.data(), regions.size(),
-        allocations.data(), allocations.size(), error, sizeof(error)
+        allocations.data(), allocations.size(), config.enable_chip_swimlane != 0, error, sizeof(error)
     );
     if (!run->state) {
         if (config.output_prefix[0]) {
@@ -298,7 +302,12 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL, true);
     const auto &config = active.prepared->config;
     if (config.output_prefix[0]) {
-        std::filesystem::create_directories(config.output_prefix);
+        std::error_code error;
+        std::filesystem::create_directories(config.output_prefix, error);
+        if (error) {
+            LOG_ERROR("WSE cannot create diagnostic directory %s: %s", config.output_prefix, error.message().c_str());
+            return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
+        }
         const auto *descriptor = reinterpret_cast<const WseGraphDescriptor *>(
             active.prepared->runtime->dev.scheduler_bootstrap.worker_context_base
         );
@@ -306,7 +315,9 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
         std::ofstream trace(std::filesystem::path(config.output_prefix) / "wse_events.jsonl");
         trace << "{\"epoch\":" << active_run_->epoch << ",\"expected_tasks\":" << active_run_->expected
-              << ",\"core_count\":" << active.prepared->num_aicore / WSE_PE_PER_CORE << "}\n";
+              << ",\"core_count\":" << active.prepared->num_aicore / WSE_PE_PER_CORE;
+        if (config.enable_chip_swimlane) trace << ",\"clock\":\"CLOCK_MONOTONIC\",\"timestamp_unit\":\"ns\"";
+        trace << "}\n";
         for (size_t stream = 0; stream <= active_run_->threads.size(); ++stream) {
             const bool host = stream == active_run_->threads.size();
             uint64_t count = 0;
@@ -318,9 +329,12 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
                       << ",\"pe\":" << (host ? "null" : std::to_string(e.pe))
                       << (host ? ",\"source\":\"host_prepare\"" : "") << ",\"task\":" << e.task
                       << ",\"block\":" << e.block << ",\"value\":" << e.value << ",\"slot\":" << e.slot
-                      << ",\"generation\":" << e.generation << "}\n";
+                      << ",\"generation\":" << e.generation;
+                if (config.enable_chip_swimlane) trace << ",\"monotonic_ns\":" << e.monotonic_ns;
+                trace << "}\n";
             }
         }
+        trace.close();
         if (!trace) return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
         std::ofstream memory(std::filesystem::path(config.output_prefix) / "wse_sram.json");
         memory << "{\"configuration\":[";
@@ -348,7 +362,15 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
                    << ",\"bytes\":" << section.bytes << "}";
         }
         memory << "]}";
+        memory.close();
         if (!memory) return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
+        if (config.enable_chip_swimlane && !wse::write_pe_swimlane(
+                                               config.output_prefix, *descriptor, active_run_->epoch,
+                                               sram_.core_count(), active_run_->state, run_events_
+                                           )) {
+            LOG_ERROR("WSE PE swimlane export failed in %s", config.output_prefix);
+            return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
+        }
     }
     return DrainOutcome::device_complete(0);
 }

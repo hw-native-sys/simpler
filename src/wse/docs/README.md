@@ -122,8 +122,28 @@ Block schedule and task dependency graph. Ticks use the unit-cost model.
 Execution advances on real Block completion. Sort `BLOCK_BEGIN` events by
 `seq` within each Core to compare actual dispatch with its planned rows. Dependency capture also emits `deps.json`.
 `wse_prepare_error.txt` records a PE run-admission failure, including runtime SRAM
-capacity exhaustion, before the execution start gate opens. Legacy device PMU,
-chip swimlane, scope-stat and argument-dump collectors are unsupported.
+capacity exhaustion, before the execution start gate opens. Device PMU, scope
+statistics and argument dumping are unsupported.
+
+### PE swimlane
+
+Set `CallConfig.enable_chip_swimlane = 1` and give `output_prefix` a directory
+before submission. After a successful run, open `wse_swimlane.pftrace` from
+that directory in Perfetto. All enabled levels (1 through 4) select the WSE
+PE trace. To retain several captures, give each run its own output directory.
+
+Tracks follow physical placement: Core 0 contains PE 0 through PE 3, followed
+by Core 1 and its four PEs, in numeric order for every configured Core. Select a
+kernel interval to see its task, Block index, and physical `core_id` and `pe_id`. The time
+axis is the simulator's monotonic clock and includes host thread scheduling.
+
+For a Group with synchronized start, follow each Core's `BLOCK_READY` marker
+to the single `SYNC_RELEASE` and from that release to each participating PE's
+kernel start. This shows both the arrival order and how long each PE takes to start
+after the barrier. A `TASK_DONE` marker records the completion time of a task with an
+observed dependent start. Follow its flow to that PE. These flow endpoints and PE
+execution intervals make up the swimlane. For startup, shutdown and SharedTile
+diagnostics, use `wse_events.jsonl`. Match a visible event to its raw record by `seq`.
 
 ## Implementation boundary
 
