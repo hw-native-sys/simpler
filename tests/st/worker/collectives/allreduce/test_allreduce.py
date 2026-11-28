@@ -547,7 +547,11 @@ def _run_rejected_domain_case(case, platform, device_ids, request, monkeypatch):
     directory = _host_log_directory()
     assert directory
     log_directory = Path(directory)
-    output = request.getfixturevalue("tmp_path") / "collective-rejection"
+    if request.config.getoption("--environment-parent-plan"):
+        # CI archives the dispatched case's JUnit shard, including its rank evidence.
+        output = Path(request.config.getoption("xmlpath")).parent / f"{type(case).__name__}-rejection"
+    else:
+        output = request.getfixturevalue("tmp_path") / "collective-rejection"
     rank_logs, captured_logs, primary_error = {}, {}, None
     worker = Worker(
         level=3,
