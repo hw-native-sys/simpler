@@ -26,7 +26,7 @@ import threading
 import time
 from typing import Any
 
-from .global_comm_domain import GLOBAL_DOMAIN_PROFILE_SIM
+from .global_comm_domain import GLOBAL_DOMAIN_PROFILE_SIM, validate_global_comm_profile
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
 
 
@@ -68,12 +68,7 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
     if str(manifest["transport"]) != HOST_TCP_TRANSPORT_PROFILE:
         raise ValueError(f"only {HOST_TCP_TRANSPORT_PROFILE} transport is accepted by simpler-remote-worker")
     comm_profile = str(manifest.get("comm_profile", GLOBAL_DOMAIN_PROFILE_SIM))
-    if comm_profile not in ("sim", "a3-fabric-v1"):
-        raise ValueError("manifest comm_profile is not supported")
-    if comm_profile == "a3-fabric-v1" and not str(manifest["platform"]).startswith("a2a3"):
-        raise ValueError("manifest a3-fabric-v1 comm_profile requires an a2a3 platform")
-    if comm_profile == "a3-fabric-v1" and str(manifest["platform"]).endswith("sim"):
-        raise ValueError("manifest a3-fabric-v1 comm_profile requires real A3 devices")
+    validate_global_comm_profile("manifest", str(manifest["platform"]), comm_profile)
     node_rank = int(manifest.get("node_rank", 0))
     node_count = int(manifest.get("node_count", 1))
     if node_count <= 0 or node_rank < 0 or node_rank >= node_count:

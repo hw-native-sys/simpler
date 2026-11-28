@@ -17,9 +17,8 @@
  * MemExportToShareableHandle / MemImportFromShareableHandle +
  * EnablePeerAccess) for the per-rank symmetric window pool (Path D).
  *
- * Scope: L3 single-host multi-card only. The VMM shareable-handle
- * exchange is host-local, so cross-host (L4) deployments need a different
- * windows backend.
+ * L3 uses host-local IPC windows. L4 uses Fabric V2 windows prepared and
+ * imported by each participating ChipWorker.
  */
 
 #include "platform_comm/comm.h"
@@ -55,6 +54,7 @@
 #include <fstream>
 #include <memory>
 #include <map>
+#include <mutex>
 #include <set>
 #include <optional>
 #include <sstream>
@@ -3028,20 +3028,232 @@ comm_abort_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_coun
     return release_domain_windows(h, allocation_id, rank_count, domain_rank, false);
 }
 
-extern "C" int
-comm_global_domain_prepare(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *) {
-    LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
+namespace {
+
+struct A5FabricDescriptor {
+    uint64_t superpod_id;
+    aclrtMemFabricHandle handle;
+};
+static_assert(sizeof(A5FabricDescriptor) <= COMM_GLOBAL_DOMAIN_HANDLE_BYTES);
+
+struct A5FabricDomain {
+    uint32_t rank = 0;
+    uint32_t rank_count = 0;
+    size_t mapping_size = 0;
+    A5FabricDescriptor exported{};
+    DomainPeerWindow local_window{};
+    std::vector<DomainPeerWindow> peer_windows;
+    void *device_ctx = nullptr;
+    bool cleanup_failed = false;
+};
+
+std::mutex a5_fabric_domains_mutex;
+std::unordered_map<uint64_t, A5FabricDomain> a5_fabric_domains;
+
+bool fabric_acl_ok(aclError status, const char *operation) {
+    if (status == ACL_SUCCESS) return true;
+    LOG_ERROR("[a5 fabric] %s -> %d", operation, static_cast<int>(status));
+    return false;
+}
+
+bool map_a5_fabric_window(DomainPeerWindow &window, size_t size) {
+    constexpr uint64_t kReserveHugePages = 1;
+    if (!fabric_acl_ok(
+            aclrtReserveMemAddress(&window.address, size, 0, nullptr, kReserveHugePages), "aclrtReserveMemAddress"
+        ) ||
+        !fabric_acl_ok(aclrtMapMem(window.address, size, 0, window.handle, 0), "aclrtMapMem")) {
+        return false;
+    }
+    window.mapped = true;
+    return true;
+}
+
+bool close_a5_fabric_domain(A5FabricDomain &domain) {
+    if (domain.cleanup_failed) return false;
+    domain.cleanup_failed = true;
+    if (domain.device_ctx != nullptr) {
+        if (!fabric_acl_ok(aclrtFree(domain.device_ctx), "aclrtFree(CommContext)")) return false;
+        domain.device_ctx = nullptr;
+    }
+    for (auto peer = domain.peer_windows.rbegin(); peer != domain.peer_windows.rend(); ++peer) {
+        if (!release_domain_window(peer->address, peer->handle, peer->mapped)) return false;
+    }
+    auto &local = domain.local_window;
+    return release_domain_window(local.address, local.handle, local.mapped);
+}
+
+}  // namespace
+
+extern "C" int comm_global_domain_prepare(
+    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
+    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+) try {
+    if (domain_id == 0 || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count ||
+        window_size == 0 || profile != COMM_GLOBAL_DOMAIN_PROFILE_A5_FABRIC || descriptor_out == nullptr ||
+        local_window_base_out == nullptr) {
+        return -1;
+    }
+    int32_t device = -1;
+    int64_t superpod_id = -1;
+    if (!fabric_acl_ok(aclrtGetDevice(&device), "aclrtGetDevice") ||
+        !fabric_acl_ok(aclrtGetDeviceInfo(device, ACL_DEV_ATTR_SUPER_POD_ID, &superpod_id), "get superpod ID")) {
+        return -1;
+    }
+    if (superpod_id < 0 || superpod_id >= UINT32_MAX) {
+        LOG_ERROR("[a5 fabric] rank %u has no valid superpod ID", domain_rank);
+        return -1;
+    }
+
+    aclrtPhysicalMemProp prop{};
+    prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
+    prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
+    prop.memAttr = ACL_HBM_MEM_HUGE;
+    prop.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    size_t granularity = 0;
+    if (!fabric_acl_ok(
+            aclrtMemGetAllocationGranularity(&prop, ACL_RT_MEM_ALLOC_GRANULARITY_MINIMUM, &granularity),
+            "aclrtMemGetAllocationGranularity"
+        ) ||
+        granularity == 0 || window_size > std::numeric_limits<size_t>::max() - (granularity - 1)) {
+        return -1;
+    }
+    const size_t size = ((window_size + (granularity - 1)) / granularity) * granularity;
+
+    std::lock_guard<std::mutex> lock(a5_fabric_domains_mutex);
+    auto [entry, inserted] = a5_fabric_domains.try_emplace(domain_id);
+    if (!inserted) return -1;
+    auto &domain = entry->second;
+    auto &local = domain.local_window;
+    if (!fabric_acl_ok(aclrtMallocPhysical(&local.handle, size, &prop, 0), "aclrtMallocPhysical(HBM)") ||
+        !map_a5_fabric_window(local, size) ||
+        !fabric_acl_ok(aclrtMemset(local.address, size, 0, size), "aclrtMemset(HBM)") ||
+        !fabric_acl_ok(
+            aclrtMemExportToShareableHandleV2(
+                local.handle, ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC,
+                &domain.exported.handle
+            ),
+            "aclrtMemExportToShareableHandleV2"
+        )) {
+        if (!close_a5_fabric_domain(domain)) return COMM_RECLAMATION_UNCONFIRMED;
+        a5_fabric_domains.erase(entry);
+        return -1;
+    }
+
+    domain.rank = domain_rank;
+    domain.rank_count = rank_count;
+    domain.mapping_size = size;
+    domain.exported.superpod_id = static_cast<uint64_t>(superpod_id);
+    CommGlobalDomainDescriptor descriptor{};
+    descriptor.version = COMM_GLOBAL_DOMAIN_VERSION;
+    descriptor.profile = COMM_GLOBAL_DOMAIN_PROFILE_A5_FABRIC;
+    descriptor.domain_rank = domain_rank;
+    descriptor.rank_count = rank_count;
+    descriptor.mapping_size = size;
+    descriptor.handle_size = sizeof(domain.exported);
+    std::memcpy(descriptor.handle, &domain.exported, sizeof(domain.exported));
+    *descriptor_out = descriptor;
+    *local_window_base_out = reinterpret_cast<uint64_t>(local.address);
+    return 0;
+} catch (const std::exception &e) {
+    LOG_ERROR("[a5 fabric] prepare: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[a5 fabric] prepare: unknown exception");
     return -1;
 }
 
-extern "C" int comm_global_domain_import(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *) {
-    LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
+extern "C" int comm_global_domain_import(
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
+) try {
+    std::lock_guard<std::mutex> lock(a5_fabric_domains_mutex);
+    auto entry = a5_fabric_domains.find(domain_id);
+    if (entry == a5_fabric_domains.end() || descriptors == nullptr || device_ctx_out == nullptr) return -1;
+    auto &domain = entry->second;
+    if (domain.cleanup_failed || !domain.peer_windows.empty() || descriptor_count != domain.rank_count) return -1;
+
+    std::vector<A5FabricDescriptor> rank_exports(domain.rank_count);
+    std::vector<bool> seen(domain.rank_count, false);
+    for (size_t i = 0; i < descriptor_count; ++i) {
+        const auto &descriptor = descriptors[i];
+        const uint32_t rank = descriptor.domain_rank;
+        if (descriptor.version != COMM_GLOBAL_DOMAIN_VERSION ||
+            descriptor.profile != COMM_GLOBAL_DOMAIN_PROFILE_A5_FABRIC || descriptor.rank_count != domain.rank_count ||
+            rank >= domain.rank_count || seen[rank] || descriptor.mapping_size != domain.mapping_size ||
+            descriptor.handle_size != sizeof(A5FabricDescriptor) || descriptor.reserved != 0) {
+            LOG_ERROR("[a5 fabric] invalid descriptor for rank %u", rank);
+            return -1;
+        }
+        auto &exported = rank_exports[rank];
+        std::memcpy(&exported, descriptor.handle, sizeof(exported));
+        if (exported.superpod_id != domain.exported.superpod_id) {
+            LOG_ERROR("[a5 fabric] rank %u and rank %u are in different superpods", domain.rank, rank);
+            return -1;
+        }
+        if (rank == domain.rank && std::memcmp(&exported.handle, &domain.exported.handle, sizeof(exported.handle))) {
+            LOG_ERROR("[a5 fabric] descriptor for local rank %u changed after export", rank);
+            return -1;
+        }
+        seen[rank] = true;
+    }
+
+    // The L4 coordinator releases partially imported windows through ABORT.
+    domain.peer_windows.resize(domain.rank_count);
+    CommContext ctx{};
+    ctx.rankId = domain.rank;
+    ctx.rankNum = domain.rank_count;
+    ctx.winSize = domain.mapping_size;
+    for (uint32_t rank = 0; rank < domain.rank_count; ++rank) {
+        void *address = domain.local_window.address;
+        if (rank != domain.rank) {
+            auto &peer = domain.peer_windows[rank];
+            if (!fabric_acl_ok(
+                    aclrtMemImportFromShareableHandleV2(
+                        &rank_exports[rank].handle, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, 0, &peer.handle
+                    ),
+                    "aclrtMemImportFromShareableHandleV2"
+                ) ||
+                !map_a5_fabric_window(peer, domain.mapping_size)) {
+                LOG_ERROR("[a5 fabric] rank %u could not map peer rank %u", domain.rank, rank);
+                return -1;
+            }
+            address = peer.address;
+        }
+        ctx.windowsIn[rank] = reinterpret_cast<uint64_t>(address);
+        ctx.windowsOut[rank] = ctx.windowsIn[rank];
+    }
+    if (!fabric_acl_ok(
+            aclrtMalloc(&domain.device_ctx, sizeof(ctx), ACL_MEM_MALLOC_HUGE_FIRST), "allocate CommContext"
+        ) ||
+        !fabric_acl_ok(
+            aclrtMemcpy(domain.device_ctx, sizeof(ctx), &ctx, sizeof(ctx), ACL_MEMCPY_HOST_TO_DEVICE),
+            "upload CommContext"
+        )) {
+        return -1;
+    }
+    *device_ctx_out = reinterpret_cast<uint64_t>(domain.device_ctx);
+    return 0;
+} catch (const std::exception &e) {
+    LOG_ERROR("[a5 fabric] import: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[a5 fabric] import: unknown exception");
     return -1;
 }
 
-extern "C" int comm_global_domain_release(uint64_t) {
-    LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
-    return -1;
+extern "C" int comm_global_domain_release(uint64_t domain_id) try {
+    std::lock_guard<std::mutex> lock(a5_fabric_domains_mutex);
+    auto entry = a5_fabric_domains.find(domain_id);
+    if (entry == a5_fabric_domains.end()) return 0;
+    if (!close_a5_fabric_domain(entry->second)) {
+        LOG_ERROR("[a5 fabric] domain %llu reclamation unconfirmed", static_cast<unsigned long long>(domain_id));
+        return COMM_RECLAMATION_UNCONFIRMED;
+    }
+    a5_fabric_domains.erase(entry);
+    return 0;
+} catch (...) {
+    LOG_ERROR("[a5 fabric] release: exception");
+    return COMM_RECLAMATION_UNCONFIRMED;
 }
 
 extern "C" int comm_destroy(CommHandle h) try {

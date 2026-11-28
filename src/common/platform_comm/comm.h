@@ -86,6 +86,7 @@ enum { COMM_DOMAIN_OWNED = 1, COMM_DOMAIN_REJECTED = 2 };
 typedef enum CommGlobalDomainProfile {
     COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM = 1,
     COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC = 2,
+    COMM_GLOBAL_DOMAIN_PROFILE_A5_FABRIC = 3,
 } CommGlobalDomainProfile;
 
 typedef struct CommGlobalDomainDescriptor {

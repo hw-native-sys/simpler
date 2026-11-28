@@ -169,6 +169,7 @@ def test_global_domain_version_matches_the_native_header():
         ("a2a3sim", "sim"),
         ("a5sim", "sim"),
         ("a2a3", "a3-fabric-v1"),
+        ("a5", "a5-fabric-v1"),
     ),
 )
 def test_global_comm_capability_reports_only_implemented_backends(platform, profile):
@@ -187,6 +188,8 @@ def test_global_comm_capability_reports_only_implemented_backends(platform, prof
         ("a2a3sim", "a3-fabric-v1"),
         ("a5", "sim"),
         ("a5", "a3-fabric-v1"),
+        ("a2a3", "a5-fabric-v1"),
+        ("a5sim", "a5-fabric-v1"),
     ),
 )
 def test_global_comm_capability_rejects_unimplemented_backends(platform, profile):

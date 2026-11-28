@@ -246,7 +246,6 @@ from .global_comm_domain import (
     GLOBAL_DOMAIN_MAX_COPY_BYTES,
     GLOBAL_DOMAIN_MAX_RANKS,
     GLOBAL_DOMAIN_MAX_STRING_BYTES,
-    GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_VERSION,
     LOCAL_COPY_REPLY,
@@ -284,6 +283,7 @@ from .global_comm_domain import (
     encode_release_command,
     resolve_global_comm_capability,
     validate_descriptor_table,
+    validate_global_comm_profile,
 )
 from .host_ddr import HostMappingRegistry
 from .host_ddr_l3 import ChildHostMappings, ParentHostMappings
@@ -1072,23 +1072,6 @@ class RemoteCallable:
         return self.target.split(":", 1)[1]
 
 
-def _validate_global_comm_capability(label: str, platform: str, comm_profile: str) -> None:
-    """Reject a profile the platform's backend cannot implement.
-
-    ``a3-fabric-v1`` maps peer windows through ``aclrtMemFabricHandle``, which
-    exists only on real A3 silicon. Every spec that names a comm profile states
-    the rule from here, so a new L3 launch path cannot admit a combination the
-    others reject.
-    """
-    if comm_profile not in GLOBAL_DOMAIN_PROFILE_IDS:
-        raise ValueError(f"{label}.comm_profile {comm_profile!r} is not supported")
-    if comm_profile == GLOBAL_DOMAIN_PROFILE_A3_FABRIC:
-        if not platform.startswith("a2a3"):
-            raise ValueError(f"{label}.comm_profile {GLOBAL_DOMAIN_PROFILE_A3_FABRIC!r} requires an a2a3 platform")
-        if platform.endswith("sim"):
-            raise ValueError(f"{label}.comm_profile {GLOBAL_DOMAIN_PROFILE_A3_FABRIC!r} requires real A3 devices")
-
-
 def _validate_global_device_ranks(label: str, global_device_ranks: tuple[int, ...], device_count: int) -> None:
     """One rank per local device, unique and non-negative."""
     if global_device_ranks and len(global_device_ranks) != device_count:
@@ -1146,7 +1129,7 @@ class RemoteWorkerSpec:
             raise ValueError(
                 f"RemoteWorkerSpec.transport must be {HOST_TCP_TRANSPORT_PROFILE!r} for the TCP daemon control plane"
             )
-        _validate_global_comm_capability("RemoteWorkerSpec", self.platform, self.comm_profile)
+        validate_global_comm_profile("RemoteWorkerSpec", self.platform, self.comm_profile)
         _validate_global_device_ranks(
             "RemoteWorkerSpec.global_device_ranks", self.global_device_ranks, len(self.device_ids)
         )
@@ -1244,7 +1227,7 @@ class MpiL3GroupSpec:
             raise ValueError("MpiL3GroupSpec.ready_port must be within 0..65535")
         if self.transport != HOST_TCP_TRANSPORT_PROFILE:
             raise ValueError(f"MpiL3GroupSpec.transport must be {HOST_TCP_TRANSPORT_PROFILE!r}")
-        _validate_global_comm_capability("MpiL3GroupSpec", self.platform, self.comm_profile)
+        validate_global_comm_profile("MpiL3GroupSpec", self.platform, self.comm_profile)
         if not self.mpirun_path:
             raise ValueError("MpiL3GroupSpec.mpirun_path must be non-empty")
         if not self.python_executable:
@@ -6992,7 +6975,7 @@ class Worker:
         comm_profile: str,
         global_device_ranks: tuple[int, ...],
     ) -> None:
-        _validate_global_comm_capability(label, platform, comm_profile)
+        validate_global_comm_profile(label, platform, comm_profile)
         _validate_global_device_ranks(f"{label}.global_device_ranks", global_device_ranks, len(device_ids))
 
     def _resolved_global_nodes(self) -> dict[int, _GlobalNodeRuntime]:

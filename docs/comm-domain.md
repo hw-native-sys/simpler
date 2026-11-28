@@ -226,9 +226,10 @@ collective, so the L4 import fanout is skipped; a partial group falls back to
 the L4 descriptor broker above.
 
 Global CommDomain capability follows the backend that the node actually
-loads: a platform ending in `sim` supports the `sim` profile, and a real
-`a2a3` platform supports `a3-fabric-v1`. Real A5 and any other
-platform/profile combination currently reject allocation before `PREPARE`.
+loads. Simulation supports the `sim` profile, real A3 supports
+`a3-fabric-v1`, and real A5 supports `a5-fabric-v1` for device HBM windows
+within one superpod. Other platform/profile combinations reject allocation
+before `PREPARE`. A5 checks the superpod IDs before importing any peer.
 Each local or remote L3 repeats the same check during `COMM_INIT`, so an
 unsupported backend never advertises a usable descriptor capability.
 
@@ -354,6 +355,8 @@ in-repository harness for the Fabric path; a run that needs to know whether
 Fabric was covered should read that job rather than infer it from the
 simulation checks. The job now drives their `test_*.py` wrappers through
 `network1-run-pytest` rather than calling `run_parent.sh` directly.
+The `global_tload_mixed_l3` wrapper also accepts A5 and selects
+`a5-fabric-v1` when run on an A5 Network1 pair.
 
 ---
 

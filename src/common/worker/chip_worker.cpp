@@ -899,11 +899,10 @@ void ChipWorker::finalize() {
     if (!comm_reclamation_unconfirmed_) {
         // Release windows while the host runtime and device context are alive.
         if (comm_global_domain_release_fn_ != nullptr) {
-            for (uint64_t domain_id : global_domain_ids_) {
-                comm_global_domain_release_fn_(domain_id);
+            while (!global_domain_ids_.empty()) {
+                comm_global_domain_release(*global_domain_ids_.begin());
             }
         }
-        global_domain_ids_.clear();
         clear_comm_sessions();
     }
 
@@ -3340,6 +3339,7 @@ std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domai
     if (comm_global_domain_prepare_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_prepare is not supported by this runtime");
     }
+    std::vector<uint8_t> descriptor_bytes(sizeof(CommGlobalDomainDescriptor));
     auto [tracked, inserted] = global_domain_ids_.insert(domain_id);
     if (!inserted) {
         throw std::runtime_error("comm_global_domain_prepare received a duplicate domain_id");
@@ -3350,16 +3350,18 @@ std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domai
         domain_id, domain_rank, rank_count, window_size, profile, &descriptor, &local_window_base
     );
     if (rc != 0) {
-        global_domain_ids_.erase(tracked);
+        if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            retain_unconfirmed_comm_cleanup();
+        } else {
+            global_domain_ids_.erase(tracked);
+        }
         throw std::runtime_error("comm_global_domain_prepare failed with code " + std::to_string(rc));
     }
     if (local_window_base == 0 || descriptor.mapping_size == 0) {
-        comm_global_domain_release_fn_(domain_id);
-        global_domain_ids_.erase(domain_id);
+        comm_global_domain_release(domain_id);
         throw std::runtime_error("comm_global_domain_prepare returned an invalid window");
     }
-    const auto *begin = reinterpret_cast<const uint8_t *>(&descriptor);
-    std::vector<uint8_t> descriptor_bytes(begin, begin + sizeof(descriptor));
+    std::memcpy(descriptor_bytes.data(), &descriptor, sizeof(descriptor));
     return {std::move(descriptor_bytes), local_window_base, static_cast<size_t>(descriptor.mapping_size)};
 }
 
@@ -3392,6 +3394,7 @@ void ChipWorker::comm_global_domain_release(uint64_t domain_id) {
     }
     int rc = comm_global_domain_release_fn_(domain_id);
     if (rc != 0) {
+        retain_unconfirmed_comm_cleanup();
         throw std::runtime_error("comm_global_domain_release failed with code " + std::to_string(rc));
     }
     global_domain_ids_.erase(domain_id);
