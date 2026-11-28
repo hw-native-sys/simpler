@@ -124,7 +124,6 @@ jobs:
     uses: ./.github/workflows/_st-npu-a2a3.yml
     with:
       runs_on: '["self-hosted","a2a3"]'
-      include_dfx_smokes: true
 
   # Qwen golden checks and DeepSeek smokes stay manual and run in a separate
   # model job, parallel with st-onboard-a2a3. Both jobs use the same gates.

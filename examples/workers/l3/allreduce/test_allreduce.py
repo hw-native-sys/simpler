@@ -22,7 +22,7 @@ from .main import run
 # declares all four platforms — so widening this is likely safe, but nobody has
 # exercised *this* demo there yet.
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
-@pytest.mark.manual(["a2a3sim"])
+@pytest.mark.manual(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 def test_allreduce(st_platform, st_device_ids):

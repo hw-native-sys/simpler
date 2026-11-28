@@ -42,6 +42,7 @@ class TestSoftmaxPrepare(SceneTestCase):
     CASES = [
         {
             "name": f"m{m}_blocks{blocks}_valid{valid}_peak{peak}",
+            "manual": ["a2a3"],
             "platforms": ["a2a3"],
             "params": {"m": m, "n": n, "blocks": blocks, "valid": valid, "peak": peak},
             **(

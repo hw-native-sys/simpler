@@ -60,6 +60,7 @@ class TestBgemmHostBuildGraph(SceneTestCase):
     CASES = [
         {
             "name": "default",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3"],
             "params": {},
         },

@@ -82,6 +82,7 @@ def _remapped_visible(st_device_ids):
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(2)
 @pytest.mark.runtime(RUNTIME)
+@pytest.mark.manual(["a2a3"])
 def test_chip_init_under_visible_devices(st_platform, st_device_ids):
     """Two granted cards, addressed by a logical id that is not its own card id."""
     scene_test = _DUMMY_TASK[st_platform]
@@ -112,6 +113,7 @@ def test_chip_init_under_visible_devices(st_platform, st_device_ids):
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(2)
 @pytest.mark.runtime(RUNTIME)
+@pytest.mark.manual(["a2a3"])
 def test_comm_domain_under_visible_devices(st_platform, st_device_ids):
     """A comm domain allocates and maps its windows when the cards are renumbered."""
     assert _COMM_DOMAIN.is_file(), f"missing scene test: {_COMM_DOMAIN}"

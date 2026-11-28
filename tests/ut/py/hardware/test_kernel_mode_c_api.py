@@ -1074,6 +1074,8 @@ def test_versioned_registration_allocates_ids_without_replacing_legacy_entries(a
 
 def _run_mode_isolation(arch, runtime, device, mode):
     lib = _load(arch, "onboard", runtime)
+    lib.simpler_get_init_error_ctx.argtypes = [ctypes.c_void_p]
+    lib.simpler_get_init_error_ctx.restype = ctypes.c_char_p
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
     if mode == "kernel":
@@ -1089,9 +1091,15 @@ def _run_mode_isolation(arch, runtime, device, mode):
     def init_kernel():
         return lib.simpler_kernel_mode_init(*common, 77)
 
+    def require_initialized(status):
+        assert status == 0, (
+            f"{arch}/{runtime} {mode} init on device {device} returned {status}: "
+            f"{lib.simpler_get_init_error_ctx(ctx)!r}"
+        )
+
     init, incompatible = (init_kernel, init_program) if mode == "kernel" else (init_program, init_kernel)
     try:
-        assert init() == 0
+        require_initialized(init())
         committed = lib.committed_device_memory_ctx(ctx)
         assert incompatible() == PTO_RUNTIME_ERR_INVALID_STATE
         assert lib.committed_device_memory_ctx(ctx) == committed
@@ -1100,7 +1108,7 @@ def _run_mode_isolation(arch, runtime, device, mode):
         assert incompatible() == PTO_RUNTIME_ERR_INVALID_STATE
         assert lib.committed_device_memory_ctx(ctx) == 0
         if mode == "program":
-            assert init_program() == 0
+            require_initialized(init_program())
             assert lib.finalize_device(ctx) == 0
     finally:
         assert lib.finalize_device(ctx) == 0

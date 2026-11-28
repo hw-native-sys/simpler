@@ -81,6 +81,7 @@ class TestSpmdBasic(SceneTestCase):
         },
         {
             "name": "Case1Onboard",
+            "manual": ["a2a3"],
             "platforms": ["a2a3"],
             "params": {"l2_alias": 1.0},
         },

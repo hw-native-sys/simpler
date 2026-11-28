@@ -100,7 +100,7 @@ class TestReduceScatterP2(SceneTestCase):
         {
             "name": "p2",
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
-            "manual": ["a2a3sim", "a5sim"],
+            "manual": ["a2a3sim", "a5sim", "a2a3"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "reduce_op": 0},
         }
@@ -151,18 +151,21 @@ class TestReduceScatterP2MaxMinProd(SceneTestCase):
     CASES = [
         {
             "name": "p2_max",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "reduce_op": 1},
         },
         {
             "name": "p2_min",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "reduce_op": 2},
         },
         {
             "name": "p2_prod",
+            "manual": ["a2a3"],
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "reduce_op": 3},

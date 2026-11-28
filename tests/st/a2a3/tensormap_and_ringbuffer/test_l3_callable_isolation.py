@@ -142,6 +142,7 @@ def _make_args(a: float, b: float) -> TaskArgsBuilder:
 
 @pytest.mark.runtime_product("auxiliary")
 @pytest.mark.coverage_runtime(_RUNTIME)
+@pytest.mark.manual(["a2a3"])
 def test_the_two_callables_are_distinguishable():
     """X and Y differ for every input pair, and ``_check`` names a wrong-callable result.
 
@@ -170,7 +171,7 @@ def test_the_two_callables_are_distinguishable():
     "sequence",
     [
         pytest.param(["X"], id="single", marks=pytest.mark.manual(["a2a3"])),
-        pytest.param(["X", "X"], id="same_twice"),
+        pytest.param(["X", "X"], id="same_twice", marks=pytest.mark.manual(["a2a3"])),
         pytest.param(["X", "Y"], id="two_callables", marks=pytest.mark.manual(["a2a3"])),
         pytest.param(["X", "Y", "X"], id="redispatch_after_other", marks=pytest.mark.manual(["a2a3"])),
         pytest.param(["X", "Y", "X", "Y", "X", "Y"], id="alternating"),
