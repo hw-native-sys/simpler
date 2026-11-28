@@ -109,6 +109,10 @@ a2a3_tmr_case(test_scalar_access_deps.cpp NO_OBJS
     LINK_OPTIONS ${_scalar_gc_link_option}
     TIMEOUT 20)
 
+# The resource-cycle diagnosis model checker exercises the header-only
+# analyzer; its exhaustive enumeration gets a limit of its own.
+a2a3_tmr_case(test_twait_model.cpp TIMEOUT 180)
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it
