@@ -246,6 +246,7 @@ class TestWireConstantAgreement:
             "TASK_FAILED": worker_mod._TASK_FAILED,
             "ACTIVATE": worker_mod._ACTIVATE,
             "PREPARE_READY": worker_mod._PREPARE_READY,
+            "CANCEL_STAGED": worker_mod._CANCEL_STAGED,
         }
         assert declared == dict(MAILBOX_STATE_VALUES)
 
