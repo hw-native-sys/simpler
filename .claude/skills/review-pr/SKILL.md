@@ -22,10 +22,10 @@ description: Review a GitHub PR, a fixed commit range, or commits on the current
    finding as interim results while required work remains. Continue through
    the required checks and agreed follow-ups, and run the review self-audit
    before delivery.
-4. **Report every review item to the requester.** Give each item a separate
-   checklist entry with its result and evidence or verification limit. State
-   whether the review Goal was achieved and why. If work remains, name the
-   open items and the blocker.
+4. **Report every review item to the requester.** Give each item an explicit
+   satisfaction status and its evidence or verification limit. Give each
+   unsatisfied item a concrete suggested change. State whether the review Goal
+   was achieved and why. If work remains, name the open items and the blocker.
 
 **Code quality takes priority over completing the feature as proposed.**
 Verify functional correctness and judge how the design affects the next
@@ -228,10 +228,10 @@ skill and its required references. Use the findings and checkpoint as evidence.
   baseline comparison and each material conclusion use that evidence.
 - Verify the changed lines behind each finding, its concrete effect, and its
   severity. Apply the same check to findings from any independent reviewer.
-- Use **Not verified** where inspected code needs missing test, build, or
-  measurement evidence. Use **Not reviewed** for source or behavior that could
-  not be inspected. Use **Not applicable** with the reason. State the open
-  judgment for each evidence or inspection limit.
+- Check that every item has a visible [status](#3-implementation-and-evidence),
+  that each status follows from the evidence, and that each **Unsatisfied** row
+  gives a concrete suggested change. State the open judgment for each evidence
+  or inspection limit.
 
 Investigate every gap that available evidence can close, update the conclusion,
 and repeat the self-audit before delivery. Finding a blocker settles the
@@ -273,14 +273,27 @@ benefits and costs. Keep the design brief proportional to the review depth.
 
 ### 3. Implementation and evidence
 
-Give the requester a Markdown checklist grouped under **Quality**, **Spec**,
-and **Standards**. List each quality dimension, acceptance criterion, and
-repository check individually. For each item, give its result, cite supporting
-evidence or state what is missing, and explain the material impact. For code
-changes, summarize the relevant difference from the baseline. Include items
-with no findings and use the self-audit statuses for unverified, unreviewed, or
-inapplicable items. Keep the author's claims and reviewer observations clearly
-attributed.
+Use Markdown tables under **Quality**, **Spec**, and **Standards** with the
+columns **Item**, **Status**, **Evidence or verification limit**, and
+**Suggested change**. Give each quality dimension, acceptance criterion, and
+repository check its own row, including items with no findings. State the
+status in words in every row. Use the requester's language for column headings
+and status labels.
+
+| Status | Meaning |
+| ------ | ------- |
+| **Satisfied** | Evidence establishes that the criterion is met within the reviewed scope. |
+| **Partially satisfied** | Evidence establishes part of the criterion. Name the parts that still need verification. |
+| **Unsatisfied** | Evidence establishes a defect or a required condition that the change fails to meet. |
+| **Not verified** | Available evidence is insufficient to judge the criterion. Name the missing evidence and mark any source or behavior that could not be inspected as **Not reviewed** in the evidence column. |
+| **Not applicable** | The criterion does not apply to the reviewed change. Give the reason. |
+
+For each row, cite the source and revision of the evidence or name what is
+missing. Identify source inspection, actual CI execution, independent
+verification, or author-reported results as applicable. Explain the material
+impact and the relevant difference from the baseline. For each **Unsatisfied**
+row, give at least one actionable change and the behavior or condition it
+should restore. Link to the detailed finding when more context is needed.
 
 ### 4. Findings and risks
 
