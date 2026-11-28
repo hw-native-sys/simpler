@@ -34,6 +34,7 @@ struct WseNodePlan {
     uint64_t block_plans_offset;
     // Descriptor-relative array of producer node IDs. A producer completes after all its Blocks.
     uint32_t wait_count;
+    uint32_t sync_start;
     uint64_t waits_offset;
 };
 
@@ -74,7 +75,9 @@ enum class WseEventKind : uint32_t {
     OP_READ,
     OP_CONSUMED,
     THREAD_BEGIN,
-    THREAD_END
+    THREAD_END,
+    BLOCK_READY,
+    SYNC_RELEASE
 };
 struct WseEvent {
     uint64_t sequence;
@@ -97,7 +100,8 @@ struct WseMemorySection {
 
 struct WseRun;
 extern "C" {
-WseRun *wse_create_run(
+// Version 2 interprets WseNodePlan::sync_start. A mismatched Host/PE pair must fail at load time.
+WseRun *wse_create_run_v2(
     const WseGraphDescriptor *, uint32_t cores, uint64_t epoch, const wse::SramRegion *, uint32_t region_count,
     const wse::SramAllocation *, uint32_t allocation_count, char *error, size_t error_size
 );

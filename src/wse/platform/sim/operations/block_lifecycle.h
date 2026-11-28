@@ -32,14 +32,24 @@ public:
         std::mutex mutex;
         std::condition_variable changed;
         bool initialized{false};
+        bool cancelled{false};
+
+        template <class Predicate>
+        void wait(std::unique_lock<std::mutex> &lock, Predicate ready) {
+            changed.wait(lock, [&] {
+                return cancelled || ready();
+            });
+            if (cancelled) throw std::runtime_error("WSE shared operation cancelled");
+        }
     };
     static void *get(void *context, uint32_t slot, size_t bytes) {
         auto &storage = *static_cast<BlockOperationStorage *>(context);
         std::lock_guard lock(storage.mutex_);
+        if (storage.cancelled_) throw std::runtime_error("WSE shared operation cancelled");
         if (slot >= storage.slots_.size() || !bytes) throw std::invalid_argument("invalid WSE shared storage slot");
         auto &entry = storage.slots_[slot];
         if (entry && entry->bytes != bytes) throw std::invalid_argument("WSE shared storage shape mismatch");
-        if (!entry) entry = std::make_unique<Slot>(bytes);
+        if (!entry) entry = std::make_shared<Slot>(bytes);
         return entry.get();
     }
     // All Block participants must have returned before their slots are destroyed.
@@ -49,8 +59,26 @@ public:
             entry.reset();
     }
 
+    void cancel() {
+        decltype(slots_) slots;
+        {
+            std::lock_guard lock(mutex_);
+            cancelled_ = true;
+            slots = slots_;
+        }
+        // An operation trace callback may request another slot while holding its slot's mutex.
+        // Keep the slots alive without holding the storage mutex while waking participants.
+        for (const auto &slot : slots) {
+            if (!slot) continue;
+            std::lock_guard slot_lock(slot->mutex);
+            slot->cancelled = true;
+            slot->changed.notify_all();
+        }
+    }
+
 private:
     std::mutex mutex_;
-    std::array<std::unique_ptr<Slot>, 64> slots_{};
+    std::array<std::shared_ptr<Slot>, 64> slots_{};
+    bool cancelled_{false};
 };
 }  // namespace wse::temporary

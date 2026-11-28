@@ -30,10 +30,21 @@ _GATE = r"""
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-namespace {std::mutex mutex;std::condition_variable changed;bool entered=false,released=false;unsigned mask=0;}
+#include <stdexcept>
+namespace {
+std::mutex mutex;
+std::condition_variable changed;
+bool entered = false, released = false, fail_on_release = false;
+unsigned mask = 0;
+}
 extern "C" void HOOK(int block){
  std::unique_lock lock(mutex);
- if(block==0){entered=true;changed.notify_all();changed.wait(lock,[]{return released;});}
+ if(block==0){
+    entered=true;
+    changed.notify_all();
+    changed.wait(lock,[]{return released;});
+    if (fail_on_release) throw std::runtime_error("injected SharedTile producer failure");
+ }
  else {mask|=1u<<block;changed.notify_all();}
 }
 extern "C" bool wait_probe(){
@@ -41,6 +52,12 @@ extern "C" bool wait_probe(){
  return changed.wait_for(lock,std::chrono::seconds(15),[]{return entered && (mask & MASK)==MASK;});
 }
 extern "C" void release_probe(){std::lock_guard lock(mutex);released=true;changed.notify_all();}
+extern "C" void reset_probe(int fail){
+    std::lock_guard lock(mutex);
+    entered = released = false;
+    mask = 0;
+    fail_on_release = fail;
+}
 """
 
 
@@ -155,11 +172,33 @@ def test_waiting_thread_holds_its_block_but_not_other_cores(tmp_path, st_platfor
 
 def test_shared_state_between_threads_of_one_block(tmp_path, st_platform):
     gate = load_gate(tmp_path, "wse_shared_probe", 14)
+    tensors = [torch.tensor([[11.0, 12.0], [13.0, 14.0]]), torch.full((4, 2, 2), -99.0)]
+    # Release a failing producer only after all three consumers report WAIT from SharedTile.read(1).
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
         worker.init()
         handle = worker.register(build_probe(st_platform, True))
-        tensors = [torch.tensor([[11.0, 12.0], [13.0, 14.0]]), torch.full((4, 2, 2), -99.0)]
+        args, buffers = prepare(worker, tensors)
+        gate.reset_probe(1)
+        failed = worker.submit(handle, args)
+        try:
+            assert gate.wait_probe(), "consumers did not reach SharedTile.read before the injected failure"
+        finally:
+            gate.release_probe()
+        with pytest.raises(RuntimeError):
+            failed.wait(timeout=15)
+        for b in buffers:
+            release_view(worker, b)
+    finally:
+        gate.release_probe()
+        worker.close()
+
+    # Execution faults terminate the Worker run lane. Open a new Worker for the successful run.
+    gate.reset_probe(0)
+    worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
+    try:
+        worker.init()
+        handle = worker.register(build_probe(st_platform, True))
         args, buffers = prepare(worker, tensors)
         config = CallConfig()
         config.output_prefix = str(tmp_path)

@@ -135,7 +135,12 @@ int DeviceRunner::ensure_binaries_loaded() {
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run"));
+    create_run_ = reinterpret_cast<decltype(create_run_)>(dlsym(aicore_so_handle_, "wse_create_run_v2"));
+    if (!create_run_) {
+        LOG_ERROR("WSE PE runtime ABI mismatch: expected wse_create_run_v2");
+        unload_executor();
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     destroy_run_ = reinterpret_cast<decltype(destroy_run_)>(dlsym(aicore_so_handle_, "wse_destroy_run"));
     execute_pe_ = reinterpret_cast<decltype(execute_pe_)>(dlsym(aicore_so_handle_, "wse_execute_pe"));
     run_events_ = reinterpret_cast<decltype(run_events_)>(dlsym(aicore_so_handle_, "wse_run_events"));
@@ -143,8 +148,8 @@ int DeviceRunner::ensure_binaries_loaded() {
     runtime_used_ = reinterpret_cast<decltype(runtime_used_)>(dlsym(aicore_so_handle_, "wse_runtime_used"));
     memory_sections_ = reinterpret_cast<decltype(memory_sections_)>(dlsym(aicore_so_handle_, "wse_memory_sections"));
     control_address_ = reinterpret_cast<decltype(control_address_)>(dlsym(aicore_so_handle_, "wse_control_address"));
-    if (!create_run_ || !destroy_run_ || !execute_pe_ || !run_events_ || !completed_tasks_ || !runtime_used_ ||
-        !memory_sections_ || !control_address_) {
+    if (!destroy_run_ || !execute_pe_ || !run_events_ || !completed_tasks_ || !runtime_used_ || !memory_sections_ ||
+        !control_address_) {
         LOG_ERROR("WSE PE runtime is missing a required entry point");
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;

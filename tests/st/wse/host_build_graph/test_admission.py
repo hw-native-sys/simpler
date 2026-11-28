@@ -130,16 +130,20 @@ def test_prebuilt_target_admission(arch, admission_artifacts):
 
 
 @pytest.mark.device_count(1)
-def test_executor_rejects_missing_memory_sections_before_create(tmp_path, st_platform, monkeypatch):
+@pytest.mark.parametrize("legacy_abi", [False, True], ids=["missing_memory_sections", "legacy_descriptor"])
+def test_executor_rejects_incompatible_abi_before_create(tmp_path, st_platform, monkeypatch, legacy_abi):
     from simpler.task_interface import ChipCallable, TaskArgs  # noqa: PLC0415
     from simpler.worker import Worker  # noqa: PLC0415
 
     marker = tmp_path / "create-called"
     source = tmp_path / "incomplete_executor.cpp"
+    create_name = "wse_create_run" if legacy_abi else "wse_create_run_v2"
+    # The old PE has every method the old Host required and ignores the sync_start word.
+    sections = "const void *wse_memory_sections(const void *, uint64_t *) { return nullptr; }\n" if legacy_abi else ""
     source.write_text(
         "#include <cstddef>\n#include <cstdint>\n#include <cstdio>\n"
         'extern "C" {\n'
-        "void *wse_create_run(const void *, uint32_t, uint64_t, const void *, uint32_t, "
+        f"void *{create_name}(const void *, uint32_t, uint64_t, const void *, uint32_t, "
         "const void *, uint32_t, char *, size_t) {\n"
         f'  if (auto *f = std::fopen({json.dumps(str(marker))}, "w")) std::fclose(f);\n'
         "  return nullptr;\n}\n"
@@ -148,7 +152,8 @@ def test_executor_rejects_missing_memory_sections_before_create(tmp_path, st_pla
         "const void *wse_run_events(const void *, uint32_t, uint64_t *count) { *count=0; return nullptr; }\n"
         "uint64_t wse_completed_tasks(const void *) { return 0; }\n"
         "uint64_t wse_runtime_used(const void *, uint32_t) { return 0; }\n"
-        "uint64_t wse_control_address(const void *, uint32_t) { return 0; }\n}\n"
+        "uint64_t wse_control_address(const void *, uint32_t) { return 0; }\n"
+        f"{sections}}}\n"
     )
     compiler = KernelCompiler(st_platform)
     library = tmp_path / "incomplete_executor.so"
@@ -173,24 +178,25 @@ def test_executor_rejects_missing_memory_sections_before_create(tmp_path, st_pla
         handle = worker.register(callable_)
         with pytest.raises(RuntimeError):
             worker.run(handle, TaskArgs())
-        assert not marker.exists(), "an incomplete PE executor reached run creation"
+        assert not marker.exists(), "an incompatible PE executor reached run creation"
     finally:
         worker.close()
 
 
-def test_pe_requires_explicit_core_matching_calendar_row(tmp_path, st_platform):
+def build_pe_probe(tmp_path, st_platform, source, extra_includes):
     compiler = KernelCompiler(st_platform)
     binaries = RuntimeBuilder(st_platform).get_binaries("host_build_graph")
     assert binaries.sim_context_path is not None
     libraries = [binaries.aicore_path, binaries.sim_context_path]
-    probe = tmp_path / "pe-admission"
+    probe = tmp_path / source.removesuffix(".cpp")
     subprocess.run(
         [
             compiler.gxx15.cxx_path,
             "-std=c++17",
             "-D__CPU_SIM",
             *(f"-I{path}" for path in compiler.get_orchestration_include_dirs("host_build_graph")),
-            str(Path(__file__).parent / "calendar/pe_admission.cpp"),
+            *(f"-I{_ROOT / path}" for path in extra_includes),
+            str(Path(__file__).parent / "calendar" / source),
             *(str(path) for path in libraries),
             *(f"-Wl,-rpath,{path.parent}" for path in libraries),
             "-o",
@@ -199,9 +205,27 @@ def test_pe_requires_explicit_core_matching_calendar_row(tmp_path, st_platform):
         check=True,
         timeout=60,
     )
+    return probe
+
+
+def test_pe_requires_explicit_core_matching_calendar_row(tmp_path, st_platform):
+    probe = build_pe_probe(tmp_path, st_platform, "pe_admission.cpp", ["src/wse/runtime/host_build_graph/host"])
     result = subprocess.run([str(probe)], capture_output=True, text=True, timeout=60, check=True)
     assert result.stdout.splitlines() == [
         "explicit_core_0 accepted",
         "wrong_calendar_core rejected",
         "missing_placement rejected",
+        "synchronous_pair accepted",
+        "split_sync_ticks rejected",
     ], result.stderr
+
+
+def test_started_peer_waits_for_busy_core_completion_or_failure(tmp_path, st_platform):
+    probe = build_pe_probe(
+        tmp_path,
+        st_platform,
+        "pe_sync_wait.cpp",
+        ["src/wse/runtime/host_build_graph/pe", "src/common/platform/sim/sim_context"],
+    )
+    for args in ([], ["fail"]):
+        subprocess.run([str(probe), *args], check=True, timeout=20)

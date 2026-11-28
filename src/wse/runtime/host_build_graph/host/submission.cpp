@@ -12,6 +12,7 @@
 #include "submission.h"
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include "host_build_graph/host/dep_compute.h"
 #include "host_build_graph/host/graph_submit.h"
 
@@ -23,7 +24,7 @@ TaskOutputTensors submit(OrchContext *ctx, int32_t kernel, const CoreTaskArgs &a
     try {
         const int32_t count = args.launch_spec.block_num();
         if (orch.total_cluster_count <= 0 || kernel < 0 || args.has_error() || count <= 0 || launch.thread_num < 1 ||
-            launch.thread_num > WSE_PE_PER_CORE || args.launch_spec.require_sync_start() ||
+            launch.thread_num > WSE_PE_PER_CORE ||
             (!launch.block_args.empty() && launch.block_args.size() != static_cast<size_t>(count)))
             throw std::invalid_argument("invalid WSE Block count, Thread count or launch table length");
         if (launch.placement.size() != static_cast<size_t>(count))
@@ -33,6 +34,12 @@ TaskOutputTensors submit(OrchContext *ctx, int32_t kernel, const CoreTaskArgs &a
         if (!launch.block_args.empty() && (args.tensor_count() || args.scalar_count()))
             throw std::invalid_argument("per-Block arguments require an empty common argument list");
         auto *recording = active_graph_recording(&orch);
+        const bool sync_start = args.launch_spec.require_sync_start();
+        if (sync_start && count < 2) throw std::invalid_argument("WSE sync_start requires at least two Blocks");
+        if (sync_start && recording)
+            throw std::invalid_argument("WSE sync_start is supported only for directly submitted SPMD tasks");
+        std::vector<int32_t> first_block_on_core;
+        if (sync_start) first_block_on_core.assign(orch.total_cluster_count, -1);
         WseKernelLaunch captured;
         captured.blocks.resize(count);
         size_t tensor_count = 0;
@@ -50,6 +57,15 @@ TaskOutputTensors submit(OrchContext *ctx, int32_t kernel, const CoreTaskArgs &a
             if (where.core_id >= static_cast<uint32_t>(orch.total_cluster_count) ||
                 where.thread_pes.size() > WSE_PE_PER_CORE)
                 throw std::invalid_argument("WSE Block targets an inactive Core or invalid Thread count");
+            if (sync_start) {
+                auto &first_block = first_block_on_core[where.core_id];
+                if (first_block >= 0)
+                    throw std::invalid_argument(
+                        "WSE sync_start requires distinct Cores: Blocks " + std::to_string(first_block) + " and " +
+                        std::to_string(b) + " target Core " + std::to_string(where.core_id)
+                    );
+                first_block = b;
+            }
             block.plan.core_id = where.core_id;
             block.plan.thread_num = where.thread_pes.empty() ? launch.thread_num : where.thread_pes.size();
             uint32_t mask = 0;

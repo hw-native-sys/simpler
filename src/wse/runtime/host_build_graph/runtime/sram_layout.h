@@ -23,16 +23,18 @@ struct Work {
 struct Queue {
     uint64_t work_offset, capacity, head, tail;
 };
+enum class BlockState : uint32_t { IDLE, WAITING_FOR_SYNC, RUNNING };
 struct CoreControl {
     uint32_t initialized, ready, quiet, retired;
     uint64_t expected_tasks;
     Queue queue;
     uint64_t block_epoch, block_serial;
-    uint32_t active, started, finished, execute;
+    BlockState block_state;
+    uint32_t started, finished, execute;
 };
 struct TaskRecord {
     uint64_t entry, predecessors_offset;
-    uint32_t blocks, host_done, has_predicate, predecessor_count;
+    uint32_t blocks, remaining_arrivals, has_predicate, predecessor_count;
     uint32_t remaining_blocks, completed;
     SchedulerDispatchPredicate predicate;
 };
@@ -41,7 +43,7 @@ struct RunControl {
     uint64_t tasks_offset, core_offsets_offset;
     SramAccess access;
     uint32_t core_count, task_count, configured, go, stop;
-    int32_t init_error;
+    bool failed;
 };
 static_assert(std::is_standard_layout_v<RunControl> && std::is_trivially_copyable_v<RunControl>);
 static_assert(std::is_standard_layout_v<TaskRecord> && std::is_trivially_copyable_v<TaskRecord>);

@@ -751,7 +751,7 @@ bool create_scheduler_state(
             plan.entry = reinterpret_cast<const uint64_t *>(runtime->callable_entry_table_addr())[kernel];
             plan.blocks = child ? child->logical_block_num :
                                   host_sm_handle.header->tasks.get_slot_state_by_task_id(original).logical_block_num;
-            const bool sync =
+            plan.sync_start =
                 child ?
                     scheduler_task_requires_sync_start(child->flags) :
                     host_sm_handle.header->tasks.get_slot_state_by_task_id(original).task_attrs.requires_sync_start();
@@ -759,10 +759,15 @@ bool create_scheduler_state(
                 child ? scheduler_task_has_predicate(child->flags) :
                         host_sm_handle.header->tasks.get_slot_state_by_task_id(original).task_attrs.has_predicate();
             if (plan.has_predicate && plan.blocks != 1) return false;
-            if (!plan.entry || !plan.blocks || plan.blocks > INT16_MAX || sync) {
-                LOG_ERROR("WSE requires a registered entry, 1 to INT16_MAX Blocks and no cluster sync-start");
+            if (!plan.entry || !plan.blocks || plan.blocks > INT16_MAX) {
+                LOG_ERROR("WSE requires a registered entry and 1 to INT16_MAX Blocks");
                 return false;
             }
+            if (plan.sync_start && (child || plan.blocks < 2)) {
+                LOG_ERROR("WSE sync_start requires a directly submitted SPMD task with at least two Blocks");
+                return false;
+            }
+            tasks[ref].sync_start = plan.sync_start;
             const auto &blocks = block_plans[ref];
             if (blocks.size() != plan.blocks) {
                 LOG_ERROR("WSE requires an explicit Core ID for every kernel Block");

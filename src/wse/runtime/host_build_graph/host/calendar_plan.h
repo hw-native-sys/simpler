@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <queue>
 #include <utility>
 #include <vector>
@@ -24,6 +25,7 @@ struct CalendarTask {
     // Empty for Graph controls and inline-completed tasks.
     std::vector<uint32_t> block_cores;
     std::vector<uint32_t> waits;
+    bool sync_start{false};
 };
 
 struct CoreCalendar {
@@ -51,19 +53,34 @@ struct LaterData {
     }
 };
 
-struct CalendarCore {
-    uint32_t free_at{0};
+struct ReadyQueue {
     std::priority_queue<ReadyBlock, std::vector<ReadyBlock>, LaterData> future;
     std::priority_queue<ReadyBlock, std::vector<ReadyBlock>, LowerPriority> available;
-    std::vector<CalendarRow> rows;
 
-    const ReadyBlock *next() {
+    const ReadyBlock *next(uint32_t free_at) {
         while (!future.empty() && future.top().data_ready <= free_at) {
             available.push(future.top());
             future.pop();
         }
         if (!available.empty()) return &available.top();
         return future.empty() ? nullptr : &future.top();
+    }
+
+    void pop() {
+        if (available.empty()) future.pop();
+        else available.pop();
+    }
+    bool empty() const { return future.empty() && available.empty(); }
+};
+
+struct CalendarCore {
+    uint32_t free_at{0};
+    ReadyQueue ordinary;
+    std::vector<CalendarRow> rows;
+
+    void append(uint32_t task, uint32_t block, uint32_t tick) {
+        rows.push_back({task, block, tick});
+        free_at = tick + 1;
     }
 };
 
@@ -90,6 +107,7 @@ inline bool build_core_calendar(const std::vector<CalendarTask> &tasks, uint32_t
         auto &state = states[id];
         state.pending_waits = task.waits.size();
         state.pending_blocks = task.block_cores.size();
+        if (task.sync_start && state.pending_blocks < 2) return false;
         for (uint32_t producer : task.waits) {
             if (producer >= id) return false;
             states[producer].successors.push_back(id);
@@ -97,6 +115,7 @@ inline bool build_core_calendar(const std::vector<CalendarTask> &tasks, uint32_t
         // Blocks mapped to one Core serialize even if every input is available.
         for (uint32_t core : task.block_cores) {
             if (core >= core_count) return false;
+            if (task.sync_start && occupancy[core]) return false;
             state.priority = std::max(state.priority, ++occupancy[core]);
         }
         for (uint32_t core : task.block_cores)
@@ -110,6 +129,8 @@ inline bool build_core_calendar(const std::vector<CalendarTask> &tasks, uint32_t
     }
 
     std::vector<CalendarCore> cores(core_count);
+    // Equal Core sets have the same resource availability, regardless of Block ID order.
+    std::map<std::vector<uint32_t>, ReadyQueue> sync_queues;
     std::queue<uint32_t> ready;
     for (uint32_t id = 0; id < tasks.size(); ++id) {
         if (!states[id].pending_waits) ready.push(id);
@@ -131,34 +152,59 @@ inline bool build_core_calendar(const std::vector<CalendarTask> &tasks, uint32_t
             if (!state.pending_blocks) {
                 state.finish = state.data_ready;
                 release_successors(id);
+                continue;
             }
             const auto &placements = tasks[id].block_cores;
-            for (uint32_t block = 0; block < placements.size(); ++block)
-                cores[placements[block]].future.push({id, block, state.data_ready, state.priority});
-        }
-        if (scheduled == row_count) break;
-        CalendarCore *selected = nullptr;
-        ReadyBlock chosen{};
-        uint32_t tick = UINT32_MAX;
-        for (auto &core : cores) {
-            const ReadyBlock *candidate = core.next();
-            if (!candidate) continue;
-            const uint32_t start = std::max(core.free_at, candidate->data_ready);
-            if (!selected || start < tick || (start == tick && LowerPriority{}(chosen, *candidate))) {
-                selected = &core;
-                chosen = *candidate;
-                tick = start;
+            if (tasks[id].sync_start) {
+                auto core_set = placements;
+                std::sort(core_set.begin(), core_set.end());
+                sync_queues[std::move(core_set)].future.push({id, 0, state.data_ready, state.priority});
+            } else {
+                for (uint32_t block = 0; block < placements.size(); ++block)
+                    cores[placements[block]].ordinary.future.push({id, block, state.data_ready, state.priority});
             }
         }
+        if (scheduled == row_count) break;
+        ReadyQueue *selected = nullptr;
+        ReadyBlock chosen{};
+        uint32_t tick = UINT32_MAX;
+        auto consider = [&](ReadyQueue &queue, uint32_t free_at) {
+            const ReadyBlock *candidate = queue.next(free_at);
+            if (!candidate) return false;
+            const uint32_t start = std::max(free_at, candidate->data_ready);
+            if (selected && (start > tick || (start == tick && !LowerPriority{}(chosen, *candidate)))) return false;
+            selected = &queue;
+            chosen = *candidate;
+            tick = start;
+            return true;
+        };
+        for (auto &core : cores)
+            consider(core.ordinary, core.free_at);
+        auto selected_sync = sync_queues.end();
+        for (auto it = sync_queues.begin(); it != sync_queues.end(); ++it) {
+            uint32_t free_at = 0;
+            for (uint32_t core : it->first)
+                free_at = std::max(free_at, cores[core].free_at);
+            if (consider(it->second, free_at)) selected_sync = it;
+        }
         if (!selected) return false;
-        if (selected->available.empty()) selected->future.pop();
-        else selected->available.pop();
-        selected->rows.push_back({chosen.task, chosen.block, tick});
-        selected->free_at = tick + 1;
+        selected->pop();
+        const auto &placements = tasks[chosen.task].block_cores;
+        uint32_t placed = 1;
+        if (selected_sync != sync_queues.end()) {
+            // Commit all rows together so competing tasks have one order on their shared Cores.
+            placed = placements.size();
+            for (uint32_t block = 0; block < placed; ++block)
+                cores[placements[block]].append(chosen.task, block, tick);
+            if (selected->empty()) sync_queues.erase(selected_sync);
+        } else {
+            cores[placements[chosen.block]].append(chosen.task, chosen.block, tick);
+        }
         auto &state = states[chosen.task];
-        state.finish = std::max(state.finish, selected->free_at);
-        if (--state.pending_blocks == 0) release_successors(chosen.task);
-        ++scheduled;
+        state.finish = std::max(state.finish, tick + 1);
+        state.pending_blocks -= placed;
+        if (!state.pending_blocks) release_successors(chosen.task);
+        scheduled += placed;
     }
 
     CoreCalendar calendar;

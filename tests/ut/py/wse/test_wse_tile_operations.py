@@ -194,6 +194,25 @@ void block_lifetime() {
     rejects([&]{old.publish(1,value);});
     rejects([&]{Shared invalid(0,1,0,1,{&epochs[0],1});});
 }
+void cancel_during_slot_access() {
+    using Storage = wse::BlockOperationStorage;
+    Storage shared;
+    auto get = [&](uint32_t slot) {
+        return static_cast<Storage::Slot *>(Storage::get(&shared, slot, 4));
+    };
+    auto *first = get(0);
+    auto *active = get(1);
+    // A SharedTile observer runs with its slot locked and may request another slot.
+    // Observe cancellation on slot 0 before requesting that slot from inside slot 1.
+    std::unique_lock observer(active->mutex);
+    std::thread abort([&] { shared.cancel(); });
+    std::unique_lock notice(first->mutex);
+    first->changed.wait(notice, [&] { return first->cancelled; });
+    notice.unlock();
+    rejects([&] { get(2); });
+    observer.unlock();
+    abort.join();
+}
 int main(int argc,char **argv) {
     assert(argc==2);
 
@@ -208,6 +227,7 @@ int main(int argc,char **argv) {
     else if(test=="overwrite")overwrite_wait();
     else if(test=="lifecycle")lifecycle();
     else if(test=="block")block_lifetime();
+    else if(test=="cancel")cancel_during_slot_access();
     else return 1;
 
 }
@@ -239,7 +259,7 @@ def operation_binary(tmp_path_factory):
 
 
 @pytest.mark.parametrize(
-    "case", ["numerical", "fractional", "ranges", "shared", "context", "lifecycle", "overwrite", "block"]
+    "case", ["numerical", "fractional", "ranges", "shared", "context", "lifecycle", "overwrite", "block", "cancel"]
 )
 def test_operation_contracts(operation_binary, case):
     subprocess.run([str(operation_binary), case], check=True, timeout=15)
