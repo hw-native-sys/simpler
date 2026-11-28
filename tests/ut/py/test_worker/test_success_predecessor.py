@@ -10,6 +10,7 @@
 """Explicit predecessor-success fences include outer completion and reverse waits."""
 
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import cast
 
@@ -211,6 +212,83 @@ def test_successor_snapshot_can_outlive_worker_close():
         second.result(timeout=0)
     finally:
         worker.close()
+
+
+def test_callback_cannot_wait_on_its_held_successor():
+    with Worker(level=3, num_sub_workers=0) as worker:
+        worker.init()
+        refused = []
+
+        def completion(_error):
+            try:
+                second.result(timeout=0)
+            except RuntimeError as error:
+                refused.append(str(error))
+
+        first = worker.submit(lambda *_args: None, completion_callback=completion)
+        second = worker.submit(lambda *_args: None, success_predecessor=first)
+        second.result(timeout=3)
+        assert refused == ["RunHandle.wait() cannot wait from this run's completion callback"]
+
+
+def test_async_callback_is_rejected_before_graph_construction():
+    with Worker(level=3, num_sub_workers=0) as worker:
+        worker.init()
+        built = []
+
+        async def completion(_error):
+            pass
+
+        callback = cast("Callable[[BaseException | None], None]", completion)
+        with pytest.raises(TypeError, match="completion_callback must be synchronous"):
+            worker.submit(lambda *_args: built.append(True), completion_callback=callback)
+        assert not built
+
+
+def test_callback_returning_coroutine_cancels_successor():
+    with Worker(level=3, num_sub_workers=0) as worker:
+        worker.init()
+
+        async def finish():
+            pass
+
+        coroutine = finish()
+        callback = cast("Callable[[BaseException | None], None]", lambda _error: coroutine)
+        try:
+            first = worker.submit(lambda *_args: None, completion_callback=callback)
+            second = worker.submit(lambda *_args: None, success_predecessor=first)
+            with pytest.raises(RuntimeError, match="predecessor failed"):
+                second.result(timeout=3)
+            with pytest.raises(TypeError, match="completion_callback returned an awaitable"):
+                first.result(timeout=0)
+            assert coroutine.cr_frame is None
+        finally:
+            coroutine.close()
+
+
+def test_graph_failure_calls_completion_outside_submit_lock():
+    with Worker(level=3, num_sub_workers=1) as worker:
+        worker.init()
+        buffer = worker.create_buffer(64)
+        graph_error = RuntimeError("graph build failed")
+        callback_errors = []
+
+        def graph(*_args):
+            raise graph_error
+
+        def completion(error):
+            # Fail the test without hanging if the serializer is still held.
+            assert not worker._submit_mu._exclusive
+            worker.release_buffer(buffer)
+            callback_errors.append(error)
+            raise ValueError("completion failed too")
+
+        with pytest.raises(RuntimeError) as failed:
+            worker.submit(graph, completion_callback=completion)
+        assert failed.value is graph_error
+        (completion_error,) = callback_errors
+        assert isinstance(completion_error, RuntimeError)
+        assert "graph build failed" in str(completion_error)
 
 
 @pytest.mark.parametrize("background_wait", [False, True])

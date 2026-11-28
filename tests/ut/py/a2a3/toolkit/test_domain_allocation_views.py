@@ -17,7 +17,7 @@ import pytest
 from simpler_setup.pto_isa import ensure_pto_isa_root
 
 ROOT = Path(__file__).resolve().parents[5]
-pytestmark = [pytest.mark.requires_toolkit, pytest.mark.platforms("a2a3")]
+pytestmark = [pytest.mark.requires_toolkit, pytest.mark.platforms(["a2a3"])]
 
 
 def test_a3_domain_query_attests_owned_views_without_device(tmp_path):

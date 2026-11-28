@@ -6,12 +6,16 @@ until the predecessor's complete result succeeds. Physical END, launch
 acceptance, and independent communication storage do not establish that success.
 Ordinary independent submissions do not acquire this dependency implicitly.
 
-`completion_callback(error)` extends the predecessor's completion boundary to
+The synchronous `completion_callback(error)` extends the predecessor's completion boundary to
 an outer runtime's cleanup and output publication. It executes once after
 Simpler finalization and before terminal publication or successor authorization.
 An earlier error is preserved; a callback failure becomes the result when no
 earlier error exists. The callback remains owned through close and cannot close
-its own Worker recursively. A failed predecessor cancels unactivated staged
+its own Worker recursively. A `result()` or `wait()` from the callback that
+depends on this result fails immediately. A callback returning an awaitable
+fails the completion. After a synchronous graph construction failure, the
+callback runs after native cleanup and after the submit lock has been released.
+A failed predecessor cancels unactivated staged
 successors; their leases remain live until cancellation is acknowledged.
 Waiting for a successor also resolves its predecessor, so reverse wait order
 does not bypass the success condition. An exception stored as the predecessor's

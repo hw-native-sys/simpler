@@ -5662,6 +5662,7 @@ class RunHandle:
         self._success_predecessor: RunHandle | None = None
         self._success_successors: list[int] = []
         self._completion_callback: Callable[[BaseException | None], None] | None = None
+        self._completion_callback_thread: int | None = None
         self._outer_completion_pending = False
 
     @classmethod
@@ -5685,6 +5686,7 @@ class RunHandle:
         handle._success_predecessor = None
         handle._success_successors = []
         handle._completion_callback = None
+        handle._completion_callback_thread = None
         handle._outer_completion_pending = False
         return handle
 
@@ -5795,10 +5797,13 @@ class RunHandle:
                 self._outer_completion_pending = True
                 self._completion_callback = None
                 try:
+                    self._completion_callback_thread = threading.get_ident()
                     self._worker._invoke_completion_callback(callback, effective_error)
                 except BaseException as callback_error:
                     if effective_error is None:
                         effective_error = callback_error
+                finally:
+                    self._completion_callback_thread = None
             if self._outer_completion_pending:
                 self._worker._complete_outer_callback(self)
                 self._outer_completion_pending = False
@@ -5901,6 +5906,9 @@ class RunHandle:
         native_error: BaseException | None = None
         try:
             with self._cv:
+                callback_thread = self._completion_callback_thread
+                if callback_thread is not None and callback_thread == threading.get_ident():
+                    raise RuntimeError("RunHandle.wait() cannot wait from this run's completion callback")
                 while not self._terminal and self._wait_in_progress:
                     remaining = None if deadline is None else deadline - _monotonic()
                     if remaining is not None and remaining <= 0:
@@ -15335,10 +15343,11 @@ class Worker:
         prepare those resources first. Waiting on the successor also resolves
         its predecessor, including when handles are waited in reverse order.
 
-        ``completion_callback(error)`` runs once after native completion and
+        The synchronous ``completion_callback(error)`` runs once after native completion and
         Simpler cleanup, before publishing the final result or authorizing a
         successor. It runs on the thread resolving the handle (possibly close)
-        and receives the preceding error or None. An exception it raises becomes
+        and receives the preceding error or None. It must return without waiting
+        for a run that requires this completion. An exception it raises becomes
         the final error when no earlier error exists. Use it to include outer
         copyback or cleanup in the predecessor-success boundary.
         """
@@ -15346,6 +15355,10 @@ class Worker:
         if completion_callback is not None:
             if self.level == 2 or not hasattr(completion_callback, "__call__"):
                 raise ValueError("completion_callback requires a callable and hierarchical Worker")
+            if inspect.iscoroutinefunction(completion_callback) or inspect.iscoroutinefunction(
+                completion_callback.__call__
+            ):
+                raise TypeError("completion_callback must be synchronous")
             submit_options["completion_callback"] = completion_callback
         if success_predecessor is not None:
             if (
@@ -15449,22 +15462,35 @@ class Worker:
                 state.slot_id, args, cfg, caller_stream=caller_stream, original_handle=callable
             )
 
-        while True:
-            with self._submit_mu.exclusive():
-                predecessor = self._cleanup_bearing_predecessor()
-                if predecessor is None:
-                    self._require_no_ordered_cleanup_failure("submit")
-                    if success_predecessor is not None or completion_callback is not None:
-                        return self._submit_l3_locked(
-                            callable,
-                            args,
-                            cfg,
-                            success_predecessor=success_predecessor,
-                            completion_callback=completion_callback,
-                        )
-                    return self._submit_l3_locked(callable, args, cfg)
-            # Finalization can drop keepalives whose destructors acquire this serializer.
-            predecessor._wait_for_handoff()
+        failed_completion: list[BaseException | None] | None = [] if completion_callback is not None else None
+        try:
+            while True:
+                with self._submit_mu.exclusive():
+                    predecessor = self._cleanup_bearing_predecessor()
+                    if predecessor is None:
+                        self._require_no_ordered_cleanup_failure("submit")
+                        if success_predecessor is not None or completion_callback is not None:
+                            return self._submit_l3_locked(
+                                callable,
+                                args,
+                                cfg,
+                                success_predecessor=success_predecessor,
+                                completion_callback=completion_callback,
+                                failed_completion=failed_completion,
+                            )
+                        return self._submit_l3_locked(callable, args, cfg)
+                # Finalization can drop keepalives whose destructors acquire this serializer.
+                predecessor._wait_for_handoff()
+        except BaseException:
+            if failed_completion and completion_callback is not None:
+                # The failed run has no public handle. The submit operation
+                # still holds its Worker lease while the outer callback runs.
+                try:
+                    self._invoke_completion_callback(completion_callback, failed_completion[0])
+                except BaseException:  # noqa: BLE001
+                    # The graph failure remains the synchronous submit outcome.
+                    pass
+            raise
 
     def _record_unreclaimable(self, message: str, cause: BaseException | None = None) -> RuntimeError:
         """Refuse all further work on this worker, and return the reason.
@@ -16144,6 +16170,7 @@ class Worker:
         *,
         success_predecessor: RunHandle | None = None,
         completion_callback: Callable[[BaseException | None], None] | None = None,
+        failed_completion: list[BaseException | None] | None = None,
     ) -> RunHandle:
         host_args, mappings = self._prepare_l3_host_args(args)
         assert self._orch is not None
@@ -16218,6 +16245,11 @@ class Worker:
                 # either the run fence fires or whole-tree teardown reclaims an
                 # unsettled cancellation.
                 self._building_run_resources = None
+                # Capture the cleanup result under the serializer. The caller
+                # invokes the user callback after releasing it.
+                handle._completion_callback = (
+                    completion_callback if failed_completion is None else failed_completion.append
+                )
                 if cancellation_error is None:
                     handle._wait_for_serialization()
                 else:
@@ -16259,7 +16291,11 @@ class Worker:
         tid = threading.get_ident()
         self._run_finalization_depth[tid] = self._run_finalization_depth.get(tid, 0) + 1
         try:
-            callback(error)
+            result = callback(error)
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise TypeError("completion_callback returned an awaitable")
         finally:
             depth = self._run_finalization_depth.get(tid, 0) - 1
             if depth <= 0:
