@@ -102,3 +102,21 @@ def test_compile_worker_budget_rejects_concurrent_overrides():
     release.set()
     worker.join(timeout=2)
     assert not worker.is_alive()
+
+
+def test_budget_override_counts_already_held_slots():
+    attempting = Event()
+    admitted = Event()
+
+    def compile_one():
+        attempting.set()
+        with compile_pool.compile_slot():
+            admitted.set()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with compile_pool.compile_slot(), compile_pool.compile_worker_budget(1):
+            future = pool.submit(compile_one)
+            assert attempting.wait(timeout=2)
+            assert not admitted.wait(timeout=0.2)
+        future.result(timeout=2)
+        assert admitted.is_set()
