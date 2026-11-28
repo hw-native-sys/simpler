@@ -1,7 +1,7 @@
 # `qwen3_14b_decode/` — Qwen3-14B 40-layer decode (CANN fused attention)
 
 > **a5 port.** This is the a5 port of
-> [`examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/`](../../a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/).
+> [`examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/`](../../../a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/).
 > The kernels are the a2a3 harvest with the arch deltas listed in
 > "Relationship to the a2a3 example" below — the math is untouched, but the
 > a2a3 harvest is not byte-portable: a5 spells the L0A fractal, the legal
