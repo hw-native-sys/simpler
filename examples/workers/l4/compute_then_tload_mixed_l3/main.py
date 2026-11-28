@@ -32,6 +32,7 @@ from simpler.task_interface import (
 )
 from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
 
+from simpler_setup.goldens import max_abs_error
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
@@ -217,7 +218,7 @@ def _unpack_floats(raw: bytes) -> tuple[float, ...]:
 
 
 def _max_diff(actual: tuple[float, ...], expected: tuple[float, ...]) -> float:
-    return max(abs(observed - wanted) for observed, wanted in zip(actual, expected))
+    return max_abs_error(observed - wanted for observed, wanted in zip(actual, expected))
 
 
 def _local_args(domain) -> TaskArgs:

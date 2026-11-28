@@ -179,7 +179,7 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
         for i in range(nranks):
             max_diff = float(torch.max(torch.abs(host_outputs[i] - expected)))
             print(f"[allreduce] chip {i}: max |out - expected| = {max_diff:.3e}")
-            if max_diff > 1e-3:
+            if not max_diff <= 1e-3:
                 ok = False
 
         if not ok:
