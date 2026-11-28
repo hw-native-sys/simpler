@@ -10,12 +10,13 @@ ninety seconds on a GitHub runner. They are cheap to get subtly wrong and the
 symptom is silent — a job that should have skipped merely *passes*, so nobody
 notices until a flake in it reddens an unrelated PR.
 
-The explicit maintainer/admin `/run-a5` command in `ci-a5-comment.yml` is a separate
+The explicit maintainer/admin `/run-a5` command in `ci-command.yml` dispatches `ci-a5-comment.yml` as a separate
 exception: it runs A5 UT and onboard scene tests without change detection,
 even for non-code PRs. Ordinary `ci.yml` runs A5 UT behind the
 A5 device and SDK outputs and A5 framework tests behind
 `a5_changed && st_affected`, alongside the existing simulation, CPU and profiling
-gates. Daily retains its A5 jobs.
+gates. Daily retains its A5 jobs. The separate `/run a3-network1` command uses the
+same admission policy to request the A3 two-machine Network1 suite.
 
 This rule is about keeping the gates honest. It is not a description of the
 current filters; those change. It is the set of invariants they must satisfy.

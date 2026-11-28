@@ -296,7 +296,7 @@ def test_environment_callers_keep_trigger_and_device_contracts():
         for platform in ("a2a3", "a5"):
             assert daily["jobs"][f"st-{family}-{platform}"]["with"]["manual_mode"] == "include"
         if family == "onboard":
-            assert comment["jobs"][f"st-{family}-a5"]["needs"] == ["gate-and-resolve"]
+            assert comment["jobs"][f"st-{family}-a5"]["needs"] == "prepare"
     for name in ("ci", "daily", "ci-a5-comment"):
         callers = workflow(name)["jobs"]
         suites = [job for job in callers.values() if job.get("uses") == "./.github/workflows/_st-framework.yml"]

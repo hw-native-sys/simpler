@@ -1,0 +1,111 @@
+name: CI Command
+
+# GitHub receives comments; no public webhook server or App secret is needed.
+# This file must be installed on main before PR comment commands become available.
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+env:
+  CI_COMMAND: ${{ contains(github.event.comment.body, 'a3-network1') && 'a3-network1' || 'a5' }}
+
+jobs:
+  route:
+    if: >-
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '/run-a5') || contains(github.event.comment.body, '/run a5') ||
+       contains(github.event.comment.body, '/run-a3-network1') || contains(github.event.comment.body, '/run a3-network1'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      command: ${{ steps.route.outputs.command }}
+      key: ${{ steps.route.outputs.key }}
+      head: ${{ steps.route.outputs.head }}
+      base: ${{ steps.route.outputs.base }}
+      merge: ${{ steps.route.outputs.merge }}
+      error: ${{ steps.route.outputs.command_error }}
+    steps:
+      - name: Checkout trusted command router
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: |
+            .github/scripts
+            .github/ci-commands.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Validate PR before joining the status writer queue
+        id: route
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/ci_control.py command-route
+
+  dispatch:
+    name: >-
+      Dispatch ${{ needs.route.outputs.command }} PR #${{ github.event.issue.number }} @${{ needs.route.outputs.head }}
+    needs: route
+    if: needs.route.outputs.key != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      error: ${{ steps.dispatch.outputs.command_error }}
+    concurrency:
+      group: ci-command-status-${{ needs.route.outputs.key }}
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: write
+      statuses: write
+    steps:
+      - name: Checkout trusted command handler
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: |
+            .github/scripts
+            .github/ci-commands.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Validate PR and dispatch the requested tests
+        id: dispatch
+        env:
+          CI_ROUTED_HEAD: ${{ needs.route.outputs.head }}
+          CI_ROUTED_BASE: ${{ needs.route.outputs.base }}
+          CI_ROUTED_MERGE: ${{ needs.route.outputs.merge }}
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/ci_control.py dispatch
+
+  feedback:
+    needs: [route, dispatch]
+    if: >-
+      always() && github.event.issue.pull_request &&
+      (needs.route.result == 'failure' || needs.dispatch.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # The conversation belongs to a PR; an issues-only token can receive 403
+      # when listing or posting its comments, including in fork repositories.
+      pull-requests: write
+    steps:
+      - name: Checkout trusted command feedback
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: |
+            .github/scripts
+            .github/ci-commands.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Explain the failed request on the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_COMMAND_ERROR: ${{ needs.route.outputs.error || needs.dispatch.outputs.error }}
+        run: python .github/scripts/ci_control.py command-feedback
