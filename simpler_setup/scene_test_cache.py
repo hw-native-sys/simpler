@@ -327,7 +327,7 @@ _disabled_dirs: set[Path] = set()
 
 
 def prune_stale_entries() -> int:
-    """Delete cache entries and lock files untouched for ``_ENTRY_RETENTION_S``.
+    """Delete cache entries untouched for ``_ENTRY_RETENTION_S``.
 
     Runs at most once per cache directory per process, after a publish has
     already proved the directory writable. Returns the number of entries removed.
@@ -358,10 +358,7 @@ def prune_stale_entries() -> int:
                 entry.unlink()
         removed += 1
 
-    for lock_path in (KERNEL_CACHE_DIR / _LOCK_DIR).glob("*.lock"):
-        with contextlib.suppress(OSError):
-            if lock_path.stat().st_mtime < cutoff:
-                lock_path.unlink()
+    # Lock files must retain their inode while other processes may hold or await flock.
     if removed:
         logger.info("[SceneTestCache] pruned %d stale entr(ies) from %s", removed, KERNEL_CACHE_DIR)
     return removed
