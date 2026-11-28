@@ -204,10 +204,11 @@ void cancel_during_slot_access() {
     auto *active = get(1);
     // A SharedTile observer runs with its slot locked and may request another slot.
     // Observe cancellation on slot 0 before requesting that slot from inside slot 1.
-    std::unique_lock observer(active->mutex);
+    std::unique_lock observer(*active);
     std::thread abort([&] { shared.cancel(); });
-    std::unique_lock notice(first->mutex);
-    first->changed.wait(notice, [&] { return first->cancelled; });
+    std::unique_lock notice(*first);
+    rejects([&] { first->wait([] { return false; }); });
+    assert(first->cancelled);
     notice.unlock();
     rejects([&] { get(2); });
     observer.unlock();

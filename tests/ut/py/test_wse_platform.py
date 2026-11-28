@@ -190,6 +190,7 @@ def test_wse_target_keeps_peer_semantics_on_reused_thread(tmp_path, core_type):
     expected = {"a2a3sim": [1.0] * 8 + [2.0, 0.0], "a5sim": [0.0] * 8 + [5.0, 17.0], "wsesim": [0.0] * 8 + [5.0, 17.0]}
     env = dict(os.environ)
     env.pop("PTO_CPU_SIM_ARCH", None)
+    target = {"a2a3sim": "a2a3sim", "a5sim": "a5sim", "wsesim": "wsesim-v2"}
     for order in (("a2a3sim", "a5sim", "wsesim"), ("wsesim", "a5sim", "a2a3sim")):
         result = subprocess.run(
             [sys.executable, "-c", _RUN, *(artifacts[p] for p in order)],
@@ -199,4 +200,4 @@ def test_wse_target_keeps_peer_semantics_on_reused_thread(tmp_path, core_type):
             timeout=60,
             check=True,
         )
-        assert json.loads(result.stdout) == [[p, expected[p]] for p in order * 2]
+        assert json.loads(result.stdout) == [[target[p], expected[p]] for p in order * 2]

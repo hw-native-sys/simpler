@@ -57,7 +57,8 @@ void contention(bool overflow) {
                     results[t].push_back(r.new_value);
                 } else
                     assert(
-                        overflow && r.status == S::OVERFLOW && r.old_value == UINT64_MAX && r.new_value == r.old_value
+                        overflow && r.status == S::VALUE_OVERFLOW && r.old_value == UINT64_MAX &&
+                        r.new_value == r.old_value
                     );
             }
         });
@@ -72,7 +73,7 @@ void contention(bool overflow) {
     for (size_t i = 0; i < values.size(); ++i)
         assert(values[i] == first + i);
     assert(word == (overflow ? UINT64_MAX : 23 + workers * count));
-    if (overflow) assert(wse::counter_signal({&word, 1}, 0, 2).status == S::OVERFLOW && word == UINT64_MAX);
+    if (overflow) assert(wse::counter_signal({&word, 1}, 0, 2).status == S::VALUE_OVERFLOW && word == UINT64_MAX);
 }
 
 void publication() {

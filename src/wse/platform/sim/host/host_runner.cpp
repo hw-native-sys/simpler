@@ -295,7 +295,9 @@ std::thread WseHostRunner::create_thread(std::function<void()> fn, std::string n
     std::promise<int> binding;
     auto ready = binding.get_future();
     std::thread child([dev_id, fn = std::move(fn), name, binding = std::move(binding)]() mutable {
-#if defined(__linux__)
+#if defined(__APPLE__)
+        if (!name.empty()) pthread_setname_np(name.c_str());
+#elif defined(__linux__)
         if (!name.empty()) pthread_setname_np(pthread_self(), name.c_str());
 #endif
         int error;

@@ -31,6 +31,11 @@ extern "C" void publish_one(wse::BlockScope scope) {
 extern "C" float consume(wse::BlockScope scope, uint64_t generation) {
     return Shared(1,0,0,2,scope).read(generation).at(0,0);
 }
+// The host and kernel can have different C++ exception runtimes.
+extern "C" bool rejects_stale_read(wse::BlockScope scope) {
+    try { consume(scope, 2); } catch (const std::invalid_argument &) { return true; }
+    return false;
+}
 extern "C" void signal_word(uint64_t *words) {
     words[1]=77;
     if(wse::counter_signal({words,1},0).status!=wse::CounterStatus::OK) std::terminate();
@@ -91,9 +96,8 @@ int main(int argc,char **argv) {
         publishing.join();
         __atomic_store_n(&epochs[0],uint64_t{0},__ATOMIC_RELEASE);
         storage[0].clear();
-        bool rejected=false;
-        try {consume(scopes[0],2);} catch(const std::invalid_argument &) {rejected=true;}
-        assert(rejected);
+        auto rejects_stale=symbol<bool(*)(wse::BlockScope)>(libs[1-producer],"rejects_stale_read");
+        assert(rejects_stale(scopes[0]));
         __atomic_store_n(&epochs[0],uint64_t{2},__ATOMIC_RELEASE);
         scopes[0].epoch=2;
         publish_one(scopes[0]); assert(consume(scopes[0],1)==37);

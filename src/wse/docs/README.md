@@ -35,8 +35,10 @@ uses `simpler_setup.environment.PROJECT_ROOT` to locate them.
 
 WSE kernel callers explicitly pass `core_type=""`; a homogeneous PE has no
 AIC/AIV compiler-role macro. The common compiler forwards this value unchanged.
-The shared CPU target header identifies these kernels as `wsesim`, while the
-pinned compatible PTO operations retain their existing A5 CPU semantics.
+The shared CPU target header identifies the current kernel ABI as `wsesim-v2`.
+Recompile prebuilt kernels marked `wsesim` before registering them with this
+runtime. The loader checks the marker before registering hooks because the
+shared Block slot layout changed. PTO operations retain their A5 CPU semantics.
 Kernel caching uses the existing source-include closure and compiler-logic
 identity; unrelated WSE headers do not invalidate a kernel's cache entry.
 
